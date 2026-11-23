@@ -89,7 +89,7 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0088_owner_delegates.sql","sha256":"d1e3be9cbb398f77d91174d1b93865536f0e3e2f1efda900e74798a6059b769b"},
+    {"name":"0088_owner_delegates.sql","sha256":"6a76a09cb3a6dc0fabb5bca8d778e95e3ccd71b20f8926e20576ee6305e93de4"},
     {"name":"0089_delegation_release_gates.sql","sha256":"9a5bc947a59ce037b679dce0fbe5a0a51fba90c15fdf8d6f80dc85e8ddc29fe1"}
   ],
   "required":[
@@ -303,7 +303,8 @@
     {"kind":"column","name":"public.delegation_agent_bindings.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_agent_bindings.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_approvals.actions","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":7,"type":"jsonb"}},
-    {"kind":"column","name":"public.delegation_approvals.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":11,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_approvals.consumed_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":11,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_approvals.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_approvals.expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":9,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_approvals.grant_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":5,"type":"text"}},
     {"kind":"column","name":"public.delegation_approvals.id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
@@ -2451,5 +2452,5 @@
   "optional":{
 
   },
-  "sha256":"925a018f52a51fbad241251c4bba17060e379d202599d509c909e987e87c9770"
+  "sha256":"1026679e5f39d58d21ed02f8eb2e4ff14d0ead992a43b97fcb25873f8ecc1e41"
 }

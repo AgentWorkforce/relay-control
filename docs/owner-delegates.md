@@ -21,26 +21,56 @@ Attestation also needs a signing key (below).
 
 ## Configuration
 
-| Variable                                                 | Meaning                                                                                                  |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`)           | base64url 32-byte Ed25519 seed. Generate: `node -e "console.log(crypto.randomBytes(32).toString('base64url'))"` |
-| `SELFHOST_DELEGATION_SIGNING_KID`                        | key id published in the JWKS and the JWS header (1–64 of `A-Za-z0-9._-`)                                 |
-| `SELFHOST_DELEGATION_PREVIOUS_KEYS`                      | optional JSON array of up to 8 `{kid, x}` retired public keys kept in the JWKS during rotation           |
+| Variable | Meaning |
+| --- | --- |
+| `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`) | The Ed25519 signing key: a PKCS#8 PEM, or Cloud's keyring JSON (below). A base64url 32-byte seed (the earlier form) is still read. |
+| `SELFHOST_DELEGATION_SIGNING_KID` | Optional. The key id, 1–64 of `A-Za-z0-9._-`. Default: the RFC 7638 thumbprint of the public key, as Cloud. |
+| `SELFHOST_DELEGATION_PREVIOUS_KEYS` | Optional JSON array of up to 3 public keys `{kid?, x}` (or OKP JWKs) kept in the JWKS: retired keys, or a key published before it signs. Not together with a keyring's `previousPublicJwks`. |
 
-The first two are required together. Without them, attestation answers
-`{"verdict":"none","reason":"unavailable"}` and the JWKS is `{"keys":[]}`.
-Rotate quarterly, publishing the new key before signing with it, so that
-relay-nodes with a cached JWKS (an hour) already know the new `kid`:
+Not configured (empty, `unset`, or a `*-disabled` placeholder, as Cloud):
+attestation answers `{"verdict":"none","reason":"unavailable"}` and the JWKS
+is `{"keys":[]}`. A value that is set but malformed stops startup, as every
+other relay-control secret does, rather than running with attestation silently
+off.
 
-1. Generate a new seed and kid. Add the new public `{kid, x}` to
-   `SELFHOST_DELEGATION_PREVIOUS_KEYS` (which publishes any extra keys) and
-   redeploy. Wait at least one JWKS cache hour.
-2. Switch `SELFHOST_DELEGATION_SIGNING_KEY`/`_KID` to the new key, and replace
-   its entry in `SELFHOST_DELEGATION_PREVIOUS_KEYS` with the old key's public
-   `{kid, x}` (from the JWKS).
-3. After the attestation TTL plus a cache hour, drop the old key.
+The kid defaults to the RFC 7638 thumbprint, as Cloud's. An explicit kid
+(`SELFHOST_DELEGATION_SIGNING_KID` or the keyring's `kid`) is kept as given
+and not checked against the thumbprint: verifiers match a kid exactly, so an
+install that already published one keeps it. Every published kid must be
+distinct.
 
-Every published kid must be distinct.
+### Generating and rotating the key
+
+Generate a key and point the server at it (the file stays mode 0600):
+
+```sh
+openssl genpkey -algorithm ed25519 -out delegation-signing.pem
+chmod 600 delegation-signing.pem
+SELFHOST_DELEGATION_SIGNING_KEY_FILE=/path/to/delegation-signing.pem
+```
+
+Its kid is shown in `GET /.well-known/relay-delegation-keys.json`.
+
+Rotate (quarterly, or at once if the key leaked) with Cloud's keyring JSON,
+which keeps up to 3 retired public keys in the JWKS so that attestations they
+signed keep verifying for their 300-second life and beyond:
+
+1. Read the current public key from the JWKS:
+   `curl -s https://<origin>/.well-known/relay-delegation-keys.json`.
+2. Generate a new key as above, and write the keyring:
+
+   ```json
+   {"currentPrivateKeyPem": "<new PEM, newlines as \n>",
+    "previousPublicJwks": [{"kty": "OKP", "crv": "Ed25519", "x": "<old x>", "kid": "<old kid>"}]}
+   ```
+
+   Keep at most 3 previous keys; drop the oldest.
+3. Set `SELFHOST_DELEGATION_SIGNING_KEY_FILE` to the keyring file and restart.
+
+Relay-nodes cache the JWKS for up to an hour and refetch on an unknown kid.
+To avoid even one refetch, publish the new public key first: add it to
+`SELFHOST_DELEGATION_PREVIOUS_KEYS`, wait an hour, then switch the signing
+key and move the old public key into the previous list.
 
 ## Who may call what
 
@@ -276,8 +306,18 @@ that state rather than on anything read before the slow Relaycast lookups:
 9. standing against the target owners as committed now: `recipient_policy`
    (relay-control reads them locally).
 
-The attestation (or the consumption) is written in the same transaction, and
-the attestation is signed last, so a refusal signs nothing. Its `exp` is the
+The attestation (or, for redeem, the consumption and the `approval.redeemed`
+event) is written in the same transaction, and the attestation is signed
+last, so a refusal signs nothing. If the `approval.redeemed` write fails, the
+consumption rolls back and the answer is `unavailable`: no use goes
+unrecorded. Refusal events stay best-effort; a failed write is logged
+(`delegation.audit_write_failed`), as is every `unavailable` caused by an
+exception (`delegation.unavailable`). See
+`docs/delegation-quote-redaction-runbook.md` for the log lines.
+
+Once every single-use action of an approval has been consumed, the approval
+is stamped `consumed_at` in the consuming transaction. A fully spent approval
+is no longer unredeemed: grant revocation and `revoke-all` leave it alone. Its `exp` is the
 least of 300 seconds after issue, the approval window found earlier, and the
 grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take
@@ -323,15 +363,18 @@ trailing `*` and nothing else wild, and it is matched against the token's `ref`.
 A gate trusts one OIDC issuer: GitHub Actions by default, or a self-host
 issuer from `SELFHOST_DELEGATION_OIDC_ISSUERS` named in `issuer` (shown on the
 gate only when it is not GitHub). A same-named repository on another issuer is
-a different repository. When several members register the same workflow, the
-approval owner's own gate is used. At the commit, the approval (revoked,
-withdrawn, expired), the gate (deleted) and a tier D grant (revoked, expired,
-narrowed) are re-read under their locks.
+a different repository. When several members register the same workflow with
+overlapping prefixes, the first (oldest) matching gate whose owner is still a
+member and has standing serves.
 
-`workflow_ref` must be a workflow in the gate's repo, pinned to a ref. When
-the publishing job runs inside a reusable workflow, the gate also sets
-`job_workflow_ref` (that workflow's file and ref, which may be in another
-repo), and the token's `job_workflow_ref` must match it too.
+`workflow_ref` must be a workflow in the gate's repo at the gate's own `ref`,
+or, for a tag gate, at its `ref_pattern` (`…/release.yml@refs/tags/v*`): each
+tag run's token names its own tag, and the gate matches `<file>@<that tag>`
+for a tag the pattern covers. When the publishing job runs inside a reusable
+workflow, the gate also sets `job_workflow_ref` (that workflow's file and a
+full ref, the gate's `ref_pattern`, or a 40-hex lowercase commit SHA, which
+may be in another repo), and the token's `job_workflow_ref` must match it
+exactly too.
 `target_prefix` must start with `<repo>:` and contain no `*`. `event` is one
 of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
 the gated ref's own workflow code (never `pull_request*` or `workflow_run`).
@@ -345,8 +388,7 @@ registered twice: 409 `gate_exists`. Each change is audited
 `Authorization: Bearer <workflow OIDC token>` and `{approval_id, action,
 dry_run?}`. Control checks, in order:
 
-1. **Delegation on**, otherwise `not_enabled`.
-2. **The token.**
+1. **The token** (before anything about the workspace is read).
    - Its signature verifies against the issuer's JWKS, found by OpenID
      discovery, cached for 10 minutes and refetched for an unknown `kid`.
    - The issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
@@ -354,9 +396,13 @@ dry_run?}`. Control checks, in order:
      URLs, at most 8; for example a GitHub Enterprise Server issuer).
    - The audience is this deployment's origin (`SELFHOST_PUBLIC_URL`).
    - The token is within its validity window, with 60 seconds of clock skew.
-   - Failing any of these is `oidc_invalid`, and an unverified token's claims
-     are never logged.
-3. **The gate**, matched against the token:
+   - Failing any of these is `oidc_invalid`. When the issuer's keys cannot be
+     read and none are cached, the answer is `unavailable` (an outage, not a
+     forged token). After a failed key fetch no refetch starts for 30
+     seconds; meanwhile the last good keys serve, or the call fails fast.
+     Each failure is logged (`delegation.dependency_failed`, op
+     `github_oidc_jwks`, with `stale_cache_served` and `status`).
+2. **The gate**, matched against the token:
    - No gate for the token's `repository` is `gate_unknown`.
    - A gate's `workflow_ref`, `ref` (or `ref_pattern`) and `event` must
      match the token's `workflow_ref`, `ref` and `event_name` exactly, and
@@ -365,10 +411,17 @@ dry_run?}`. Control checks, in order:
      case-insensitively, as on GitHub; the workflow file and ref exactly.
    - The first verified match pins the gate to the token's `repository_id`
      and `repository_owner_id` (shown on the gate); a pinned gate needs them
-     to match, so a repository that later reuses the name never does.
-   - The action's target must start with the matching gate's
-     `target_prefix`, otherwise `target_prefix`.
-4. **The approval.** The normal redeem checks run:
+     to match, so a repository that later reuses the name never does. A gate
+     serves only once its stored ids are the token's: a token without the
+     ids, a failed pin, or a concurrent first request that pinned other ids
+     is `gate_mismatch`.
+   - Until a gate matches and is pinned, the caller is nobody in particular:
+     `oidc_invalid`, `gate_unknown` and `gate_mismatch` write nothing to the
+     workspace's audit log.
+3. **Delegation on**, otherwise `not_enabled`.
+4. **The target prefix**: the action's target must start with a matching
+   gate's `target_prefix`, otherwise `target_prefix`.
+5. **The approval.** The normal redeem checks run:
    - the approval exists, and the action is one it names;
    - revocation;
    - for a delegate's (tier D) approval: its grant, the delegate's binding,
@@ -385,25 +438,34 @@ dry_run?}`. Control checks, in order:
    - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
    - `<repo>:land:<branch>:<head sha>`
    - `<repo>:ios:<distribution>:<build number>:<sha>`
-5. **Single use per run, per action** (§5.1).
+6. **A fresh re-read** of what the redeem rests on (delegation on, the
+   approval unrevoked and unexpired, its tier D grant live and in scope and
+   the class not newly tier O, its tier O owner and the gate's owner still
+   members, the class still allowed). A dry run answers from it.
+7. **Single use per run, per action** (§5.1), decided under locks as at
+   redeem (`decideUnderLocks`: the gate owner's and, for tier O, the approval
+   owner's membership, the policy, the tier D grant, the approval, then the
+   gate row). A departed gate owner is `recipient_policy` for tier D and a
+   departed approval owner `revoked` for tier O.
    - The first redeem of an action consumes that action and binds it to the
-     token's `run_id` (and repository and issuer). Other actions of the same
-     approval are unaffected.
+     token's `run_id` (and repository, compared case-insensitively, and
+     issuer). Other actions of the same approval are unaffected. Once every
+     single-use action is spent the approval is stamped `consumed_at`.
    - Any later redeem in the same run, by another job or a later attempt,
      answers `{ok:true, consumed:true, same_run:true}`.
    - Any other run gets `consumed`.
 
 `dry_run: true` runs every check and never consumes. It answers
 `{ok:true, consumed:false, dry_run:true}` or `{ok:false, reason, dry_run:true}`.
-Redeems are audited as `gate.redeemed` or `gate.refused`, with the run,
-workflow and action and auth method `github_oidc`; a passing dry run is
-`gate.checked`, so `gate.redeemed` counts real uses only. A dry run carries
-`dry_run: true` in the event data, as in Cloud.
-
-A gate serves only while its owner is still a member. At the commit, the
-current policy and grant decide as at attest and redeem (`not_enabled`,
-`out_of_scope`, `tier_o_required`), and the gate owner's membership is
-re-read under a share lock.
+`gate.redeemed` (with the run, attempt, repository, workflow refs, ref,
+event, action and `same_run`, auth method `github_oidc`) is written in the
+consuming transaction: if the write fails, the consumption and run binding
+roll back and the job is answered `unavailable`. `gate.refused` and a passing
+dry run's `gate.checked` are best-effort (a failed write is logged), so
+`gate.redeemed` counts real uses only. A dry run carries `dry_run: true` in
+the event data, as in Cloud. An exception is logged as
+`delegation.unavailable` (op `gate_redeem`), and each refusal but
+`oidc_invalid` as `delegation.refused`.
 
 Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
 `delegation_gate_redemptions`.
@@ -419,7 +481,9 @@ Revocation happens in these cases:
 
 Revoking invalidates every unredeemed approval under the grant at once.
 `revoke-all` also invalidates the owner's (or, with `all`, the workspace's)
-unredeemed tier O approvals, and answers `{revoked: [grant ids]}`.
+unredeemed approvals, writes one `approval.revoked` event for them with data
+`{scope: "revoke_all", count, approval_ids}`, and answers
+`{revoked: [grant ids]}`.
 Turning `delegation_enabled` off makes every attestation and redeem
 `not_enabled` without deleting grants.
 
@@ -459,7 +523,9 @@ itself is also in the signed claims (`quote`). Quote text is redacted to `quote_
 `quote_redacted_at` set) once it is older than the org's
 `quote_retention_days`. An hourly sweep (started with the server) also runs the
 redaction and marks lapsed grants `expired`, so a quiet workspace does not keep
-quote text past its window.
+quote text past its window. Each run handles at most 500 grants and 500
+quotes, then tries the due Relaycast redactions and reports the queue's
+backlog (see `docs/delegation-quote-redaction-runbook.md`).
 
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,
   default 90. It is set with `GET`/`PUT /api/v1/orgs/{org}/delegation-policy`

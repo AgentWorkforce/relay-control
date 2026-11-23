@@ -3519,9 +3519,12 @@ paths:
         `workflow_ref`, `ref` (or the gate's `ref_pattern`) and
         `event_name` must match a registered gate exactly, plus
         `job_workflow_ref` when the gate sets it (`gate_unknown` when
-        the repository has no gate, `gate_mismatch` otherwise), and the
-        action's target must start with that gate's `target_prefix`
-        (`target_prefix`). Then the normal redeem checks run (approval, grant,
+        the repository has no gate, `gate_mismatch` otherwise, also for a
+        token without GitHub's repository ids while the gate is unpinned),
+        and the action's target must start with that gate's `target_prefix`
+        (`target_prefix`). Until a gate matches, nothing is written to the
+        workspace's audit log; a key outage with no cached keys is
+        `unavailable`. Then the normal redeem checks run (approval, grant,
         delegate binding, scope, policy, tier O, revocation, expiry, the gate
         owner's standing, conditions). A `release` target must name exactly
         one release (§11a.2); any other approval is malformed.
@@ -10298,8 +10301,8 @@ components:
       properties:
         repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
         issuer: { type: string, description: "relay-control only: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. A same-named repository on another issuer is another repository." }
-        workflow_ref: { type: string, maxLength: 512, example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
-        job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@refs/heads/main" }
+        workflow_ref: { type: string, maxLength: 512, description: "<repo>/.github/workflows/<file>@<the gate's ref, or its ref_pattern for a tag gate>", example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
+        job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in: <owner>/<repo>/.github/workflows/<file>@<full ref, the gate's ref_pattern, or a 40-hex lowercase commit SHA>", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@0123456789abcdef0123456789abcdef01234567" }
         ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
         ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
         event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }

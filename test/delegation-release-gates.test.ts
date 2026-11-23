@@ -633,3 +633,47 @@ test("gates: workflow_ref is at the gate's ref; a reusable workflow may be pinne
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: otherSha })), approvalId, STABLE, dry)).body,
     { ok: false, reason: "gate_mismatch", dry_run: true });
 });
+
+test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fails fast), and is logged", async (t) => {
+  const { workflowOidcVerifier, OidcKeysUnavailable } = await import("../src/delegation/oidc.js");
+  const { setDelegationLogSinkForTesting } = await import("../src/delegation/observe.js");
+  const lines: string[] = [];
+  setDelegationLogSinkForTesting((_level, line) => { lines.push(line); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  const github = issuer(GITHUB);
+  const serve = oidcFetch([github]);
+  let down = true;
+  let fetches = 0;
+  const clock = { ms: Date.now() };
+  const verify = workflowOidcVerifier({ issuers: [GITHUB], audience: "https://control.example.test", now: () => new Date(clock.ms),
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      fetches += 1;
+      return down ? new Response("busy", { status: 503 }) : serve(input, init);
+    }) as typeof fetch });
+  const seconds = Math.floor(clock.ms / 1000);
+  const token = (kid = github.kid) => mint({ ...github, kid }, { iss: GITHUB, aud: "https://control.example.test", sub: "repo:x",
+    repository: REPO, workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "push",
+    run_id: "1", run_attempt: "1", iat: seconds, nbf: seconds, exp: seconds + 600 });
+  // No keys yet and the issuer is down: an outage, not a forged token.
+  await assert.rejects(verify(token()), OidcKeysUnavailable);
+  const afterFirst = fetches;
+  // Within the backoff, no fetch starts: it fails fast.
+  await assert.rejects(verify(token()), OidcKeysUnavailable);
+  assert.equal(fetches, afterFirst);
+  const failed = lines.map(line => JSON.parse(line) as Record<string, unknown>).filter(line => line.message === "delegation.dependency_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.op, "github_oidc_jwks");
+  assert.equal(failed[0]!.stale_cache_served, false);
+  assert.equal(failed[0]!.status, 503);
+  // After 30 s it fetches again; the issuer is back.
+  clock.ms += 31_000;
+  down = false;
+  assert.equal((await verify(token())).repository, REPO);
+  // The issuer goes down again: an unknown kid refetches (after the cooldown), fails, and the last good keys still serve.
+  down = true;
+  clock.ms += 61_000;
+  await assert.rejects(verify(token("rotated-kid")), /oidc_invalid: unknown_key/);
+  assert.equal((await verify(token())).repository, REPO);
+  const stale = lines.map(line => JSON.parse(line) as Record<string, unknown>).filter(line => line.message === "delegation.dependency_failed").at(-1)!;
+  assert.equal(stale.stale_cache_served, true);
+});

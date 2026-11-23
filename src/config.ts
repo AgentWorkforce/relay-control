@@ -15,7 +15,7 @@ import {
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
 import type { GithubAppConfig } from "./admin/github-app.js";
 import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
-import { privateKeyFromSeed, type DelegationSigningConfig } from "./delegation/jws.js";
+import { privateKeyFromSeed, publicX, type DelegationSigningConfig } from "./delegation/jws.js";
 
 /** One extra site: a dashboard origin and an API origin (may be equal). */
 export type ExtraSite = { dashboardOrigin: string; apiOrigin: string };
@@ -754,44 +754,136 @@ export function loadDelegationOidcIssuers(env: Env): string[] {
 }
 
 const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;
+/** As Cloud: retired (or pre-published) public keys kept in the JWKS. */
+const MAX_PREVIOUS_DELEGATION_KEYS = 3;
 
+/** RFC 7638 thumbprint of an Ed25519 public key (members in lexicographic order, no whitespace), as Cloud's kid. */
+export function delegationKeyThumbprint(x: string): string {
+  return createHash("sha256").update(`{"crv":"Ed25519","kty":"OKP","x":"${x}"}`).digest("base64url");
+}
+
+/** As Cloud: empty, `unset` and any `*-disabled` placeholder mean "not configured". */
+function realDelegationKeyValue(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed && trimmed !== "unset" && !trimmed.endsWith("-disabled") ? trimmed : null;
+}
+
+/** A 32-byte Ed25519 seed from a PKCS#8 PEM private key. */
+function seedFromPem(pem: string, name: string): Buffer {
+  let key;
+  try {
+    key = createPrivateKey(pem);
+  } catch {
+    throw new Error(`${name} must be a PKCS#8 PEM Ed25519 private key`);
+  }
+  if (key.asymmetricKeyType !== "ed25519") throw new Error(`${name} must be an Ed25519 key`);
+  const der = key.export({ format: "der", type: "pkcs8" });
+  return Buffer.from(der.subarray(der.byteLength - 32));
+}
+
+function previousDelegationKey(value: unknown, name: string): { kid: string; x: string } {
+  const key = value as Record<string, unknown> | null;
+  if (!key || typeof key !== "object" || "d" in key || typeof key.x !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(key.x) ||
+      (key.kty !== undefined && key.kty !== "OKP") || (key.crv !== undefined && key.crv !== "Ed25519") ||
+      (key.kid !== undefined && (typeof key.kid !== "string" || !DELEGATION_KID.test(key.kid)))) {
+    throw new Error(`${name} must hold public Ed25519 keys ({kid?, x} or an OKP JWK without "d")`);
+  }
+  return { kid: typeof key.kid === "string" ? key.kid : delegationKeyThumbprint(key.x), x: key.x };
+}
+
+/**
+ * The attestation signing key, as Cloud's signing.ts reads its key ring.
+ * `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`) is one of:
+ *
+ * - a PKCS#8 PEM Ed25519 private key (`openssl genpkey -algorithm ed25519`);
+ * - Cloud's keyring JSON `{"currentPrivateKeyPem": "<PEM>", "kid"?: "<id>",
+ *   "previousPublicJwks"?: [<public OKP Ed25519 JWK>, …]}` (at most 3), used
+ *   across a rotation;
+ * - a base64url 32-byte seed (the earlier relay-control form).
+ *
+ * The kid defaults to the RFC 7638 thumbprint of the public key, as Cloud's.
+ * `SELFHOST_DELEGATION_SIGNING_KID` (or the keyring's `kid`) may name it
+ * explicitly; it is kept as given, because verifiers match a kid exactly and
+ * an install that already published one must not change it under them.
+ * `SELFHOST_DELEGATION_PREVIOUS_KEYS` may list retired or pre-published public
+ * keys (`[{kid?, x}]`), unless the keyring already does.
+ *
+ * Empty, `unset` or a `*-disabled` placeholder is not configured: attestation
+ * answers `unavailable` and the JWKS is empty. A value that is set but
+ * malformed stops startup, as every other relay-control secret does.
+ */
 export function loadDelegationSigning(env: Env): DelegationSigningConfig | null {
-  const seedValue = readSecret(env, "SELFHOST_DELEGATION_SIGNING_KEY");
-  const kid = env.SELFHOST_DELEGATION_SIGNING_KID?.trim();
-  const previousValue = env.SELFHOST_DELEGATION_PREVIOUS_KEYS?.trim();
-  if (!seedValue && !kid && !previousValue) return null;
-  if (!seedValue || !kid) {
-    throw new Error("SELFHOST_DELEGATION_SIGNING_KEY (or _FILE) and SELFHOST_DELEGATION_SIGNING_KID are required together");
+  const raw = realDelegationKeyValue(readSecret(env, "SELFHOST_DELEGATION_SIGNING_KEY"));
+  const explicitKid = env.SELFHOST_DELEGATION_SIGNING_KID?.trim() || null;
+  const previousValue = env.SELFHOST_DELEGATION_PREVIOUS_KEYS?.trim() || null;
+  if (!raw) {
+    if (explicitKid || previousValue) {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KID and SELFHOST_DELEGATION_PREVIOUS_KEYS need SELFHOST_DELEGATION_SIGNING_KEY (or _FILE)");
+    }
+    return null;
   }
-  if (!DELEGATION_KID.test(kid)) throw new Error("SELFHOST_DELEGATION_SIGNING_KID must be 1-64 of A-Z a-z 0-9 . _ -");
-  if (!/^[A-Za-z0-9_-]{43}$/.test(seedValue)) {
-    throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a base64url 32-byte Ed25519 seed");
-  }
-  const seed = Buffer.from(seedValue, "base64url");
-  if (seed.byteLength !== 32) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a base64url 32-byte Ed25519 seed");
-  privateKeyFromSeed(seed);
-  let previous: DelegationSigningConfig["previous"] = [];
-  if (previousValue) {
-    let parsed: unknown;
+  let seed: Buffer;
+  let ringKid: string | null = null;
+  let previousInput: unknown[] = [];
+  if (raw.startsWith("{")) {
+    let ring: Record<string, unknown>;
     try {
-      parsed = JSON.parse(previousValue);
+      ring = JSON.parse(raw) as Record<string, unknown>;
     } catch {
-      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of {kid, x}");
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring must be JSON {currentPrivateKeyPem, kid?, previousPublicJwks?}");
     }
-    // Every published kid is distinct (the active one included): a verifier
-    // uses the first key with a matching kid, so a duplicate would hide one.
-    const seen = new Set<string>([kid]);
-    if (!Array.isArray(parsed) || parsed.length > 8 || !parsed.every((item: unknown) => {
-      const key = item as Record<string, unknown> | null;
-      const ok = Boolean(key) && typeof key === "object" && Object.keys(key!).sort().join(",") === "kid,x"
-        && typeof key!.kid === "string" && DELEGATION_KID.test(key!.kid) && !seen.has(key!.kid)
-        && typeof key!.x === "string" && /^[A-Za-z0-9_-]{43}$/.test(key!.x);
-      if (ok) seen.add(key!.kid as string);
-      return ok;
-    })) {
-      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of at most 8 {kid, x} with distinct kids");
+    if (typeof ring.currentPrivateKeyPem !== "string") {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring needs currentPrivateKeyPem");
     }
-    previous = (parsed as Array<{ kid: string; x: string }>).map(key => ({ kid: key.kid, x: key.x }));
+    seed = seedFromPem(ring.currentPrivateKeyPem, "SELFHOST_DELEGATION_SIGNING_KEY currentPrivateKeyPem");
+    if (ring.kid !== undefined && ring.kid !== null) {
+      if (typeof ring.kid !== "string" || !DELEGATION_KID.test(ring.kid)) {
+        throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring kid must be 1-64 of A-Z a-z 0-9 . _ -");
+      }
+      ringKid = ring.kid;
+    }
+    if (ring.previousPublicJwks !== undefined) {
+      if (!Array.isArray(ring.previousPublicJwks)) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY previousPublicJwks must be an array");
+      previousInput = ring.previousPublicJwks;
+      if (previousValue && previousInput.length) {
+        throw new Error("Set previous keys in the keyring or in SELFHOST_DELEGATION_PREVIOUS_KEYS, not both");
+      }
+    }
+  } else if (raw.startsWith("-----BEGIN")) {
+    seed = seedFromPem(raw, "SELFHOST_DELEGATION_SIGNING_KEY");
+  } else {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(raw)) {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a PKCS#8 PEM, a keyring JSON, or a base64url 32-byte Ed25519 seed");
+    }
+    seed = Buffer.from(raw, "base64url");
+  }
+  if (seed.byteLength !== 32) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must hold a 32-byte Ed25519 seed");
+  const x = publicX(privateKeyFromSeed(seed));
+  if (explicitKid && ringKid && explicitKid !== ringKid) {
+    throw new Error("SELFHOST_DELEGATION_SIGNING_KID differs from the keyring's kid");
+  }
+  const kid = explicitKid ?? ringKid ?? delegationKeyThumbprint(x);
+  if (!DELEGATION_KID.test(kid)) throw new Error("SELFHOST_DELEGATION_SIGNING_KID must be 1-64 of A-Z a-z 0-9 . _ -");
+  if (previousValue) {
+    try {
+      const parsed = JSON.parse(previousValue) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("not an array");
+      previousInput = parsed;
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of {kid?, x}");
+    }
+  }
+  if (previousInput.length > MAX_PREVIOUS_DELEGATION_KEYS) {
+    throw new Error(`At most ${MAX_PREVIOUS_DELEGATION_KEYS} previous delegation signing keys may be published`);
+  }
+  // Every published kid is distinct (the active one included): a verifier
+  // uses the first key with a matching kid, so a duplicate would hide one.
+  const seen = new Set<string>([kid]);
+  const previous = previousInput.map(item => previousDelegationKey(item, "SELFHOST_DELEGATION_PREVIOUS_KEYS"))
+    .filter(key => !(key.x === x && key.kid === kid));
+  for (const key of previous) {
+    if (seen.has(key.kid)) throw new Error("Previous delegation signing keys must have distinct kids");
+    seen.add(key.kid);
   }
   return { kid, seed, previous };
 }
