@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
@@ -21,6 +21,7 @@ import {
   ownerDisplay,
   PR_TARGET,
   REPO_TARGET,
+  repoPart,
   sameActions,
   sha256Hex,
   tierDApprovalId,
@@ -89,6 +90,8 @@ export type DelegationDeps = {
   signer: DelegationSigner | null;
   /** Gate-only installs keep relaygate ids for Desktop agents; the feature reports unavailable there. */
   gateOnly: boolean;
+  /** Server-held key for quote digests (§8); never exported. */
+  quoteKey: Buffer;
   now: () => Date;
 };
 
@@ -129,7 +132,6 @@ type ApprovalRow = {
   actions: Action[];
   single_use: boolean;
   expires_at: Date | string;
-  consumed_at: Date | string | null;
   invalidated_at: Date | string | null;
 };
 
@@ -270,7 +272,19 @@ export type AuditInput = {
   reason?: string | null;
   data?: Record<string, unknown>;
   quote?: string | null;
+  /** The quote's keyed digest (quoteDigest); required with a quote. */
+  quoteHash?: string | null;
 };
+
+/**
+ * §8: a quote's digest is an HMAC-SHA256 under a per-workspace key derived
+ * from the server-held quote key, never a plain hash, so a reader of the log
+ * cannot test guessed quotes against it. The key never leaves the server.
+ */
+export function quoteDigest(quoteKey: Buffer, workspaceId: string, quote: string): string {
+  const workspaceKey = createHmac("sha256", quoteKey).update(`relay-delegation-quote:${workspaceId}`).digest();
+  return createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex");
+}
 
 export async function recordDelegationAudit(executor: SqlExecutor, input: AuditInput): Promise<void> {
   await executor.query(
@@ -285,7 +299,7 @@ export async function recordDelegationAudit(executor: SqlExecutor, input: AuditI
       input.ownerUserId && UUID.test(input.ownerUserId) ? input.ownerUserId : null,
       input.grantId ?? null, input.approvalId ?? null, input.messageId ?? null, input.recipientAgentId ?? null,
       input.reason ?? null, JSON.stringify(input.data ?? {}),
-      input.quote ?? null, input.quote ? sha256Hex(input.quote) : null,
+      input.quote ?? null, input.quote ? input.quoteHash ?? null : null,
     ],
   );
 }
@@ -325,6 +339,33 @@ export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> 
  * Revokes grants and invalidates every unredeemed approval under them, in
  * the caller's transaction. Returns the revoked rows (inactive ones are skipped).
  */
+/** Whether every action of an approval has been consumed (single use is per action, §5.1). */
+async function allActionsConsumed(executor: SqlExecutor, approval: Pick<ApprovalRow, "id" | "actions">): Promise<boolean> {
+  const consumed = Number((await executor.query<{ count: string | number }>(
+    "SELECT count(*) AS count FROM delegation_action_consumptions WHERE approval_id = $1", [approval.id],
+  )).rows[0]?.count ?? 0);
+  return consumed >= approval.actions.length;
+}
+
+/** Whether one action of an approval has been consumed. */
+export async function actionConsumed(executor: SqlExecutor, approvalId: string,
+  action: Pick<Action, "class" | "target">): Promise<boolean> {
+  return (await executor.query(
+    "SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1 AND class = $2 AND target = $3",
+    [approvalId, action.class, action.target],
+  )).rows.length > 0;
+}
+
+/** Consumes one action atomically; false when it was already consumed. */
+export async function consumeAction(executor: SqlExecutor, input: { approvalId: string; workspaceId: string;
+  action: Pick<Action, "class" | "target">; consumedBy: string }): Promise<boolean> {
+  return (await executor.query(
+    `INSERT INTO delegation_action_consumptions (approval_id, workspace_id, class, target, consumed_by)
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING approval_id`,
+    [input.approvalId, input.workspaceId, input.action.class, input.action.target, input.consumedBy],
+  )).rows.length === 1;
+}
+
 export async function revokeGrants(executor: SqlExecutor, input: {
   workspaceId: string; grantIds: string[]; actorUserId: string | null; reason: string; authMethod: string | null;
 }): Promise<GrantRow[]> {
@@ -340,7 +381,7 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   const ids = revoked.map(row => row.id);
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND consumed_at IS NULL AND invalidated_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL
         AND (grant_id = ANY($2::text[])
           OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))`,
     [input.workspaceId, ids],
@@ -371,7 +412,7 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
     actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND consumed_at IS NULL AND invalidated_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL
         AND ($2::uuid IS NULL OR owner_user_id = $2)`,
     [input.workspaceId, input.ownerUserId],
   );
@@ -427,6 +468,8 @@ export type AttestationClaims = {
   actions: Action[];
   standing: Standing;
   single_use: boolean;
+  /** §16.4: the stored quote, or null once redacted (or never given). */
+  quote: string | null;
   iat: number;
   exp: number;
   jti: string;
@@ -464,7 +507,8 @@ export function resolveStanding(input: { approvalOwnerId: string; recipientOwner
   // prompt_approval and config_change belong to the machine owner alone.
   if (input.actions.some(action => action.class === "prompt_approval" || action.class === "config_change")) return null;
   for (const action of input.actions) {
-    if (PR_TARGET.test(action.target) || REPO_TARGET.test(action.target)) return null;
+    const repo = repoPart(action);
+    if (PR_TARGET.test(repo) || REPO_TARGET.test(repo)) return null;
     const named = input.targetOwners.some(entry => entry.owner_ids?.includes(input.approvalOwnerId)
       && classTargetCovered(action.class, entry.pattern, action.target));
     if (!named) return null;
@@ -666,7 +710,9 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       )).rows[0];
       if (!minted || minted.tier !== "O" || minted.owner_user_id !== approval.owner_id) refuse("no_approval");
       if (minted!.invalidated_at) refuse("revoked");
-      if (minted!.consumed_at) refuse("consumed");
+      // A tier O approval belongs to the grant's owner (§6.2).
+      if (minted!.owner_user_id !== grant.owner_user_id) refuse("no_approval");
+      if (minted!.single_use && await allActionsConsumed(deps.database, minted!)) refuse("consumed");
       if (time(minted!.expires_at) <= now.getTime()) refuse("expired");
       if (!sameActions(minted!.actions, messageActions)) refuse("out_of_scope");
       actions = minted!.actions.map(canonicalAction);
@@ -712,7 +758,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       )).rows[0];
       if (!stored) refuse("unavailable");
       if (stored!.invalidated_at || stored!.grant_id !== grant.id) refuse("revoked");
-      if (stored!.consumed_at) refuse("consumed");
+      if ((stored!.single_use || actions.every(highRisk)) && await allActionsConsumed(deps.database, stored!)) refuse("consumed");
       expiresAt = Math.min(expiresAt, time(stored!.expires_at));
       singleUse = stored!.single_use || singleUse;
     }
@@ -743,6 +789,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       actions: actions.map(canonicalAction),
       standing,
       single_use: singleUse,
+      quote: approval.quote ?? null,
       iat,
       exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
       jti: randomUUID(),
@@ -769,6 +816,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         data: { actions: claims.actions, tier, standing, single_use: singleUse, jti: claims.jti, kid: deps.signer!.kid,
           quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null },
         quote: approval.quote ?? null,
+        quoteHash: approval.quote ? quoteDigest(deps.quoteKey, workspace.id, approval.quote) : null,
       });
       await redactExpiredQuotes(tx);
     });
@@ -859,27 +907,26 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       accept: attested!.accept === "own_owner" ? "own_owner" : "code_owners", actions: [action!],
     });
     if (!standing) refuse("recipient_policy");
-    if (approval!.consumed_at) refuse("consumed");
+    const singleUse = approval!.single_use || highRisk(action!);
+    if (singleUse && await actionConsumed(deps.database, approval!.id, action!)) refuse("consumed");
     const conditions = evaluateConditions(action!.conditions ?? [], now);
     if (conditions.kind === "unavailable") refuse("condition_unavailable");
     if (conditions.kind === "unmet") throw new ConditionUnmet(conditions.unmet);
     if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
         (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
-    const singleUse = approval!.single_use || highRisk(action!);
     await deps.database.transaction(async (tx) => {
       // The grant may have been narrowed or revoked during the Relaycast
       // lookups: recheck it under its row lock in both paths, then consume a
       // single-use approval in the same transaction.
       await recheckGrant(tx, workspace.id, grant!.id, [action!], policy, deps.now().getTime());
+      // The approval may have been revoked or withdrawn meanwhile.
+      const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE",
+        [input.approvalId])).rows.length > 0;
+      if (!live) refuse("revoked");
       if (!singleUse) return;
-      const consumed = (await tx.query<{ id: string }>(
-        `UPDATE delegation_approvals
-            SET consumed_at = now(), consumed_by_agent_id = $3, consumed_action = $4::jsonb
-          WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NULL AND invalidated_at IS NULL
-          RETURNING id`,
-        [input.approvalId, workspace.id, input.recipientAgentId, JSON.stringify(canonicalAction(action!))],
-      )).rows[0];
-      if (!consumed) refuse("consumed");
+      // Single use is per action (§5.1): one atomic insert per action.
+      if (!await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
+        consumedBy: input.recipientAgentId })) refuse("consumed");
     });
     // The consumption above is the authority; a failed log write must not turn
     // a spent approval into a refusal the agent would retry.
@@ -937,7 +984,7 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
     if (!grantFitsPolicy(grant, policy)) continue;
     // Not the session's own agent: a delegate never answers its own prompts.
     if (grant.delegate_agent_id === session.agentId) continue;
-    if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:any` }])) continue;
+    if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:probe:approve` }])) continue;
     // A released or re-bound agent is never offered (its grant is revoked, as at attestation).
     if (await delegateStillBound(deps, workspace, grant, true)) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });

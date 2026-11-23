@@ -20,7 +20,7 @@ type Message = {
 };
 /** Acknowledged rows are kept, owner-scoped, as Relaycast does; only unacknowledged ones are pending. */
 /** `agentId` is the recipient's immutable id at delivery time; a same-name replacement never sees it. */
-type Delivery = { id: string; agent: string; agentId: string; message: Message; reason: string; acked: boolean };
+type Delivery = { id: string; agent: string; agentId?: string; message: Message; reason: string; acked: boolean };
 type Channel = { id: string; name: string; topic: string | null; members: Set<string>; archived: boolean };
 /** An outbound webhook subscription, with the workspace key that created it. */
 type Subscription = {
@@ -310,7 +310,7 @@ export function createRelaycastWorld(roster: unknown[]) {
     if ((match = /^\/v1\/deliveries\/by-message\/([^/]+)$/.exec(path)) && method === "GET" && caller) {
       // Relaycast #543: only this token's own pending delivery of the message;
       // unknown, foreign and acknowledged ids are the same 404.
-      const row = deliveries.find(item => item.agentId === caller.id && !item.acked && item.message.id === decodeURIComponent(match![1]!));
+      const row = deliveries.find(item => (item.agentId ?? agents.get(item.agent)?.id) === caller.id && !item.acked && item.message.id === decodeURIComponent(match![1]!));
       if (!row) return fail(404, "delivery_not_found");
       return ok({ message_id: row.message.id, sender_agent_id: row.message.agent_id, workspace_id: deliveryWorkspace.id,
         channel_id: row.message.channel_id ?? row.message.conversation_id, delivery_reason: row.reason,

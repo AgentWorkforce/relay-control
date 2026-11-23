@@ -20,6 +20,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "coding_agent_device_sessions",
   "cursor_cloud_links",
   "cursor_cloud_runs",
+  "delegation_action_consumptions",
   "delegation_agent_bindings",
   "delegation_approvals",
   "delegation_attestations",

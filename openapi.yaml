@@ -3432,11 +3432,11 @@ paths:
         - { name: grant_id, in: query, required: false, schema: { type: string, pattern: "^grt_[A-Za-z0-9]{8,64}$" } }
         - { name: format, in: query, required: false, schema: { type: string, enum: [json, jsonl] } }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000 } }
-        - name: after
+        - name: after_id
           in: query
           required: false
-          description: Resume after this event `id`. Events are returned in id order, so paging never skips events that share a timestamp.
-          schema: { type: string, pattern: "^[1-9][0-9]{0,18}$" }
+          description: Resume after this event `id` (as Cloud). Ids increase strictly, while timestamps can repeat within one transaction, so paging never skips events.
+          schema: { type: string, pattern: "^(0|[1-9][0-9]{0,15})$" }
       responses:
         "200":
           description: Events
@@ -3641,8 +3641,12 @@ paths:
       operationId: redeemDelegatedApproval
       tags: [Owner delegates]
       description: |
-        Agent route, same credentials as attestation. Required right before
-        acting when the approval is single-use or the action has conditions.
+        Agent route, same credentials as attestation. Called right before
+        every action (§6.3), and every redeem is audited
+        (`approval.redeemed`). Single use is per action (§5.1): each action of
+        a single-use approval (`release`, every `deploy`, `secret_change`,
+        `destructive`, `spend`, `config_change`, or a tier O approval minted
+        single-use) redeems once, and redeeming one never consumes another.
         Requires an earlier attestation of this approval to this recipient
         (otherwise `no_approval`); standing is re-checked under that
         attestation's `accept`.
@@ -3651,7 +3655,10 @@ paths:
         `head_sha`, `reviews_approved`, `mergeable`) are
         `condition_unavailable` on relay-control. An unmet condition answers
         `condition_unmet` with `unmet` and does not consume. A single-use
-        approval is consumed atomically; a second redeem is `consumed`.
+        action is consumed atomically; a second redeem of it is `consumed`.
+        `checked.head_sha` (the PR head Cloud checked) is never returned by
+        relay-control: it does not read GitHub, so a PR-condition redeem is
+        `condition_unavailable` instead.
       security:
         - bearerAuth: []
       requestBody:
@@ -3685,6 +3692,11 @@ paths:
                     properties:
                       ok: { const: true }
                       consumed: { type: boolean }
+                      checked:
+                        type: object
+                        description: Cloud only, for PR targets. relay-control never returns it.
+                        properties:
+                          head_sha: { type: string, pattern: "^[0-9a-f]{40}$" }
                   - type: object
                     required: [ok, reason]
                     properties:
@@ -3694,6 +3706,78 @@ paths:
         "400": { description: "`invalid_request`" }
         "401": { description: Missing or invalid credential }
         "403": { description: "`forbidden`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/withdraw:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: withdrawDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        The delegate that sent an approval withdraws it (§7), for example when
+        the owner later says no. Proven by the delegate's own Relaycast token,
+        which must authenticate as `delegate_agent_id` and name an agent in
+        this workspace's relay; no person's credential is needed, because
+        withdrawing only ever narrows. Only an approval attested from this
+        delegate can be withdrawn. The next attest or redeem of it is
+        `revoked`. Allowed while delegation is off. Audited
+        `approval.withdrawn`. Rate limited per client address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [delegate_agent_id, delegate_token, approval_id]
+              properties:
+                delegate_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                delegate_token: { type: string, minLength: 12, maxLength: 512 }
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+      responses:
+        "200":
+          description: Withdrawn (also when it was already withdrawn or revoked)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { const: true }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`invalid_agent`" }
+        "404": { description: "`not_found`: unknown, or not an approval this delegate sent" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`" }
+  /api/v1/workspaces/{workspaceId}/delegates/approvals/{approvalId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: approvalId, in: path, required: true, schema: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" } }
+    delete:
+      operationId: revokeDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        Revoke one approval, tier D or tier O (§7): its owner, or a workspace
+        owner/admin. Allowed while delegation is off; revoking only narrows.
+        Every later attest or redeem of it is `revoked`. Audited
+        `approval.revoked`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approval_id, revoked]
+                properties:
+                  approval_id: { type: string }
+                  revoked: { const: true }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`" }
   /api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10068,7 +10152,7 @@ components:
     DelegationAttestationClaims:
       type: object
       required: [v, ws, owner_id, owner_display, delegate_agent_id, grant_id, message_id, recipient_agent_id, approval_id,
-        tier, actions, standing, single_use, iat, exp, jti]
+        tier, actions, standing, single_use, quote, iat, exp, jti]
       properties:
         v: { const: 1 }
         ws: { type: string }
@@ -10082,6 +10166,7 @@ components:
         tier: { type: string, enum: [D, O] }
         actions: { type: array, items: { $ref: "#/components/schemas/DelegationAction" } }
         standing: { type: string, enum: [own_owner, code_owner] }
+        quote: { type: [string, "null"], description: "§16.4: the stored quote, or null once redacted or never given" }
         single_use: { type: boolean }
         iat: { type: integer }
         exp: { type: integer }

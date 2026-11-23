@@ -14,7 +14,7 @@ import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
-import { randomUUID } from "node:crypto";
+import { randomUUID, hkdfSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -576,6 +576,9 @@ export function createApp(input: {
   // workspace until an admin turns delegation_enabled on.
   const delegation = createDelegationHandler({
     database: store.database,
+    quoteKey: config.delegationQuoteKey
+      ? Buffer.from(config.delegationQuoteKey, "utf8")
+      : Buffer.from(hkdfSync("sha256", config.encryptionKeyring.active.key, Buffer.alloc(0), "relay-delegation-quote-digest", 32)),
     relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
     signer: config.delegationSigning ? new DelegationSigner(config.delegationSigning) : null,
     gateOnly: Boolean(config.relaygatePublicUrl),
@@ -583,6 +586,7 @@ export function createApp(input: {
     authenticateAccessToken: (token) => store.authenticateAccessToken(token),
     workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
     json,
+    relaycastBinding: (workspaceId) => store.relaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
     clientKey: (request) => limiterKey(clientIp(request)),
     now: input.now,

@@ -186,6 +186,14 @@ stripped. The cut is at 80 characters on a code point boundary, so an emoji is n
 The attestation's `standing` is `own_owner` when every action held by own
 owner, otherwise `code_owner`.
 
+### pr_ops (§5.1)
+
+An approval names one operation on one PR: `owner/repo#N:<op>`, where `<op>`
+is `open`, `close`, `reopen`, `label=<name>`, `unlabel=<name>`,
+`request_review=<login>`, `rerun_ci` or `comment`. A grant of `owner/repo`,
+`owner/repo#N` or `owner/*` covers every op on a covered PR. PR conditions and
+CODEOWNERS standing use the PR part.
+
 ### config_change (§5.1, §5.3)
 
 A session's own permissions, sandbox and configuration are delegable (§15,
@@ -207,7 +215,9 @@ Khaliq's decision).
 ### prompt_approval (§9.3)
 
 A grant target is `*` or `<agent id>:*`. An approval target is
-`<session agent id>:<request ref>` and must name the recipient itself. Only
+`<session agent id>:<request ref>:approve` or `:deny`, so the decision is
+bound in the target, and it must name the recipient itself. It takes no
+conditions; the node applies it directly, without a redeem. Only
 the machine owner's delegates count. `prompt-delegates` lists the machine
 owner's delegates whose live grants cover the session (excluding the session
 itself). It returns an empty list when delegation is off or the class is not
@@ -216,11 +226,13 @@ proof, is `403 forbidden`.
 
 ## Redeem
 
-Redeem is required right before acting when the approval is single-use (any
-high-risk action: `release`, `secret_change`, `destructive`, `spend`,
-`config_change`, or `deploy` to `:prod`/`:production`) or when the action has
-conditions.
-Control:
+The receiving agent redeems right before **every** action (§6.3), and every
+redeem is audited (`approval.redeemed`). Single use is **per action** (§5.1):
+each action of a single-use approval redeems once, and redeeming one never
+consumes another. Single-use classes are `release`, every `deploy`,
+`secret_change`, `destructive`, `spend` and `config_change`; an owner-minted
+approval can also be single-use as a whole. A multi-use action is re-checked
+on every redeem and never consumed. Control:
 
 - requires an earlier attestation of that approval to this recipient
   (otherwise `no_approval`), and re-checks standing under that attestation's
@@ -234,10 +246,27 @@ Control:
   - An unmet condition answers `condition_unmet` with `unmet` and does not
     consume the approval.
 
-A single-use approval is consumed by one conditional `UPDATE` (not consumed,
-not invalidated, not expired, grant still live), so a replay or a race with a
-revocation is refused. The answer is `{ok:true, consumed}` or
-`{ok:false, reason, unmet?}`.
+The grant is re-checked under its row lock, and a single-use action is
+consumed by one atomic insert in the same transaction, so a replay or a race
+with a revocation or a narrowing is refused. The answer is
+`{ok:true, consumed}` or `{ok:false, reason, unmet?}`. Cloud also returns
+`checked.head_sha` for PR targets; relay-control never does, because it does
+not read GitHub (PR conditions are `condition_unavailable`).
+
+### Revoking or withdrawing one approval
+
+- `DELETE /delegates/approvals/{approval_id}`: the approval's owner (or an
+  admin) revokes one approval, tier D or tier O. It is allowed while
+  delegation is off, and is audited as `approval.revoked`.
+- `POST /messaging/delegation/withdraw` takes `{delegate_agent_id,
+  delegate_token, approval_id}`. The delegate that sent an approval
+  withdraws it, for example when the owner later says no. The proof is the
+  delegate's own Relaycast token: it must name an agent in this workspace's
+  relay, and an attestation from this delegate must exist. No person's
+  credential is needed, because withdrawing only narrows. It is audited as
+  `approval.withdrawn`.
+
+After either, the next attest or redeem of that approval is `revoked`.
 
 ## Revocation
 
@@ -264,12 +293,17 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.redeemed`, `redeem.refused`
 - `policy.updated`, `target_owners.updated`
 
-`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after=` shows a member
+`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
 their own events and an admin all of them. Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
-`data`. Quote text is redacted to `quote_hash` (with
+`data`. `quote_hash` is a keyed digest (§8): an HMAC-SHA256 under a
+per-workspace key derived from a server-held key, so a reader of the log
+cannot test guessed quotes against it. The key is `SELFHOST_DELEGATION_QUOTE_KEY`
+(at least 32 bytes) or, when unset, derived from the active encryption key;
+set it to keep digests stable across encryption key rotations. The quote
+itself is also in the signed claims (`quote`). Quote text is redacted to `quote_hash` (with
 `quote_redacted_at` set) once it is older than the org's
 `quote_retention_days`. An hourly sweep (started with the server) also runs the
 redaction and marks lapsed grants `expired`, so a quiet workspace does not keep

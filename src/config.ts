@@ -59,6 +59,13 @@ export type SelfhostConfig = {
    */
   delegationSigning?: DelegationSigningConfig | null;
   /**
+   * SELFHOST_DELEGATION_QUOTE_KEY (or _FILE): at least 32 bytes, the server
+   * key behind the keyed quote digests in the delegation audit log (§8). Unset:
+   * derived from the active encryption key (HKDF), so it never leaves the
+   * server; set it to keep digests stable across encryption key rotations.
+   */
+  delegationQuoteKey?: string | null;
+  /**
    * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
    * a workspace queues the same delete for relayfile-control's Flows data.
    * Unset: nothing is queued (the legacy local Flows rows still cascade).
@@ -608,6 +615,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
     delegationSigning: loadDelegationSigning(env),
+    delegationQuoteKey: loadDelegationQuoteKey(env),
     flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
@@ -699,6 +707,13 @@ function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureAp
     throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
   }
   return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+export function loadDelegationQuoteKey(env: Env): string | null {
+  const key = readSecret(env, "SELFHOST_DELEGATION_QUOTE_KEY");
+  if (!key) return null;
+  if (Buffer.byteLength(key) < 32) throw new Error("SELFHOST_DELEGATION_QUOTE_KEY (or _FILE) must be at least 32 bytes");
+  return key;
 }
 
 const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;

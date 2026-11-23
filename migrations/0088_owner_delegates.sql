@@ -121,8 +121,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS delegation_grants_active_pair
 
 -- Approvals Control knows about: tier O approvals minted by the owner, and
 -- tier D approvals recorded at their first attestation (approval_id derived
--- from the workspace and message id). Single-use consumption is the atomic
--- UPDATE ... WHERE consumed_at IS NULL in redeem.
+-- from the workspace and message id). Single use is per action (§5.1): see
+-- delegation_action_consumptions. invalidated_at revokes the whole approval
+-- (grant revoked, owner revoke, or the delegate's withdrawal).
 CREATE TABLE IF NOT EXISTS delegation_approvals (
   id text PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -133,9 +134,6 @@ CREATE TABLE IF NOT EXISTS delegation_approvals (
   actions jsonb NOT NULL,
   single_use boolean NOT NULL,
   expires_at timestamptz NOT NULL,
-  consumed_at timestamptz,
-  consumed_by_agent_id text,
-  consumed_action jsonb,
   invalidated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT delegation_approvals_tier CHECK (tier IN ('D', 'O'))
@@ -143,6 +141,19 @@ CREATE TABLE IF NOT EXISTS delegation_approvals (
 
 CREATE INDEX IF NOT EXISTS delegation_approvals_grant_idx
   ON delegation_approvals (grant_id) WHERE grant_id IS NOT NULL;
+
+-- Single use is per action (§5.1): each (approval, class, target) is consumed
+-- at most once, by one atomic insert; consuming one action never consumes
+-- another in the same approval.
+CREATE TABLE IF NOT EXISTS delegation_action_consumptions (
+  approval_id text NOT NULL REFERENCES delegation_approvals(id) ON DELETE CASCADE,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  class text NOT NULL,
+  target text NOT NULL,
+  consumed_by text NOT NULL,
+  consumed_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (approval_id, class, target)
+);
 
 -- Each issued attestation (jti). Redeem requires one for the same approval
 -- and recipient, so an approval id seen by another agent cannot be redeemed.

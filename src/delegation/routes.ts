@@ -86,6 +86,8 @@ type JsonWriter = (response: ServerResponse, status: number, body: unknown, noSt
 
 export type DelegationRoutesInput = {
   database: Database;
+  /** Server-held key for keyed quote digests (§8). */
+  quoteKey: Buffer;
   relaycast: RelaycastClient;
   signer: DelegationSigner | null;
   gateOnly: boolean;
@@ -95,6 +97,8 @@ export type DelegationRoutesInput = {
     id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; role: Principal["role"];
   } | null>;
   json: JsonWriter;
+  /** A workspace's Relaycast binding, without a person (claims/complete, withdraw). */
+  relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
   rateLimit: (response: ServerResponse, key: string, rule: { limit: number; windowMs: number }) => void;
   clientKey: (request: IncomingMessage) => string;
   now?: () => Date;
@@ -204,6 +208,12 @@ const redeemBody = z.object({
   approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
   action: z.object({ class: actionClass, target: z.string().min(1).max(256) }).strict(),
 }).strict();
+const withdrawBody = z.object({
+  delegate_agent_id: z.string().min(1).max(200),
+  delegate_token: z.string().min(12).max(512),
+  approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
+}).strict();
+const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
 const promptDelegatesBody = z.object({
   session_agent_id: z.string().min(1).max(200),
   session_token: z.string().min(12).max(512),
@@ -241,13 +251,14 @@ function policyRefusal(classes: readonly ActionClass[], policy: DelegationPolicy
 
 export function isDelegationPath(path: string): boolean {
   return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}` || ORG_POLICY_PATH.test(path)
-    || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates)?)$/.test(path);
+    || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates|\/withdraw)?)$/.test(path);
 }
 
 export function createDelegationHandler(input: DelegationRoutesInput) {
   const now = input.now ?? (() => new Date());
   const deps: DelegationDeps = {
     database: input.database, relaycast: input.relaycast, signer: input.signer, gateOnly: input.gateOnly, now,
+    quoteKey: input.quoteKey,
   };
 
   async function sessionFacts(token: string): Promise<SessionFacts | null> {
@@ -421,7 +432,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       input.json(response, 200, policy, true);
       return true;
     }
-    const match = /^\/api\/v1\/workspaces\/([^/]+)\/(delegates(?:\/(.*))?|messaging\/delegation(\/redeem|\/prompt-delegates)?)$/.exec(path);
+    const match = /^\/api\/v1\/workspaces\/([^/]+)\/(delegates(?:\/(.*))?|messaging\/delegation(\/redeem|\/prompt-delegates|\/withdraw)?)$/.exec(path);
     if (!match) return false;
     let workspaceId: string;
     try {
@@ -433,6 +444,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     const json = (status: number, body: unknown) => input.json(response, status, body, true);
 
     // Agent routes ------------------------------------------------------
+    if (match[4] === "/withdraw") {
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      input.rateLimit(response, `delegation-withdraw:${input.clientKey(request)}`, CLAIM_COMPLETE_RATE);
+      const body = parse(withdrawBody, await readJson(request), "Invalid request");
+      json(200, await withdrawApproval(body.approval_id, body.delegate_agent_id, body.delegate_token, workspaceId));
+      return true;
+    }
     if (match[2]!.startsWith("messaging/delegation")) {
       if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       const caller = await desktopCaller(request, workspaceId);
@@ -496,6 +514,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         return fail("invalid_agent", "The agent token does not prove this agent id", 403);
       }
       const proven = agent;
+      // A token proves its own agent, not which relay workspace it lives in:
+      // the agent must also exist, with the same id, in this workspace's relay.
+      const binding = await input.relaycastBinding(workspace.id);
+      const local = binding ? await input.relaycast.getRosterAgent(binding.relaycastApiKey, proven.name).catch(() => null) : null;
+      if (!local || local.id !== proven.id || local.status === "released") {
+        fail("invalid_agent", "The agent is not part of this workspace's relay", 403);
+      }
       if (!await memberRole(input.database, workspace.id, claim.user_id)) {
         fail("invalid_code", "Claim code is invalid or expired", 404);
       }
@@ -631,6 +656,32 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return true;
     }
 
+    if (sub?.startsWith("approvals/") && !sub.slice(10).includes("/")) {
+      if (method !== "DELETE") fail("method_not_allowed", "Method not allowed", 405);
+      const approvalId = sub.slice(10);
+      if (!APPROVAL_ID.test(approvalId)) fail("not_found", "Approval not found", 404);
+      // Revoking one approval (tier D or tier O): its owner, or an org owner or
+      // admin. Allowed while delegation is off; revoking only narrows.
+      const approval = (await input.database.query<{ id: string; owner_user_id: string; invalidated_at: Date | null }>(
+        "SELECT id, owner_user_id, invalidated_at FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
+        [approvalId, workspace.id],
+      )).rows[0];
+      if (!approval || (approval.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Approval not found", 404);
+      await input.database.transaction(async (tx) => {
+        const updated = (await tx.query(
+          "UPDATE delegation_approvals SET invalidated_at = now() WHERE id = $1 AND invalidated_at IS NULL RETURNING id",
+          [approvalId],
+        )).rows.length > 0;
+        if (updated) {
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "approval.revoked", ...actor,
+            ownerUserId: approval!.owner_user_id, approvalId,
+            reason: approval!.owner_user_id === principal.userId ? "owner_revoked" : "admin_revoked" });
+        }
+      });
+      json(200, { approval_id: approvalId, revoked: true });
+      return true;
+    }
+
     if (sub === "approvals") {
       if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       const body = parse(mintBody, await readJson(request), "Invalid approval");
@@ -672,8 +723,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
       // Resume after an event id: events are returned in id order, so this
       // never skips events that share a timestamp.
-      const after = params.get("after");
-      if (after && !/^[1-9][0-9]{0,18}$/.test(after)) fail("invalid_request", "after must be an event id", 400);
+      // As Cloud: `?after_id=<last event id>`; ids increase strictly, timestamps can repeat.
+      const after = params.get("after_id");
+      if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
       if (format !== "json" && format !== "jsonl") fail("invalid_request", "format is json or jsonl", 400);
       const limit = Math.min(MAX_AUDIT_EVENTS,
@@ -835,6 +887,51 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return true;
     }
     return fail("not_found", "Route not found", 404);
+  }
+
+  /**
+   * POST .../messaging/delegation/withdraw (§7): the delegate that sent an
+   * approval withdraws it, proven by its own Relaycast token (and its presence
+   * in this workspace's relay), so the next attest or redeem is `revoked`.
+   * Withdrawing only ever narrows, so no person's credential is needed, as for
+   * claims/complete.
+   */
+  async function withdrawApproval(approvalId: string, delegateAgentId: string, delegateToken: string, workspaceId: string) {
+    const workspace = (await input.database.query<{ id: string }>(
+      "SELECT id FROM workspaces WHERE id::text = $1", [workspaceId],
+    )).rows[0];
+    if (!workspace) return fail("not_found", "Approval not found", 404);
+    const binding = await input.relaycastBinding(workspace.id);
+    if (input.gateOnly || !binding) return UNAVAILABLE();
+    let agent;
+    try {
+      agent = await input.relaycast.authenticatedAgent(delegateToken);
+    } catch (error) {
+      if (!(error instanceof RelaycastCallError) || ![401, 403, 404].includes(error.status)) return UNAVAILABLE();
+      agent = null;
+    }
+    if (!agent || agent.id !== delegateAgentId) return fail("invalid_agent", "The agent token does not prove this agent id", 403);
+    const local = await input.relaycast.getRosterAgent(binding.relaycastApiKey, agent.name).catch(() => null);
+    if (!local || local.id !== agent.id) return fail("invalid_agent", "The agent is not part of this workspace's relay", 403);
+    // Only an approval this delegate sent: one attested from it.
+    const sent = (await input.database.query<{ owner_user_id: string }>(
+      `SELECT a.owner_user_id FROM delegation_approvals a
+        WHERE a.id = $1 AND a.workspace_id = $2
+          AND EXISTS (SELECT 1 FROM delegation_attestations t WHERE t.approval_id = a.id AND t.delegate_agent_id = $3)`,
+      [approvalId, workspace.id, agent.id],
+    )).rows[0];
+    if (!sent) return fail("not_found", "Approval not found", 404);
+    await input.database.transaction(async (tx) => {
+      const updated = (await tx.query(
+        "UPDATE delegation_approvals SET invalidated_at = now() WHERE id = $1 AND invalidated_at IS NULL RETURNING id",
+        [approvalId],
+      )).rows.length > 0;
+      if (updated) {
+        await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "approval.withdrawn", actorAgentId: agent!.id,
+          authMethod: "agent_token", ownerUserId: sent.owner_user_id, approvalId, reason: "delegate_withdrew" });
+      }
+    });
+    return { ok: true };
   }
 
   async function grantFor(workspaceId: string, grantId: string): Promise<GrantRow | null> {

@@ -165,7 +165,13 @@ test("scope matching follows §16.1", () => {
   const scopes = [{ class: "merge" as const, targets: ["owner/*"] }];
   assert.ok(actionsCovered(scopes, [{ class: "merge", target: "owner/a#1" }]));
   assert.ok(!actionsCovered(scopes, [{ class: "merge", target: "owner/a#1" }, { class: "merge", target: "x/y" }]));
-  assert.ok(!actionsCovered(scopes, [{ class: "pr_ops", target: "owner/a" }]));
+  assert.ok(!actionsCovered(scopes, [{ class: "pr_ops", target: "owner/a#1:close" }]));
+  // pr_ops: a grant of `owner/repo`, `owner/repo#N` or `owner/*` covers every op on a covered PR.
+  const prOps = [{ class: "pr_ops" as const, targets: ["owner/a"] }];
+  assert.ok(actionsCovered(prOps, [{ class: "pr_ops", target: "owner/a#7:close" }]));
+  assert.ok(actionsCovered(prOps, [{ class: "pr_ops", target: "owner/a#7:label=bug" }]));
+  assert.ok(!actionsCovered(prOps, [{ class: "pr_ops", target: "owner/b#7:close" }]));
+  assert.ok(!actionsCovered(prOps, [{ class: "pr_ops", target: "owner/a:close" }]));
 });
 
 test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
@@ -174,7 +180,8 @@ test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
   }
   assert.ok(highRisk({ class: "deploy", target: "web:prod" }));
   assert.ok(highRisk({ class: "deploy", target: "web:production" }));
-  assert.ok(!highRisk({ class: "deploy", target: "web:staging" }));
+  // Every deploy is single use (§16.1), in every environment.
+  assert.ok(highRisk({ class: "deploy", target: "web:staging" }));
   assert.ok(!highRisk({ class: "merge", target: "a/b#1" }));
   const ws = "8d7c0a4e-0000-4000-8000-000000000001";
   const digest = createHash("sha256").update(`${ws}|233`).digest().subarray(0, 16);
@@ -454,7 +461,7 @@ test("attestation: a live delegate's in-scope approval is signed and verifies ag
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   const claims = attested.body.claims;
   assert.deepEqual(Object.keys(claims).sort(), ["actions", "approval_id", "delegate_agent_id", "exp", "grant_id", "iat", "jti",
-    "message_id", "owner_display", "owner_id", "recipient_agent_id", "single_use", "standing", "tier", "v", "ws"]);
+    "message_id", "owner_display", "owner_id", "quote", "recipient_agent_id", "single_use", "standing", "tier", "v", "ws"]);
   assert.equal(claims.standing, "own_owner");
   assert.equal(claims.v, 1);
   assert.equal(claims.ws, env.workspaceId);
@@ -491,7 +498,11 @@ test("attestation: a live delegate's in-scope approval is signed and verifies ag
   const [event] = await env.events("approval.attested");
   assert.equal(event!.jti, claims.jti);
   assert.equal(event!.quote, "yes merge 2250 when green");
-  assert.equal(event!.quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
+  // §8: a keyed digest (HMAC under a server key), never the plain SHA-256 of the quote.
+  assert.match(event!.quote_hash!, /^[0-9a-f]{64}$/);
+  assert.notEqual(event!.quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
+  // §16.4: the quote is in the signed claims.
+  assert.equal(claims.quote, "yes merge 2250 when green");
 
   // Positive verdicts are not cached: a second ask issues a fresh jti.
   const again = await env.attest(recipient, messageId);
@@ -528,7 +539,9 @@ test("attestation refusal reasons", async (t) => {
 
   // out_of_scope: the whole approval is refused when one action is outside the grant.
   assert.equal(await reason(send(env, bot, recipient, env.approval([...merge, { class: "merge", target: "Other/repo#1" }]))), "out_of_scope");
-  assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "pr_ops", target: "AgentWorkforce/relay" }]))), "out_of_scope");
+  assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "pr_ops", target: "Other/repo#1:close" }]))), "out_of_scope");
+  // A pr_ops target names the operation (§5.1): a bare repo is not an action.
+  assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "pr_ops", target: "AgentWorkforce/relay" }]))), "no_approval");
   // A wildcard action target is not a concrete action: the approval is malformed (as in Cloud).
   assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/*" }]))), "no_approval");
 
@@ -818,17 +831,23 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
   }
   const created = await env.grant(bot.id, [{ class: "prompt_approval", targets: [`${session.id}:*`] }]);
 
-  const ok = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:req_42` }]));
+  const ok = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:req_42:approve` }]));
   const attested = await env.attest(session, ok);
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   assert.equal(attested.body.claims.standing, "own_owner");
-  assert.deepEqual(attested.body.claims.actions, [{ class: "prompt_approval", target: `${session.id}:req_42` }]);
+  assert.deepEqual(attested.body.claims.actions, [{ class: "prompt_approval", target: `${session.id}:req_42:approve` }]);
   // It must name this session.
   const other = await env.desktopIdentity("other-session");
-  const wrongSession = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${other.id}:req_1` }]));
+  const wrongSession = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${other.id}:req_1:approve` }]));
   assert.equal((await env.attest(session, wrongSession)).body.reason, "out_of_scope");
   // Only not_before may condition a prompt_approval.
-  const badCondition = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:r`,
+  // No conditions at all on a prompt_approval, and the decision is bound in the target.
+  const noDecision = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:req_43` }]));
+  assert.equal((await env.attest(session, noDecision)).body.reason, "no_approval");
+  const notBefore = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:req_44:approve`,
+    conditions: [{ type: "not_before", at: new Date(Date.now() + 60_000).toISOString() }] }]));
+  assert.equal((await env.attest(session, notBefore)).body.reason, "no_approval");
+  const badCondition = send(env, bot, session, env.approval([{ class: "prompt_approval", target: `${session.id}:r:approve`,
     conditions: [{ type: "mergeable" }] }]));
   assert.equal((await env.attest(session, badCondition)).body.reason, "no_approval");
   // Never through code owners: Bob's session refuses even with a target-owners entry.
@@ -838,7 +857,7 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
   await env.browser("/delegates/target-owners", "PUT", [{ pattern: "*", owner_ids: [env.ownerId] }]);
   const wideBot = await env.claim("wide-bot");
   await env.grant(wideBot.id, [{ class: "prompt_approval", targets: ["*"] }]);
-  const forBob = send(env, wideBot, bobsSession, env.approval([{ class: "prompt_approval", target: `${bobsSession.id}:r9` }]));
+  const forBob = send(env, wideBot, bobsSession, env.approval([{ class: "prompt_approval", target: `${bobsSession.id}:r9:deny` }]));
   assert.equal((await env.attest(bobsSession, forBob, "code_owners", bobDesktop.accessToken)).body.reason, "recipient_policy");
 
   // prompt-delegates: the machine owner's delegates whose grants cover the session.
@@ -918,6 +937,8 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/messaging/delegation/redeem": ["post"],
     "/api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates": ["post"],
     "/api/v1/orgs/{organizationId}/delegation-policy": ["get", "put"],
+    "/api/v1/workspaces/{workspaceId}/delegates/approvals/{approvalId}": ["delete"],
+    "/api/v1/workspaces/{workspaceId}/messaging/delegation/withdraw": ["post"],
   };
   for (const [path, methods] of Object.entries(expected)) {
     for (const method of methods) assert.ok(spec.paths[path]?.[method], `${method.toUpperCase()} ${path}`);
@@ -990,7 +1011,7 @@ test("quote_retention_days is an org setting (1–3650, default 90) that every w
   let events = await audit();
   assert.equal(byJti(events, old).quote, null);
   assert.ok(byJti(events, old).quote_redacted_at);
-  assert.equal(byJti(events, old).quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
+  assert.match(byJti(events, old).quote_hash!, /^[0-9a-f]{64}$/);
   assert.equal(byJti(events, recent).quote, "yes merge 2250 when green");
   assert.equal(byJti(events, recent).quote_redacted_at, null);
 
@@ -1108,9 +1129,9 @@ test("review: tokens act only in their own workspace; oversized bodies get 413; 
   }
   const all = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
   const first = (await env.bearer("/delegates/audit?limit=2")).body.events as Array<{ id: string }>;
-  const rest = (await env.bearer(`/delegates/audit?after=${first.at(-1)!.id}`)).body.events as Array<{ id: string }>;
+  const rest = (await env.bearer(`/delegates/audit?after_id=${first.at(-1)!.id}`)).body.events as Array<{ id: string }>;
   assert.deepEqual([...first, ...rest].map(event => event.id), all.map(event => event.id));
-  assert.equal((await env.bearer("/delegates/audit?after=abc")).status, 400);
+  assert.equal((await env.bearer("/delegates/audit?after_id=abc")).status, 400);
 });
 
 test("review: a grant revoked or narrowed during the Relaycast lookups is rechecked under its lock", async (t) => {
@@ -1145,9 +1166,9 @@ test("review: a grant revoked or narrowed during the Relaycast lookups is rechec
   };
   assert.deepEqual((await env.redeem(recipient, attested.body.claims.approval_id, prod)).body, { ok: false, reason: "out_of_scope" });
   // Not consumed by the refused redeem.
-  const row = await env.database.query<{ consumed_at: Date | null }>(
-    "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [attested.body.claims.approval_id]);
-  assert.equal(row.rows[0]!.consumed_at, null);
+  // Nothing consumed by the refused redeem.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
+    [attested.body.claims.approval_id])).rows.length, 0);
   env.world.handle = handle;
 });
 
@@ -1199,4 +1220,75 @@ test("review: prompt-delegates omits a released agent", async (t) => {
   assert.equal((await list()).body.delegates.length, 1);
   env.world.agents.get("assistant")!.status = "released";
   assert.deepEqual((await list()).body, { delegates: [] });
+});
+
+// ---------------------------------------------------------------------------
+// Contract f5ec9c93: per-action single use, every redeem audited, revoke one
+// approval, delegate withdraw.
+
+test("single use is per action; every redeem is audited", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v1.2.3:${"a".repeat(40)}:42` };
+  const deploy = { class: "deploy", target: "web:staging" };
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  await env.grant(bot.id, [{ class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }, { class: "deploy", targets: ["*:staging"] },
+    { class: "merge", targets: ["AgentWorkforce/*"] }]);
+  const messageId = send(env, bot, recipient, env.approval([release, deploy]));
+  const attested = await env.attest(recipient, messageId);
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const approvalId = attested.body.claims.approval_id as string;
+  // Each action redeems once; redeeming one never consumes the other.
+  assert.deepEqual((await env.redeem(recipient, approvalId, release)).body, { ok: true, consumed: true });
+  assert.deepEqual((await env.redeem(recipient, approvalId, release)).body, { ok: false, reason: "consumed" });
+  assert.deepEqual((await env.redeem(recipient, approvalId, deploy)).body, { ok: true, consumed: true });
+  assert.deepEqual((await env.redeem(recipient, approvalId, deploy)).body, { ok: false, reason: "consumed" });
+  // With every action used, the same message attests as consumed.
+  assert.equal((await env.attest(recipient, messageId)).body.reason, "consumed");
+  // A multi-use action is redeemed before every use, and each use is audited.
+  const merge = { class: "merge", target: "AgentWorkforce/relay#99" };
+  const multi = await env.attest(recipient, send(env, bot, recipient, env.approval([merge])));
+  for (let index = 0; index < 3; index += 1) {
+    assert.deepEqual((await env.redeem(recipient, multi.body.claims.approval_id, merge)).body, { ok: true, consumed: false });
+  }
+  const redeemed = (await env.database.query<{ approval_id: string }>(
+    "SELECT approval_id FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows;
+  assert.equal(redeemed.filter(row => row.approval_id === multi.body.claims.approval_id).length, 3);
+  assert.equal(redeemed.filter(row => row.approval_id === approvalId).length, 2);
+});
+
+test("the owner revokes one approval; the delegate that sent one withdraws it", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#101" };
+  const first = await env.attest(recipient, send(env, bot, recipient, env.approval([merge])));
+  const firstId = first.body.claims.approval_id as string;
+  // Revoke one approval (allowed while delegation is off: revoking only narrows).
+  await env.enable({ delegation_enabled: false });
+  const revoked = await env.bearer(`/delegates/approvals/${firstId}`, "DELETE");
+  assert.equal(revoked.status, 200, revoked.raw);
+  assert.deepEqual(revoked.body, { approval_id: firstId, revoked: true });
+  await env.enable();
+  assert.deepEqual((await env.redeem(recipient, firstId, merge)).body, { ok: false, reason: "revoked" });
+  // Another member cannot revoke the owner's approval; an unknown id is 404.
+  const memberId = await env.addMember("member@acme.test");
+  const member = await env.desktopSignIn({ hostName: "member-box", userId: memberId });
+  assert.equal((await env.bearer(`/delegates/approvals/${firstId}`, "DELETE", undefined, member.accessToken)).status, 404);
+  assert.equal((await env.bearer("/delegates/approvals/apv_unknown12345", "DELETE")).status, 404);
+
+  // The delegate withdraws an approval it sent, with its own token; the next redeem is revoked.
+  const second = await env.attest(recipient, send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#102" }])));
+  const secondId = second.body.claims.approval_id as string;
+  const withdraw = (body: Record<string, unknown>) =>
+    request(env.origin, `${env.base}/messaging/delegation/withdraw`, { method: "POST", body });
+  // Not the sender: another agent, or a token that is not the delegate's.
+  const other = env.world.addAgent("someone-else");
+  assert.equal((await withdraw({ delegate_agent_id: other.id, delegate_token: other.token, approval_id: secondId })).status, 404);
+  assert.equal((await withdraw({ delegate_agent_id: bot.id, delegate_token: other.token, approval_id: secondId })).status, 403);
+  const done = await withdraw({ delegate_agent_id: bot.id, delegate_token: bot.token, approval_id: secondId });
+  assert.equal(done.status, 200, done.raw);
+  assert.deepEqual(done.body, { ok: true });
+  assert.deepEqual((await env.redeem(recipient, secondId, { class: "merge", target: "AgentWorkforce/relay#102" })).body,
+    { ok: false, reason: "revoked" });
+  const events = (await env.database.query<{ event: string; reason: string | null }>(
+    "SELECT event, reason FROM delegation_audit_events WHERE event IN ('approval.revoked', 'approval.withdrawn') ORDER BY id")).rows;
+  assert.deepEqual(events, [{ event: "approval.revoked", reason: "owner_revoked" }, { event: "approval.withdrawn", reason: "delegate_withdrew" }]);
 });

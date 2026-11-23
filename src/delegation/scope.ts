@@ -97,7 +97,24 @@ export const PR_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100
 /** `owner/repo`: a repository target (Cloud's REPO_TARGET). */
 export const REPO_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
 /** `<session agent id>:<request ref>`: a prompt_approval action target. */
-const PROMPT_TARGET = /^[^\s:*#/]{1,200}:[^\s:*#/]{1,200}$/u;
+const PROMPT_TARGET = /^([^\s:*#/]{1,200}):([^\s:*#/]{1,200}):(approve|deny)$/u;
+/**
+ * `owner/repo#N:<op>`: a pr_ops action target names one operation on one PR
+ * (§5.1): open, close, reopen, label=<name>, unlabel=<name>,
+ * request_review=<login>, rerun_ci or comment.
+ */
+const PR_OPS_TARGET = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}):(open|close|reopen|rerun_ci|comment|(?:label|unlabel)=[^\s:*#/]{1,100}|request_review=[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$/u;
+
+/** A pr_ops target's PR (`owner/repo#N`) and operation, or null when it is not one. */
+export function prOpsTarget(target: string): { pr: string; op: string } | null {
+  const match = PR_OPS_TARGET.exec(target);
+  return match ? { pr: match[1]!, op: match[2]! } : null;
+}
+
+/** The PR or repo an action's target names, for PR conditions and CODEOWNERS standing. */
+export function repoPart(action: Pick<Action, "class" | "target">): string {
+  return action.class === "pr_ops" ? prOpsTarget(action.target)?.pr ?? action.target : action.target;
+}
 /** `<agent id>:<setting>=<value>`: a config_change action target, exact, no `*` (§16.1), as Cloud's CONFIG_TARGET. */
 const CONFIG_TARGET = /^([^\s:*#/=]{1,200}):([A-Za-z0-9_.-]{1,100})=([^\s*]{0,200})$/u;
 
@@ -118,11 +135,14 @@ export function actionIsValid(action: Pick<Action, "class" | "target" | "conditi
   if (!isConcreteTarget(action.target)) return false;
   if (action.class === "prompt_approval" && !PROMPT_TARGET.test(action.target)) return false;
   if (action.class === "config_change" && !configTarget(action.target)) return false;
+  if (action.class === "pr_ops" && !prOpsTarget(action.target)) return false;
   const conditions = action.conditions ?? [];
   if (conditions.length > MAX_CONDITIONS) return false;
   if (new Set(conditions.map(condition => condition.type)).size !== conditions.length) return false;
-  // prompt_approval and config_change take `not_before` only.
-  const prTarget = action.class !== "prompt_approval" && action.class !== "config_change" && PR_TARGET.test(action.target);
+  // prompt_approval takes no conditions (the node applies it without a redeem);
+  // config_change takes `not_before` only.
+  if (action.class === "prompt_approval" && conditions.length) return false;
+  const prTarget = action.class !== "config_change" && PR_TARGET.test(repoPart(action));
   return conditions.every(condition => condition.type === "not_before" || prTarget);
 }
 
@@ -243,15 +263,13 @@ export function targetCovered(pattern: string, target: string, subsumes = false)
 }
 
 /**
- * §16.1 prompt_approval: an approval target is `<agent id>:<request ref>`,
- * split at the first `:`; a grant target is `*` or `<agent id>:*`.
+ * §16.1 prompt_approval: an approval target is
+ * `<agent id>:<request ref>:approve` or `:deny` (the decision is bound in the
+ * target); a grant target is `*` or `<agent id>:*`.
  */
-export function promptTarget(target: string): { agentId: string; ref: string } | null {
-  const at = target.indexOf(":");
-  if (at <= 0 || at === target.length - 1) return null;
-  const agentId = target.slice(0, at);
-  const ref = target.slice(at + 1);
-  return agentId.includes("*") || ref.includes("*") ? null : { agentId, ref };
+export function promptTarget(target: string): { agentId: string; ref: string; decision: "approve" | "deny" } | null {
+  const match = PROMPT_TARGET.exec(target);
+  return match ? { agentId: match[1]!, ref: match[2]!, decision: match[3] as "approve" | "deny" } : null;
 }
 
 export function validPromptPattern(pattern: string): boolean {
@@ -273,6 +291,11 @@ export function classTargetCovered(cls: ActionClass, pattern: string, target: st
     const parsed = configTarget(target);
     return parsed !== null && (pattern === "*" || `${parsed.agentId}:*` === pattern);
   }
+  // pr_ops grants (`owner/repo`, `owner/repo#N`, `owner/*`) cover every op on a covered PR.
+  if (cls === "pr_ops" && !subsumes) {
+    const parsed = prOpsTarget(target);
+    return parsed !== null && targetCovered(pattern, parsed.pr);
+  }
   if (cls !== "prompt_approval") return targetCovered(pattern, target, subsumes);
   if (!validPromptPattern(pattern)) return false;
   if (pattern === "*") return subsumes ? validPromptPattern(target) : promptTarget(target) !== null;
@@ -289,8 +312,8 @@ export function actionsCovered(scopes: readonly Scope[], actions: readonly Pick<
 
 /** §16.1: high-risk actions are always single-use. */
 export function highRisk(action: Pick<Action, "class" | "target">): boolean {
-  if (["release", "secret_change", "destructive", "spend", "config_change"].includes(action.class)) return true;
-  return action.class === "deploy" && /:(prod|production)$/.test(action.target);
+  // §16.1: always single use, per action; `deploy` in every environment.
+  return ["release", "deploy", "secret_change", "destructive", "spend", "config_change"].includes(action.class);
 }
 
 /** The classes in `actions` that need tier O under the defaults, the workspace policy and the grant. */
