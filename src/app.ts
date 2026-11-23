@@ -463,6 +463,8 @@ export function createApp(input: {
   messagingFetch?: typeof fetch;
   /** Test hook: fetch for release-gate OIDC discovery and JWKS (docs/owner-delegates.md). */
   delegationOidcFetch?: typeof fetch;
+  /** GitHub's REST API, for resolving a gate's repository ids at registration (tests inject it). */
+  delegationGithubFetch?: typeof fetch;
   /** RELAYCAST_INTERNAL_SECRET: lets webhook inboxes issue temporary Agent Relay workspaces. */
   relaycastInternalSecret?: string | null;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -597,6 +599,16 @@ export function createApp(input: {
       now: input.now,
     }),
     oidcIssuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+    githubFetch: input.delegationGithubFetch ?? globalThis.fetch,
+    // The workspace's GitHub connection (App installation or OAuth), when it has one, as Cloud's installation reader.
+    githubToken: async (workspaceId, userId) => {
+      if (!admin) return null;
+      try {
+        return (await admin.connections.runtimeToken({ workspaceId, provider: "github", actor: { kind: "user", userId } })).accessToken;
+      } catch {
+        return null;
+      }
+    },
     // Never provisions: these lookups can run before any caller is proven.
     relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),

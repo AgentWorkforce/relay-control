@@ -1,6 +1,6 @@
 import type { SqlExecutor } from "../database.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims, type WorkflowOidcVerifier } from "./oidc.js";
-import { logAuditWriteFailed, logRefused, logUnavailable } from "./observe.js";
+import { logAuditWriteFailed, logRefused, logRepositoryMismatch, logUnavailable } from "./observe.js";
 import { actionIsValid, canonicalAction, releaseTargetSha, type Action, type ActionClass, type Condition, type ReasonCode } from "./scope.js";
 import {
   actionConsumed,
@@ -110,12 +110,27 @@ function workflowMatches(gateRef: string, claimRef: string | null, gate: Pick<Ga
  * repository that later reuses the name never does. Repository names compare
  * case-insensitively, as on GitHub.
  */
-export function gateMatches(gate: Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" |
-  "ref_pattern" | "event" | "repository_id" | "repository_owner_id">,
-  claims: Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name" |
-    "repository_id" | "repository_owner_id">): boolean {
-  if (gate.repository_id && gate.repository_id !== claims.repository_id) return false;
-  if (gate.repository_owner_id && gate.repository_owner_id !== claims.repository_owner_id) return false;
+export function gateMatches(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
+  return gateMatchesByName(gate, claims) && sameRepositoryIds(gate, claims);
+}
+
+type GateMatchFields = Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" | "ref_pattern" | "event" |
+  "repository_id" | "repository_owner_id">;
+type ClaimMatchFields = Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name" |
+  "repository_id" | "repository_owner_id">;
+
+/**
+ * GitHub's stable ids, resolved at registration, as Cloud: a repository that
+ * later reuses the name (after a rename, transfer or delete) never matches. A
+ * gate without ids (none are created any more) never serves.
+ */
+function sameRepositoryIds(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
+  return Boolean(gate.repository_id && gate.repository_owner_id && gate.repository_id === claims.repository_id &&
+    gate.repository_owner_id === claims.repository_owner_id);
+}
+
+/** Every signed field except the repository ids. */
+function gateMatchesByName(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
   const refMatches = gate.ref !== null ? gate.ref === claims.ref :
     gate.ref_pattern !== null && /^refs\/tags\/[^\s*]+\*$/u.test(gate.ref_pattern) &&
       claims.ref.startsWith(gate.ref_pattern.slice(0, -1)) && claims.ref.length > gate.ref_pattern.length - 1;
@@ -176,7 +191,11 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // Counted per reason. A token no trusted issuer signed is not counted, so
     // forged calls cannot drive events.
     // Not `gate_unknown` either: any GitHub account can mint a genuine token for this audience.
-    if (reason !== "oidc_invalid" && reason !== "gate_unknown") logRefused("gate_redeem", { workspaceId: workspace.id, reason, gateId: gate?.id ?? null });
+    if (reason !== "oidc_invalid" && reason !== "gate_unknown") {
+      logRefused("gate_redeem", { workspaceId: workspace.id, reason, gateId: gate?.id ?? null,
+        ...(claims ? { repository: claims.repository, workflow_ref: claims.workflow_ref, ref: claims.ref,
+          event_name: claims.event_name } : {}) });
+    }
     return { ok: false, reason, ...(unmet ? { unmet } : {}), ...(dryRun ? { dry_run: true as const } : {}) };
   };
   try {
@@ -198,23 +217,23 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (!registered.length) return await refuse("gate_unknown");
     // Matching the repository alone is not enough: a workflow edited on
     // another branch also gets a token for the same repository.
-    let exact = registered.filter(item => gateMatches(item, claims!));
-    if (!exact.length) return await refuse("gate_mismatch");
-    // The first verified match pins a gate to the repository ids. A gate serves
-    // only once its stored ids are this token's: a token without the ids, a
-    // failed pin, or a concurrent first request that pinned other ids, does not.
-    if (exact.some(candidate => !candidate.repository_id)) {
-      if (!claims.repository_id || !claims.repository_owner_id) return await refuse("gate_mismatch");
-      const kept: GateRow[] = [];
-      for (const item of exact) {
-        if (item.repository_id) { kept.push(item); continue; }
-        const saved = await pinGateRepository(deps.database, item.id, claims.repository_id, claims.repository_owner_id);
-        if (saved && saved.repository_id === claims.repository_id && saved.repository_owner_id === claims.repository_owner_id) {
-          kept.push({ ...item, repository_id: claims.repository_id, repository_owner_id: claims.repository_owner_id });
-        }
-      }
-      exact = kept;
-      if (!exact.length) return await refuse("gate_mismatch");
+    const byName = registered.filter(item => gateMatchesByName(item, claims!));
+    if (!byName.length) return await refuse("gate_mismatch");
+    // Every gate holds the repository ids GitHub reported at registration;
+    // redeem never pins. A token that matches a gate by name but carries
+    // other ids comes from a different repository using the name (a squat, a
+    // recreated or transferred repo): refused, logged, and audited so the
+    // gate's owner sees it, also on a dry run. As Cloud.
+    const exact = byName.filter(item => sameRepositoryIds(item, claims!));
+    if (!exact.length) {
+      const squatted = byName.find(item => item.repository_id);
+      if (!squatted) return await refuse("gate_mismatch");
+      gate = squatted;
+      ownerUserId = squatted.owner_user_id;
+      audited = true;
+      logRepositoryMismatch({ workspaceId: workspace.id, gateId: squatted.id, repository: claims.repository,
+        token_repository_id: claims.repository_id, token_repository_owner_id: claims.repository_owner_id });
+      return await refuse("repository_mismatch");
     }
     audited = true;
     const policy = await loadPolicy(deps.database, workspace.id);
@@ -241,7 +260,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       const named = releaseTargetSha(action.target);
       if (!named) return await refuse("out_of_scope");
       if (named.sha.toLowerCase() !== claims.sha) {
-        candidates = named.form === "candidate" ? candidates.filter(item => item.allow_source_sha_mismatch === true) : [];
+        // Never through a tag gate: anyone who can push a tag picks the commit, and with it the workflow.
+        candidates = named.form === "candidate" ?
+          candidates.filter(item => item.allow_source_sha_mismatch === true && item.ref_pattern === null) : [];
         if (!candidates.length) return await refuse("sha_mismatch");
         gate = candidates[0]!;
       }
@@ -325,6 +346,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       const result = await consumeForGateRun(tx, { workspaceId: workspace.id, approvalId: approval.id, gateId: servingGate.id,
         claims: oidc, action });
       if (result === "gate_gone") return "gate_unknown" as const;
+      if (result === "revoked") return "revoked" as const;
       if (result === "taken") return "consumed" as const;
       await audit("gate.redeemed", null, { same_run: result === "same_run" }, tx);
       return result;
@@ -336,19 +358,6 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     logUnavailable("gate_redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId, gateId: gate?.id ?? null });
     return refuse("unavailable");
   }
-}
-
-/** Pins an unpinned gate to the repository ids, then reads what the live gate holds (Cloud's pinGateRepository). */
-async function pinGateRepository(executor: SqlExecutor, gateId: string, repositoryId: string, repositoryOwnerId: string):
-  Promise<{ repository_id: string | null; repository_owner_id: string | null } | null> {
-  await executor.query(
-    `UPDATE delegation_gates SET repository_id = $2, repository_owner_id = $3
-      WHERE id = $1 AND repository_id IS NULL AND deleted_at IS NULL`,
-    [gateId, repositoryId, repositoryOwnerId],
-  );
-  return (await executor.query<{ repository_id: string | null; repository_owner_id: string | null }>(
-    "SELECT repository_id, repository_owner_id FROM delegation_gates WHERE id = $1 AND deleted_at IS NULL", [gateId],
-  )).rows[0] ?? null;
 }
 
 /** Whether a consumed action was consumed by this same run (another job, or a later attempt, of it). */
@@ -370,13 +379,14 @@ async function boundRun(executor: SqlExecutor, approvalId: string, action: Pick<
  * records the run, a later one in that run is `same_run`, any other `taken`.
  */
 async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: string; approvalId: string; gateId: string;
-  claims: WorkflowClaims; action: Action }): Promise<"consumed" | "same_run" | "taken" | "gate_gone"> {
+  claims: WorkflowClaims; action: Action }): Promise<"consumed" | "same_run" | "taken" | "gate_gone" | "revoked"> {
   const gateLive = (await tx.query("SELECT 1 FROM delegation_gates WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
     [input.gateId])).rows.length > 0;
   if (!gateLive) return "gate_gone";
   const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR SHARE",
     [input.approvalId])).rows.length > 0;
-  if (!live) return "taken";
+  // A revoked approval at consume is `revoked`, as Cloud.
+  if (!live) return "revoked";
   if (await consumeAction(tx, { approvalId: input.approvalId, workspaceId: input.workspaceId, action: input.action,
     consumedBy: `github-run:${input.claims.run_id}` })) {
     await tx.query(
@@ -434,4 +444,45 @@ export function gateRedeemStatus(result: GateRedeemResult): number {
   if (result.ok || ("dry_run" in result && result.dry_run)) return 200;
   if (result.reason === "oidc_invalid") return 401;
   return result.reason === "unavailable" || result.reason === "condition_unavailable" ? 503 : 403;
+}
+
+/** GitHub's stable ids for a repository, and its canonical `owner/name`. */
+export type RepositoryIds = { repositoryId: string; repositoryOwnerId: string; fullName: string };
+
+/** GitHub could not answer (network, 5xx, rate limit, a malformed body): registration answers 503. */
+export class GithubUnavailable extends Error {
+  constructor() {
+    super("github_unavailable");
+  }
+}
+
+/**
+ * GitHub's ids for the repository a gate is registered for, resolved before
+ * the gate exists, as Cloud's resolveGateRepository: through the workspace's
+ * GitHub connection when it has one (its token), else GitHub's public API.
+ * Null when GitHub knows no such repository the caller can see (404), or the
+ * canonical name differs from the one registered (case-insensitive). Throws
+ * GithubUnavailable when GitHub cannot answer.
+ */
+export async function resolveGateRepository(input: { repo: string; token: string | null; fetchImpl: typeof fetch }):
+  Promise<RepositoryIds | null> {
+  const [owner, name] = input.repo.split("/");
+  let response: Response;
+  try {
+    response = await input.fetchImpl(`https://api.github.com/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}`, {
+      headers: { accept: "application/vnd.github+json", "user-agent": "relay-control", "x-github-api-version": "2022-11-28",
+        ...(input.token ? { authorization: `Bearer ${input.token}` } : {}) },
+      redirect: "error", signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new GithubUnavailable();
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) throw new GithubUnavailable();
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const id = body?.id, ownerId = (body?.owner as Record<string, unknown> | undefined)?.id, fullName = body?.full_name;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || typeof ownerId !== "number" || !Number.isSafeInteger(ownerId) ||
+      typeof fullName !== "string") throw new GithubUnavailable();
+  return fullName.toLowerCase() === input.repo.toLowerCase()
+    ? { repositoryId: String(id), repositoryOwnerId: String(ownerId), fullName } : null;
 }

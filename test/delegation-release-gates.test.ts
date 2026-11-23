@@ -50,7 +50,20 @@ async function setup(t: TestContext) {
   const github = issuer(GITHUB);
   const ghes = issuer(GHES);
   const seed = randomBytes(32);
-  const env = await copilotDesktopSetup(t, { delegationOidcFetch: oidcFetch([github, ghes]) }, undefined,
+  /** GitHub's REST API: the gated repository resolves to stable ids; anything else is 404. Tests change `github.repos`. */
+  const githubApi = { repos: new Map<string, { id: number; owner: number; full_name: string } | "down">([
+    [REPO.toLowerCase(), { id: 70151234, owner: 90122, full_name: REPO }],
+  ]), calls: [] as Array<{ url: string; authorization: string | null }> };
+  const githubFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    githubApi.calls.push({ url, authorization: new Headers(init?.headers).get("authorization") });
+    const match = /^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)$/.exec(url);
+    const repo = match ? githubApi.repos.get(`${decodeURIComponent(match[1]!)}/${decodeURIComponent(match[2]!)}`.toLowerCase()) : undefined;
+    if (repo === "down") return new Response("unavailable", { status: 503 });
+    if (!repo) return Response.json({ message: "Not Found" }, { status: 404 });
+    return Response.json({ id: repo.id, full_name: repo.full_name, owner: { id: repo.owner } });
+  }) as typeof fetch;
+  const env = await copilotDesktopSetup(t, { delegationOidcFetch: oidcFetch([github, ghes]), delegationGithubFetch: githubFetch }, undefined,
     { delegationSigning: { kid: "dlg-test", seed, previous: [] }, delegationOidcIssuers: [GHES] });
   const desktop = await env.desktopSignIn({ hostName: "owner-box" });
   const base = `/api/v1/workspaces/${env.workspaceId}`;
@@ -116,7 +129,7 @@ async function setup(t: TestContext) {
     return (await env.database.query<{ reason: string | null; data: Record<string, unknown> }>(
       "SELECT reason, data FROM delegation_audit_events WHERE event = $1 ORDER BY id", [event])).rows;
   }
-  return { ...env, github, ghes, desktop, base, browser, bearer, approval, workflowClaims, redeem, gate, events };
+  return { ...env, github, ghes, githubApi, desktop, base, browser, bearer, approval, workflowClaims, redeem, gate, events };
 }
 
 test("release target grammar (§11a.2)", () => {
@@ -165,7 +178,8 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   assert.equal(viaDesktop.status, 201, viaDesktop.raw);
   assert.match(viaDesktop.body.gate_id, /^gate_[A-Za-z0-9]+$/);
   assert.deepEqual(Object.keys(viaDesktop.body).sort(),
-    ["created_at", "event", "gate_id", "owner_id", "ref", "repo", "target_prefix", "workflow_ref"]);
+    ["created_at", "event", "gate_id", "owner_id", "ref", "repo", "repository_id", "repository_owner_id", "target_prefix",
+      "workflow_ref"]);
   const listed = await env.bearer("/delegates/gates");
   assert.deepEqual(listed.body.gates.map((gate: { gate_id: string }) => gate.gate_id), [viaDesktop.body.gate_id]);
   // Another member neither sees nor deletes it.
@@ -185,7 +199,7 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   assert.equal((await env.browser("/delegates/gates", "POST", body)).body.code, "not_enabled");
   const audited = (await env.database.query<{ event: string }>(
     "SELECT event FROM delegation_audit_events WHERE event LIKE 'gate.%' ORDER BY id")).rows.map(row => row.event);
-  assert.deepEqual(audited, ["gate.registered", "gate.deleted"]);
+  assert.deepEqual(audited, ["gate.registered", "gate.pinned", "gate.deleted"]);
 });
 
 test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer are oidc_invalid)", async (t) => {
@@ -220,7 +234,8 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
   const ghesToken = mint(env.ghes, env.workflowClaims({ iss: GHES, run_id: "42" }));
   // A same-named repository on another issuer is another repository: the GitHub gate does not match it.
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: false, reason: "gate_mismatch" });
-  const ghesGate = await env.gate({ issuer: GHES });
+  // A self-host issuer's repository is not on github.com: its owner names the ids.
+  const ghesGate = await env.gate({ issuer: GHES, repository_id: "70151234", repository_owner_id: "90122" });
   assert.equal(ghesGate.issuer, GHES);
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: true, consumed: true });
   assert.equal((await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main",
@@ -522,21 +537,24 @@ test("gates: allowed events, one live gate per workflow identity, pinned reposit
   const fileCase = mint(env.github, env.workflowClaims({ workflow_ref: WORKFLOW.replace("desktop-promote", "Desktop-Promote"),
     job_workflow_ref: WORKFLOW.replace("desktop-promote", "Desktop-Promote"), ...ids }));
   assert.deepEqual((await env.redeem(fileCase, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
-  // The first verified match pinned GitHub's repository ids: a repository that reuses the name never matches.
+  // The gate was pinned at registration to GitHub's ids: a repository that reuses the name is
+  // repository_mismatch (logged and audited for the gate's owner, also on a dry run).
   const listed = (await env.bearer("/delegates/gates")).body.gates as Array<Record<string, unknown>>;
   const view = listed.find(item => item.gate_id === pinned.gate_id)!;
   assert.equal(view.repository_id, ids.repository_id);
   assert.equal(view.repository_owner_id, ids.repository_owner_id);
+  const pinEvent = (await env.events("gate.pinned")).find(row => row.data.gate_id === pinned.gate_id)!;
+  assert.deepEqual(pinEvent.data, { gate_id: pinned.gate_id, repo: REPO, repository_id: ids.repository_id,
+    repository_owner_id: ids.repository_owner_id, source: "registration" });
   const reused = mint(env.github, env.workflowClaims({ repository_id: "99999999", repository_owner_id: "90122" }));
-  assert.deepEqual((await env.redeem(reused, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
-  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims(ids)), approvalId)).body, { ok: true, consumed: true });
-  // An unpinned gate never serves a token without the repository ids, and that job writes nothing to the log.
-  assert.equal((await env.bearer(`/delegates/gates?gate_id=${pinned.gate_id}`, "DELETE")).status, 200);
-  await env.gate();
-  const before = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event LIKE 'gate.%'")).rows.length;
+  assert.deepEqual((await env.redeem(reused, approvalId, STABLE, dry)).body, { ok: false, reason: "repository_mismatch", dry_run: true });
+  const mismatch = (await env.events("gate.refused")).filter(row => row.reason === "repository_mismatch");
+  assert.equal(mismatch.length, 1);
+  // A token without the ids never matches a pinned gate either.
   const idless = mint(env.github, env.workflowClaims({ repository_id: undefined, repository_owner_id: undefined }));
-  assert.deepEqual((await env.redeem(idless, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
-  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event LIKE 'gate.%'")).rows.length, before);
+  assert.deepEqual((await env.redeem(idless, approvalId, STABLE, dry)).body, { ok: false, reason: "repository_mismatch", dry_run: true });
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims(ids)), approvalId)).body, { ok: true, consumed: true });
+
 });
 
 test("gates: a gate serves only while its owner is a member; policy at the commit decides", async (t) => {
@@ -699,6 +717,8 @@ test("gate redeem: a release is bound to the run's commit (sha claim); status co
   const mismatch = await env.redeem(token({ sha: other }), approvalId);
   assert.equal(mismatch.status, 403, mismatch.raw);
   assert.deepEqual(mismatch.body, { ok: false, reason: "sha_mismatch" });
+  // A SHA-256 repository's 64-hex sha never matches a 40-hex target.
+  assert.deepEqual((await env.redeem(token({ sha: SHA + "0".repeat(24) }), approvalId)).body, { ok: false, reason: "sha_mismatch" });
   // A dry run always answers 200 with its verdict.
   const dryMismatch = await env.redeem(token({ sha: other }), approvalId, STABLE, dry);
   assert.equal(dryMismatch.status, 200, dryMismatch.raw);
@@ -714,6 +734,17 @@ test("gate redeem: a release is bound to the run's commit (sha claim); status co
   assert.equal(served.status, 200, served.raw);
   assert.deepEqual(served.body, { ok: true, consumed: true });
   assert.equal((await env.events("gate.redeemed")).at(-1)!.data.sha, other);
+  // A tag gate never serves off-commit, even with the flag set behind registration's back.
+  const tagWorkflow = `${REPO}/.github/workflows/release.yml@refs/tags/v*`;
+  const tagGate = await env.gate({ workflow_ref: tagWorkflow, ref: undefined, ref_pattern: "refs/tags/v*", event: "push",
+    target_prefix: `${REPO}:stable:` });
+  await env.database.query("UPDATE delegation_gates SET allow_source_sha_mismatch = true WHERE id = $1", [tagGate.gate_id]);
+  const tagApproval = await env.approval([STABLE.replace(":123456789", ":123456790")]);
+  const tagToken = mint(env.github, env.workflowClaims({ run_id: "902", sha: other, ref: "refs/tags/v2026.11.7", event_name: "push",
+    workflow_ref: `${REPO}/.github/workflows/release.yml@refs/tags/v2026.11.7`,
+    job_workflow_ref: `${REPO}/.github/workflows/release.yml@refs/tags/v2026.11.7` }));
+  assert.deepEqual((await env.redeem(tagToken, tagApproval, STABLE.replace(":123456789", ":123456790"))).body,
+    { ok: false, reason: "sha_mismatch" });
   // Land and iOS targets are always bound, even through an opted-out gate.
   const ios = `${REPO}:ios:testflight:42:${SHA}`;
   const iosApproval = await env.approval([ios]);
@@ -726,15 +757,39 @@ test("gate redeem: a release is bound to the run's commit (sha claim); status co
   assert.equal(unknown.status, 403, unknown.raw);
 });
 
-test("gates: target_prefix ends at a segment boundary; a case-variant duplicate is 409", async (t) => {
+test("gates: registration pins the repository on GitHub; tag gates cannot opt out of the sha binding", async (t) => {
   const env = await setup(t);
   const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch" };
+  // target_prefix ends at a segment boundary.
   const open = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable` });
   assert.equal(open.status, 400, open.raw);
+  // GitHub knows no such repository: 422 repository_unresolved, and no gate is created.
+  const ghost = "AgentWorkforce/ghost";
+  const unresolved = await env.browser("/delegates/gates", "POST", { repo: ghost,
+    workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push", target_prefix: `${ghost}:` });
+  assert.equal(unresolved.status, 422, unresolved.raw);
+  assert.equal(unresolved.body.code, "repository_unresolved");
+  // A renamed repository (canonical name differs) is unresolved too.
+  env.githubApi.repos.set(ghost.toLowerCase(), { id: 1, owner: 2, full_name: "AgentWorkforce/renamed" });
+  assert.equal((await env.browser("/delegates/gates", "POST", { repo: ghost,
+    workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push",
+    target_prefix: `${ghost}:` })).status, 422);
+  // GitHub down: 503 unavailable.
+  env.githubApi.repos.set(ghost.toLowerCase(), "down");
+  const down = await env.browser("/delegates/gates", "POST", { repo: ghost,
+    workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push", target_prefix: `${ghost}:` });
+  assert.equal(down.status, 503, down.raw);
+  assert.equal((await env.bearer("/delegates/gates")).body.gates.length, 0);
+  // A GitHub Actions gate cannot name its own ids.
+  assert.equal((await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:`,
+    repository_id: "1", repository_owner_id: "2" })).status, 400);
+  // A tag gate cannot opt out of binding the release to the run's commit.
+  const tag = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: `${REPO}/.github/workflows/release.yml@refs/tags/v*`,
+    ref_pattern: "refs/tags/v*", event: "push", target_prefix: `${REPO}:`, allow_source_sha_mismatch: true });
+  assert.equal(tag.status, 400, tag.raw);
+  // The exact same live gate twice is 409.
   await env.gate({ target_prefix: `${REPO}:stable:` });
-  const lower = REPO.toLowerCase();
-  const duplicate = await env.browser("/delegates/gates", "POST", { ...body, repo: lower,
-    workflow_ref: WORKFLOW.replace(REPO, lower), target_prefix: `${lower}:stable:` });
+  const duplicate = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable:` });
   assert.equal(duplicate.status, 409, duplicate.raw);
   assert.equal(duplicate.body.code, "gate_exists");
 });

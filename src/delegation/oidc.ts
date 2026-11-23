@@ -125,8 +125,19 @@ export function workflowOidcVerifier(input: {
     return list;
   }
 
+  /** Imported RSA keys by kid, modulus and exponent (at most 32), so a hot redeem path does not re-import (as Cloud). */
+  const rsaKeys = new Map<string, KeyObject>();
   function publicKey(jwk: Jwk): KeyObject {
-    if (jwk.kty === "RSA" && jwk.n && jwk.e) return createPublicKey({ key: { kty: "RSA", n: jwk.n, e: jwk.e }, format: "jwk" });
+    if (jwk.kty === "RSA" && jwk.n && jwk.e) {
+      const id = `${jwk.kid ?? ""}\u0000${jwk.n}\u0000${jwk.e}`;
+      let key = rsaKeys.get(id);
+      if (!key) {
+        if (rsaKeys.size >= 32) rsaKeys.clear();
+        key = createPublicKey({ key: { kty: "RSA", n: jwk.n, e: jwk.e }, format: "jwk" });
+        rsaKeys.set(id, key);
+      }
+      return key;
+    }
     if (jwk.kty === "EC" && jwk.crv === "P-256" && jwk.x && jwk.y) {
       return createPublicKey({ key: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }, format: "jwk" });
     }

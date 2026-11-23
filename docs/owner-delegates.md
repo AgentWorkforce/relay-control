@@ -168,9 +168,14 @@ Control then:
    checks tier O requirements: the policy's and the grant's
    `require_tier_o` (no class needs tier O by default, §15). Last, standing (§5.4) for
    every action under `accept` (default `code_owners`);
-7. fixes a tier D approval's expiry at its first attestation, as Cloud's
-   `approvalExpiry` does. The base time is Relaycast's `created_at` when it
-   reports one, otherwise now. The expiry is the approval's `expires_at`
+7. reads a tier D message's send time, as Cloud: Relaycast's `created_at`
+   when it reports one, else the time in its snowflake id (top 42 bits:
+   milliseconds since 2025-01-01T00:00:00Z; at most 5 minutes in the future).
+   An unknown send time is `unavailable`. A message sent before the grant was
+   created (before a revoke and re-grant, or before any grant) was never
+   authorized by it: `revoked`. Then it fixes the approval's expiry at its
+   first attestation, as Cloud's `approvalExpiry` does. The base time is the
+   send time. The expiry is the approval's `expires_at`
    (default base + 1 hour), capped at base + 24 hours and at the grant's
    expiry. Later attestations keep the stored value;
 8. at the commit point, in one transaction after every Relaycast lookup,
@@ -313,6 +318,8 @@ consumption rolls back and the answer is `unavailable`: no use goes
 unrecorded. Refusal events (`approval.refused`, `redeem.refused`) are
 written only once the recipient is proven; a refusal before that (delegation
 off, no key, a bad token) is logged as `delegation.refused`, never audited.
+An identical `approval.refused` (message, recipient, reason) is written once
+per 10 minutes; repeats are still logged.
 They stay best-effort; a failed write is logged
 (`delegation.audit_write_failed`), as is every `unavailable` caused by an
 exception (`delegation.unavailable`). See
@@ -385,13 +392,26 @@ exactly too.
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
 true) lets candidate-run release targets name a source commit the run is not
-on (see step 5). `event` is one
+on (see step 5). A tag gate (`ref_pattern`) cannot set it (400): anyone who can
+push a tag picks the commit, and with it the workflow.
+
+**Pinned at registration, as Cloud.** Registering resolves the repository's
+GitHub ids through the workspace's GitHub connection (App installation or
+OAuth) when it has one, else GitHub's public API. GitHub's canonical
+`full_name` must equal the registered `repo` (case-insensitive). The gate
+stores `repository_id` and `repository_owner_id`, and `gate.pinned`
+(`{gate_id, repo, repository_id, repository_owner_id, source: "registration"}`)
+is audited after `gate.registered`. A repository GitHub doesn't know (or
+can't show this workspace, or that was renamed) is 422 `repository_unresolved`;
+a GitHub outage is 503 `unavailable`. relay-control only: a gate on a self-host
+issuer names `repository_id` and `repository_owner_id` itself, because Control
+cannot look those repositories up on github.com; a GitHub Actions gate cannot. `event` is one
 of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
 the gated ref's own workflow code (never `pull_request*` or `workflow_run`).
 Registering needs delegation on and a current member (the membership is
 held until the insert commits). The same live gate (owner, repo,
 `workflow_ref`, `job_workflow_ref`, event, `target_prefix`) cannot be
-registered twice, in any letter case: 409 `gate_exists`. A registry outage is
+registered twice (the repository in any letter case): 409 `gate_exists`. A registry outage is
 logged as `delegation.unavailable` (op `gate_registry`). Each change is audited
 (`gate.registered`, `gate.deleted`).
 
@@ -422,12 +442,12 @@ dry_run?}`. Control checks, in order:
      its `job_workflow_ref` too when set; otherwise `gate_mismatch`. Matching the repository alone is not enough.
      Repository names (also the `owner/repo/` part of a workflow ref) match
      case-insensitively, as on GitHub; the workflow file and ref exactly.
-   - The first verified match pins the gate to the token's `repository_id`
-     and `repository_owner_id` (shown on the gate); a pinned gate needs them
-     to match, so a repository that later reuses the name never does. A gate
-     serves only once its stored ids are the token's: a token without the
-     ids, a failed pin, or a concurrent first request that pinned other ids
-     is `gate_mismatch`.
+   - Redeem never pins. A gate serves only a token carrying its stored
+     `repository_id` and `repository_owner_id`, so a repository that later
+     reuses the name never does. No gate matching by name is `gate_mismatch`.
+     A gate that matches by name but holds other ids is `repository_mismatch`:
+     audited as `gate.refused` for that gate's owner and logged as
+     `delegation.repository_mismatch` (warn), also on a dry run.
    - Until a gate matches and is pinned, the caller is nobody in particular:
      `oidc_invalid`, `gate_unknown` and `gate_mismatch` write nothing to the
      workspace's audit log.
@@ -448,8 +468,9 @@ dry_run?}`. Control checks, in order:
 
    Right after the action is found, a `release` is bound to the run's commit,
    as Cloud: the target's sha (the last segment for land and iOS, the source
-   sha for a candidate) must equal the token's `sha`. On a mismatch only gates
-   with `allow_source_sha_mismatch` keep serving a candidate target, land and
+   sha for a candidate) must equal the token's `sha` (a 64-hex sha never equals
+   a 40-hex target). On a mismatch only exact-ref gates with
+   `allow_source_sha_mismatch` keep serving a candidate target, land and
    iOS targets keep none, and with none left the answer is `sha_mismatch`.
    Other classes are not sha-bound. Every gate event carries the run's `sha`.
 
@@ -543,7 +564,8 @@ snapshot xmin, read with the rows: events of transactions below it are final.
   itself when none is.
 - `complete` is true when the page is not full and nothing was held back.
   Events after the cursor may repeat; none is ever skipped.
-- An id that names no event of this workspace is 400 `invalid_request`.
+- An id that names no event of this workspace, or one this viewer cannot list,
+  is 400 `invalid_request`.
 
 The log is append-only (a trigger refuses every change but a
 quote redaction, and deletes outside a workspace deletion). Each event is `id, event,
@@ -562,7 +584,7 @@ itself is also in the signed claims (`quote`). Quote text is redacted to `quote_
 `quote_retention_days`. An hourly sweep (started with the server) also runs the
 redaction and marks lapsed grants `expired`, so a quiet workspace does not keep
 quote text past its window. Each run handles at most 500 grants and 500
-quotes, then tries the due Relaycast redactions and reports the queue's
+quotes (read per workspace as one index range up to its org's cutoff), then tries the due Relaycast redactions and reports the queue's
 backlog (see `docs/delegation-quote-redaction-runbook.md`).
 
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,

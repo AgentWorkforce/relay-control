@@ -8,7 +8,8 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
-import { gateRedeemStatus, gateView, redeemThroughGate, type GateRow } from "./gates.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
+import { gateRedeemStatus, gateView, GithubUnavailable, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -107,6 +108,10 @@ export type DelegationRoutesInput = {
   json: JsonWriter;
   /** Release gates (§11a.3): the workflow OIDC verifier for gate redeem. */
   workflowOidc: WorkflowOidcVerifier;
+  /** GitHub's REST API (gate repository resolution at registration). */
+  githubFetch?: typeof fetch;
+  /** The workspace's GitHub connection token for this person, or null when it has none. */
+  githubToken?: (workspaceId: string, userId: string) => Promise<string | null>;
   /** The issuers that verifier accepts (GitHub Actions first); a gate names one of them. */
   oidcIssuers: readonly string[];
   /** A workspace's organization and Relaycast binding, without a person. */
@@ -260,7 +265,22 @@ const gateBody = z.object({
    * targets are always bound. As Cloud.
    */
   allow_source_sha_mismatch: z.boolean().optional(),
+  /**
+   * relay-control only, for a gate on a self-host issuer (whose repositories
+   * Control cannot look up on GitHub): the repository's numeric ids, pinned as
+   * given. Refused for a GitHub Actions gate, which is resolved on GitHub.
+   */
+  repository_id: z.string().regex(/^[1-9][0-9]{0,19}$/u).optional(),
+  repository_owner_id: z.string().regex(/^[1-9][0-9]{0,19}$/u).optional(),
 }).strict().superRefine((gate, context) => {
+  // A tag gate trusts whatever commit a tag is pushed at; only binding the run
+  // to the approved commit keeps an unreviewed workflow out. It cannot opt out (as Cloud).
+  if (gate.allow_source_sha_mismatch === true && gate.ref_pattern !== undefined) {
+    context.addIssue({ code: "custom", message: "allow_source_sha_mismatch needs an exact ref, not ref_pattern" });
+  }
+  if ((gate.repository_id === undefined) !== (gate.repository_owner_id === undefined)) {
+    context.addIssue({ code: "custom", message: "set repository_id and repository_owner_id together" });
+  }
   if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
     context.addIssue({ code: "custom", message: "set exactly one of ref and ref_pattern" });
   }
@@ -766,6 +786,34 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const issuer = (body.issuer ?? input.oidcIssuers[0]!).replace(/\/+$/, "");
         if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
         await requireEnabled(workspace.id);
+        // As Cloud: the gate is pinned to the repository's GitHub ids at
+        // registration (the workspace's GitHub connection, else the public
+        // API; the canonical name must match). Redeem never pins.
+        let repository: { repositoryId: string; repositoryOwnerId: string };
+        if (issuer === GITHUB_ACTIONS_OIDC_ISSUER) {
+          if (body.repository_id !== undefined) {
+            fail("invalid_request", "repository_id is resolved on GitHub for a GitHub Actions gate", 400);
+          }
+          let resolved;
+          try {
+            resolved = await resolveGateRepository({ repo: body.repo, fetchImpl: input.githubFetch ?? globalThis.fetch,
+              token: input.githubToken ? await input.githubToken(workspace.id, principal.userId).catch(() => null) : null });
+          } catch (error) {
+            if (!(error instanceof GithubUnavailable)) throw error;
+            logUnavailable("gate_registry", error, { workspaceId: workspace.id });
+            return fail("unavailable", "GitHub could not be reached to resolve the repository", 503);
+          }
+          if (!resolved) {
+            return fail("repository_unresolved", "GitHub knows no repository by that name that this workspace can see", 422);
+          }
+          repository = resolved;
+        } else {
+          // A self-host issuer's repositories are not on github.com: the owner names the ids.
+          if (body.repository_id === undefined) {
+            fail("invalid_request", "A gate on a self-host issuer needs repository_id and repository_owner_id", 400);
+          }
+          repository = { repositoryId: body.repository_id!, repositoryOwnerId: body.repository_owner_id! };
+        }
         const row = await input.database.transaction(async (tx) => {
           // Held until commit, as Cloud: a departure cannot finish between the
           // caller's membership check and this insert and leave a live gate.
@@ -773,14 +821,18 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
                (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
-                target_prefix, allow_source_sha_mismatch, created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+                target_prefix, allow_source_sha_mismatch, repository_id, repository_owner_id, created_auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
             [mintId("gate"), workspace.id, principal.userId, issuer, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
               body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, body.allow_source_sha_mismatch === true,
-              caller.authMethod],
+              repository.repositoryId, repository.repositoryOwnerId, caller.authMethod],
           )).rows[0]!;
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
             ownerUserId: principal.userId, data: gateView(created) });
+          // The pin is visible to the owner: which repository this gate trusts, and from when.
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.pinned", ...actor,
+            ownerUserId: principal.userId, data: { gate_id: created.id, repo: created.repo,
+              repository_id: created.repository_id, repository_owner_id: created.repository_owner_id, source: "registration" } });
           return created;
         }).catch((error: unknown) => {
           if ((error as { code?: string })?.code === "23505") fail("gate_exists", "You already registered this gate", 409);

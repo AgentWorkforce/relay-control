@@ -2,6 +2,7 @@ import { createHmac, hkdfSync, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
+import { messageSentAt } from "./relaycast-ids.js";
 import { logAuditWriteFailed, logRefused, logRevokeFailed, logUnavailable } from "./observe.js";
 import {
   actionIsValid,
@@ -378,21 +379,25 @@ export function auditView(row: Record<string, unknown>) {
 export async function redactExpiredQuotes(executor: SqlExecutor, limit?: number): Promise<number> {
   return Number((await executor.query<{ count: number }>(
     `WITH due AS (
-       SELECT e.id FROM delegation_audit_events AS e
-        WHERE e.quote IS NOT NULL
-          AND ((
-                -- The shortest window an org can set is one day: a constant
-                -- bound lets the partial (created_at) WHERE quote IS NOT NULL
-                -- index prune the scan before the per-org window is evaluated.
-                e.created_at <= now() - interval '1 day'
-            AND e.created_at <= now() - make_interval(days => COALESCE(
-                (SELECT p.quote_retention_days FROM delegation_org_policies p
-                   JOIN workspaces w ON w.organization_id = p.organization_id
-                  WHERE w.id = e.workspace_id), $1)))
-            OR (e.message_id IS NOT NULL AND EXISTS (
-                SELECT 1 FROM delegation_quote_redactions q
-                 WHERE q.workspace_id = e.workspace_id AND q.message_id = e.message_id)))
-        LIMIT $2),
+       -- As Cloud: each workspace's cutoff is computed once, then its due
+       -- quotes are read as one (workspace_id, created_at) index range, so the
+       -- cost follows the due rows, not every quote an org with a long window
+       -- keeps.
+       (SELECT d.id FROM workspaces w
+          LEFT JOIN delegation_org_policies p ON p.organization_id = w.organization_id
+          CROSS JOIN LATERAL (
+            SELECT e.id FROM delegation_audit_events e
+             WHERE e.workspace_id = w.id AND e.quote IS NOT NULL
+               AND e.created_at <= now() - make_interval(days => COALESCE(p.quote_retention_days, $1))
+             ORDER BY e.created_at LIMIT $2) d
+         LIMIT $2)
+       UNION
+       -- Any row still quoting a message whose redaction was requested
+       -- (relay-control also catches a write that raced the request).
+       (SELECT e.id FROM delegation_quote_redactions q
+          JOIN delegation_audit_events e ON e.workspace_id = q.workspace_id AND e.message_id = q.message_id
+         WHERE e.quote IS NOT NULL
+         LIMIT $2)),
      redacted AS (
        UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
         WHERE e.id IN (SELECT id FROM due) AND e.quote IS NOT NULL
@@ -475,9 +480,12 @@ export async function listAuditPage(executor: SqlExecutor, input: {
   const paged = Boolean(input.afterId && input.afterId !== "0");
   let cursor: { xact_id: string; id: string } | null = null;
   if (paged) {
+    // The cursor must be an event this viewer can list, so a cursor lookup
+    // reveals nothing about events outside the viewer's view (as Cloud).
     const row = (await executor.query<{ xact_id: string }>(
-      "SELECT xact_id::text FROM delegation_audit_events WHERE workspace_id = $1 AND id = $2::bigint",
-      [input.workspaceId, input.afterId],
+      `SELECT xact_id::text FROM delegation_audit_events
+        WHERE workspace_id = $1 AND id = $2::bigint AND ($3::boolean OR owner_user_id = $4 OR actor_user_id = $4)`,
+      [input.workspaceId, input.afterId, input.all, input.viewerUserId],
     )).rows[0];
     if (!row) throw new AuditCursorError();
     cursor = { xact_id: row.xact_id, id: input.afterId! };
@@ -823,6 +831,25 @@ async function standingFor(executor: SqlExecutor, workspaceId: string, input: Om
   return resolveStanding({ ...input, targetOwners: needsTable ? await loadTargetOwners(executor, workspaceId) : [] });
 }
 
+/** A repeated identical refusal within this window is logged but not written again (as Cloud). */
+export const REFUSAL_DEDUP_MS = 10 * 60 * 1000;
+
+/**
+ * Whether the same refusal (workspace, message, recipient, reason) was already
+ * audited within REFUSAL_DEDUP_MS: a caller retrying one message in a loop
+ * writes one `approval.refused` row per window, not one per call.
+ */
+export async function refusedRecently(executor: SqlExecutor, input: { workspaceId: string; messageId: string;
+  recipientAgentId: string; reason: string }): Promise<boolean> {
+  return (await executor.query(
+    `SELECT 1 FROM delegation_audit_events
+      WHERE workspace_id = $1 AND message_id = $2 AND event = 'approval.refused' AND recipient_agent_id = $3
+        AND reason = $4 AND created_at > now() - make_interval(secs => $5)
+      LIMIT 1`,
+    [input.workspaceId, input.messageId, input.recipientAgentId, input.reason, REFUSAL_DEDUP_MS / 1000],
+  )).rows.length > 0;
+}
+
 export type DelegationVerdict =
   | { verdict: "delegate"; attestation: string; claims: AttestationClaims }
   | { verdict: "none"; reason: ReasonCode };
@@ -1088,11 +1115,19 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       tier = "D";
       actions = messageActions;
       context.approvalId = tierDApprovalId(workspace.id, input.messageId);
+      // The message's send time decides two things, as Cloud: its approval
+      // window, and whether it predates this grant. A message sent before the
+      // grant was created (before a revoke and re-grant, or before any grant)
+      // was never authorized by it and is refused. With no known send time
+      // (Relaycast's created_at, else the time in its snowflake id) it fails
+      // closed.
+      const sentDate = messageSentAt(input.messageId, delivered!.created_at, now);
+      if (!sentDate) return refuse("unavailable");
+      if (sentDate.getTime() < time(grant.created_at)) refuse("revoked");
+      const sentAt = sentDate.getTime();
       // Cloud's approvalExpiry: the sender's expires_at, default 1 hour after
-      // the send (Relaycast's created_at when reported, else now), at most 24
-      // hours after it, never past the grant. The first attestation stores it.
-      const sentAt = delivered!.created_at && !Number.isNaN(Date.parse(delivered!.created_at))
-        ? Date.parse(delivered!.created_at) : now.getTime();
+      // the send, at most 24 hours after it, never past the grant. The first
+      // attestation stores it.
       const requested = approval.expires_at ? Date.parse(approval.expires_at) : sentAt + APPROVAL_DEFAULT_MS;
       expiresAt = Math.min(requested, sentAt + APPROVAL_MAX_MS, time(grant.expires_at));
       singleUse = actions.some(highRisk);
@@ -1211,7 +1246,11 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // A refusal before the caller's recipient is proven (delegation off, no
     // key, a bad token) is logged and counted only: unproven callers never
     // write audit rows. As Cloud.
-    if (context.proven) await recordDelegationAudit(deps.database, {
+    // A repeated identical refusal (message, recipient, reason) within the
+    // dedup window is logged but not written again, as Cloud.
+    const repeated = context.proven && await refusedRecently(deps.database, { workspaceId: workspace.id,
+      messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason }).catch(() => false);
+    if (context.proven && !repeated) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "approval.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
@@ -1383,8 +1422,14 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
     // Not the session's own agent: a delegate never answers its own prompts.
     if (grant.delegate_agent_id === session.agentId) continue;
     if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:probe:approve` }])) continue;
-    // A released or re-bound agent is never offered (its grant is revoked, as at attestation).
-    if (await delegateStillBound(deps, workspace, grant, true)) continue;
+    // A released or re-bound agent is never offered (its grant is revoked, as
+    // at attestation). One grant whose binding cannot be read is skipped (and
+    // logged), not the whole list, as Cloud.
+    const unbound = await delegateStillBound(deps, workspace, grant, true).catch((error: unknown) => {
+      logUnavailable("prompt_delegates", error, { workspaceId: workspace.id, grantId: grant.id });
+      return "unavailable" as const;
+    });
+    if (unbound) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });
   }
   return { delegates };

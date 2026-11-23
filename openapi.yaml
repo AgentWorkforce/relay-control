@@ -3472,6 +3472,8 @@ paths:
         "401": { description: "`unauthorized`" }
         "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
         "409": { description: "`gate_exists`: you already registered this gate" }
+        "422": { description: "`repository_unresolved`: GitHub knows no repository by that name that this workspace can see (the gate is pinned to its ids at registration)" }
+        "503": { description: "`unavailable`: GitHub could not be reached to resolve the repository" }
     delete:
       operationId: deleteDelegationGate
       tags: [Owner delegates]
@@ -10268,7 +10270,7 @@ components:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
         consumed, not_pending, unavailable, condition_unmet, condition_unavailable, gate_unknown, oidc_invalid,
-        gate_mismatch, target_prefix, sha_mismatch]
+        gate_mismatch, target_prefix, sha_mismatch, repository_mismatch]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
@@ -10325,7 +10327,9 @@ components:
         ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
         event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
         target_prefix: { type: string, maxLength: 256, description: "Starts with <repo>: and ends with : (a segment boundary); no wildcard", example: "AgentWorkforce/relay-app:" }
-        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false." }
+        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false. Refused (400) with ref_pattern." }
+        repository_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "relay-control only, for a gate on a self-host issuer (required there, refused for GitHub Actions): the repository's id, pinned as given. A GitHub Actions gate is resolved on GitHub." }
+        repository_owner_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "With repository_id." }
     DelegationAction:
       type: object
       description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.
