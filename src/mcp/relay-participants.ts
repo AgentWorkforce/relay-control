@@ -1926,7 +1926,8 @@ function createRelayService(context: McpContext) {
           // creating channels by the posts it reads, so its creations are rate limited per agent, failing closed.
           // A linked Desktop identity is the person's own session and is not limited.
           if (oauth && !identity.desktop && !await admitChannelCreate(identity.name)) {
-            console.info("[relay-channel]", JSON.stringify({ step: "channel_create_limited", channel }));
+            // Caller-chosen names (the channel, the agent) stay out of logs.
+            console.info("[relay-channel]", JSON.stringify({ step: "channel_create_limited" }));
             throw new RelayToolError(`${identity.name} has created too many channels recently, so #${channel} was not created. Join an existing channel (list_relay_channels), or try again later.`);
           }
           try {
@@ -2034,7 +2035,7 @@ function createRelayService(context: McpContext) {
               } catch (error) {
                 unread.add(message.id);
                 // Ids and the error class only.
-                console.info("[relay-channel]", JSON.stringify({ step: "thread_read_failed", channel, message_id: message.id,
+                console.info("[relay-channel]", JSON.stringify({ step: "thread_read_failed", message_id: message.id,
                   error: error instanceof RelaycastCallError ? `${error.operation ?? "unknown"}:${error.status}` : error instanceof Error ? error.name : "unknown" }));
                 return;
               }

@@ -1484,9 +1484,11 @@ test("an OAuth assistant creates at most 5 channels per agent per clock hour, fa
   assert.deepEqual((await f.database.query("SELECT count FROM relay_channel_creations")).rows.map(r=>Number(r.count)),[1]);
   // A counter that cannot be read refuses the creation, with a log line an operator can see (no names or content).
   await f.database.query("DROP TABLE relay_channel_creations");
-  const warned:string[]=[];const warn=console.warn;console.warn=(...args:unknown[])=>{warned.push(args.map(String).join(" "));};
-  try { await assert.rejects(f.service.subscribeChannel({channel:"family-7",create:true}),/too many channels recently/); } finally { console.warn=warn; }
+  const warned:string[]=[];const warn=console.warn,info=console.info;
+  console.warn=console.info=(...args:unknown[])=>{warned.push(args.map(String).join(" "));};
+  try { await assert.rejects(f.service.subscribeChannel({channel:"family-7",create:true}),/too many channels recently/); } finally { console.warn=warn;console.info=info; }
   assert.ok(warned.some(line=>line.includes("channel_create_counter_unavailable")));
+  assert.ok(warned.some(line=>line.includes("channel_create_limited")));
   assert.ok(!warned.some(line=>line.includes("family-7") || line.includes("approved-agent")));
   assert.equal(f.world.channels.has("family-7"),false);
 });
@@ -1521,5 +1523,5 @@ test("include_replies reports a thread that fails to load on its post and still 
   assert.deepEqual([(byText.get("post 6") as any).replies.length,(byText.get("post 6") as any).replies_truncated],[10,true]);
   assert.match(read.reply_guidance,/replies_unavailable/);
   assert.ok(logged.some(line=>line.includes("thread_read_failed") && line.includes(posts[2]!) && line.includes("read_thread:503")));
-  assert.ok(!logged.some(line=>line.includes("post 2")));
+  assert.ok(!logged.some(line=>line.includes("post 2") || line.includes("family")));
 });
