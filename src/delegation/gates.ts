@@ -2,6 +2,8 @@ import type { SqlExecutor } from "../database.js";
 import { OidcInvalid, type WorkflowClaims, type WorkflowOidcVerifier } from "./oidc.js";
 import { actionIsValid, canonicalAction, type ActionClass, type Condition, type ReasonCode } from "./scope.js";
 import {
+  actionConsumed,
+  consumeAction,
   delegateStillBound,
   evaluateConditions,
   loadPolicy,
@@ -33,7 +35,8 @@ export type GateRow = {
   workspace_id: string;
   owner_user_id: string;
   repo: string;
-  job_workflow_ref: string;
+  workflow_ref: string;
+  job_workflow_ref: string | null;
   ref: string | null;
   ref_pattern: string | null;
   event: string;
@@ -49,7 +52,8 @@ export function gateView(row: GateRow) {
     gate_id: row.id,
     owner_id: row.owner_user_id,
     repo: row.repo,
-    job_workflow_ref: row.job_workflow_ref,
+    workflow_ref: row.workflow_ref,
+    ...(row.job_workflow_ref ? { job_workflow_ref: row.job_workflow_ref } : {}),
     ...(row.ref ? { ref: row.ref } : {}),
     ...(row.ref_pattern ? { ref_pattern: row.ref_pattern } : {}),
     event: row.event,
@@ -64,16 +68,19 @@ export type GateRedeemResult =
   | { ok: false; reason: ReasonCode; unmet?: Condition[]; dry_run?: true };
 
 /**
- * Every one of repository, job_workflow_ref, ref and event_name must match
- * exactly. A gate with `ref_pattern` (`refs/tags/<prefix>*`) matches a tag ref
- * that starts with that prefix (and is longer than it) instead of one exact ref.
+ * Every one of repository, workflow_ref, ref and event_name must match
+ * exactly, plus job_workflow_ref when the gate names a reusable workflow
+ * (§11a.3). A gate with `ref_pattern` (`refs/tags/<prefix>*`) matches a tag
+ * ref that starts with that prefix (and is longer than it) instead of one
+ * exact ref.
  */
-export function gateMatches(gate: Pick<GateRow, "repo" | "job_workflow_ref" | "ref" | "ref_pattern" | "event">,
-  claims: Pick<WorkflowClaims, "repository" | "job_workflow_ref" | "ref" | "event_name">): boolean {
+export function gateMatches(gate: Pick<GateRow, "repo" | "workflow_ref" | "job_workflow_ref" | "ref" | "ref_pattern" | "event">,
+  claims: Pick<WorkflowClaims, "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name">): boolean {
   const refMatches = gate.ref !== null ? gate.ref === claims.ref :
     gate.ref_pattern !== null && /^refs\/tags\/[^\s*]+\*$/u.test(gate.ref_pattern) &&
       claims.ref.startsWith(gate.ref_pattern.slice(0, -1)) && claims.ref.length > gate.ref_pattern.length - 1;
-  return gate.repo === claims.repository && gate.job_workflow_ref === claims.job_workflow_ref && refMatches &&
+  return gate.repo === claims.repository && gate.workflow_ref === claims.workflow_ref &&
+    (gate.job_workflow_ref === null || gate.job_workflow_ref === claims.job_workflow_ref) && refMatches &&
     gate.event === claims.event_name;
 }
 
@@ -103,7 +110,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       workspaceId: workspace.id, event, authMethod: "github_oidc", ownerUserId, grantId, approvalId: input.approvalId,
       reason,
       data: { action: input.action, gate_id: gate?.id ?? null,
-        ...(claims ? { issuer: claims.issuer, repository: claims.repository, job_workflow_ref: claims.job_workflow_ref,
+        ...(claims ? { issuer: claims.issuer, repository: claims.repository, workflow_ref: claims.workflow_ref,
+          job_workflow_ref: claims.job_workflow_ref,
           ref: claims.ref, event_name: claims.event_name, run_id: claims.run_id, run_attempt: claims.run_attempt } : {}),
         ...(dryRun ? { dry_run: true } : {}), ...extra },
     });
@@ -160,15 +168,19 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return await refuse("out_of_scope");
     }
 
-    // A consumed approval answers only the run that consumed it: another job
+    // A consumed action answers only the run that consumed it: another job
     // of the same workflow run, or a later attempt of it.
-    if (approval.consumed_at) {
-      const prior = (await deps.database.query<{ run_id: string; repository: string; issuer: string }>(
-        "SELECT run_id, repository, issuer FROM delegation_gate_redemptions WHERE approval_id = $1", [approval.id],
+    const boundRun = async (executor: SqlExecutor) => {
+      const prior = (await executor.query<{ run_id: string; repository: string; issuer: string }>(
+        `SELECT run_id, repository, issuer FROM delegation_gate_redemptions
+          WHERE approval_id = $1 AND class = $2 AND target = $3`,
+        [approval.id, action.class, action.target],
       )).rows[0];
-      if (!prior || prior.run_id !== claims.run_id || prior.repository !== claims.repository || prior.issuer !== claims.issuer) {
-        return await refuse("consumed");
-      }
+      return Boolean(prior && prior.run_id === claims!.run_id && prior.repository === claims!.repository &&
+        prior.issuer === claims!.issuer);
+    };
+    if (await actionConsumed(deps.database, approval.id, action)) {
+      if (!await boundRun(deps.database)) return await refuse("consumed");
     } else {
       if (time(approval.expires_at) <= now.getTime()) return await refuse("expired");
       // The gate's owner stands where a recipient's owner would (§5.4).
@@ -188,29 +200,24 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // Single use per run, atomically: the first redeem wins and records the
     // run; any later redeem in that run is same_run; any other run is consumed.
     const outcome = await deps.database.transaction(async (tx: SqlExecutor) => {
-      const consumed = (await tx.query<{ id: string }>(
-        `UPDATE delegation_approvals
-            SET consumed_at = now(), consumed_by_agent_id = $3, consumed_action = $4::jsonb
-          WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NULL AND invalidated_at IS NULL
-          RETURNING id`,
-        [approval.id, workspace.id, `github-run:${claims!.run_id}`, JSON.stringify(canonicalAction(action))],
-      )).rows[0];
-      if (consumed) {
+      // The approval may have been revoked or withdrawn meanwhile.
+      const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE",
+        [approval.id])).rows.length > 0;
+      if (!live) return "revoked" as const;
+      if (await consumeAction(tx, { approvalId: approval.id, workspaceId: workspace.id, action,
+        consumedBy: `github-run:${claims!.run_id}` })) {
         await tx.query(
           `INSERT INTO delegation_gate_redemptions
-             (approval_id, workspace_id, gate_id, issuer, repository, run_id, run_attempt, action)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
-          [approval.id, workspace.id, gate!.id, claims!.issuer, claims!.repository, claims!.run_id, claims!.run_attempt,
-            JSON.stringify(canonicalAction(action))],
+             (approval_id, class, target, workspace_id, gate_id, issuer, repository, run_id, run_attempt)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [approval.id, action.class, action.target, workspace.id, gate!.id, claims!.issuer, claims!.repository,
+            claims!.run_id, claims!.run_attempt],
         );
         return "consumed" as const;
       }
-      const prior = (await tx.query<{ run_id: string; repository: string; issuer: string }>(
-        "SELECT run_id, repository, issuer FROM delegation_gate_redemptions WHERE approval_id = $1 FOR UPDATE", [approval.id],
-      )).rows[0];
-      return prior && prior.run_id === claims!.run_id && prior.repository === claims!.repository &&
-        prior.issuer === claims!.issuer ? "same_run" as const : "taken" as const;
+      return await boundRun(tx) ? "same_run" as const : "taken" as const;
     });
+    if (outcome === "revoked") return await refuse("revoked");
     if (outcome === "taken") return await refuse("consumed");
     const sameRun = outcome === "same_run";
     await audit("gate.redeemed", null, { same_run: sameRun }).catch(() => undefined);

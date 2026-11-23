@@ -19,6 +19,9 @@ const MAX_TOKEN_CHARS = 16_384;
 export type WorkflowClaims = {
   issuer: string;
   repository: string;
+  /** The workflow the run started from (`<repo>/.github/workflows/<file>@<ref>`). */
+  workflow_ref: string;
+  /** The workflow file the job runs in: a reusable workflow's, or the same as workflow_ref. */
   job_workflow_ref: string;
   ref: string;
   event_name: string;
@@ -142,6 +145,7 @@ export function workflowOidcVerifier(input: {
     return {
       issuer,
       repository: text("repository"),
+      workflow_ref: text("workflow_ref"),
       job_workflow_ref: text("job_workflow_ref"),
       ref: text("ref"),
       event_name: text("event_name"),

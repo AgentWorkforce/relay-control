@@ -226,10 +226,17 @@ const withdrawBody = z.object({
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
 const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
 const GATE_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
-/** `POST /delegates/gates` (§11a.3), as Cloud's gateSchema. Every field is matched exactly against the job's OIDC token. */
+const WORKFLOW_FILE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[^\s@*]{1,200}@refs\/[^\s*]{1,250}$/u;
+/**
+ * `POST /delegates/gates` (§11a.3). Every field is matched exactly against
+ * the job's OIDC token: `workflow_ref` (the workflow the run started from,
+ * in the gate's repo), and `job_workflow_ref` too when the publishing job runs
+ * inside a reusable workflow (which may live in another repo).
+ */
 const gateBody = z.object({
   repo: z.string().regex(GATE_REPO),
-  job_workflow_ref: z.string().min(1).max(512),
+  workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF),
+  job_workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF).optional(),
   ref: z.string().regex(/^refs\/(?:heads|tags)\/[^\s*]{1,250}$/u).optional(),
   /** Tag-triggered workflows: `refs/tags/<literal prefix>*`, a single trailing `*` and nothing else. */
   ref_pattern: z.string().regex(/^refs\/tags\/[^\s*]{1,200}\*$/u).optional(),
@@ -239,9 +246,9 @@ const gateBody = z.object({
   if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
     context.addIssue({ code: "custom", message: "set exactly one of ref and ref_pattern" });
   }
-  // The workflow must live in the gate's own repository, pinned to a ref.
-  if (!gate.job_workflow_ref.startsWith(`${gate.repo}/.github/workflows/`) || !gate.job_workflow_ref.includes("@refs/")) {
-    context.addIssue({ code: "custom", message: "job_workflow_ref must be <repo>/.github/workflows/<file>@<ref>" });
+  // The run's workflow must live in the gate's own repository, pinned to a ref.
+  if (!gate.workflow_ref.startsWith(`${gate.repo}/.github/workflows/`)) {
+    context.addIssue({ code: "custom", message: "workflow_ref must be <repo>/.github/workflows/<file>@<ref>" });
   }
   // A prefix not anchored to this repository would let one gate redeem another repo's releases.
   if (!gate.target_prefix.startsWith(`${gate.repo}:`) || /\s|\*/u.test(gate.target_prefix)) {
@@ -718,11 +725,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const row = await input.database.transaction(async (tx) => {
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
-               (id, workspace_id, owner_user_id, repo, job_workflow_ref, ref, ref_pattern, event, target_prefix,
-                created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-            [mintId("gate"), workspace.id, principal.userId, body.repo, body.job_workflow_ref, body.ref ?? null,
-              body.ref_pattern ?? null, body.event, body.target_prefix, caller.authMethod],
+               (id, workspace_id, owner_user_id, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
+                target_prefix, created_auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+            [mintId("gate"), workspace.id, principal.userId, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
+              body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, caller.authMethod],
           )).rows[0]!;
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
             ownerUserId: principal.userId, data: gateView(created) });

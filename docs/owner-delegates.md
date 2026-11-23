@@ -304,11 +304,11 @@ job therefore cannot skip the check. No stored secret is involved.
 
 **Registering a gate.** `GET`/`POST`/`DELETE /delegates/gates` are for the
 owner, by browser session or verified Desktop bearer. `DELETE` names the gate
-with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, job_workflow_ref, ref,
+with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, workflow_ref, job_workflow_ref?, ref,
 ref_pattern, event, target_prefix}`. For example:
 
 - `repo`: `AgentWorkforce/relay-app`
-- `job_workflow_ref`: `AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main`
+- `workflow_ref`: `AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main`
 - `ref`: `refs/heads/main`
 - `event`: `workflow_dispatch`
 - `target_prefix`: `AgentWorkforce/relay-app:`
@@ -316,7 +316,10 @@ ref_pattern, event, target_prefix}`. For example:
 A gate sets exactly one of `ref` (exact, `refs/heads/...` or `refs/tags/...`)
 and `ref_pattern`. A `ref_pattern` is `refs/tags/<literal prefix>*`, with one
 trailing `*` and nothing else wild, and it is matched against the token's `ref`.
-`job_workflow_ref` must be a workflow in the gate's repo, pinned to a ref.
+`workflow_ref` must be a workflow in the gate's repo, pinned to a ref. When
+the publishing job runs inside a reusable workflow, the gate also sets
+`job_workflow_ref` (that workflow's file and ref, which may be in another
+repo), and the token's `job_workflow_ref` must match it too.
 `target_prefix` must start with `<repo>:` and contain no `*`. Registering needs delegation on. Each change is audited
 (`gate.registered`, `gate.deleted`).
 
@@ -337,9 +340,9 @@ dry_run?}`. Control checks, in order:
      are never logged.
 3. **The gate**, matched against the token:
    - No gate for the token's `repository` is `gate_unknown`.
-   - A gate's `job_workflow_ref`, `ref` (or `ref_pattern`) and `event` must
-     match the token's `job_workflow_ref`, `ref` and `event_name` exactly,
-     otherwise `gate_mismatch`. Matching the repository alone is not enough.
+   - A gate's `workflow_ref`, `ref` (or `ref_pattern`) and `event` must
+     match the token's `workflow_ref`, `ref` and `event_name` exactly, and
+     its `job_workflow_ref` too when set; otherwise `gate_mismatch`. Matching the repository alone is not enough.
    - The action's target must start with the matching gate's
      `target_prefix`, otherwise `target_prefix`.
 4. **The approval.** The normal redeem checks run:
@@ -359,9 +362,10 @@ dry_run?}`. Control checks, in order:
    - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
    - `<repo>:land:<branch>:<head sha>`
    - `<repo>:ios:<distribution>:<build number>:<sha>`
-5. **Single use per run.**
-   - The first redeem consumes the approval and binds it to the token's
-     `run_id` (and repository and issuer).
+5. **Single use per run, per action** (§5.1).
+   - The first redeem of an action consumes that action and binds it to the
+     token's `run_id` (and repository and issuer). Other actions of the same
+     approval are unaffected.
    - Any later redeem in the same run, by another job or a later attempt,
      answers `{ok:true, consumed:true, same_run:true}`.
    - Any other run gets `consumed`.

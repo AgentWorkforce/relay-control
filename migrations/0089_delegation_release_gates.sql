@@ -8,7 +8,11 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   repo text NOT NULL,
-  job_workflow_ref text NOT NULL,
+  -- The workflow file and ref the run started from (the token's workflow_ref).
+  workflow_ref text NOT NULL,
+  -- Set when the publishing job runs inside a reusable workflow: that
+  -- workflow's file and ref (the token's job_workflow_ref), required to match too.
+  job_workflow_ref text,
   -- Exactly one of ref (exact) and ref_pattern (`refs/tags/<literal prefix>*`).
   ref text,
   ref_pattern text,
@@ -24,17 +28,19 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
 CREATE INDEX IF NOT EXISTS delegation_gates_repo_idx
   ON delegation_gates (workspace_id, repo) WHERE deleted_at IS NULL;
 
--- The run a gate redeem consumed an approval for. Any later redeem in the same
--- run (another job of it, or a later attempt) succeeds as same_run; any other
--- run is refused as consumed.
+-- The run a gate redeem consumed an action for (single use is per action,
+-- §5.1). Any later redeem of that action in the same run (another job of it,
+-- or a later attempt) succeeds as same_run; any other run is refused as consumed.
 CREATE TABLE IF NOT EXISTS delegation_gate_redemptions (
-  approval_id text PRIMARY KEY REFERENCES delegation_approvals(id) ON DELETE CASCADE,
+  approval_id text NOT NULL REFERENCES delegation_approvals(id) ON DELETE CASCADE,
+  class text NOT NULL,
+  target text NOT NULL,
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   gate_id text NOT NULL REFERENCES delegation_gates(id) ON DELETE CASCADE,
   issuer text NOT NULL,
   repository text NOT NULL,
   run_id text NOT NULL,
   run_attempt integer NOT NULL,
-  action jsonb NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (approval_id, class, target)
 );
