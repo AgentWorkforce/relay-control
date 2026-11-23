@@ -795,6 +795,14 @@ The dashboard session endpoints are deliberately not a general proxy:
   error, and an absent summary stays `status: empty`. With the direct read API
   configured, this read uses the caller's workspace-bound token without issuing
   a History session or falling back to another backend.
+- `GET|PATCH /cloud/api/v1/workspaces/:id/sessions/:sessionId/access`,
+  `POST .../access/reset` and `GET .../access/history` manage who may read one
+  session on a relaygate install (`src/sessions/access-routes.ts`). The policy
+  is relaygate's; `src/sessions/access.ts` validates input, resolves member
+  emails to user ids and maps relaygate's answers, and the MCP tools in
+  `src/mcp/session-access.ts` use the same service. Each call carries the
+  person's own read token to relaygate's per-session access routes, which take
+  no `workspace=` (docs/sessions-read-api.md, "Session access").
 
 These upstream requests add `workspace=` from the tenant-authorized database
 record. Caller-supplied origins, paths, workspace IDs, and credentials are

@@ -3,6 +3,7 @@ import type { SelfhostConfig } from "../config.js";
 import type { Principal } from "../store.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { requestReadSession, SessionReadError, type ReaderKind } from "../session-read.js";
+import type { AccessReply, AccessRequest } from "./access.js";
 
 /**
  * Workspace-scoped History reads for the dashboard sessions views, served by
@@ -246,4 +247,70 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/** relaygate's session access routes (./access.ts); nothing else is reachable through accessViaDashboardReader. */
+const ACCESS_ROUTES = /^\/v1\/sessions\/[^/]+\/access(?:\/reset|\/history)?$/;
+
+/**
+ * Session access calls for the dashboard with the acting person's own read
+ * token (the same per-person cache as readWorkspaceHistory, minted for this
+ * {user, organization, workspace} and this request's reader kind). Never a
+ * workspace or service credential.
+ *
+ * PATCH and POST carry a JSON body. A 401 is retried once with a fresh token
+ * on GET only; a write is never repeated. relaygate's access routes are per
+ * session, so no `workspace=` parameter is sent and no workspace attestation
+ * is required. Every status is returned for ./access.ts to map.
+ */
+export async function accessViaDashboardReader(
+  config: SelfhostConfig,
+  identity: HistoryIdentity,
+  request: AccessRequest,
+): Promise<AccessReply> {
+  if (!ACCESS_ROUTES.test(request.path)) throw new UpstreamError("read", undefined, "Not a session access route");
+  const origin = config.relayhistoryUrl;
+  if (!origin) return { kind: "not_configured" };
+  const query = request.query?.toString();
+  const url = new URL(query ? `${request.path}?${query}` : request.path, `${origin}/`);
+  if (url.origin !== new URL(origin).origin) return { kind: "not_sent" };
+  const write = request.method !== "GET";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let accessToken: string;
+    try {
+      accessToken = await readToken(config, identity);
+    } catch {
+      return { kind: "not_sent" };
+    }
+    let response: Response;
+    try {
+      response = await globalThis.fetch(url, {
+        method: request.method,
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          ...(write ? { "content-type": "application/json" } : {}),
+        },
+        ...(write ? { body: JSON.stringify(request.body ?? {}) } : {}),
+      });
+    } catch {
+      return { kind: "lost" };
+    }
+    if (response.status === 401 && attempt === 0 && !write) {
+      await response.body?.cancel().catch(() => {});
+      cacheFor(config).delete(cacheKey(identity));
+      continue;
+    }
+    if (response.status === 401) cacheFor(config).delete(cacheKey(identity));
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    return { kind: "response", status: response.status, body };
+  }
+  return { kind: "response", status: 401, body: null };
 }

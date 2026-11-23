@@ -302,6 +302,73 @@ pair through Control (see the README); without it MCP reads use the same
 dashboard path above. Both paths use the read API, so cursors stay valid
 whichever one is selected.
 
+## Session access
+
+When the read API is relaygate, a session access administrator can see and
+change who may read one session. relaygate holds the policy and decides who
+is an administrator; Control stores nothing for it (no migration). It is on
+only when all three hold: `SELFHOST_RELAYGATE_PUBLIC_URL` is set (which also
+turns on `reader_kind` in the mint), `SESSION_READ_API_MCP_READS=true`, and
+the session read API is configured. Otherwise the MCP tools are not listed
+and the routes answer `404 session_access_not_configured`.
+
+Surfaces:
+
+| MCP tool (group `session_access`) | Dashboard route (`/cloud` cookie or bearer) | relaygate |
+| --- | --- | --- |
+| `get_session_access` | `GET /api/v1/workspaces/{ws}/sessions/{id}/access` | `GET /v1/sessions/{id}/access` |
+| `set_session_access` | `PATCH .../access` | `PATCH /v1/sessions/{id}/access` |
+| `reset_session_access` | `POST .../access/reset` | `POST /v1/sessions/{id}/access/reset` |
+| `get_session_access_history` | `GET .../access/history?after=&limit=` | `GET /v1/sessions/{id}/access/history` |
+
+Every upstream call carries the acting person's own read token, minted for
+that person with reader kind `mcp` (tools), `browser` (cookie) or `device`
+(bearer); never a workspace credential, the Control token or the issuer
+secret. The tools are offered only on a person's own session: not on an OAuth
+connection, a Desktop provider credential, a staff read grant or a workspace
+agent identity token. A cookie-carried PATCH or POST needs an allowed Origin
+(`403 csrf_rejected`).
+
+Changing access:
+
+- `mode` is three digits (owner, group, other), each 0, 2, 4 or 6. `"000"`
+  with `r` entries restricts reading to those entries.
+- `members` (emails) and `groups` (`{gid, perm}`), when given, **replace** the
+  current per-person and group lists. They are not merged: send every entry
+  that should remain. At most 64 each; `perm` is `r`, `w` or `rw`.
+- Emails resolve to current members of the workspace's organization, case
+  insensitively. An email that names no member, a member of another
+  organization, or more than one user refuses the whole change
+  (`unknown_members`, listing the emails) and nothing is sent. Only user ids
+  go upstream, never an email or a name.
+- `label` is null or 1 to 24 letters, digits, spaces, dots, underscores or
+  hyphens.
+- `reason` (1 to 200 characters, no control characters) is required on every
+  change and reset, and is kept in relaygate's audit history. Never put
+  session content in it.
+- Without an expected version Control reads the current version first and
+  sends it; relaygate always receives `expectedVersion` and `reason`.
+
+Reads show per-person entries with email and name for current members; a user
+who is no longer a member is shown as `member: false` (with the user id only)
+so the entry can be removed. History rows are oldest first, `limit` 1 to 200
+(default 50), with `next_after` / `nextAfter` for the next page.
+
+Outcomes:
+
+| relaygate or transport | Tool `outcome` | Route |
+| --- | --- | --- |
+| 2xx | `ok` | 200 |
+| refused before sending | `invalid_request` / `unknown_members` | 400 |
+| 400 | `invalid_request` | 400 |
+| 403 | `not_access_admin` | 403 |
+| 404 (unknown session; relaygate decides 403 first) | `not_found` | 404 |
+| 409 | `conflict` with the current version, never retried | 409 `currentVersion` |
+| a read lost, 401 after one retry, 5xx, unreadable body | `unavailable` | 503 `session_access_unavailable` |
+| a PATCH or reset whose answer was lost, or an unreadable 2xx | `outcome_unknown` (may have applied: read again) | 504 `session_access_outcome_unknown` |
+
+A write is sent once and never retried, including after a 401.
+
 ## Revocation
 
 Control rechecks the token row on every introspection call, and the ingest

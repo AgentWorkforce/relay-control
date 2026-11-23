@@ -20,6 +20,7 @@ import { registerTeamActivity } from "./team-activity.js";
 import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
 import { registerGrokRoutineTools } from "./grok-routine-tools.js";
+import { registerSessionAccessTools } from "./session-access.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
 export const SELFHOST_MCP_INSTRUCTIONS =
@@ -80,8 +81,9 @@ export function buildMcpServer(context: McpContext): McpServer {
   const webhookInbox = context.webhookInbox;
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
+  const sessionAccess = context.sessionAccess;
   registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
-    staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
+    sessionAccess: Boolean(sessionAccess), staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
     relayfacts: () => registerRelayfactsTools(server, context),
@@ -95,6 +97,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     ...(replicas ? { replicas: () => registerReplicasTools(server, context, replicas) } : {}),
     ...(webhookInbox ? { webhook_inbox: () => registerWebhookInboxTools(server, context, webhookInbox) } : {}),
     ...(capyPermits ? { capy_binding: () => registerCapyPermitTools(server,context) } : {}),
+    ...(sessionAccess ? { session_access: () => registerSessionAccessTools(server, sessionAccess) } : {}),
   });
   return server;
 }

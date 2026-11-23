@@ -4,6 +4,7 @@ import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { MCP_READER_HEADER } from "../session-read.js";
 import { isRecord, unsupportedReason, WORKSPACE_ATTESTATION_HEADER, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
+import type { AccessReply, AccessRequest } from "../sessions/access.js";
 
 /**
  * Client configuration deliberately excludes the issuer URL and internal secret.
@@ -159,4 +160,51 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
     return {status:"ok",body};
   }
   throw new UpstreamError("read",401);
+}
+
+/** relaygate's session access routes (src/sessions/access.ts); nothing else is reachable through accessViaSessionRead. */
+const ACCESS_ROUTES = /^\/v1\/sessions\/[^/]+\/access(?:\/reset|\/history)?$/;
+
+/**
+ * Session access calls with the acting person's own read token, held exactly
+ * as for reads (minted through Control's public session-read route with the
+ * MCP reader marker, so the token names reader kind `mcp`). Never a workspace
+ * or service credential.
+ *
+ * Differences from readViaSessionRead: PATCH and POST carry a JSON body; a 401
+ * is retried once with a refreshed token on GET only (a write is never
+ * repeated); no `workspace=` parameter and no workspace attestation, because
+ * relaygate's access routes are per session, not per workspace; every status
+ * is returned to the caller, which maps it.
+ */
+export async function accessViaSessionRead(
+  config:ReaderConfig,identity:HistoryIdentity,request:AccessRequest,marker:string,
+):Promise<AccessReply> {
+  if(!config.sessionReadMcpReads || !config.sessionReadApi) return {kind:"not_configured"};
+  if(!ACCESS_ROUTES.test(request.path)) throw new UpstreamError("read",undefined,"Not a session access route");
+  const write=request.method!=="GET";
+  let rejectedAccess:string|undefined;
+  for(let attempt=0;attempt<2;attempt++) {
+    let held:Held;
+    try { held=await heldSession(config,identity,marker,rejectedAccess); } catch { return {kind:"not_sent"}; }
+    const query=request.query?.toString();
+    const url=new URL(query?`${request.path}?${query}`:request.path,held.baseUrl);
+    if(url.origin!==new URL(held.baseUrl).origin) return {kind:"not_sent"};
+    let response:Response;
+    try {
+      response=await globalThis.fetch(url,{method:request.method,redirect:"error",signal:AbortSignal.timeout(15_000),
+        headers:{accept:"application/json",authorization:`Bearer ${held.accessToken}`,
+          ...(write?{"content-type":"application/json"}:{})},
+        ...(write?{body:JSON.stringify(request.body??{})}:{})});
+    } catch { return {kind:"lost"}; }
+    if(response.status===401 && attempt===0 && !write) {
+      await response.body?.cancel().catch(()=>{});
+      rejectedAccess=held.accessToken; // Refresh through Control once, never remint.
+      continue;
+    }
+    let body:unknown=null;
+    try { body=await response.json(); } catch { body=null; }
+    return {kind:"response",status:response.status,body};
+  }
+  return {kind:"response",status:401,body:null};
 }
