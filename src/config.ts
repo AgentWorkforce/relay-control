@@ -70,6 +70,13 @@ export type SelfhostConfig = {
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
   /**
+   * SESSION_READ_API_POINT_SUMMARY_WORKSPACE: one complete workspace UUID
+   * whose native point-summary reads (`GET /v1/sessions/{id}/summary`) use
+   * the read API even with sessionReadMcpReads off. Lowercase; null (unset,
+   * empty or not exactly one UUID) selects nobody. Default null.
+   */
+  sessionReadPointSummaryWorkspace?: string | null;
+  /**
    * SESSION_READ_MINT_INCLUDE_ROLE: send the member's org role in the read API
    * mint/refresh bodies. Default off; enable only after the read API accepts it.
    */
@@ -600,6 +607,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
+    sessionReadPointSummaryWorkspace: loadSessionReadPointSummaryWorkspace(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
     sessionReadMintIncludeRole: loadSessionReadMintIncludeRole(env),
     ...introspection,
@@ -670,6 +678,19 @@ function loadSessionReadMcpReads(env: Env): boolean {
     throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
   }
   return true;
+}
+
+const WORKSPACE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Exactly one workspace, or nobody. The trimmed value must be one complete
+ * UUID (compared in lowercase, the form workspace ids are stored in); an
+ * empty, malformed, wildcard, prefix or comma-separated value selects no
+ * workspace, leaving every read on today's single-reader selection.
+ */
+export function loadSessionReadPointSummaryWorkspace(env: Env): string | null {
+  const value = env.SESSION_READ_API_POINT_SUMMARY_WORKSPACE?.trim().toLowerCase() ?? "";
+  return WORKSPACE_UUID.test(value) ? value : null;
 }
 
 function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureApi"] {

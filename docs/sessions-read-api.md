@@ -300,7 +300,9 @@ non-200 read as their usual "unavailable" tool error.
 `SESSION_READ_API_MCP_READS=true` additionally gives MCP its own per-user read
 pair through Control (see the README); without it MCP reads use the same
 dashboard path above. Both paths use the read API, so cursors stay valid
-whichever one is selected.
+whichever one is selected. `SESSION_READ_API_POINT_SUMMARY_WORKSPACE`, when set
+to one workspace UUID, selects the per-user pair for that workspace's MCP point
+summary reads only (see docs/session-summaries.md).
 
 ## Revocation
 
