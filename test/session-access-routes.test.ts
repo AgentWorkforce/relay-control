@@ -37,6 +37,8 @@ function relaygateStub() {
   const issued = new Set<string>();
   const policies = new Map<string, { version: number; mode: string; acl: unknown[]; users: unknown[]; label: string | null }>();
   const history: Array<Record<string, unknown>> = [];
+  /** Who relaygate records as the actor of the next change (`ctl:<userId>` for a Control person). */
+  const actor = { id: "agent-7", name: null as string | null };
   /** Per-path forced answers: status, or "drop" to destroy the connection. */
   const forced = new Map<string, number | "drop">();
   let serial = 0;
@@ -111,7 +113,9 @@ function relaygateStub() {
       res.end(JSON.stringify({ error: { code: "conflict", message: "stale" }, currentVersion: policy.version }));
       return;
     }
-    const before = { mode: policy.mode, gid: 7, acl: policy.acl, users: policy.users, label: policy.label };
+    // relaygate records no before state for a session's first change.
+    const first = !history.some((row) => row.session_id === sessionId);
+    const before = first ? null : { mode: policy.mode, gid: 7, acl: policy.acl, users: policy.users, label: policy.label };
     const reset = match[2] === "reset";
     if (reset) Object.assign(policy, { mode: "640", acl: [], users: [], label: null });
     else {
@@ -122,16 +126,20 @@ function relaygateStub() {
     }
     policy.version++;
     history.push({
-      seq: history.length + 1, at: "2026-01-01T00:00:00.000Z", session_id: sessionId, actor_id: "relaygate-actor",
-      actor_name: null, version: policy.version, reason: body.reason,
+      seq: history.length + 1, at: "2026-01-01T00:00:00.000Z", session_id: sessionId, actor_id: actor.id,
+      actor_name: actor.name, version: policy.version, reason: body.reason,
       before, after: reset ? { reset: true } : { mode: policy.mode, gid: 7, acl: policy.acl, users: policy.users, label: policy.label },
     });
     res.end(JSON.stringify(answer(sessionId, reset)));
   });
-  return { server, mints, access, forced, policies };
+  return { server, mints, access, forced, policies, history, actor };
 }
 
-async function setup(t: TestContext, options: { configured?: boolean } = {}) {
+/**
+ * configured: false turns reader-kind mints off (the public URL stays set).
+ * sessionsOnly: no SELFHOST_RELAYGATE_PUBLIC_URL, mints still carry the reader kind.
+ */
+async function setup(t: TestContext, options: { configured?: boolean; sessionsOnly?: boolean } = {}) {
   const gate = relaygateStub();
   const gateUrl = await listen(gate.server);
   const database = new PGliteDatabase();
@@ -158,9 +166,9 @@ async function setup(t: TestContext, options: { configured?: boolean } = {}) {
     relaycastPublicUrl: "https://relay.selfhosted.company", relayhistoryUrl: gateUrl, relayhistoryPublicUrl: gateUrl,
     bootstrapToken: "fake-bootstrap-token-".repeat(3), encryptionKeyring: KEYRING, internalServiceToken: null,
     oauthRedirectUrl: `${controlUrl}/unused`, dashboardUrl: controlUrl, host: "127.0.0.1", port: 3000,
-    sessionReadApi: { url: gateUrl, publicUrl: gateUrl, secret: SECRET, mintReaderKind: true },
+    sessionReadApi: { url: gateUrl, publicUrl: gateUrl, secret: SECRET, mintReaderKind: configured },
     sessionReadMcpReads: true,
-    relaygatePublicUrl: configured ? "https://gate.selfhosted.company" : null,
+    relaygatePublicUrl: options.sessionsOnly ? null : "https://gate.selfhosted.company",
   };
   control.on("request", createApp({ config, store }));
   t.after(async () => {
@@ -211,6 +219,7 @@ const upstreamPatches = (env: Awaited<ReturnType<typeof setup>>) => env.gate.acc
 
 test("MCP: the four tools run as the person, with the person's own read token", async (t) => {
   const env = await setup(t);
+  env.gate.actor.name = `ctl:${env.ownerId}`;
   const listed = await env.rpc("tools/list");
   const names = (listed.body.result.tools as Array<{ name: string }>).map((tool) => tool.name);
   for (const name of SESSION_ACCESS_TOOLS) assert.ok(names.includes(name), `${name} listed`);
@@ -245,7 +254,14 @@ test("MCP: the four tools run as the person, with the person's own read token", 
   const history = await env.tool("get_session_access_history", { session_id: SESSION });
   assert.equal(history.structuredContent.outcome, "ok");
   assert.equal(history.structuredContent.rows.length, 1);
-  assert.equal(history.structuredContent.rows[0].reason, "restrict to the review group");
+  const row = history.structuredContent.rows[0];
+  assert.equal(row.reason, "restrict to the review group");
+  assert.deepEqual([row.actor_id, row.actor_name], ["agent-7", `ctl:${env.ownerId}`]);
+  assert.deepEqual(row.actor, { user_id: env.ownerId, email: "owner@example.test", name: "Fake Owner", member: true });
+  assert.equal(row.before, null, "the first change has no before state");
+  assert.deepEqual(row.after.members, [
+    { user_id: env.teammate.userId, email: "teammate@example.test", name: "Fake Teammate", perm: "r", member: true },
+  ]);
   assert.equal(history.structuredContent.next_after, null);
 
   const reset = await env.tool("reset_session_access", { session_id: SESSION, reason: "back to defaults", expected_version: 2 });
@@ -324,6 +340,34 @@ test("MCP: a former member's grant is shown as member:false", async (t) => {
   ]);
 });
 
+test("MCP: history actors for a current member, a former member and a non-Control name", async (t) => {
+  const env = await setup(t);
+  const row = (seq: number, actorName: string | null) => ({
+    seq, at: "2026-01-01T00:00:00.000Z", session_id: SESSION, actor_id: `agent-${seq}`, actor_name: actorName,
+    version: seq + 1, reason: "x", before: null,
+    after: { mode: "000", gid: 7, acl: [], users: [{ userId: env.former.userId, perm: "r" }], label: null },
+  });
+  env.gate.history.push(row(1, `ctl:${env.teammate.userId}`), row(2, `ctl:${env.former.userId}`), row(3, "gate-operator"));
+  const history = await env.tool("get_session_access_history", { session_id: SESSION });
+  assert.equal(history.structuredContent.outcome, "ok");
+  assert.deepEqual(history.structuredContent.rows.map((entry: any) => entry.actor), [
+    { user_id: env.teammate.userId, email: "teammate@example.test", name: "Fake Teammate", member: true },
+    { user_id: env.former.userId, member: false },
+    null,
+  ]);
+  assert.deepEqual(history.structuredContent.rows[2].actor_name, "gate-operator");
+  assert.deepEqual(history.structuredContent.rows[0].after.members, [{ user_id: env.former.userId, perm: "r", member: false }]);
+
+  const dashboard = await env.http("GET", env.route("/history"));
+  assert.equal(dashboard.status, 200);
+  assert.deepEqual(dashboard.body.rows.map((entry: any) => entry.actor), [
+    { userId: env.teammate.userId, email: "teammate@example.test", name: "Fake Teammate", member: true },
+    { userId: env.former.userId, member: false },
+    null,
+  ]);
+  assert.deepEqual(dashboard.body.rows.map((entry: any) => entry.before), [null, null, null]);
+});
+
 test("MCP: staff read grants and agent identity tokens never reach the session access tools", () => {
   for (const name of SESSION_ACCESS_TOOLS) {
     assert.ok(!(STAFF_READ_GRANT_TOOLS as readonly string[]).includes(name));
@@ -336,6 +380,7 @@ test("MCP: staff read grants and agent identity tokens never reach the session a
 
 test("dashboard: the four routes for a device, with the person's own read token", async (t) => {
   const env = await setup(t);
+  env.gate.actor.name = `ctl:${env.ownerId}`;
   const got = await env.http("GET", env.route(""));
   assert.equal(got.status, 200);
   assert.equal(got.body.access.version, 1);
@@ -356,6 +401,8 @@ test("dashboard: the four routes for a device, with the person's own read token"
   assert.equal(history.status, 200);
   assert.equal(history.body.rows.length, 1);
   assert.equal(history.body.nextAfter, null);
+  assert.deepEqual(history.body.rows[0].actor, { userId: env.ownerId, email: "owner@example.test", name: "Fake Owner", member: true });
+  assert.equal(history.body.rows[0].before, null);
   const historyCall = env.gate.access.find((call) => call.path.endsWith("/history"))!;
   assert.equal(historyCall.query.get("after"), "0");
   assert.equal(historyCall.query.get("limit"), "10");
@@ -453,4 +500,26 @@ test("not configured: tools are not listed and the routes refuse", async (t) => 
     assert.deepEqual([refused.status, refused.body.error], [404, "session_access_not_configured"], `${method} ${suffix}`);
   }
   assert.equal(env.gate.access.length, 0);
+});
+
+test("sessions-only install (no relaygate public URL): tools listed, MCP and dashboard reach relaygate with the person's own read token", async (t) => {
+  const env = await setup(t, { sessionsOnly: true });
+  const listed = await env.rpc("tools/list");
+  const names = (listed.body.result.tools as Array<{ name: string }>).map((tool) => tool.name);
+  for (const name of SESSION_ACCESS_TOOLS) assert.ok(names.includes(name), `${name} listed`);
+
+  const got = await env.tool("get_session_access", { session_id: SESSION });
+  assert.equal(got.structuredContent.outcome, "ok");
+  const route = await env.http("GET", env.route(""));
+  assert.equal(route.status, 200);
+  assert.equal(route.body.access.version, 1);
+
+  assert.equal(env.gate.access.length, 2);
+  const kinds = env.gate.mints.map((mint) => mint.reader_kind);
+  assert.ok(kinds.includes("mcp") && kinds.includes("device"), `reader kinds ${kinds.join(",")}`);
+  for (const mint of env.gate.mints) assert.equal(mint.userId, env.ownerId);
+  for (const call of env.gate.access) {
+    assert.match(call.bearer!, /^Bearer rth_at_read_/);
+    assert.notEqual(call.bearer, `Bearer ${env.pair.accessToken}`);
+  }
 });

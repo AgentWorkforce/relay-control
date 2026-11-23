@@ -5,6 +5,7 @@ import {
   getAccess,
   resetAccess,
   setAccess,
+  type AccessActor,
   type AccessDeps,
   type AccessGrant,
   type AccessHistoryRow,
@@ -57,9 +58,16 @@ function snapshot(value: AccessSnapshot | null) {
   };
 }
 
+function actor(value: AccessActor | null) {
+  if (!value) return null;
+  return value.member
+    ? { user_id: value.userId, email: value.email, name: value.name, member: true }
+    : { user_id: value.userId, member: false };
+}
+
 function historyRow(row: AccessHistoryRow) {
   return {
-    seq: row.seq, at: row.at, actor_id: row.actorId, actor_name: row.actorName, version: row.version,
+    seq: row.seq, at: row.at, actor_id: row.actorId, actor_name: row.actorName, actor: actor(row.actor), version: row.version,
     reason: row.reason, before: snapshot(row.before), after: snapshot(row.after),
   };
 }
@@ -119,7 +127,7 @@ export function registerSessionAccessTools(server: McpServer, deps: AccessDeps):
 
   server.registerTool("get_session_access_history", {
     title: "Get session access history",
-    description: "List the audited before/after changes to one session's access, oldest first. Follow next_after for more. Only session access administrators may use this.",
+    description: "List the audited before/after changes to one session's access, oldest first. Each row has actor (the Control person who made the change: email and name for a current member, member:false for a former one, null when the change did not come from a Control person); before is null on the first change. Follow next_after for more. Only session access administrators may use this; an administrator may manage a session they cannot read.",
     inputSchema: {
       session_id: sessionId,
       after: z.number().int().optional().describe("Return changes after this seq (default 0)."),

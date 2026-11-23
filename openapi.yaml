@@ -4083,14 +4083,18 @@ paths:
       operationId: getSessionAccess
       description: |
         Who may read one session (docs/sessions-read-api.md, "Session
-        access"). Served only when the session read API is relaygate
-        (`SELFHOST_RELAYGATE_PUBLIC_URL` set and
-        `SESSION_READ_API_MCP_READS=true`); otherwise 404
+        access"). Served only when read token mints carry the reader kind
+        (`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+        `SELFHOST_RELAYGATE_PUBLIC_URL` set) and
+        `SESSION_READ_API_MCP_READS=true`, with the session read API URL
+        pointing at relaygate's sessions listener; otherwise 404
         `session_access_not_configured`. Also served at the same path without
         the `/cloud` prefix for a bearer. Control forwards relaygate
         `GET /v1/sessions/{sessionId}/access` with the caller's own read
-        token; relaygate decides who is a session access administrator.
-        Per-person entries name current members by email and name; a user
+        token; relaygate decides who is a session access administrator,
+        before it looks the session up. An administrator may manage a session
+        they cannot read; a non-administrator gets 403 whether or not the
+        session exists. Per-person entries name current members by email and name; a user
         who is no longer a member is `member: false`.
       responses:
         "200":
@@ -4191,7 +4195,9 @@ paths:
       operationId: getSessionAccessHistory
       description: |
         The audited before/after rows of every access change, oldest first.
-        Follow `nextAfter` (null on the last page).
+        Follow `nextAfter` (null on the last page). `actor` is the Control
+        person behind a row whose `actorName` is `ctl:<userId>`, else null;
+        `before` is null on a session's first change.
       parameters:
         - name: after
           in: query
@@ -10683,7 +10689,7 @@ components:
           type: boolean
     SessionAccessHistoryRow:
       type: object
-      required: [seq, at, actorId, actorName, version, reason, before, after]
+      required: [seq, at, actorId, actorName, actor, version, reason, before, after]
       properties:
         seq:
           type: integer
@@ -10691,16 +10697,40 @@ components:
           type: string
         actorId:
           type: [string, "null"]
+          description: relaygate's internal agent id, as recorded.
         actorName:
           type: [string, "null"]
+          description: relaygate's actor name, as recorded; `ctl:<userId>` for a Control person.
+        actor:
+          $ref: "#/components/schemas/SessionAccessActor"
         version:
           type: integer
         reason:
           type: [string, "null"]
         before:
           $ref: "#/components/schemas/SessionAccessSnapshot"
+          description: Null on a session's first change.
         after:
           $ref: "#/components/schemas/SessionAccessSnapshot"
+    SessionAccessActor:
+      type: [object, "null"]
+      description: |
+        The Control person named by `actorName` `ctl:<userId>`, resolved like a
+        per-person entry: email and name for a current member of the
+        organization, `member: false` with the user id only otherwise. Null
+        when `actorName` is not of that form.
+      required: [userId, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        member:
+          type: boolean
     SessionAccessError:
       type: object
       required: [error, message]
@@ -11839,8 +11869,10 @@ components:
     SessionAccessFailure:
       description: |
         400 invalid_request or unknown_members; 403 not_access_admin (relaygate
-        refused: not a session access administrator), csrf_rejected,
-        forbidden or handoff_not_exchanged; 404 not_found (unknown session),
+        refused: not a session access administrator, decided before the
+        session is looked up, so it says nothing about whether the session
+        exists), csrf_rejected, forbidden or handoff_not_exchanged; 404
+        not_found (an administrator naming a session relaygate does not know),
         session_access_not_configured or a workspace outside the tenant; 409
         conflict with currentVersion; 503 session_access_unavailable; 504
         session_access_outcome_unknown (a write whose answer was lost).

@@ -20,17 +20,19 @@ import { isRecord } from "./history.js";
  */
 
 /**
- * The one configuration condition for both surfaces: the read API is
- * relaygate (SELFHOST_RELAYGATE_PUBLIC_URL set, so read-token mints name a
- * reader kind) and the per-person MCP reader is on (SESSION_READ_API_MCP_READS),
- * as gate-only installs configure it.
+ * The one configuration condition for both surfaces: read-token mints carry
+ * the reader kind (SESSION_READ_MINT_INCLUDE_READER_KIND=true, or unset with
+ * SELFHOST_RELAYGATE_PUBLIC_URL set), which only relaygate accepts, and the
+ * per-person MCP reader is on (SESSION_READ_API_MCP_READS=true). The read API
+ * URL must then be relaygate's sessions listener. SELFHOST_RELAYGATE_PUBLIC_URL
+ * itself is not required: a sessions-only install keeps Relaycast direct.
  */
 export function sessionAccessConfigured(
-  config: Pick<SelfhostConfig, "relaygatePublicUrl" | "sessionReadMcpReads"> & {
+  config: Pick<SelfhostConfig, "sessionReadMcpReads"> & {
     sessionReadApi?: Pick<NonNullable<SelfhostConfig["sessionReadApi"]>, "mintReaderKind"> | null;
   },
 ): boolean {
-  return Boolean(config.relaygatePublicUrl && config.sessionReadApi?.mintReaderKind && config.sessionReadMcpReads);
+  return Boolean(config.sessionReadApi?.mintReaderKind && config.sessionReadMcpReads);
 }
 
 export type AccessMember = { userId: string; email: string; name: string | null };
@@ -87,11 +89,23 @@ export type AccessPolicy = {
   updatedAt: string | null;
 };
 
+/**
+ * The Control person behind a history row: relaygate records a Control person
+ * as actor_name `ctl:<userId>`, resolved like a grant without its perm.
+ */
+export type AccessActor =
+  | { userId: string; email: string; name: string | null; member: true }
+  | { userId: string; member: false };
+
 export type AccessHistoryRow = {
   seq: number;
   at: string;
+  /** relaygate's internal agent id, as recorded. */
   actorId: string | null;
+  /** relaygate's actor name, as recorded (`ctl:<userId>` for a Control person). */
   actorName: string | null;
+  /** The Control person when actorName is `ctl:<userId>`; null otherwise. */
+  actor: AccessActor | null;
   version: number;
   reason: string | null;
   before: AccessSnapshot | null;
@@ -120,8 +134,8 @@ export type AccessFailure =
 export type AccessResult<T> = { outcome: "ok"; value: T } | AccessFailure;
 
 export const ACCESS_MESSAGES = {
-  not_found: "Session not found, or you may not read it.",
-  not_access_admin: "You are not a session access administrator.",
+  not_found: "Session not found.",
+  not_access_admin: "You are not a session access administrator. This answer does not say whether the session exists.",
   conflict: "Session access changed since the version you gave. Read the access again and retry with the current version.",
   unknown_members: "Some emails are not current members of this organization; nothing was changed.",
   unavailable: "Session access is temporarily unavailable. Please try again.",
@@ -380,7 +394,22 @@ function snapshotOf(value: unknown, members: Map<string, AccessMember>): AccessS
   };
 }
 
-/** `{rows: [{seq, at, session_id, actor_id, actor_name, version, before, after, reason}]}`. */
+const CONTROL_ACTOR = /^ctl:(.+)$/;
+
+function actorOf(actorName: string | null, members: Map<string, AccessMember>): AccessActor | null {
+  const userId = actorName === null ? undefined : CONTROL_ACTOR.exec(actorName)?.[1];
+  if (!userId) return null;
+  const member = members.get(userId);
+  return member
+    ? { userId, email: member.email, name: member.name, member: true }
+    : { userId, member: false };
+}
+
+/**
+ * `{rows: [{seq, at, session_id, actor_id, actor_name, version, before, after, reason}]}`.
+ * before is null on a session's first change; before and after users are
+ * bare user ids, resolved against the organization's members like grants.
+ */
 function historyOf(body: unknown, sessionId: string, members: Map<string, AccessMember>): AccessHistoryRow[] | null {
   if (!isRecord(body) || !Array.isArray(body.rows)) return null;
   const rows: AccessHistoryRow[] = [];
@@ -391,11 +420,13 @@ function historyOf(body: unknown, sessionId: string, members: Map<string, Access
     const before = snapshotOf(row.before, members);
     const after = snapshotOf(row.after, members);
     if (before === undefined || after === undefined) return null;
+    const actorName = typeof row.actor_name === "string" ? row.actor_name : null;
     rows.push({
       seq: row.seq as number,
       at: row.at,
       actorId: typeof row.actor_id === "string" ? row.actor_id : null,
-      actorName: typeof row.actor_name === "string" ? row.actor_name : null,
+      actorName,
+      actor: actorOf(actorName, members),
       version: row.version as number,
       reason: typeof row.reason === "string" ? row.reason : null,
       before,

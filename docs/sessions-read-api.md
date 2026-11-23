@@ -317,10 +317,20 @@ whichever one is selected.
 When the read API is relaygate, a session access administrator can see and
 change who may read one session. relaygate holds the policy and decides who
 is an administrator; Control stores nothing for it (no migration). It is on
-only when all three hold: `SELFHOST_RELAYGATE_PUBLIC_URL` is set (which also
-turns on `reader_kind` in the mint), `SESSION_READ_API_MCP_READS=true`, and
-the session read API is configured. Otherwise the MCP tools are not listed
-and the routes answer `404 session_access_not_configured`.
+only when both hold: read token mints carry the reader kind
+(`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+`SELFHOST_RELAYGATE_PUBLIC_URL` set), and `SESSION_READ_API_MCP_READS=true`.
+The session read API URL must be relaygate's sessions listener; a
+sessions-only install without a public relaygate URL qualifies. Otherwise the
+MCP tools are not listed and the routes answer
+`404 session_access_not_configured`.
+
+relaygate checks that the caller is a session access administrator before it
+looks the session up. An administrator can manage a session they cannot
+themselves read, and a non-administrator gets the 403 answer
+(`not_access_admin`) whether or not the session exists. An administrator gets
+404 (`not_found`, "Session not found.") only for a session id relaygate does
+not know.
 
 Surfaces:
 
@@ -364,6 +374,15 @@ who is no longer a member is shown as `member: false` (with the user id only)
 so the entry can be removed. History rows are oldest first, `limit` 1 to 200
 (default 50), with `next_after` / `nextAfter` for the next page.
 
+Each history row keeps relaygate's `actor_id` (its internal agent id) and
+`actor_name` as recorded, and adds `actor`. relaygate records a Control person
+as `actor_name` `ctl:<userId>`; that user id resolves like a grant, to
+`{user_id, email, name, member: true}` (`userId` on the route) for a current
+member of the organization or `{user_id, member: false}` otherwise. Any other
+`actor_name` gives `actor: null`. The user ids in `before` and `after` resolve
+the same way as per-person entries. `before` is null on a session's first
+change.
+
 Outcomes:
 
 | relaygate or transport | Tool `outcome` | Route |
@@ -372,7 +391,7 @@ Outcomes:
 | refused before sending | `invalid_request` / `unknown_members` | 400 |
 | 400 | `invalid_request` | 400 |
 | 403 | `not_access_admin` | 403 |
-| 404 (unknown session; relaygate decides 403 first) | `not_found` | 404 |
+| 404 (an administrator naming an unknown session; 403 is decided first) | `not_found` ("Session not found.") | 404 |
 | 409 | `conflict` with the current version, never retried | 409 `currentVersion` |
 | a read lost, 401 after one retry, 5xx, unreadable body | `unavailable` | 503 `session_access_unavailable` |
 | a PATCH or reset whose answer was lost, or an unreadable 2xx | `outcome_unknown` (may have applied: read again) | 504 `session_access_outcome_unknown` |

@@ -316,8 +316,8 @@ export function describeCapabilities(input: {
     if (id === "session_access") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: input.authMode === "oauth"
         ? "Session access management needs your own Agent Relay sign-in; an OAuth connection cannot use it."
-        : "Session access management needs relaygate as this installation's session read API, and your own exchanged Agent Relay sign-in.",
-      how_to_enable: "An operator runs the gate-only read path (SELFHOST_RELAYGATE_PUBLIC_URL and SESSION_READ_API_MCP_READS); then connect with your own Agent Relay sign-in. relaygate still decides who is a session access administrator." };
+        : "Session access management needs relaygate's sessions listener as this installation's session read API, and your own exchanged Agent Relay sign-in.",
+      how_to_enable: "An operator points the session read API URL at relaygate's sessions listener, makes read token mints carry the reader kind (SESSION_READ_MINT_INCLUDE_READER_KIND=true, or unset with SELFHOST_RELAYGATE_PUBLIC_URL set) and sets SESSION_READ_API_MCP_READS=true; then connect with your own Agent Relay sign-in. relaygate still decides who is a session access administrator." };
     if (id === "connect") {
       // Connect rooms have no self-host implementation yet. The hosted edition
       // serves them; a public hosted invite is joined from Agent Relay Desktop,

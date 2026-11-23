@@ -51,12 +51,16 @@ function stub(script: Script, members: () => Promise<AccessMember[]> = async () 
 
 const ok = (body: unknown): AccessReply => ({ kind: "response", status: 200, body });
 
-test("configuration: only a relaygate read path with per-person MCP reads", () => {
+test("configuration: reader-kind mints with per-person MCP reads, with or without the relaygate public URL", () => {
   const api = { mintReaderKind: true };
-  assert.equal(sessionAccessConfigured({ relaygatePublicUrl: "https://gate.example.test", sessionReadApi: api, sessionReadMcpReads: true }), true);
-  assert.equal(sessionAccessConfigured({ relaygatePublicUrl: null, sessionReadApi: api, sessionReadMcpReads: true }), false);
-  assert.equal(sessionAccessConfigured({ relaygatePublicUrl: "https://gate.example.test", sessionReadApi: { mintReaderKind: false }, sessionReadMcpReads: true }), false);
-  assert.equal(sessionAccessConfigured({ relaygatePublicUrl: "https://gate.example.test", sessionReadApi: api, sessionReadMcpReads: false }), false);
+  assert.equal(sessionAccessConfigured({ sessionReadApi: api, sessionReadMcpReads: true }), true);
+  // Sessions-only install: no SELFHOST_RELAYGATE_PUBLIC_URL, mints still carry the reader kind.
+  const sessionsOnly = { relaygatePublicUrl: null, sessionReadApi: api, sessionReadMcpReads: true };
+  assert.equal(sessionAccessConfigured(sessionsOnly), true);
+  assert.equal(sessionAccessConfigured({ sessionReadApi: { mintReaderKind: false }, sessionReadMcpReads: true }), false);
+  assert.equal(sessionAccessConfigured({ sessionReadApi: {}, sessionReadMcpReads: true }), false);
+  assert.equal(sessionAccessConfigured({ sessionReadApi: null, sessionReadMcpReads: true }), false);
+  assert.equal(sessionAccessConfigured({ sessionReadApi: api, sessionReadMcpReads: false }), false);
 });
 
 test("get: maps user ids to current members and shows a former member as member:false", async () => {
@@ -196,8 +200,11 @@ test("a reason of exactly 200 characters is accepted", async () => {
 });
 
 test("404 and 403 map to not_found and not_access_admin", async () => {
+  // relaygate answers 403 before it looks the session up; 404 reaches only an
+  // administrator, and only for an unknown session.
   const notFound = stub(() => ({ kind: "response", status: 404, body: null }));
-  assert.equal((await getAccess(notFound.deps, SESSION)).outcome, "not_found");
+  const missing = await getAccess(notFound.deps, SESSION);
+  assert.deepEqual(missing.outcome === "not_found" && missing.message, "Session not found.");
   const forbidden = stub(() => ({ kind: "response", status: 403, body: null }));
   assert.equal((await getAccess(forbidden.deps, SESSION)).outcome, "not_access_admin");
   assert.equal((await setAccess(forbidden.deps, SESSION, { mode: "640", reason: "x", expectedVersion: 1 })).outcome, "not_access_admin");
@@ -260,33 +267,66 @@ test("reset: reads the version first when none is given", async () => {
   assert.deepEqual(calls[1]!.body, { expectedVersion: 6, reason: "back to defaults" });
 });
 
-test("history: maps actors' grants, passes after and limit, and pages", async () => {
+test("history: maps actors and grants, passes after and limit, and pages", async () => {
   const { deps, calls } = stub(() => ok({
     rows: [
       {
-        seq: 4, at: "2026-01-01T00:00:00.000Z", session_id: SESSION, actor_id: "user-a", actor_name: "Alpha",
+        seq: 4, at: "2026-01-01T00:00:00.000Z", session_id: SESSION, actor_id: "agent-41", actor_name: "ctl:user-a",
         version: 2, reason: "share",
         before: null,
         after: { mode: "000", gid: 7, acl: [], users: [{ userId: "user-b", perm: "r" }, { userId: "user-gone", perm: "r" }], label: null },
       },
       {
-        seq: 5, at: "2026-01-02T00:00:00.000Z", session_id: SESSION, actor_id: "user-a", actor_name: "Alpha",
-        version: 3, reason: "reset", before: { mode: "000", gid: 7, acl: [], users: [], label: null },
+        seq: 5, at: "2026-01-02T00:00:00.000Z", session_id: SESSION, actor_id: "agent-42", actor_name: "ctl:user-gone",
+        version: 3, reason: "reset",
+        before: { mode: "000", gid: 7, acl: [], users: [{ userId: "user-a", perm: "rw" }, { userId: "user-gone", perm: "r" }], label: null },
         after: { reset: true },
+      },
+      {
+        seq: 6, at: "2026-01-03T00:00:00.000Z", session_id: SESSION, actor_id: "agent-43", actor_name: "gate-operator",
+        version: 4, reason: "operator change", before: { reset: true },
+        after: { mode: "640", gid: 7, acl: [], users: [], label: null },
       },
     ],
   }));
-  const result = await accessHistory(deps, SESSION, { after: 3, limit: 2 });
+  const result = await accessHistory(deps, SESSION, { after: 3, limit: 3 });
   assert.ok(result.outcome === "ok");
-  assert.equal(result.value.nextAfter, 5);
-  assert.deepEqual(result.value.rows[0]!.after!.members, [
+  assert.equal(result.value.nextAfter, 6);
+  const [first, second, third] = result.value.rows;
+  // A current member, a former member, and a name that is not a Control person.
+  assert.deepEqual([first!.actorId, first!.actorName], ["agent-41", "ctl:user-a"]);
+  assert.deepEqual(first!.actor, { userId: "user-a", email: "alpha@example.test", name: "Alpha", member: true });
+  assert.deepEqual(second!.actor, { userId: "user-gone", member: false });
+  assert.deepEqual([third!.actorName, third!.actor], ["gate-operator", null]);
+  // before is null on the first change; before and after users are bare ids
+  // resolved like grants.
+  assert.equal(first!.before, null);
+  assert.deepEqual(first!.after!.members, [
     { userId: "user-b", email: "Beta@Example.test", name: null, perm: "r", member: true },
     { userId: "user-gone", perm: "r", member: false },
   ]);
-  assert.equal(result.value.rows[1]!.after!.reset, true);
+  assert.deepEqual(second!.before!.members, [
+    { userId: "user-a", email: "alpha@example.test", name: "Alpha", perm: "rw", member: true },
+    { userId: "user-gone", perm: "r", member: false },
+  ]);
+  assert.equal(second!.after!.reset, true);
+  assert.equal(third!.before!.reset, true);
   assert.equal(calls[0]!.path, `/v1/sessions/${SESSION}/access/history`);
   assert.equal(calls[0]!.query!.get("after"), "3");
-  assert.equal(calls[0]!.query!.get("limit"), "2");
+  assert.equal(calls[0]!.query!.get("limit"), "3");
+
+  const noActor = stub(() => ok({
+    rows: [{ seq: 1, at: "2026-01-01T00:00:00.000Z", version: 1, actor_id: null, actor_name: null, before: null, after: null }],
+  }));
+  const bare = await accessHistory(noActor.deps, SESSION);
+  assert.ok(bare.outcome === "ok");
+  assert.deepEqual([bare.value.rows[0]!.actor, bare.value.rows[0]!.before], [null, null]);
+  for (const name of ["ctl:", "ctl", "user-a"]) {
+    const other = stub(() => ok({ rows: [{ seq: 1, at: "2026-01-01T00:00:00.000Z", version: 1, actor_name: name, before: null }] }));
+    const answer = await accessHistory(other.deps, SESSION);
+    assert.ok(answer.outcome === "ok");
+    assert.equal(answer.value.rows[0]!.actor, null, name);
+  }
 
   const short = stub(() => ok({ rows: [] }));
   const empty = await accessHistory(short.deps, SESSION);

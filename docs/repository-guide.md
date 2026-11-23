@@ -805,7 +805,9 @@ The dashboard session endpoints are deliberately not a general proxy:
   a History session or falling back to another backend.
 - `GET|PATCH /cloud/api/v1/workspaces/:id/sessions/:sessionId/access`,
   `POST .../access/reset` and `GET .../access/history` manage who may read one
-  session on a relaygate install (`src/sessions/access-routes.ts`). The policy
+  session when the read API is relaygate's sessions listener and read token
+  mints carry the reader kind (`src/sessions/access-routes.ts`; the public
+  relaygate URL is not required). The policy
   is relaygate's; `src/sessions/access.ts` validates input, resolves member
   emails to user ids and maps relaygate's answers, and the MCP tools in
   `src/mcp/session-access.ts` use the same service. Each call carries the
