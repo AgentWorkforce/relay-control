@@ -551,7 +551,10 @@ export async function redactMessageQuotes(database: Database, input: { workspace
     const rows = (await tx.query<{ workspace_id: string; message_id: string }>(
       `UPDATE delegation_audit_events SET quote = NULL, quote_redacted_at = now()
         WHERE workspace_id = $1 AND message_id = $2 AND quote IS NOT NULL
-          AND ($3::boolean OR owner_user_id = $4)
+          -- An owner redacts rows filed under them, and the ownerless rows they
+          -- caused (a refusal before any grant from the claimed owner); an
+          -- admin redacts any. As Cloud.
+          AND ($3::boolean OR owner_user_id = $4 OR (owner_user_id IS NULL AND actor_user_id = $4))
         RETURNING workspace_id, message_id`,
       [input.workspaceId, input.messageId, input.asAdmin, input.actorUserId],
     )).rows;

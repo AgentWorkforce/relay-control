@@ -1956,3 +1956,24 @@ test("review: a grant-less refusal keeps its quote, which retention redacts (que
   assert.equal((await row(second)).quote, null);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_quote_redactions WHERE message_id = $1", [second])).rows.length, 1);
 });
+
+test("review: a member redacts the ownerless refusal rows they caused; not another member's", async (t) => {
+  const { env } = await ready(t);
+  // Ownerless rows caused by a plain member (the recipient's owner here is the workspace owner, an admin, so seed directly).
+  const plainId = await env.addMember("causer@acme.test");
+  const plain = await env.desktopSignIn({ hostName: "causer-box", userId: plainId });
+  const otherId = await env.addMember("bystander@acme.test");
+  const other = await env.desktopSignIn({ hostName: "bystander-box", userId: otherId });
+  await env.database.query(
+    `INSERT INTO delegation_audit_events (workspace_id, event, actor_user_id, message_id, quote, quote_hash)
+     VALUES ($1, 'approval.refused', $2, 'm-caused', 'their words', 'hmac-sha256:v1:z')`, [env.workspaceId, plainId]);
+  // Another member cannot redact it; the member who caused it can.
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: "m-caused" }, other.accessToken)).status, 404);
+  const done = await env.bearer("/delegates/quotes/redact", "POST", { message_id: "m-caused" }, plain.accessToken);
+  assert.equal(done.status, 200, done.raw);
+  assert.equal(done.body.redacted_events, 1);
+  const row = (await env.database.query<{ quote: string | null }>(
+    "SELECT quote FROM delegation_audit_events WHERE message_id = 'm-caused' AND event = 'approval.refused'")).rows[0]!;
+  assert.equal(row.quote, null);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_quote_redactions WHERE message_id = 'm-caused'")).rows.length, 1);
+});

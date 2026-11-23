@@ -459,8 +459,9 @@ backlog (see `docs/delegation-quote-redaction-runbook.md`).
 ### Redacting one message's quote
 
 `POST /delegates/quotes/redact {message_id}` lets the owner redact the quote
-of one delegate message at any time (§8, §15.9); an org owner or admin may
-redact any. The audit copies become null (their digests stay), one
+of one delegate message at any time (§8, §15.9), along with the ownerless
+rows they caused (a refusal before any grant from the claimed owner); an org
+owner or admin may redact any. The audit copies become null (their digests stay), one
 `quote.redacted` event is written, and Relaycast is asked to redact the
 quote in its stored `owner_approval`:
 `POST {relaycast}/internal/workspaces/{relay workspace}/messages/{message}/owner-approval/redact-quote`
