@@ -32,6 +32,7 @@ import {
 import {
   anyBinding,
   attestDelegation,
+  AuditCursorError,
   auditView,
   CLAIM_TTL_MS,
   expireLapsed,
@@ -748,11 +749,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
-      // Resume after an event id, as Cloud: `?after_id=<last event id>`.
-      // Events are returned in id order and a page never runs past an event
-      // that could still be committing (listAuditPage's watermark), so
-      // resuming after the last id never skips an event committed out of
-      // id order. As Cloud, a paged read also leaves out the last 30 seconds.
+      // Resume after an event id, as Cloud: `?after_id=<last event id>` (0:
+      // from the start). Pages are commit-safe (listAuditPage), so resuming
+      // never skips an event committed out of id order. An id that names no
+      // event of this workspace is invalid_request.
       const after = params.get("after_id");
       if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
@@ -763,6 +763,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const events = (await listAuditPage(input.database, {
         workspaceId: workspace.id, all: caller.admin, viewerUserId: principal.userId, since: since || null,
         grantId: grantId || null, limit, afterId: after,
+      }).catch((error: unknown) => {
+        if (error instanceof AuditCursorError) return fail("invalid_request", "after_id must be an event id", 400);
+        throw error;
       })).map(auditView);
       if (format === "jsonl") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });

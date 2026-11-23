@@ -258,26 +258,30 @@ not read GitHub (PR conditions are `condition_unavailable`).
 ### Commit-point checks
 
 Attestation (before signing) and redeem (before consuming) end in one
-transaction that re-reads, from committed state, everything the earlier
-checks read before the slow Relaycast lookups:
+transaction, as Cloud's `decideUnderLocks`. It share-locks, in this order,
+the caller's membership row, the workspace policy row, the grant row, the
+approval row and then (re-proving the bearer) the session row, and decides on
+that state rather than on anything read before the slow Relaycast lookups:
 
-1. the workspace policy, share-locked (a policy `PUT` locks it for update):
-   delegation off is `not_enabled`;
-2. the grant, locked for update (revocation and `PATCH` take the same lock):
-   `revoked` or `expired`;
-3. every action against the current grant and policy (allowed classes, the
+1. membership gone: `not_pending`;
+2. delegation off: `not_enabled`;
+3. the approval revoked, withdrawn or invalidated: `revoked`;
+4. the grant revoked: `revoked`; the grant or the approval expired: `expired`;
+5. any action outside the current grant and policy (allowed classes, the
    grant's fit, scope coverage, the recipient's own target): `out_of_scope`;
-4. for tier D, the current policy's and grant's `require_tier_o`:
-   `tier_o_required`;
-5. the caller's membership and bearer, share-locked: `not_pending`;
-6. the approval row, locked: revoked, withdrawn or invalidated is `revoked`;
-7. standing against the target owners as committed now: `recipient_policy`.
+6. for tier D, any action in the union of the protocol, policy and grant
+   Tier O lists: `tier_o_required`;
+7. `code_owner_match` changed since standing was resolved: `unavailable` (retry);
+8. the bearer revoked: `not_pending`;
+9. standing against the target owners as committed now: `recipient_policy`
+   (relay-control reads them locally).
 
-The reason codes are the same as the early checks'. Locks are taken policy,
-then grant, then membership, session and approval; a policy `PUT` (policy,
+The attestation (or the consumption) is written in the same transaction, and
+the attestation is signed last, so a refusal signs nothing. Its `exp` is the
+least of 300 seconds after issue, the approval window found earlier, and the
+grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take
-them in the same order. Attestation signs last, inside the transaction, so a
-refusal at the commit point signs nothing.
+these rows in the same order.
 
 ### Revoking or withdrawing one approval
 
@@ -323,17 +327,16 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.revoked`, `approval.withdrawn`, `quote.redacted`
 
 `GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
-their own events and an admin all of them. Events come in id order; resume
-with `after_id=<last id>`. Ids come from a sequence at insert, but a row only
-becomes visible when its transaction commits, so a later id can be visible
-before an earlier one. A page therefore stops before the first event (of any
-viewer or filter) that could still be committing: one inserted at or after
-the start of a transaction still in flight on the database (read from
-`pg_stat_activity` before the page's snapshot; a five-minute lag if activity
-tracking is off). A page can be short or empty while writes are in flight;
-the next read with the same `after_id` returns the rest, and nothing is ever
-skipped. As Cloud, a paged read (`after_id`; start a follow at
-`after_id=0`) also leaves out events from the last 30 seconds. Each event is `id, event,
+their own events and an admin all of them. Paging is commit-safe, as Cloud:
+each event records the id of the transaction that wrote it (`xact_id`,
+never returned), events come in `(xact_id, id)` order, and only events of
+transactions older than the oldest one still in flight are returned. That set
+is final, so resuming with `after_id=<last id>` never skips an event committed
+out of id order; a just-committed event appears once every older transaction
+has ended. `after_id` resolves to its event's `(xact_id, id)`; `0` starts from
+the beginning, and an id that names no event of this workspace is 400
+`invalid_request`. The log is append-only (a trigger refuses every change but a
+quote redaction, and deletes outside a workspace deletion). Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
@@ -360,14 +363,16 @@ quote text past its window.
   org.
 - A shorter window redacts existing older quotes at the next sweep. A longer
   one restores nothing.
-- The redaction runs hourly from the server, and also on every attestation
-  and every audit read. The hash and the event itself are kept.
-- Redaction is per message. Once any event's quote for a message is
-  redacted, attesting that message again signs `quote: null` and stores only
-  the digest (with `quote_redacted_at` set), and the next sweep or audit read
-  redacts any other event still quoting it (one written concurrently with the
-  redaction). Each redacted message is also queued for redaction in
-  Relaycast (see below).
+- The redaction runs hourly from the server, and also on every audit read.
+  The hash and the event itself are kept. Nulling the quotes and queueing
+  their Relaycast redaction are one statement.
+- Redaction is per message. Every quote write and every redaction of a
+  message take the same transaction-scoped advisory lock
+  (`delegation-quote:<workspace>:<message>`). Under it, a message with a
+  redaction requested (queued or done) is attested with `quote: null` and its
+  event stores only the digest, with `quote_redacted_at` set. The sweep and
+  audit reads also redact any event still quoting such a message. Each
+  redacted message is queued for redaction in Relaycast (see below).
 
 ### Redacting one message's quote
 
@@ -375,13 +380,22 @@ quote text past its window.
 of one delegate message at any time (§8, §15.9); an org owner or admin may
 redact any. The audit copies become null (their digests stay), one
 `quote.redacted` event is written, and Relaycast is asked to redact the
-quote in its stored `owner_approval` through its internal route (with
-`RELAYCAST_INTERNAL_SECRET`). The answer is `{message_id, redacted_events,
-relaycast: "redacted" | "queued"}`; a Relaycast failure, or no internal
-secret, leaves it queued (`delegation_quote_redactions`) for the hourly
-sweep, which retries with back-off. With no quote of the caller's for that
-message the answer is 404 `not_found`. Expired quotes redacted by retention
-are queued for Relaycast the same way.
+quote in its stored `owner_approval`:
+`POST {relaycast}/internal/workspaces/{relay workspace}/messages/{message}/owner-approval/redact-quote`
+with `RELAYCAST_INTERNAL_SECRET` and no body. The answer is `{message_id,
+redacted_events, relaycast: "redacted" | "queued"}`. With no quote of the
+caller's for that message it is 404 `not_found`. Expired quotes redacted by
+retention are queued the same way. Each Relaycast try is recorded as Cloud
+records it (`relaycast_outcome`, `relaycast_status`):
+
+- 2xx: `redacted`, done;
+- 404 `owner_approval_not_found`: `absent`, done;
+- 5xx, 429, a network error or timeout, or a 404 without that code: retried
+  by the hourly sweep once due: `last_attempt_at` at least
+  `min(2^min(attempts, 9), 360)` minutes ago, with no attempt cap;
+- any other answer (400, 401, 403, a redirect): `rejected`, parked for an
+  operator (clear `relaycast_outcome` to retry it) and still counted as
+  unfinished.
 
 ## Migration
 
