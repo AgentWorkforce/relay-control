@@ -90,7 +90,7 @@
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0088_grok_routines_cloud_copy.sql","sha256":"044f5dec50906156fbabf361099dcae5bb6a50a3fd9e4be17974e2c26e274ce2"},
     {"name":"0089_channel_message_events.sql","sha256":"12eafd9d6aad00c89c0ae9fc03fdc9ca278d0d7f4196b99fa83c5de6783d7e44"},
-    {"name":"0090_connection_event_settings.sql","sha256":"0c0a5904a4a6bd5a1f1b1f913b1f95a02b97c171183de535c1327f31fb5d8b61"}
+    {"name":"0090_connection_event_settings.sql","sha256":"1c190be7e3d1907cf55549228c054e0137120fe829f3338f7acbc4f06d4e94c9"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -711,8 +711,9 @@
     {"kind":"column","name":"public.mcp_attestation_tool_uses.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_attestation_tool_uses.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_grant_event_settings.grant_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
+    {"kind":"column","name":"public.mcp_grant_event_settings.last_inbox_read_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":3,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_grant_event_settings.trust_workspace_members_in_channels","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":2,"type":"boolean"}},
-    {"kind":"column","name":"public.mcp_grant_event_settings.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":3,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.mcp_grant_event_settings.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":4,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_oauth_authorization_codes.agent_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.mcp_oauth_authorization_codes.client_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
     {"kind":"column","name":"public.mcp_oauth_authorization_codes.code_challenge","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
@@ -2272,5 +2273,5 @@
   "optional":{
 
   },
-  "sha256":"ed38c7bfac2e168ebbc2cc8f5e1d6e44d8ae4ba40421d5f719002cd448294467"
+  "sha256":"174ce4c8e7bdc4349714613f4d84b1aea741aebb8a8b9582c0f321aa1320e94f"
 }

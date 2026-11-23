@@ -10,7 +10,7 @@ import { encryptSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastClient, type RelaycastClient } from "../src/messaging/relaycast.js";
-import { GrokRoutines, GROK_SETUP_PATH } from "../src/mcp/grok-routines.js";
+import { GrokRoutines, GROK_SETUP_PATH, INBOX_REFRESH_INTERVAL_MS } from "../src/mcp/grok-routines.js";
 import { CHANNEL_RETRY_WINDOW_MS, CHANNEL_WAKE_WINDOW_MS, MAX_AGENT_THREAD_WAKES, MAX_CHANNEL_WAKES, MAX_THREAD_WAKES } from "../src/mcp/channel-wake.js";
 import { createMcpOAuthProtocol } from "../src/mcp/oauth/protocol.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
@@ -48,9 +48,12 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
   const sessions = new McpOAuthSessions(database, { protocol, tenancyMode: "multi", now: clock });
   const world = createRelaycastWorld([], { mentions: true, now: clock });
   const relayPaths: string[] = [];
+  /** Runs during a Relaycast request, before it is answered (`METHOD path` → hook). */
+  const relayHooks = new Map<string, () => Promise<void>>();
   const relayFetch: typeof fetch = async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
     relayPaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    await relayHooks.get(`${init?.method ?? "GET"} ${url.pathname}`)?.();
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: now.toISOString() })) });
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -158,7 +161,7 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
     for (let scan = 0; scan < 6; scan++) { now = new Date(now.getTime() + 6_000); await routines.tick(); }
   };
   return { database, owner, world, routines, calls, tool, setup, person, recordedAgent, member, participant, outsider, channel, post, reply, channelEvents, drain,
-    relayPaths, gatePaths, gateTokens, connect, addGrant, chatClient, grokClient,
+    relayPaths, relayHooks, gatePaths, gateTokens, connect, addGrant, chatClient, grokClient,
     advance: (ms: number) => { now = new Date(now.getTime() + ms); } };
 }
 
@@ -487,4 +490,97 @@ test("member trust: the switch parses on and off and defaults on", () => {
   assert.equal(loadMcpOAuthConfig({}, () => undefined).channelMemberTrust, true);
   assert.equal(loadMcpOAuthConfig({ SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS: "off" }, () => undefined).channelMemberTrust, false);
   assert.throws(() => loadMcpOAuthConfig({ SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS: "maybe" }, () => undefined), /must be on or off/);
+});
+
+/** A pull-only OAuth connection (no routine) as `family-chat`, joined and in the channel with a person. */
+const pullOnly = async (f: Fixture) => {
+  const grant = randomUUID(), family = randomUUID();
+  await f.addGrant(grant, f.chatClient, "family-chat", family);
+  const chat = await f.connect(grant, family);
+  await chat("join_relay", {});
+  await f.person("parent");
+  f.world.channelAs("parent", CHANNEL);
+  f.world.channels.get(CHANNEL)!.members.add("family-chat");
+  return { grant, chat };
+};
+const inboxReads = (f: Fixture) => f.relayPaths.filter(path => path === "GET /v1/deliveries").length;
+
+test("pull refresh: the inbox is read outside the user, organization and grant fence, at most once per interval", async t => {
+  const f = await fixture(t);
+  const { chat } = await pullOnly(f);
+  // While Relaycast answers the inbox read, another transaction can take the organization lock at once.
+  let fenceFree: boolean | null = null;
+  f.relayHooks.set("GET /v1/deliveries", async () => {
+    fenceFree = await Promise.race([
+      f.database.transaction(async tx => { await tx.query("SELECT pg_advisory_xact_lock(hashtext('org:' || $1::text))", [f.owner.organizationId]); return true; }),
+      new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_500)),
+    ]);
+  });
+  f.world.channelAs("parent", CHANNEL, "@family-chat first");
+  f.relayPaths.length = 0;
+  const first = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(fenceFree, true, "no transaction or organization lock is held during the inbox read");
+  f.relayHooks.clear();
+  assert.deepEqual(first.refresh, { status: "ok" });
+  assert.equal(first.events.length, 1);
+  f.world.channelAs("parent", CHANNEL, "@family-chat second");
+  const second = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(inboxReads(f), 1, "two reads inside the interval make one inbox read");
+  assert.equal(second.events.length, 1, "the second read returns stored events");
+  f.advance(INBOX_REFRESH_INTERVAL_MS + 1);
+  const third = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(inboxReads(f), 2);
+  assert.equal(third.events.length, 2);
+  // A scheduled read never refreshes (like Cloud): the scan feeds a polling schedule.
+  f.advance(INBOX_REFRESH_INTERVAL_MS + 1);
+  await chat("get_recent_events", { scheduled: true });
+  assert.equal(inboxReads(f), 2);
+});
+
+test("pull refresh: an unreadable inbox returns stored events with Cloud's freshness warning", async t => {
+  const f = await fixture(t);
+  const { chat } = await pullOnly(f);
+  f.world.failNext("GET", "/v1/deliveries", 503);
+  const result = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(result.refresh.status, "failed");
+  assert.match(result.refresh.message, /do not interpret an empty list as no new messages/);
+});
+
+test("bot-thread: a 401 or 403 root read is unverified (retried, then dropped after the window); a 410 root is an ordinary reply", async t => {
+  const f = await fixture(t);
+  await webhook(f);
+  await f.person("parent");
+  f.channel("parent");
+  const denied = f.post("fake-grok", "I'll check");
+  const forbidden = f.post("fake-grok", "and this");
+  const gone = f.post("fake-grok", "old");
+  await f.drain();
+  for (let attempt = 0; attempt < 30; attempt++) {
+    f.world.failNext("GET", `/v1/messages/${denied.id}`, 401);
+    f.world.failNext("GET", `/v1/messages/${forbidden.id}`, 403);
+  }
+  f.world.failNext("GET", `/v1/messages/${gone.id}`, 410, { code: "gone" });
+  const a = await f.reply("parent", denied.id, "news?");
+  const b = await f.reply("parent", forbidden.id, "news?");
+  await f.reply("parent", gone.id, "still?");
+  await f.drain();
+  assert.deepEqual(f.world.pending("fake-grok").map(row => row.message.id).sort(), [a.id, b.id].sort(),
+    "401 and 403 are not proof: kept for retry; 410 is acknowledged");
+  f.advance(CHANNEL_RETRY_WINDOW_MS + 1_000);
+  await f.drain();
+  assert.deepEqual(f.world.pending("fake-grok"), []);
+  assert.deepEqual(woke(f), []);
+  assert.deepEqual(await f.channelEvents(), []);
+});
+
+test("retention: a pull-only connection's events are deleted after seven days by the scan, with no routine anywhere", async t => {
+  const f = await fixture(t);
+  const { grant, chat } = await pullOnly(f);
+  f.world.sendAs("parent", "family-chat", "a private DM");
+  await chat("get_recent_events", {});
+  assert.equal((await f.database.query("SELECT 1 FROM grok_bot_events WHERE grant_id=$1", [grant])).rows.length, 1);
+  assert.equal((await f.database.query("SELECT 1 FROM grok_bot_routines")).rows.length, 0);
+  f.advance(8 * 24 * 3_600_000);
+  await f.routines.tick();
+  assert.equal((await f.database.query("SELECT 1 FROM grok_bot_events")).rows.length, 0);
 });

@@ -121,11 +121,21 @@ migration `0088_grok_routines_cloud_copy.sql` first.
 - The copied prompt calls `get_event` and `get_recent_events`. These are
   registered in tool group `grok_events`, listed only while the flag is on,
   for every OAuth connection (each reads only its own approved agent's events),
-  not only Grok Bot connections with a routine. `get_recent_events` first
-  reads one page (up to 100 deliveries) of the connection's hosted inbox into
-  the log and acknowledges it after commit, so an assistant with no routine
-  still gets its events; if the inbox cannot be read, the stored events are
-  returned. It does not read the inbox for a routine saved before the copy. The worker ingests each inbox delivery into
+  not only Grok Bot connections with a routine. A manual `get_recent_events`
+  (not `scheduled`) first reads one page (up to 100 deliveries) of the
+  connection's hosted inbox into the log, as Cloud does, at most once per ten
+  seconds per connection. That **drains the inbox**: direct messages become
+  events, addressed channel posts become `relay.channel_message` events, and
+  every other channel post is acknowledged without being stored. So
+  `check_relay_inbox` on the same connection no longer sees those deliveries
+  (whichever reads first takes them); read the channel's other posts with
+  `read_relay_channel`. The inbox and thread-root reads run before the user,
+  organization and grant fence is taken; inside it the participant is checked
+  again and the page is stored, then acknowledged after commit. If the inbox
+  cannot be read, the stored events are returned with Cloud's `refresh`
+  warning. It does not read the inbox for a routine saved before the copy.
+  Cloud serves `check_relay_inbox` and the event tools on different endpoints;
+  here they share one, which is why the race is visible. The worker ingests each inbox delivery into
   `grok_bot_events`, with message text encrypted under the Control keyring,
   and acknowledges the page only after the events have committed. That
   includes the bot's own sends, so they cannot fill the 100-item page.
@@ -135,7 +145,8 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   relaygate with its own (renewed) token and never talks to Relaycast
   directly.
 - Events are kept for seven days, then deleted on the next scan whatever
-  the flag says. They belong to the connection (migration
+  the flag says. The scan runs whenever MCP OAuth is active, with or without a
+  routine, so a pull-only connection's events are deleted on time too. They belong to the connection (migration
   `0089_channel_message_events.sql`) and are also deleted when its routine is
   disconnected, on revocation, or when the grant is no longer valid. Reads never return older
   events. `cursor` is the grant's own sequence.
@@ -182,8 +193,9 @@ wake setting). There is no separate flag.
   (checked first), or (2) the thread root was sent by the agent's own Relaycast
   agent ID (never its name). The root is read once per thread per inbox page,
   only when (1) says no, through the same client and token as the inbox read
-  (relaygate on a gate-only install). A missing root (404 or deleted) makes it
-  an ordinary reply. A failed read (timeout, 5xx, network) leaves only that
+  (relaygate on a gate-only install). A missing root (404, or 410 gone) makes
+  it an ordinary reply. Any other failed read (401 or 403, another 4xx, 429,
+  5xx, a timeout or a network error) leaves only that
   delivery unacknowledged and retries it; once the message is older than ten
   minutes it is treated as an ordinary reply and acknowledged. An unverified
   thread never wakes, and the rest of the page is stored and acknowledged.
@@ -231,8 +243,7 @@ unchanged.
 - **Installation off switch** (a self-host addition, not in Cloud):
   `SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS=off` turns this trust off for
   every connection, whatever each one saved, and stops offering the settings
-  tools. Default on, pending the owner's decision: the switch and its default
-  are a proposal, not settled.
+  tools. Default on.
 - The loop caps under "Channel posts" stay the guard against one manipulated
   agent driving every member's assistants, together with the reply mode and
   the untrusted-data framing.

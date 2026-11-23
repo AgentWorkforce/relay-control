@@ -46,6 +46,14 @@ type Participant = { id: string; token_ciphertext: string; relaycast_workspace_i
 type Remote = Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
 /** The approved agent's hosted inbox, verified: the client (Relaycast, or relaygate when gated) and its current token. */
 type Inbox = { via: RelaycastClient; token: string; remote: Remote; relaycastWorkspaceId: string };
+type RootCheck = "bot-thread" | "other" | "unverified";
+/** A manual refresh's network half, read before the fence: the page and the thread roots it needs. */
+type PreparedRefresh = { grant: Grant; participant: Participant; renewedToken?: string; inbox: Inbox; page: HostedDelivery[];
+  roots: Map<string, RootCheck> };
+/** At most one manual inbox refresh per connection in this interval; reads within it return stored events. */
+export const INBOX_REFRESH_INTERVAL_MS = 10_000;
+/** Cloud's freshness message when the inbox could not be refreshed. */
+const REFRESH_FAILED = "The upstream inbox could not be fully refreshed. These are saved events; do not interpret an empty list as no new messages.";
 
 const DUPLICATE_ROUTINE = "This Grok routine is already connected to another Agent Relay connection. Disconnect it there first, or use a different routine.";
 const ROUTINE_URL_INDEX = "grok_bot_routines_routine_url";
@@ -210,41 +218,106 @@ export class GrokRoutines {
   }
 
   /**
-   * Cloud's get_recent_events, after one bounded refresh of the connection's hosted inbox, so a connection with no
-   * routine (a pull-only assistant) still gets its events. The refreshed deliveries are acknowledged after commit.
+   * Cloud's get_recent_events. A manual read (not `scheduled`) first refreshes the connection's hosted inbox, one page,
+   * so a connection with no routine (a pull-only assistant) still gets its events; like Cloud, it drains that inbox:
+   * deliveries are stored or dropped (an unaddressed channel post) and acknowledged after commit. Every network read
+   * (inbox, thread roots) happens before the user, organization and grant fence is taken; inside it the grant and
+   * participant are checked again and the page is stored. At most one refresh per connection per
+   * INBOX_REFRESH_INTERVAL_MS. `refresh` reports Cloud's freshness result.
    */
   async recent(grantId: string, owner: Owner, input: { since?: string; limit: number; scheduled?: boolean }) {
+    const prepared = input.scheduled === true ? null : await this.prepareRefresh(grantId, owner);
     let acknowledgement: Acknowledgement | null = null;
+    let refresh: { status: "ok" } | { status: "failed"; message: string } | undefined = prepared === null ? undefined
+      : "page" in prepared ? undefined : prepared.status === "ok" ? { status: "ok" } : { status: "failed", message: REFRESH_FAILED };
     const result = await this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner, { events: true });
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1 FOR UPDATE", [grantId])).rows[0] ?? null;
-      acknowledgement = await this.refresh(tx, grant, routine, owner);
+      if (prepared && "page" in prepared) {
+        const applied = await this.applyRefresh(tx, grant, routine, owner, prepared);
+        refresh = applied === false ? { status: "failed", message: REFRESH_FAILED } : { status: "ok" };
+        acknowledgement = applied === false ? null : applied;
+      }
       return recentEvents(tx, this.options.keyring, grant, routine, input, this.retainedSince());
     });
     if (acknowledgement) await this.acknowledge([acknowledgement]);
-    return result;
+    return refresh ? { ...result, refresh } : result;
   }
 
   /**
-   * One inbox page for an event read. Skipped (null) when the copy is off, before the connection has joined, for a
-   * routine saved before the copy (its pasted prompt drains the inbox itself), or when the inbox cannot be read now;
-   * stored events are still returned. A gated participant whose relaygate enrolment lapsed is left to the scan.
+   * The network half of a manual refresh, outside the fence. Null when no refresh applies: the copy is off, the
+   * connection has not joined, or its routine was saved before the copy (its pasted prompt drains the inbox itself).
+   * `ok` without a page: this connection's inbox was read within INBOX_REFRESH_INTERVAL_MS. `failed`: the inbox
+   * could not be read now (stored events are still returned); a gated participant whose relaygate enrolment lapsed
+   * is left to the scan.
    */
-  private async refresh(tx: SqlExecutor, grant: Grant, routine: Routine | null, owner: Owner): Promise<Acknowledgement | null> {
-    if (!this.cloudCopy || !grant.agent_remote_id || (routine && !routine.cloud_copy)) return null;
+  private async prepareRefresh(grantId: string, owner: Owner): Promise<PreparedRefresh | { status: "ok" | "failed" } | null> {
+    if (!this.cloudCopy) return null;
+    // A short fenced read: the grant, the interval claim and the participant row. No network inside.
+    const claimed = await this.options.database.transaction(async tx => {
+      const grant = await this.grant(tx, grantId, owner, { events: true });
+      const routine = (await tx.query<Routine>("SELECT cloud_copy FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
+      if (!grant.agent_remote_id || (routine && !routine.cloud_copy)) return null;
+      const now = this.now();
+      const due = await tx.query(`INSERT INTO mcp_grant_event_settings(grant_id,last_inbox_read_at,updated_at) VALUES ($1,$2,$2)
+        ON CONFLICT (grant_id) DO UPDATE SET last_inbox_read_at=$2
+        WHERE mcp_grant_event_settings.last_inbox_read_at IS NULL OR mcp_grant_event_settings.last_inbox_read_at<=$3 RETURNING grant_id`,
+      [grant.id, now, new Date(now.getTime() - INBOX_REFRESH_INTERVAL_MS)]);
+      if (!due.rows.length) return "recent" as const;
+      try { return { grant, participant: await this.participantFor(tx, grant, owner) }; } catch (error) {
+        if (error instanceof Error && error.message === "identity_unavailable") return "failed" as const;
+        throw error;
+      }
+    });
+    if (claimed === null) return null;
+    if (claimed === "recent") return { status: "ok" };
+    if (claimed === "failed") return { status: "failed" };
     const signal = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
-    let inbox: Inbox | null;
-    let page: HostedDelivery[];
     try {
-      inbox = (await this.openInbox(tx, grant, owner, signal)).inbox;
-      if (!inbox) return null;
-      page = (await inbox.via.readHostedInbox(inbox.token, signal)).slice(0, 100);
+      const verified = await this.verifyInbox(claimed.participant, claimed.grant, owner, signal);
+      if (!verified.inbox) return { status: "failed" };
+      const inbox = verified.inbox;
+      const page = (await inbox.via.readHostedInbox(inbox.token, signal)).slice(0, 100);
+      // Thread roots for the replies that might be the bot's thread (a person's, the only kind that wakes through a
+      // thread), read now so the fenced half needs no network.
+      const replies = page.filter(message => isChannelDelivery(message) && message.reason === "thread-reply"
+        && message.thread_id && message.sender_id && message.sender_id !== inbox.remote.id);
+      const kinds = replies.length ? await senderKinds(this.options.database,
+        { workspaceId: owner.workspaceId, relaycastWorkspaceId: inbox.relaycastWorkspaceId }, replies.map(message => message.sender_id!)) : new Map();
+      const threads = [...new Set(replies.filter(message => kinds.get(message.sender_id!) === "human").map(message => message.thread_id!))];
+      const roots = new Map<string, RootCheck>();
+      if (threads.length) {
+        const agent = { workspaceId: owner.workspaceId, agentRemoteId: inbox.remote.id };
+        await Promise.all(threads.map(async threadId => {
+          if (await addressedInThread(this.options.database, agent, threadId, this.retainedSince())) return;
+          roots.set(threadId, await this.rootCheck(inbox, threadId, signal));
+        }));
+      }
+      return { grant: claimed.grant, participant: claimed.participant, renewedToken: verified.renewedToken, inbox, page, roots };
     } catch (error) {
-      if (error instanceof RelaycastCallError || (error instanceof Error && error.message === "identity_unavailable")) return null;
+      if (error instanceof RelaycastCallError || (error instanceof Error && error.message === "identity_unavailable")) return { status: "failed" };
       throw error;
     }
-    const ids = await this.ingestPage(tx, grant, routine, inbox, owner, page, signal);
-    return ids.length ? { via: inbox.via, token: inbox.token, ids } : null;
+  }
+
+  /**
+   * The fenced half of a manual refresh: the participant must be the one read before (same row and token), then the
+   * page is stored with the roots read before. False when the participant changed meanwhile (nothing is stored or
+   * acknowledged); null when there is nothing to acknowledge.
+   */
+  private async applyRefresh(tx: SqlExecutor, grant: Grant, routine: Routine | null, owner: Owner, prepared: PreparedRefresh):
+    Promise<Acknowledgement | null | false> {
+    if (routine && !routine.cloud_copy) return false;
+    let current: Participant;
+    try { current = await this.participantFor(tx, grant, owner); } catch { return false; }
+    if (current.id !== prepared.participant.id || current.token_ciphertext !== prepared.participant.token_ciphertext
+        || grant.agent_remote_id !== prepared.inbox.remote.id) return false;
+    if (prepared.renewedToken) {
+      await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
+        [current.id, encryptSecret(prepared.renewedToken, this.options.keyring.active)]);
+    }
+    const ids = await this.ingestPage(tx, grant, routine, prepared.inbox, owner, prepared.page, undefined, prepared.roots);
+    return ids.length ? { via: prepared.inbox.via, token: prepared.inbox.token, ids } : null;
   }
 
   /** Acknowledges committed deliveries; a failure stops that inbox's run and is retried on the next read. */
@@ -417,12 +490,23 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
 
   /**
    * The grant's approved hosted participant, verified as this person's in this workspace, with the client it reads
-   * through (relaygate for a gated participant; its rg_ token is renewed at half-life). `inbox` is null when a gated
-   * participant must enrol again at relaygate first (`rejected`: relaygate refused its token). Throws
-   * identity_unavailable for any mismatch.
+   * through (relaygate for a gated participant; its rg_ token is renewed at half-life and stored here). `inbox` is
+   * null when a gated participant must enrol again at relaygate first (`rejected`: relaygate refused its token).
+   * Throws identity_unavailable for any mismatch.
    */
   private async openInbox(tx: SqlExecutor, grant: Grant, owner: Owner, signal: AbortSignal):
     Promise<{ participant: Participant; inbox: Inbox | null; rejected: boolean }> {
+    const participant = await this.participantFor(tx, grant, owner);
+    const verified = await this.verifyInbox(participant, grant, owner, signal);
+    if (verified.renewedToken) {
+      await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
+        [participant.id, encryptSecret(verified.renewedToken, this.options.keyring.active)]);
+    }
+    return { participant, inbox: verified.inbox, rejected: verified.rejected };
+  }
+
+  /** The grant's approved hosted participant row, in this person's workspace on its current Relaycast binding. */
+  private async participantFor(tx: SqlExecutor, grant: Grant, owner: Owner): Promise<Participant> {
     const participant = (await tx.query<Participant>(
       `SELECT p.id,p.token_ciphertext,p.relaycast_workspace_id,p.relaygate_agent_id,p.agent_name,p.admitted_clients,
         p.updated_at < $5 AS stale
@@ -432,30 +516,39 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
     [owner.workspaceId, owner.userId, grant.agent_remote_id, owner.organizationId,
       new Date(this.now().getTime() - GATE_TOKEN_REFRESH_AFTER_MS)])).rows[0];
     if (!participant) throw new Error("identity_unavailable");
+    return participant;
+  }
+
+  /**
+   * Network only, no database: picks the client (relaygate for a gated participant), renews a gated token at
+   * half-life (returned as `renewedToken` for the caller to store) and verifies the agent behind the token.
+   */
+  private async verifyInbox(participant: Participant, grant: Grant, owner: Owner, signal: AbortSignal):
+    Promise<{ inbox: Inbox | null; rejected: boolean; renewedToken?: string }> {
     // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
     const gated = participant.relaygate_agent_id !== null;
     if (gated && !this.options.gate) throw new Error("identity_unavailable");
     const via = gated ? this.options.gate! : this.options.client;
     let token = decryptSecret(participant.token_ciphertext, this.options.keyring);
-    if (gated && !(participant.admitted_clients ?? []).includes(grant.kind)) return { participant, inbox: null, rejected: false };
+    if (gated && !(participant.admitted_clients ?? []).includes(grant.kind)) return { inbox: null, rejected: false };
     let remote: Remote;
+    let renewedToken: string | undefined;
     try {
       if (gated && participant.stale) {
         // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
-        token = await via.refreshGateToken(token, signal);
-        await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
-          [participant.id, encryptSecret(token, this.options.keyring.active)]);
+        token = renewedToken = await via.refreshGateToken(token, signal);
       }
       remote = await via.authenticatedAgent(token, signal);
     } catch (error) {
-      if (gated && error instanceof RelaycastCallError && error.status === 401) return { participant, inbox: null, rejected: true };
+      if (gated && error instanceof RelaycastCallError && error.status === 401) return { inbox: null, rejected: true };
       throw error;
     }
     if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
         isBindingOwnedIdentity(remote.metadata) ||
         remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(owner.userId) ||
         remote.metadata.cloud_workspace_id !== owner.workspaceId) throw new Error("identity_unavailable");
-    return { participant, inbox: { via, token, remote, relaycastWorkspaceId: participant.relaycast_workspace_id }, rejected: false };
+    return { inbox: { via, token, remote, relaycastWorkspaceId: participant.relaycast_workspace_id }, rejected: false,
+      ...(renewedToken ? { renewedToken } : {}) };
   }
 
   /**
@@ -514,7 +607,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
    * reserves a wake-up unless a wake cap is reached, and an unreserved post wakes nobody.
    */
   private async ingestPage(tx: SqlExecutor, grant: Grant, routine: Routine | null, inbox: Inbox, owner: Owner,
-    page: HostedDelivery[], signal: AbortSignal): Promise<string[]> {
+    page: HostedDelivery[], signal?: AbortSignal, prefetched?: Map<string, RootCheck>): Promise<string[]> {
     const { remote } = inbox;
     const now = this.now();
     const deferred = new Set<string>();
@@ -529,7 +622,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
       // routine) stores events that wake nobody.
       const waking = routine?.cloud_copy && (routine.delivery_mode === "polling" || routine.credentials_ciphertext) ? routine : null;
       const agent = { workspaceId: owner.workspaceId, agentRemoteId: remote.id };
-      const roots = new Map<string, Promise<"bot-thread" | "other" | "unverified">>();
+      const roots = new Map<string, Promise<RootCheck>>();
       for (const message of incoming) {
         const trust: SenderTrust = message.sender_id && senders.owned.has(message.sender_id) ? { trusted: true, reason: "your agent" } : UNTRUSTED;
         if (!isChannelDelivery(message)) {
@@ -543,7 +636,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         let addressed: ChannelAddress = message.reason === "mention" ? "mention" : "post";
         // Only a person's reply can wake through a thread (channelWakeAllows), so only theirs is checked.
         if (message.reason === "thread-reply" && message.thread_id && senderKind === "human") {
-          const thread = await this.botThread(tx, agent, inbox, message.thread_id, roots, signal);
+          const thread = await this.botThread(tx, agent, inbox, message.thread_id, roots, signal, prefetched);
           if (thread === "bot-thread") addressed = "bot-thread";
           else if (thread === "unverified" && !channelRetryExpired(message, now)) { deferred.add(message.delivery_id); continue; }
         }
@@ -576,20 +669,30 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
    * Whether a thread reply is in a thread the bot is part of. Rule (1), checked first: an addressed post of this
    * thread is already stored for the bot. Rule (2), only when (1) says no: the thread root was sent by the bot's own
    * Relaycast agent id (never its name), read once per thread per page through the inbox's own client and token (so
-   * relaygate on a gate-only install). A missing root (404, deleted) is not the bot's; a failed read is "unverified".
+   * relaygate on a gate-only install). `prefetched`: roots already read outside the fence; a thread missing from it
+   * is "unverified" (retried), never read here.
    */
   private async botThread(tx: SqlExecutor, agent: { workspaceId: string; agentRemoteId: string }, inbox: Inbox, threadId: string,
-    roots: Map<string, Promise<"bot-thread" | "other" | "unverified">>, signal: AbortSignal) {
-    if (await addressedInThread(tx, agent, threadId, this.retainedSince())) return "bot-thread" as const;
+    roots: Map<string, Promise<RootCheck>>, signal: AbortSignal | undefined, prefetched?: Map<string, RootCheck>): Promise<RootCheck> {
+    if (await addressedInThread(tx, agent, threadId, this.retainedSince())) return "bot-thread";
+    if (prefetched) return prefetched.get(threadId) ?? "unverified";
     let root = roots.get(threadId);
     if (!root) {
-      root = inbox.via.getMessage(inbox.token, threadId, signal).then(
-        found => found?.agentId === inbox.remote.id ? "bot-thread" as const : "other" as const,
-        (error: unknown) => error instanceof RelaycastCallError && error.status >= 400 && error.status < 500 && error.status !== 429
-          ? "other" as const : "unverified" as const);
+      root = this.rootCheck(inbox, threadId, signal);
       roots.set(threadId, root);
     }
     return root;
+  }
+
+  /**
+   * Rule (2) read. Only a missing root (404, or 410 gone) is not the bot's; any other refusal (401 or 403 from a lapsed
+   * token or a policy change, another 4xx, 429, 5xx, a timeout) proves nothing and is "unverified", so the
+   * CHANNEL_RETRY_WINDOW_MS retry applies.
+   */
+  private rootCheck(inbox: Inbox, threadId: string, signal?: AbortSignal): Promise<RootCheck> {
+    return inbox.via.getMessage(inbox.token, threadId, signal).then(
+      found => found?.agentId === inbox.remote.id ? "bot-thread" as const : "other" as const,
+      (error: unknown) => error instanceof RelaycastCallError && (error.status === 404 || error.status === 410) ? "other" as const : "unverified" as const);
   }
 
   /** Neither provider error bodies nor URLs/keys are ever stored or logged. */

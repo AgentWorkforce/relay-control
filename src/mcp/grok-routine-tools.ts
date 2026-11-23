@@ -180,7 +180,7 @@ export function registerGrokEventTools(server: McpServer, context: McpContext): 
   });
 
   server.registerTool("get_recent_events", {
-    description: "List your recent Agent Relay events with full message text, oldest first. Pass since as an event cursor or ISO timestamp to read only newer events; omit it for the latest ones. Use after a gap, a missed wake-up, or when an event arrived without data. Scheduled polling routines pass scheduled=true so Pause delivery holds their cursor while manual reads remain available; polling_active=false means that schedule was replaced and should stop. This connection reads only the Relay identity it was approved as; agent, when passed, must be that identity.",
+    description: "List your recent Agent Relay events with full message text, oldest first. Pass since as an event cursor or ISO timestamp to read only newer events; omit it for the latest ones. Use after a gap, a missed wake-up, or when an event arrived without data. Scheduled polling routines pass scheduled=true so Pause delivery holds their cursor while manual reads remain available; polling_active=false means that schedule was replaced and should stop. This connection reads only the Relay identity it was approved as; agent, when passed, must be that identity. A manual read first refreshes this connection's Relay inbox and drains it: direct messages and channel posts addressed to you become events, other channel posts are acknowledged without being kept, and check_relay_inbox no longer shows them; read a channel's other posts with read_relay_channel.",
     inputSchema: {
       since: z.string().trim().min(1).max(1024).optional()
         .describe("Reuse the most recent returned cursor exactly; scheduled polling cursors may be opaque."),
