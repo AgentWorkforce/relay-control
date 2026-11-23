@@ -5956,7 +5956,7 @@ paths:
           in: query
           required: false
           description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
-          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -6018,16 +6018,35 @@ paths:
         Any other purpose from it is 403 enrollment_operator_scope; a
         revoked, expired or other-workspace one is 401. Every other admin
         route refuses it (401) and introspection reports `wrong-kind`.
+        agent-identity grants exactly relay:agent and requires agentName
+        (trimmed, at most 64 characters, the Relay agent-name rules, no
+        reserved name in any letter case; 400 otherwise). label defaults to
+        the name. It always expires: neverExpires is a 400, expiryDays 1-365,
+        default 90. Minting again for the same name (case-blind) rotates: the
+        new token acts as the same agent and older tokens stay live until
+        revoked or expired. A name a person's hosted Relay participant or a
+        linked Desktop agent already uses in this workspace is a 409
+        name_taken, and so is a name another agent holds on the workspace's
+        Relaycast roster (released or not; the identity's own agent from an
+        earlier join does not count). The roster is read before the mint
+        transaction; an unreadable roster is a 503 relay_unavailable with
+        Retry-After and nothing is written. For an owner or admin caller the
+        route's workspace access check first binds a workspace that has no
+        Relaycast binding yet (as on every owner/admin route), so the roster
+        read always has a binding to read. Only the hosted MCP route
+        /api/v1/mcp/shared-sessions admits it, as a bearer, and there it
+        reaches the Relay messaging tools and describe_capabilities only.
+        Every other gate refuses it and introspection reports it inactive.
+        See docs/identity.md "Workspace agent identity tokens".
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [label]
               properties:
-                label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+                label: { type: string, maxLength: 128, description: "Required for every purpose but agent-identity, where it defaults to agentName." }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
                 expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: default 7, ceiling 30 single-use / 90 multi-use (operator-configurable)" }
                 email:
                   type: string
@@ -6060,8 +6079,9 @@ paths:
                 neverExpires:
                   type: boolean
                   description: >-
-                    workflow, relayfile-agent and acquisition-operator only; cannot be
-                    combined with expiryDays.
+                    workflow, relayfile-agent and acquisition-operator only (a 400 for
+                    agent-identity, which always expires); cannot be combined with
+                    expiryDays.
                 agent_name:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -6069,6 +6089,13 @@ paths:
                     relayfile-agent only, required. The agent the token speaks for;
                     unique per workspace among non-revoked relayfile-agent tokens
                     (409 agent_name_conflict otherwise).
+                agentName:
+                  type: string
+                  maxLength: 64
+                  description: >-
+                    agent-identity only, required. The workspace agent the token acts
+                    as on the hosted MCP Relay messaging tools. Unique per workspace
+                    case-blind; minting again for the same name rotates.
                 nodeName:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -6096,9 +6123,13 @@ paths:
                   - type: object
                     properties:
                       accessToken: { type: string }
-        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, agentName, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
         "403": { description: "enrollment_operator_scope: an enrollment-operator token asked for a purpose other than desktop-enrollment" }
-        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
+        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization; name_taken: a person's hosted Relay participant, a linked Desktop agent, or another agent on the workspace's Relaycast roster already uses the agent-identity agentName" }
+        "503":
+          description: "relay_unavailable: the workspace's Relaycast roster could not be read to check the agent-identity agentName; nothing was minted. relaycast_not_ready: the workspace has no Relaycast binding yet and this installation could not provision one (owner/admin callers, any purpose); nothing was minted. Retry after the Retry-After seconds."
+          headers:
+            Retry-After: { schema: { type: integer } }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10805,8 +10836,8 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
-        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
+        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); agent-identity: the workspace agent the token acts as; null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
         scopes:
