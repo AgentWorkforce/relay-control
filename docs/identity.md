@@ -1257,8 +1257,9 @@ before 0014. A change takes effect on the next restart. The domain routes
 answer `409 domains_managed_by_env` to `PUT` and `DELETE` in single mode.
 
 **Multi mode.** The organization a sign-in lands in is chosen in this order:
-1. the invite the person followed, then every other open invite for the
-   email (each is accepted; the session lands in the last one accepted);
+1. the invite the person followed (and any other open invite for the email
+   in that organization); without an invite link, every open invite for
+   the email (each is accepted; the session lands in the last one accepted);
 2. otherwise an existing membership: the remembered organization
    (`users.last_organization_id`) when still a member, else the
    newest;
@@ -1267,6 +1268,18 @@ answer `409 domains_managed_by_env` to `PUT` and `DELETE` in single mode.
 4. otherwise a personal organization named "<name>'s Workspace" with a
    `Default` workspace, when personal organizations are on; else
    `403 no_organization`.
+
+So an invited person joins the inviting organization and never gets a
+personal one, whether they sign in through the invite link or not, by any
+sign-in method. Only an open invite counts: without the link, an expired or
+revoked invite is ignored (a personal organization when those are on); with
+the link, an expired, revoked or replaced invite answers `410` and a rotated
+one `404 invite_invalid`, and nothing is created. An invite created while a
+personal organization's Relaycast workspace is being provisioned still wins:
+the selection runs again before the organization is written and the unused
+workspace is released. Someone who already has a personal organization keeps
+it when invited later and lands in the inviting organization on their next
+sign-in. Invite and sign-in emails are compared lower-cased and trimmed.
 
 The workspace is the remembered one (`last_workspace_id`) when it is in that
 organization, else the organization's oldest. A refused sign-in rolls back

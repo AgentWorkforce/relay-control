@@ -1,6 +1,7 @@
 import type { SelfhostConfig } from "../config.js";
 import type { Database } from "../database.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
+import { browserOriginsFor } from "../site-origins.js";
 import type { AmpConfig } from "./config.js";
 import { createAmpHandler } from "./routes.js";
 import { createAmpRuntime, type AmpRuntime } from "./runtime.js";
@@ -54,7 +55,7 @@ export function createAmpModule(input: {
     deps,
     database: input.database,
     internalServiceToken: input.config.internalServiceToken,
-    browserOrigins: [...new Set([new URL(input.config.publicBaseUrl).origin, new URL(input.config.dashboardUrl).origin])],
+    browserOrigins: browserOriginsFor(input.config),
     wake: () => worker?.wake(),
   });
   return {

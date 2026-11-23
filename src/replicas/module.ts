@@ -1,6 +1,7 @@
 import type { SelfhostConfig } from "../config.js";
 import type { Database } from "../database.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
+import { browserOriginsFor } from "../site-origins.js";
 import { DEFAULT_REPLICAS_IDENTITY_ISSUER, type ReplicasConfig } from "./config.js";
 import { environmentMcpUrl } from "./environments.js";
 import { createReplicaIdentityVerifier } from "./identity.js";
@@ -57,7 +58,7 @@ export function createReplicasModule(input: {
     deps,
     database: input.database,
     internalServiceToken: input.config.internalServiceToken,
-    browserOrigins: [...new Set([new URL(input.config.publicBaseUrl).origin, new URL(input.config.dashboardUrl).origin])],
+    browserOrigins: browserOriginsFor(input.config),
     ...(input.rateLimits ? { rateLimits: input.rateLimits } : {}),
   });
   return { config: input.replicas, deps, handle };
