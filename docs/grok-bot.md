@@ -231,7 +231,8 @@ unchanged.
 - **Installation off switch** (a self-host addition, not in Cloud):
   `SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS=off` turns this trust off for
   every connection, whatever each one saved, and stops offering the settings
-  tools. Default on.
+  tools. Default on, pending the owner's decision: the switch and its default
+  are a proposal, not settled.
 - The loop caps under "Channel posts" stay the guard against one manipulated
   agent driving every member's assistants, together with the reply mode and
   the untrusted-data framing.

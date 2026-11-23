@@ -61,7 +61,7 @@ export type McpContext = {
    */
   grokEvents?: GrokRoutines;
   /**
-   * SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS (default on): whether get_event may trust a channel post from a
+   * SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS (default on, pending the owner's decision): whether get_event may trust a channel post from a
    * current workspace member's agent, and whether settings.read / settings.update are offered.
    */
   channelMemberTrust?: boolean;

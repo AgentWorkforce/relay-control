@@ -17,7 +17,7 @@ export type McpOAuthConfig = {
    */
   grokCloudCopy?: boolean;
   /**
-   * SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS (default on): the installation's off switch for trusting, in
+   * SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS (default on, pending the owner's decision): the installation's off switch for trusting, in
    * channel posts, agents of current workspace members (Cloud's trustWorkspaceMembersInChannels). Off: never
    * trusted, and the per-connection setting is not offered.
    */

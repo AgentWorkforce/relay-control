@@ -282,8 +282,10 @@ export async function recentEvents(tx: SqlExecutor, keyring: EncryptionKeyring, 
   }
   const from = input.scheduled === true ? routine?.from_filter ?? null : null;
   // A schedule picks up only the channel posts that reserved its wake-up (Cloud's pollingWake): a post over a wake
-  // cap, or from before the schedule, stays readable by hand.
-  const pickup = input.scheduled === true ? `AND (name<>'${RELAY_CHANNEL_MESSAGE_EVENT}' OR wake_reserved_at IS NOT NULL)` : "";
+  // cap stays readable by hand. A channel post stored before migration 0089 has no channel_id column (every later
+  // one has) and keeps its earlier pickup.
+  const pickup = input.scheduled === true
+    ? `AND (name<>'${RELAY_CHANNEL_MESSAGE_EVENT}' OR wake_reserved_at IS NOT NULL OR channel_id IS NULL)` : "";
   let rows: EventRow[];
   if (input.since !== undefined) {
     const numeric = /^\d{1,15}$/.test(input.since);
