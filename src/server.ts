@@ -36,7 +36,7 @@ import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { mcpOAuthActiveNotice } from "./mcp/oauth/routes.js";
-import { GrokRoutines } from "./mcp/grok-routines.js";
+import { GrokRoutines, grokRoutinesOptions } from "./mcp/grok-routines.js";
 import { createRelaycastClient } from "./messaging/relaycast.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
@@ -180,11 +180,9 @@ const mcpOAuthTeardown = new McpOAuthTeardown({
   database,keyring:config.encryptionKeyring,
   client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
 });
-const grokRoutines = new GrokRoutines({
-  database, keyring:config.encryptionKeyring,
-  client:createRelaycastClient({internalOrigin:config.relaycastUrl}),
-  publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,
-});
+const grokRoutines = new GrokRoutines(grokRoutinesOptions(config, {
+  database, tenancyMode: store.tenancy, client: createRelaycastClient({ internalOrigin: config.relaycastUrl }),
+}));
 // Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
 const factory = createFactoryModule({
   config,
