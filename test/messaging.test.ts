@@ -1195,6 +1195,17 @@ test("relaycast client looks agents up by name with the bounded names query", as
   await assert.rejects(client.findAgentByName(key, "alpha"),
     (error: unknown) => error instanceof RelaycastCallError && error.status === 503 && error.operation === "find_agents");
   assert.equal(calls.length, 1, "no fallback roster read");
+
+  const hanging = createRelaycastClient({
+    internalOrigin: "http://relaycast.test/",
+    fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    })) as typeof fetch,
+  });
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(hanging.findAgentsByNames(key, ["alpha"], { signal: controller.signal }),
+    (error: unknown) => error instanceof RelaycastCallError && error.status === 0 && error.operation === "find_agents");
 });
 
 // ---- GET /resolve: the workspace-wide Relaycast key (Cloud parity) ----------

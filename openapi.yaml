@@ -1453,6 +1453,68 @@ paths:
           description: Session revoked
         "404":
           description: Token not found
+  /api/v1/auth/cloud-bridge/start:
+    get:
+      security: []
+      operationId: cloudBridgeStart
+      description: >-
+        Session bridge for organizations moved from Agent Relay Cloud
+        (docs/identity.md). 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Sets the
+        encrypted attempt cookie agent_relay_cloud_bridge (SameSite=None,
+        Path /cloud/api/v1/auth/cloud-bridge/consume, 5 minutes) and redirects
+        to SELFHOST_CLOUD_BRIDGE_HANDOFF_URL with only a nonce. Public form
+        /cloud/api/v1/auth/cloud-bridge/start.
+      parameters:
+        - name: next
+          in: query
+          required: false
+          schema: { type: string }
+          description: Same-site path to land on after sign-in; anything else becomes /.
+      responses:
+        "302":
+          description: Redirect to the Cloud handoff page
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts from this address
+  /api/v1/auth/cloud-bridge/consume:
+    post:
+      security: []
+      operationId: cloudBridgeConsume
+      description: >-
+        Cloud's handoff page posts the signed assertion here (public form
+        /cloud/api/v1/auth/cloud-bridge/consume). Origin must equal the
+        handoff URL's origin. On success sets the session cookie and answers
+        303 to the start's next. Refusals are HTML pages; the x-error-code
+        header carries cloud_bridge_invalid or an account-level
+        cloud_bridge_* code. 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [assertion]
+              properties:
+                assertion:
+                  type: string
+                  description: Compact EdDSA JWS, typ cloud-bridge+jwt
+      responses:
+        "303":
+          description: Signed in; redirect to next
+        "400":
+          description: cloud_bridge_invalid
+        "403":
+          description: >-
+            cloud_bridge_user_unknown, cloud_bridge_org_not_moved,
+            cloud_bridge_not_member, cloud_bridge_auth_too_old or
+            cloud_bridge_signed_out
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts
+        "503":
+          description: not_ready (no organization or workspace yet)
   /api/v1/cli/login:
     get:
       security: [{ cookieAuth: [] }]
@@ -1471,7 +1533,8 @@ paths:
         handoff access token bound to the challenge and redirects (307) to the
         loopback redirect_uri with state, access_token,
         access_token_expires_at and api_url (<site>/cloud: the dashboard or
-        public origin the request arrived on). No
+        public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL
+        through its edge router). No
         refresh token is placed in the URL. With desktop_host_name, a consent
         page asks the person to approve "Agent Relay Desktop on <host>" first;
         its Approve posts the same parameters back (303 on approval).
@@ -1561,7 +1624,7 @@ paths:
                   accessTokenExpiresAt: { type: string, format: date-time }
                   refreshToken: { type: string }
                   refreshTokenExpiresAt: { type: string, format: date-time }
-                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on)" }
+                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)" }
                   tokenType: { type: string, enum: [Bearer] }
         "400":
           description: Missing codeVerifier
@@ -1697,6 +1760,86 @@ paths:
           description: Invalid body
         "403":
           description: Bootstrap bearer required
+  /api/v1/installation/cloud-bridge/organizations:
+    get:
+      security: [{ bearerAuth: [] }]
+      operationId: listCloudBridgeOrganizations
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Organizations listed for the session bridge from Agent Relay Cloud,
+        open or not.
+      responses:
+        "200":
+          description: Bridge windows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CloudBridgeOrganization"
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: The bridge is off
+  /api/v1/installation/cloud-bridge/organizations/{organizationId}:
+    parameters:
+      - name: organizationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      security: [{ bearerAuth: [] }]
+      operationId: setCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Opens
+        or changes the organization's bridge window. List an organization
+        only after its import has been applied and verified. closesAt must be
+        in the future and at most 90 days after opensAt (default now).
+        Audited as installation.cloud_bridge.organization_set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [closesAt, setBy]
+              properties:
+                closesAt: { type: string, format: date-time }
+                opensAt: { type: string, format: date-time }
+                setBy: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        "200":
+          description: The stored window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CloudBridgeOrganization"
+        "400":
+          description: Invalid body or window
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: Organization not found, or the bridge is off
+        "409":
+          description: organization_empty (the organization has no members)
+    delete:
+      security: [{ bearerAuth: [] }]
+      operationId: removeCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Removes the window. Audited as
+        installation.cloud_bridge.organization_removed.
+      responses:
+        "204":
+          description: Removed
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: No window for this organization, or the bridge is off
   /api/v1/auth/whoami:
     get:
       operationId: whoami
@@ -5813,7 +5956,7 @@ paths:
           in: query
           required: false
           description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
-          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -5875,16 +6018,35 @@ paths:
         Any other purpose from it is 403 enrollment_operator_scope; a
         revoked, expired or other-workspace one is 401. Every other admin
         route refuses it (401) and introspection reports `wrong-kind`.
+        agent-identity grants exactly relay:agent and requires agentName
+        (trimmed, at most 64 characters, the Relay agent-name rules, no
+        reserved name in any letter case; 400 otherwise). label defaults to
+        the name. It always expires: neverExpires is a 400, expiryDays 1-365,
+        default 90. Minting again for the same name (case-blind) rotates: the
+        new token acts as the same agent and older tokens stay live until
+        revoked or expired. A name a person's hosted Relay participant or a
+        linked Desktop agent already uses in this workspace is a 409
+        name_taken, and so is a name another agent holds on the workspace's
+        Relaycast roster (released or not; the identity's own agent from an
+        earlier join does not count). The roster is read before the mint
+        transaction; an unreadable roster is a 503 relay_unavailable with
+        Retry-After and nothing is written. For an owner or admin caller the
+        route's workspace access check first binds a workspace that has no
+        Relaycast binding yet (as on every owner/admin route), so the roster
+        read always has a binding to read. Only the hosted MCP route
+        /api/v1/mcp/shared-sessions admits it, as a bearer, and there it
+        reaches the Relay messaging tools and describe_capabilities only.
+        Every other gate refuses it and introspection reports it inactive.
+        See docs/identity.md "Workspace agent identity tokens".
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [label]
               properties:
-                label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+                label: { type: string, maxLength: 128, description: "Required for every purpose but agent-identity, where it defaults to agentName." }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
                 expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: default 7, ceiling 30 single-use / 90 multi-use (operator-configurable)" }
                 email:
                   type: string
@@ -5917,8 +6079,9 @@ paths:
                 neverExpires:
                   type: boolean
                   description: >-
-                    workflow, relayfile-agent and acquisition-operator only; cannot be
-                    combined with expiryDays.
+                    workflow, relayfile-agent and acquisition-operator only (a 400 for
+                    agent-identity, which always expires); cannot be combined with
+                    expiryDays.
                 agent_name:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -5926,6 +6089,13 @@ paths:
                     relayfile-agent only, required. The agent the token speaks for;
                     unique per workspace among non-revoked relayfile-agent tokens
                     (409 agent_name_conflict otherwise).
+                agentName:
+                  type: string
+                  maxLength: 64
+                  description: >-
+                    agent-identity only, required. The workspace agent the token acts
+                    as on the hosted MCP Relay messaging tools. Unique per workspace
+                    case-blind; minting again for the same name rotates.
                 nodeName:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -5953,9 +6123,13 @@ paths:
                   - type: object
                     properties:
                       accessToken: { type: string }
-        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, agentName, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
         "403": { description: "enrollment_operator_scope: an enrollment-operator token asked for a purpose other than desktop-enrollment" }
-        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
+        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization; name_taken: a person's hosted Relay participant, a linked Desktop agent, or another agent on the workspace's Relaycast roster already uses the agent-identity agentName" }
+        "503":
+          description: "relay_unavailable: the workspace's Relaycast roster could not be read to check the agent-identity agentName; nothing was minted. relaycast_not_ready: the workspace has no Relaycast binding yet and this installation could not provision one (owner/admin callers, any purpose); nothing was minted. Retry after the Retry-After seconds."
+          headers:
+            Retry-After: { schema: { type: integer } }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -9833,7 +10007,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
+          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_ROUTED_SITE_URL when set and the request carries one x-original-host header naming its host, else SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
     DeviceLookup:
       type: object
       required: [user_code, client_name, desktop_host_name, status, expires_at, current_workspace_id, workspaces]
@@ -9888,7 +10062,16 @@ components:
         apiUrl:
           type: string
           format: uri
-          description: "`<site>/cloud` (the dashboard or public origin the request arrived on)"
+          description: "`<site>/cloud` (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)"
+    CloudBridgeOrganization:
+      type: object
+      required: [organizationId, opensAt, closesAt, setBy, updatedAt]
+      properties:
+        organizationId: { type: string, format: uuid }
+        opensAt: { type: string, format: date-time }
+        closesAt: { type: string, format: date-time }
+        setBy: { type: string }
+        updatedAt: { type: string, format: date-time }
     Whoami:
       type: object
       required:
@@ -10653,8 +10836,8 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
-        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
+        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); agent-identity: the workspace agent the token acts as; null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
         scopes:

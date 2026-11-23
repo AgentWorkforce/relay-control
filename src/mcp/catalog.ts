@@ -44,6 +44,8 @@ export function ensureToolTitles(server: McpServer): void {
 export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "get_relay_message_status", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
   "post_relay_channel", "read_relay_channel"] as const;
+/** Directory reads do not act as the managed chat, so they survive a missing synced Desktop identity. */
+const RELAY_DIRECTORY_TOOLS = ["list_relay_agents", "get_relay_agent_card"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
 const AMP_TOOLS = ["list_amp_threads", "bind_amp_thread", "unbind_amp_thread"] as const;
 const WEBHOOK_INBOX_TOOLS = ["link_webhook_inbox", "unlink_webhook_inbox"] as const;
@@ -103,11 +105,16 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
     return (["shared_session_reads", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
+  }
+  // A workspace agent identity token (docs/identity.md) reaches Relay
+  // messaging and capability discovery only, whatever else the server enables.
+  if (options.agentIdentity) {
+    return (["relay_messaging", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
   }
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relayfacts", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
@@ -141,16 +148,24 @@ export function registerToolPlan(plan: readonly ToolPlanEntry[], registrars: Too
 /** The owner/admin refusal shared by describe_capabilities and every launch tool. */
 export const LAUNCH_ROLE_REFUSAL = "Only current workspace owners and admins can manage agent launches. Call describe_capabilities for details.";
 
-export type McpAuthMode = "session" | "cli_login" | "oauth" | "staff_read_grant";
+export type McpAuthMode = "session" | "cli_login" | "oauth" | "staff_read_grant" | "agent_identity";
 
 /** The only tools a staff read grant may list or call; the MCP route refuses every other call before a server is built. */
 export const STAFF_READ_GRANT_TOOLS: readonly string[] = [...SHARED_SESSION_READ_TOOLS, CAPABILITY_DISCOVERY_TOOL];
+
+/**
+ * The only tools a workspace agent identity token may list or call: Relay
+ * messaging and capability discovery. The MCP route refuses every other call
+ * before a server is built, and the server registers nothing else for it.
+ */
+export const AGENT_IDENTITY_TOOLS: readonly string[] = [...RELAY_TOOLS, CAPABILITY_DISCOVERY_TOOL];
 
 const AUTH_MODE_LABELS: Readonly<Record<McpAuthMode, string>> = {
   session: "browser session",
   cli_login: "Agent Relay CLI login",
   oauth: "workspace-bound OAuth connection",
   staff_read_grant: "staff read grant (read-only, sessions-only, pinned to one workspace)",
+  agent_identity: "workspace agent identity token (Relay messaging only, as one named agent)",
 };
 
 export type WorkspaceRole = "owner" | "admin" | "member" | "none" | null;
@@ -160,6 +175,8 @@ export type CapabilityGroup = {
   title: string;
   status: "available" | "restricted" | "unavailable";
   tools: string[];
+  /** Listed tools whose calls are refused while the rest of the group remains usable. */
+  restricted_tools?: Array<{ name: string; reason: string }>;
   reason?: string;
   how_to_enable?: string;
   call_requirements?: string;
@@ -211,7 +228,7 @@ export function describeCapabilities(input: {
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
     capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
-    staffReadGrant: input.authMode === "staff_read_grant" })
+    staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
@@ -222,6 +239,13 @@ export function describeCapabilities(input: {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "This connection is a staff read grant: read-only access to one workspace's shared sessions and capability discovery, nothing else.",
         how_to_enable: "Use your own Agent Relay sign-in as a member of a workspace for these tools." };
+    }
+    if (input.authMode === "agent_identity") {
+      if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "relay_messaging"
+        ? { call_requirements: "Acts only as this token's named agent. join_relay takes no desktop_address and no other name; `as` may name only this agent." } : {}) };
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "This connection is a workspace agent identity token: Relay messaging as one named agent and capability discovery, nothing else.",
+        how_to_enable: "Use a person's Agent Relay sign-in for these tools." };
     }
     if (id === "customer_support" && !input.customerSupport) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The customer support backend is not configured on this installation.",
@@ -256,9 +280,12 @@ export function describeCapabilities(input: {
         ? "Use your own Agent Relay sign-in (a person connection) for these tools."
         : "An operator adds events_shim to SELFHOST_FEATURES (chart selectedFeatures)." };
     if (item && id === "relay_messaging" && input.nativeAuthorityAvailable === false) {
-      return { ...base, status: "restricted", tools: [...item.tools],
-        reason: input.nativeAuthorityReason ?? "Agent Relay could not verify this chat's synced Desktop identity.",
-        how_to_enable: input.nativeAuthorityHowToEnable ?? "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry." };
+      const reason = input.nativeAuthorityReason ?? "Agent Relay could not verify this chat's synced Desktop identity.";
+      return { ...base, status: "available", tools: [...item.tools],
+        restricted_tools: item.tools.filter(name => !(RELAY_DIRECTORY_TOOLS as readonly string[]).includes(name))
+          .map(name => ({ name, reason })),
+        how_to_enable: input.nativeAuthorityHowToEnable ?? "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry.",
+        call_requirements: "Agent directory reads remain available. Acting as this managed chat requires its synced Desktop identity." };
     }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };

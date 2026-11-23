@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { registerAmpTools } from "../src/amp/mcp-tools.js";
 import { claimNext, RELAY_EVENT_MAX_BYTES } from "../src/amp/delivery.js";
 import { decrypt, ownedThreadPage } from "../src/amp/service.js";
+import { AMP_CLI_BRIDGE } from "../src/amp/provider.js";
 import { startAmpWorker } from "../src/amp/worker.js";
 import { planToolGroups } from "../src/mcp/catalog.js";
 import type { McpContext } from "../src/mcp/context.js";
@@ -14,6 +16,18 @@ import {
 import { BOOTSTRAP } from "./flows-helpers.js";
 
 const NOT_FOUND = { error: "Not found" };
+
+test("Amp discovery requests one lookahead row for the bounded 100-thread page", () => {
+  let args: string[] = [];
+  runInNewContext(AMP_CLI_BRIDGE, {
+    require: () => ({ spawnSync: (_command: string, value: string[]) => {
+      args = value; return { status: 0, stdout: "[]" };
+    } }),
+    process: { env: { RELAY_AMP_OPERATION: JSON.stringify({ kind: "discover" }) },
+      stdout: { write: () => undefined }, exit: () => undefined },
+  });
+  assert.deepEqual(Array.from(args), ["--log-file", "/dev/null", "threads", "search", "author:me", "--json", "--limit", "101"]);
+});
 
 test("amp gating: off answers 404 before auth on every route and starts no worker (req 8)", async (t) => {
   for (const variant of [{ amp: null }, { amp: ampConfig({ enabled: false }) }]) {

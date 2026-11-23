@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { decryptSecret, encryptSecret, hashSecret, secureEqual, type EncryptionKeyring } from "../crypto.js";
@@ -8,8 +9,16 @@ import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
 import { cloudPathForNext } from "../auth/desktop-login.js";
 import { attemptClearCookies, attemptSetCookies, readAttemptCookie } from "./attempt-cookie.js";
+import {
+  CLOUD_BRIDGE_MAX_ASSERTION_BYTES,
+  CLOUD_BRIDGE_SKEW_SECONDS,
+  CloudBridgeAssertionError,
+  verifyCloudBridgeAssertion,
+  type CloudBridgeClaims,
+  type CloudBridgeRefusalReason,
+} from "./cloud-bridge.js";
 import { choosePasswordPage, confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
-import { IdentityError, IdentityStore, type Role } from "./store.js";
+import { IdentityError, IdentityStore, type CloudBridgeAccountReason, type Role } from "./store.js";
 import type { Database } from "../database.js";
 import { PasswordHasher } from "./password/hashing.js";
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, type HibpFetch } from "./password/policy.js";
@@ -25,6 +34,26 @@ const DEVICE_COOKIE = "agent_relay_device";
 const OIDC_COOKIE = "agent_relay_oidc";
 const MICROSOFT_COOKIE = "agent_relay_microsoft";
 const OIDC_ATTEMPT_TTL_MS = 10 * 60 * 1_000;
+const CLOUD_BRIDGE_COOKIE = "agent_relay_cloud_bridge";
+/**
+ * The bridge attempt cookie is scoped to the public consume path: Cloud posts
+ * to the audience base (…/cloud), the only mount a separate dashboard host
+ * routes to this service, and nothing else needs to see the cookie.
+ */
+const CLOUD_BRIDGE_CONSUME_PATH = "/cloud/api/v1/auth/cloud-bridge/consume";
+const CLOUD_BRIDGE_ATTEMPT_TTL_MS = 5 * 60 * 1_000;
+/** The form holds one assertion field; the assertion itself is capped lower. */
+const CLOUD_BRIDGE_FORM_MAX_BYTES = 8 * 1_024;
+/** The account-level refusals, each with its own browser code. */
+const CLOUD_BRIDGE_ACCOUNT_REASONS = ["user_unknown", "org_not_moved", "not_member", "auth_too_old", "signed_out"] as const;
+const CLOUD_BRIDGE_REFUSAL_TEXT: Record<string, { title: string; message: string }> = {
+  cloud_bridge_invalid: { title: "Sign-in link expired", message: "This sign-in from Agent Relay Cloud could not be completed. Start again from Agent Relay Cloud, or sign in here." },
+  cloud_bridge_user_unknown: { title: "Unable to sign in", message: "Your account has not been moved to this deployment. Sign in here, or ask your administrator." },
+  cloud_bridge_org_not_moved: { title: "Unable to sign in", message: "Your organization is not set up to continue from Agent Relay Cloud here. Sign in here, or ask your administrator." },
+  cloud_bridge_not_member: { title: "Unable to sign in", message: "Your account is not a member of this organization here. Ask an owner or admin to add you." },
+  cloud_bridge_auth_too_old: { title: "Sign in again", message: "Your Agent Relay Cloud sign-in is too old to continue here. Sign in here instead." },
+  cloud_bridge_signed_out: { title: "Sign in again", message: "You signed out of this deployment after your Agent Relay Cloud sign-in. Sign in here instead." },
+};
 /** Password sign-in retention sweep (login attempts, spent tokens). */
 const SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
 const RATE = {
@@ -38,6 +67,12 @@ const RATE = {
   personalOrgPerAddress: { limit: 3, windowMs: 60 * 60 * 1_000 },
   personalOrgPerIp: { limit: 10, windowMs: 60 * 60 * 1_000 },
   settings: { limit: 60, windowMs: 60 * 60 * 1_000 },
+  /** Session bridge from Agent Relay Cloud, per source address. */
+  cloudBridgeStart: { limit: 30, windowMs: 5 * 60 * 1_000 },
+  cloudBridgeConsume: { limit: 30, windowMs: 5 * 60 * 1_000 },
+  /** Session bridge, once the assertion's signature has verified. */
+  cloudBridgePerUser: { limit: 10, windowMs: 10 * 60 * 1_000 },
+  cloudBridgePerOrganization: { limit: 1_200, windowMs: 10 * 60 * 1_000 },
   /** Multi mode: self-serve POST /api/v1/organizations. */
   organizationPerUser: { limit: 5, windowMs: 60 * 60 * 1_000 },
   organizationPerIp: { limit: 20, windowMs: 60 * 60 * 1_000 },
@@ -55,6 +90,13 @@ const TemporaryPasswordRequest = z.object({
 const InstallationSettingsPatch = z.object({
   personalOrgSignupEnabled: z.boolean().nullable().optional(),
   selfServeOrganizationsEnabled: z.boolean().nullable().optional(),
+}).strict();
+
+const CloudBridgeWindow = z.object({
+  closesAt: z.iso.datetime({ offset: true }),
+  opensAt: z.iso.datetime({ offset: true }).optional(),
+  /** Who opened or changed the window: the bootstrap token names no person. */
+  setBy: z.string().trim().min(1).max(120),
 }).strict();
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown): T {
@@ -502,6 +544,189 @@ export function createIdentityModule(input: {
     }
   }
 
+  // ---- session bridge from Agent Relay Cloud (docs/identity.md) -------------------
+
+  type CloudBridgeAttempt = { p: "cloud-bridge-attempt"; nonce: string; next: string; exp: number };
+  type CloudBridgeVerified = { sub: string | null; orgId: string | null; jti: string | null };
+  const CLOUD_BRIDGE_KID = /^[A-Za-z0-9_-]{1,128}$/;
+
+  /**
+   * Answers a refused consume. Every request- and assertion-level reason gets
+   * the same cloud_bridge_invalid, so the page tells a prober nothing; the
+   * reason itself goes to one log line and, once the signature verified and
+   * the organization exists here, an audit row in that organization. Only
+   * claims from a verified assertion are ever logged, and never the
+   * assertion, a segment of it, the nonce or the cookie.
+   */
+  async function cloudBridgeRefused(
+    response: ServerResponse,
+    reason: CloudBridgeRefusalReason,
+    detail: { kid: string | null; verified: CloudBridgeVerified | null; next: string; clear: string[] },
+  ): Promise<void> {
+    const kid = detail.kid && CLOUD_BRIDGE_KID.test(detail.kid) ? detail.kid : null;
+    const verified = detail.verified;
+    log("cloud bridge refused", {
+      reason,
+      ...(kid ? { kid } : {}),
+      ...(verified ? { sub: verified.sub, orgId: verified.orgId, jti: verified.jti } : {}),
+    });
+    if (verified?.orgId) {
+      try {
+        await store.recordCloudBridgeRefusal({ organizationId: verified.orgId, reason, sub: verified.sub, jti: verified.jti, kid });
+      } catch (error) {
+        log("cloud bridge refusal audit failed", { reason, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const account = (CLOUD_BRIDGE_ACCOUNT_REASONS as readonly string[]).includes(reason);
+    const code = account ? `cloud_bridge_${reason}` : "cloud_bridge_invalid";
+    const text = CLOUD_BRIDGE_REFUSAL_TEXT[code]!;
+    // The page is for a person; the header lets a script or test tell the codes apart.
+    response.setHeader("x-error-code", code);
+    sendHtml(response, account ? 403 : 400, messagePage({ ...text, back: `/login?next=${encodeURIComponent(detail.next)}` }), detail.clear);
+  }
+
+  /**
+   * GET /api/v1/auth/cloud-bridge/start: binds a fresh nonce to this browser
+   * in an encrypted attempt cookie and sends the browser to Cloud's handoff
+   * page, which signs an assertion for that nonce. Only the nonce travels to
+   * Cloud; `next` stays in the cookie.
+   */
+  function cloudBridgeStart(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    const bridge = config.cloudBridge!;
+    if (limited(`cloud-bridge-start:${limiterKey(clientIp(request))}`, RATE.cloudBridgeStart)) {
+      sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
+      return;
+    }
+    const next = safeNextPath(url.searchParams.get("next"));
+    const nonce = randomBytes(32).toString("base64url");
+    const attempt: CloudBridgeAttempt = { p: "cloud-bridge-attempt", nonce, next, exp: now() + CLOUD_BRIDGE_ATTEMPT_TTL_MS };
+    // SameSite=None: the consume request is Cloud's cross-site form post, and
+    // a Lax cookie would not be sent with it.
+    const cookies = attemptSetCookies(
+      encryptSecret(JSON.stringify(attempt), keyring.active),
+      CLOUD_BRIDGE_COOKIE,
+      CLOUD_BRIDGE_CONSUME_PATH,
+      CLOUD_BRIDGE_ATTEMPT_TTL_MS / 1_000,
+      "None",
+    );
+    if (!cookies) {
+      sendHtml(response, 400, messagePage({ title: "Unable to sign in", message: "The sign-in return target is too large.", back: "/login" }));
+      return;
+    }
+    const location = new URL(bridge.handoffUrl);
+    location.searchParams.set("nonce", nonce);
+    redirect(response, 302, location.toString(), cookies);
+  }
+
+  /** The consume form: one url-encoded field. Anything else is a malformed request. */
+  async function cloudBridgeForm(request: IncomingMessage): Promise<URLSearchParams | null> {
+    const type = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
+    if (type !== "application/x-www-form-urlencoded") return null;
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of request) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > CLOUD_BRIDGE_FORM_MAX_BYTES) return null;
+      chunks.push(buffer);
+    }
+    return new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+  }
+
+  /**
+   * POST /api/v1/auth/cloud-bridge/consume: Cloud's handoff page posts the
+   * signed assertion here. Verifies it, checks it belongs to this browser's
+   * attempt, spends it, and signs the named user in without creating
+   * anything. The attempt cookie is cleared on every answer.
+   */
+  async function cloudBridgeConsume(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const bridge = config.cloudBridge!;
+    const clear = attemptClearCookies(CLOUD_BRIDGE_COOKIE, CLOUD_BRIDGE_CONSUME_PATH, "None");
+    if (limited(`cloud-bridge-consume:${limiterKey(clientIp(request))}`, RATE.cloudBridgeConsume)) {
+      sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }), clear);
+      return;
+    }
+    // Only Cloud's handoff page may post here. Its exact origin is required:
+    // a missing or "null" Origin (a no-referrer page, a sandboxed frame, a
+    // file) is refused like any other, before the assertion is read.
+    if (request.headers.origin !== bridge.handoffOrigin) {
+      await cloudBridgeRefused(response, "origin", { kid: null, verified: null, next: "/", clear });
+      return;
+    }
+    let attempt: CloudBridgeAttempt | null = null;
+    try {
+      const raw = readAttemptCookie((name) => cookie(request, name), CLOUD_BRIDGE_COOKIE);
+      attempt = raw ? JSON.parse(decryptSecret(raw, keyring)) as CloudBridgeAttempt : null;
+    } catch {
+      attempt = null;
+    }
+    if (!attempt || attempt.p !== "cloud-bridge-attempt" || typeof attempt.nonce !== "string" || !(attempt.exp > now())) {
+      await cloudBridgeRefused(response, "attempt_missing", { kid: null, verified: null, next: "/", clear });
+      return;
+    }
+    // Checked again here, not only at start: the cookie is the only place
+    // `next` lives between the two requests.
+    const next = safeNextPath(typeof attempt.next === "string" ? attempt.next : null);
+    const form = await cloudBridgeForm(request);
+    const assertion = form?.get("assertion") ?? "";
+    if (!assertion || assertion.length > CLOUD_BRIDGE_MAX_ASSERTION_BYTES) {
+      await cloudBridgeRefused(response, "malformed", { kid: null, verified: null, next, clear });
+      return;
+    }
+    let claims: CloudBridgeClaims;
+    try {
+      claims = verifyCloudBridgeAssertion(assertion, bridge, now());
+    } catch (error) {
+      if (!(error instanceof CloudBridgeAssertionError)) throw error;
+      await cloudBridgeRefused(response, error.reason, { kid: error.kid, verified: error.verified, next, clear });
+      return;
+    }
+    const verified: CloudBridgeVerified = { sub: claims.sub, orgId: claims.orgId, jti: claims.jti };
+    if (limited(`cloud-bridge-sub:${claims.sub}`, RATE.cloudBridgePerUser)
+      || limited(`cloud-bridge-org:${claims.orgId}`, RATE.cloudBridgePerOrganization)) {
+      log("cloud bridge rate limited", verified);
+      sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }), clear);
+      return;
+    }
+    if (!secureEqual(claims.nonce, attempt.nonce)) {
+      await cloudBridgeRefused(response, "nonce_mismatch", { kid: claims.kid, verified, next, clear });
+      return;
+    }
+    // Spent before the sign-in, outside its transaction, so a refused
+    // sign-in still uses the assertion up: a replay never gets a second try.
+    if (!await store.burnCloudBridgeAssertion(claims.jti, new Date((claims.exp + CLOUD_BRIDGE_SKEW_SECONDS) * 1_000))) {
+      await cloudBridgeRefused(response, "replayed", { kid: claims.kid, verified, next, clear });
+      return;
+    }
+    let result: Awaited<ReturnType<IdentityStore["bridgeSignIn"]>>;
+    try {
+      result = await store.bridgeSignIn({
+        userId: claims.sub,
+        organizationId: claims.orgId,
+        workspaceId: claims.workspaceId,
+        authTime: claims.authTime,
+        authMethod: claims.authMethod,
+        jti: claims.jti,
+        maxAuthAgeSeconds: bridge.maxAuthAgeSeconds,
+        skewSeconds: CLOUD_BRIDGE_SKEW_SECONDS,
+      });
+    } catch (error) {
+      if (!(error instanceof IdentityError)) throw error;
+      const reason = error.code.startsWith("cloud_bridge_") ? error.code.slice("cloud_bridge_".length) : null;
+      if (reason && (CLOUD_BRIDGE_ACCOUNT_REASONS as readonly string[]).includes(reason)) {
+        await cloudBridgeRefused(response, reason as CloudBridgeAccountReason, { kid: claims.kid, verified, next, clear });
+        return;
+      }
+      sendHtml(response, error.status, messagePage({
+        title: error.code === "not_ready" ? "Almost ready" : "Unable to sign in",
+        message: error.message,
+        back: `/login?next=${encodeURIComponent(next)}`,
+      }), clear);
+      return;
+    }
+    redirect(response, 303, next, [sessionCookie(result.tokens), ...clear]);
+  }
+
   async function handle(
     request: IncomingMessage,
     response: ServerResponse,
@@ -559,6 +784,21 @@ export function createIdentityModule(input: {
         await providerCallback(request, response, url, provider);
         return true;
       }
+    }
+
+    // ---- session bridge from Agent Relay Cloud ------------------------------------
+    // Off answers 404 like an unknown route. The consume route is a cross-site
+    // form post by design: it checks Cloud's exact Origin itself, not the
+    // same-origin rule of this deployment's own forms.
+    if (path === "/api/v1/auth/cloud-bridge/start" && method === "GET") {
+      if (!config.cloudBridge) return false;
+      cloudBridgeStart(request, response, url);
+      return true;
+    }
+    if (path === "/api/v1/auth/cloud-bridge/consume" && method === "POST") {
+      if (!config.cloudBridge) return false;
+      await cloudBridgeConsume(request, response);
+      return true;
     }
 
     // ---- password form (the /login page) ---------------------------------------
@@ -960,6 +1200,48 @@ export function createIdentityModule(input: {
         });
       }
       sendJson(response, 200, settings);
+      return true;
+    }
+
+    // ---- API: session bridge windows (bootstrap bearer only) ------------------------
+    // Which moved organizations may bridge, and until when. 404 while the
+    // bridge is off, like its browser routes.
+    if (path === "/api/v1/installation/cloud-bridge/organizations" && method === "GET") {
+      if (!config.cloudBridge) return false;
+      const auth = await helpers.authenticateWithBootstrap(request);
+      if (auth.kind !== "bootstrap") throw new IdentityHttpError(403, "forbidden", "Bootstrap token required");
+      sendJson(response, 200, { organizations: await store.listCloudBridgeOrganizations() });
+      return true;
+    }
+    const bridgeOrganization = /^\/api\/v1\/installation\/cloud-bridge\/organizations\/([^/]+)$/.exec(path);
+    if (bridgeOrganization && (method === "PUT" || method === "DELETE")) {
+      if (!config.cloudBridge) return false;
+      const auth = await helpers.authenticateWithBootstrap(request);
+      if (auth.kind !== "bootstrap") throw new IdentityHttpError(403, "forbidden", "Bootstrap token required");
+      if (limited("installation-cloud-bridge", RATE.settings)) {
+        throw new IdentityHttpError(429, "rate_limited", "Too many settings changes. Try again later.");
+      }
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(bridgeOrganization[1]!);
+      } catch {
+        throw new IdentityHttpError(404, "not_found", "Organization not found");
+      }
+      if (method === "DELETE") {
+        if (!await store.removeCloudBridgeOrganization(organizationId)) {
+          throw new IdentityHttpError(404, "not_found", "No bridge window for this organization");
+        }
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return true;
+      }
+      const body = parseBody(CloudBridgeWindow, await helpers.requestObject(request));
+      sendJson(response, 200, await store.setCloudBridgeOrganization({
+        organizationId,
+        opensAt: body.opensAt ? new Date(body.opensAt) : null,
+        closesAt: new Date(body.closesAt),
+        setBy: body.setBy,
+      }));
       return true;
     }
 

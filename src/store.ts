@@ -979,6 +979,23 @@ export class ControlPlaneStore {
     } : null;
   }
 
+  /**
+   * A workspace's Relaycast API key when the workspace already has a binding;
+   * null when it has none (or no such workspace). Never provisions one.
+   */
+  async existingRelaycastApiKey(workspaceId: string): Promise<string | null> {
+    const result = await this.database.query<{
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
+    }>(
+      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (!row || row.relaycast_workspace_id === null || row.relaycast_api_key_ciphertext === null) return null;
+    return decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring);
+  }
+
   /** A workspace's Relaycast credentials, for services that use Relaycast. */
   async relaycastBinding(workspaceId: string): Promise<{
     relaycastWorkspaceId: string;

@@ -6,6 +6,8 @@ import { normalizeEmailAddress } from "../identity/config.js";
 import { NODE_ID_PATTERN, revokeSessionDeviceCredentials } from "../store.js";
 import { lockIdentity, lockOrganization } from "../tenancy.js";
 import { iso, recordAudit, type AuditActor } from "./audit.js";
+import { agentNameError, RESERVED_AGENT_NAMES } from "../mcp/oauth/agent-name.js";
+import { isReservedClientName } from "../reserved-client-names.js";
 
 export const API_TOKEN_PREFIX = "sh_wk_";
 /**
@@ -117,6 +119,14 @@ export const API_TOKEN_PURPOSE_SCOPES = {
    * (authenticateEnrollmentOperator); every other gate refuses it.
    */
   "enrollment-operator": ["enrollment:mint"],
+  /**
+   * An `sh_wk_` token that acts as one named agent of the workspace on the
+   * hosted MCP server's Relay messaging tools, and nowhere else
+   * (docs/identity.md, "Workspace agent identity tokens"). Only the MCP
+   * shared-sessions route admits it (authenticateAgentIdentity); every other
+   * gate refuses it, and introspection authorizes no service scope for it.
+   */
+  "agent-identity": ["relay:agent"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type ApiTokenPurpose = keyof typeof API_TOKEN_PURPOSE_SCOPES;
@@ -126,16 +136,45 @@ export const ACQUISITION_OPERATOR_PURPOSE = "acquisition-operator" satisfies Api
 export const RELAY_NODE_PURPOSE = "relay-node" satisfies ApiTokenPurpose;
 export const DESKTOP_ENROLLMENT_PURPOSE = "desktop-enrollment" satisfies ApiTokenPurpose;
 export const ENROLLMENT_OPERATOR_PURPOSE = "enrollment-operator" satisfies ApiTokenPurpose;
+export const AGENT_IDENTITY_PURPOSE = "agent-identity" satisfies ApiTokenPurpose;
+/** The one scope an agent-identity token carries. */
+export const AGENT_IDENTITY_SCOPE = "relay:agent";
+/** Longest agent identity name, after trimming. */
+export const AGENT_IDENTITY_NAME_MAX_LENGTH = 64;
+/** Default lifetime of an agent-identity token; it may never be non-expiring. */
+export const DEFAULT_AGENT_IDENTITY_EXPIRY_DAYS = 90;
 /** The one desktop-enrollment consent value (docs/identity.md, "MCP consent"). */
 export const ENROLLMENT_MCP_CONSENT_ADMIN = "admin";
 /** The one desktop-enrollment policy consent value: sessions it provisions are managed. */
 export const ENROLLMENT_POLICY_CONSENT_ADMIN = "admin";
 
 export class ApiTokenError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  /** When set, the response carries `Retry-After` with this many seconds. */
+  readonly retryAfterSeconds?: number;
+
+  constructor(readonly status: number, readonly code: string, message: string, retryAfterSeconds?: number) {
     super(message);
     this.name = "ApiTokenError";
+    if (retryAfterSeconds !== undefined) this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+/**
+ * Reads the workspace's Relaycast roster for an agent-identity mint: "free"
+ * when the workspace has no Relaycast binding, no roster agent has the name,
+ * or the roster agent is the one `ownerRef` registered; "held" when any other
+ * agent has it. Throws when the roster cannot be read. It must not provision
+ * a Relaycast binding.
+ */
+export type AgentIdentityRosterCheck = (
+  workspaceId: string,
+  agentName: string,
+  ownerRef: string | null,
+) => Promise<"free" | "held">;
+
+/** Owner reference an agent identity registers its Relay participant under. */
+export function agentIdentityOwnerRef(identityId: string): string {
+  return `agent-identity:${identityId}`;
 }
 
 export type ApiTokenRecord = {
@@ -156,7 +195,8 @@ export type ApiTokenRecord = {
   status: "active" | "expired" | "revoked" | "exchanged";
   /**
    * relayfile-agent: the agent the token speaks for; relay-node: the node
-   * name (same value as nodeName); else null.
+   * name (same value as nodeName); agent-identity: the workspace agent the
+   * token acts as; else null.
    */
   agent_name: string | null;
   /** relay-node only: the node the token is bound to; else null. */
@@ -205,6 +245,48 @@ export type RelayNodePrincipal = {
   organizationId: string;
   nodeName: string;
 };
+
+/** A live agent-identity token, as the hosted MCP route sees it. */
+export type AgentIdentityPrincipal = {
+  tokenId: string;
+  workspaceId: string;
+  workspaceName: string;
+  organizationId: string;
+  organizationName: string;
+  /** The agent_identities row: stable across token rotation. */
+  agentIdentityId: string;
+  /** The identity's name as minted (case preserved). */
+  agentName: string;
+};
+
+/**
+ * Name prefixes the hosted MCP relay tools give their own participants: the
+ * owner's launcher (launcherName) and Cursor cloud agent runs
+ * (cursorCloudParticipantName). An agent identity never takes one.
+ */
+const RESERVED_AGENT_NAME_PREFIXES = ["launcher-", "cursor-cloud-"];
+
+/**
+ * Why an agent identity name is refused, or null when it is accepted. The name
+ * is trimmed, at most 64 characters, passes the Relay agent-name rules, and is
+ * none of the reserved Relay names in any letter case, and does not start
+ * with a prefix the relay tools give their own participants.
+ */
+export function agentIdentityNameError(value: unknown): string | null {
+  if (typeof value !== "string") return "agentName is required.";
+  const name = value.trim();
+  if (!name) return "agentName is required.";
+  if (name.length > AGENT_IDENTITY_NAME_MAX_LENGTH) return `agentName must be at most ${AGENT_IDENTITY_NAME_MAX_LENGTH} characters.`;
+  const relayError = agentNameError(name);
+  if (relayError) return `Invalid agentName: ${relayError}`;
+  const lower = name.toLowerCase();
+  for (const reserved of RESERVED_AGENT_NAMES) {
+    if (reserved.toLowerCase() === lower) return "Invalid agentName: That name is reserved. Pick another.";
+  }
+  if (RESERVED_AGENT_NAME_PREFIXES.some(prefix => lower.startsWith(prefix))) return "Invalid agentName: That name is reserved. Pick another.";
+  if (isReservedClientName(name)) return "Invalid agentName: That name is reserved. Pick another.";
+  return null;
+}
 
 type Row = {
   id: string;
@@ -390,9 +472,61 @@ export class ApiTokenStore {
     return result.rows.map(toRecord);
   }
 
-  /** Mints one token in its own transaction; see createIn. */
-  async create(input: CreateApiTokenInput): Promise<ApiTokenRecord & { accessToken: string }> {
+  /**
+   * Mints one token in its own transaction; see createIn. With `agentRoster`,
+   * an agent-identity mint first checks the workspace's Relaycast roster for
+   * the name, outside the transaction: a name another agent holds is refused
+   * with 409 name_taken, and an unreadable roster with 503 relay_unavailable
+   * (Retry-After 5), both before anything is written.
+   *
+   * The check and the mint are not atomic: an agent can register the name
+   * on the roster between the two. The join-time refusal (a roster agent the
+   * identity does not own is never attached) is the backstop.
+   */
+  async create(
+    input: CreateApiTokenInput,
+    options: { agentRoster?: AgentIdentityRosterCheck } = {},
+  ): Promise<ApiTokenRecord & { accessToken: string }> {
+    if (options.agentRoster && input.purpose === AGENT_IDENTITY_PURPOSE && agentIdentityNameError(input.agentName) === null) {
+      await this.checkAgentRoster(input.workspaceId, (input.agentName as string).trim(), options.agentRoster);
+    }
     return this.database.transaction((tx) => this.createIn(tx, input));
+  }
+
+  /**
+   * The roster half of create(). An existing identity (case-blind) is looked
+   * up by the letter case of its first mint and counts its own roster agent
+   * as free, so rotation after the identity joined still mints.
+   */
+  private async checkAgentRoster(
+    workspaceId: string,
+    agentName: string,
+    roster: AgentIdentityRosterCheck,
+  ): Promise<void> {
+    const existing = await this.database.query<{ id: string; agent_name: string }>(
+      `SELECT id, agent_name FROM agent_identities
+        WHERE workspace_id = $1 AND lower(agent_name) = lower($2)`,
+      [workspaceId, agentName],
+    );
+    const identity = existing.rows[0];
+    let held: "free" | "held";
+    try {
+      held = await roster(
+        workspaceId,
+        identity?.agent_name ?? agentName,
+        identity ? agentIdentityOwnerRef(identity.id) : null,
+      );
+    } catch {
+      throw new ApiTokenError(
+        503,
+        "relay_unavailable",
+        "The workspace's Relay roster could not be read, so the agent name could not be checked. Try again shortly.",
+        5,
+      );
+    }
+    if (held === "held") {
+      throw new ApiTokenError(409, "name_taken", "That agent name is already used by an agent on this workspace's Relay.");
+    }
   }
 
   /**
@@ -405,6 +539,13 @@ export class ApiTokenStore {
     tx: SqlExecutor,
     input: CreateApiTokenInput,
   ): Promise<ApiTokenRecord & { accessToken: string }> {
+    const agentIdentity = input.purpose === AGENT_IDENTITY_PURPOSE;
+    if (agentIdentity) {
+      const nameError = agentIdentityNameError(input.agentName);
+      if (nameError) throw new ApiTokenError(400, "invalid_request", nameError);
+      // The label is optional for an agent identity token: it defaults to the name.
+      if (input.label === undefined || input.label === null) input = { ...input, label: (input.agentName as string).trim() };
+    }
     if (typeof input.label !== "string" || !input.label.trim() || input.label.trim().length > 128) {
       throw new ApiTokenError(400, "invalid_request", "label must be 1-128 characters");
     }
@@ -431,6 +572,9 @@ export class ApiTokenStore {
         );
       }
       agentName = input.agentName;
+    } else if (agentIdentity) {
+      // Validated above; the stored name is the identity's (see below).
+      agentName = (input.agentName as string).trim();
     } else if (input.agentName !== undefined) {
       throw new ApiTokenError(
         400,
@@ -533,7 +677,20 @@ export class ApiTokenStore {
       );
     }
     let expiresAt: Date | null;
-    if (enrollment) {
+    if (agentIdentity) {
+      if (input.neverExpires !== undefined && input.neverExpires !== false) {
+        throw new ApiTokenError(400, "invalid_request", "agent-identity tokens always expire");
+      }
+      const days = input.expiryDays ?? DEFAULT_AGENT_IDENTITY_EXPIRY_DAYS;
+      if (!Number.isInteger(days) || (days as number) < 1 || (days as number) > MAX_API_TOKEN_EXPIRY_DAYS) {
+        throw new ApiTokenError(
+          400,
+          "invalid_request",
+          `expiryDays must be an integer from 1 to ${MAX_API_TOKEN_EXPIRY_DAYS} for agent-identity tokens`,
+        );
+      }
+      expiresAt = new Date(Date.now() + (days as number) * 24 * 60 * 60 * 1_000);
+    } else if (enrollment) {
       if (input.neverExpires !== undefined && input.neverExpires !== false) {
         throw new ApiTokenError(400, "invalid_request", "desktop-enrollment keys always expire");
       }
@@ -593,6 +750,17 @@ export class ApiTokenStore {
         "An active relayfile-agent token already exists for this agent_name; revoke it first",
       );
     const oneLivePerAgent = purpose === RELAYFILE_AGENT_PURPOSE;
+    let agentIdentityId: string | null = null;
+    if (agentIdentity) {
+      const identity = await this.resolveAgentIdentity(tx, {
+        workspaceId: input.workspaceId,
+        organizationId: input.organizationId,
+        agentName: agentName!,
+        createdByUserId: input.actor.kind === "user" ? input.actor.userId : null,
+      });
+      agentIdentityId = identity.id;
+      agentName = identity.agentName;
+    }
     try {
       if (oneLivePerAgent) {
         const existing = await tx.query(
@@ -606,8 +774,8 @@ export class ApiTokenStore {
         `INSERT INTO workspace_api_tokens
            (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
             created_by_user_id, expires_at, agent_name, aud, user_id, mcp_consent,
-            max_uses, policy_consent, minted_by_token_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+            max_uses, policy_consent, minted_by_token_id, agent_identity_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
         [
           id,
           input.workspaceId,
@@ -625,6 +793,7 @@ export class ApiTokenStore {
           maxUses,
           policyConsent,
           input.mintedByTokenId ?? null,
+          agentIdentityId,
         ],
       );
     } catch (error) {
@@ -642,6 +811,8 @@ export class ApiTokenStore {
             maxUses > 1 ? ` maxUses=${maxUses}` : ""}${policyConsent ? ` policyConsent=${policyConsent}` : ""})`
         : purpose === RELAY_NODE_PURPOSE
         ? `${id} (relay-node: ${agentName})`
+        : agentIdentity
+        ? `${id} (agent-identity: ${agentName} identity ${agentIdentityId})`
         : agentName !== null
         ? `${id} (${purpose}: ${agentName} -> ${aud})`
         : aud !== null
@@ -1233,6 +1404,102 @@ export class ApiTokenStore {
     return row
       ? { tokenId: row.id, workspaceId: row.workspace_id, organizationId: row.organization_id }
       : null;
+  }
+
+  /**
+   * Admits a live agent-identity token for the hosted MCP route. Only a row
+   * that is unrevoked, has a non-null expiry in the future, has purpose
+   * agent-identity, carries exactly the scope relay:agent and names a
+   * non-empty agent of an existing identity in the token's own workspace and
+   * organization is admitted; anything else returns null. Workspace and
+   * organization come only from the token row. Records the use.
+   */
+  async authenticateAgentIdentity(token: string): Promise<AgentIdentityPrincipal | null> {
+    if (!token.startsWith(API_TOKEN_PREFIX)) return null;
+    const result = await this.database.query<{
+      id: string;
+      workspace_id: string;
+      workspace_name: string;
+      organization_id: string;
+      organization_name: string;
+      agent_identity_id: string;
+      agent_name: string;
+    }>(
+      `UPDATE workspace_api_tokens t
+          SET last_used_at = now()
+         FROM workspaces w, organizations o, agent_identities ai
+        WHERE t.token_hash = $1
+          AND t.revoked_at IS NULL
+          AND t.expires_at IS NOT NULL AND t.expires_at > now()
+          AND t.purpose = '${AGENT_IDENTITY_PURPOSE}'
+          AND t.scopes = ARRAY['${AGENT_IDENTITY_SCOPE}']::text[]
+          AND w.id = t.workspace_id
+          AND o.id = w.organization_id
+          AND ai.id = t.agent_identity_id
+          AND ai.workspace_id = t.workspace_id
+          AND ai.organization_id = w.organization_id
+        RETURNING t.id, t.workspace_id, w.name AS workspace_name, w.organization_id,
+                  o.name AS organization_name, ai.id AS agent_identity_id, ai.agent_name`,
+      [hashSecret(token)],
+    );
+    const row = result.rows[0];
+    const agentName = row?.agent_name?.trim();
+    return row && agentName
+      ? {
+          tokenId: row.id,
+          workspaceId: row.workspace_id,
+          workspaceName: row.workspace_name,
+          organizationId: row.organization_id,
+          organizationName: row.organization_name,
+          agentIdentityId: row.agent_identity_id,
+          agentName,
+        }
+      : null;
+  }
+
+  /**
+   * Finds or creates the workspace agent identity for a name (case-blind), in
+   * the minting transaction. A new identity is refused with 409 name_taken
+   * when a person's hosted Relay participant or a linked Desktop identity of
+   * this workspace already uses the name; an existing identity is reused
+   * (rotation), but only while no person's participant has taken the name
+   * since. The identity keeps the letter case of its first mint.
+   */
+  private async resolveAgentIdentity(
+    tx: SqlExecutor,
+    input: { workspaceId: string; organizationId: string; agentName: string; createdByUserId: string | null },
+  ): Promise<{ id: string; agentName: string }> {
+    const taken = () => new ApiTokenError(
+      409,
+      "name_taken",
+      "That agent name is already used in this workspace by a person or a linked Desktop agent.",
+    );
+    const inUse = await tx.query(
+      `SELECT 1 FROM hosted_relay_participants
+        WHERE workspace_id = $1 AND user_id IS NOT NULL AND lower(agent_name) = lower($2)
+       UNION ALL
+       SELECT 1 FROM desktop_relay_identities
+        WHERE workspace_id = $1 AND lower(agent_name) = lower($2)
+       LIMIT 1`,
+      [input.workspaceId, input.agentName],
+    );
+    if (inUse.rows.length > 0) throw taken();
+    await tx.query(
+      `INSERT INTO agent_identities (id, workspace_id, organization_id, agent_name, created_by_user_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, lower(agent_name)) DO NOTHING`,
+      [randomUUID(), input.workspaceId, input.organizationId, input.agentName, input.createdByUserId],
+    );
+    const identity = await tx.query<{ id: string; agent_name: string; organization_id: string }>(
+      `SELECT id, agent_name, organization_id FROM agent_identities
+        WHERE workspace_id = $1 AND lower(agent_name) = lower($2)
+        FOR UPDATE`,
+      [input.workspaceId, input.agentName],
+    );
+    const row = identity.rows[0];
+    if (!row || row.organization_id !== input.organizationId) throw taken();
+    await tx.query("UPDATE agent_identities SET updated_at = now() WHERE id = $1", [row.id]);
+    return { id: row.id, agentName: row.agent_name };
   }
 
   /** A live relay-node token (not revoked, not expired), recording its use; else null. */
