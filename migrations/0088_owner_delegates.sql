@@ -177,7 +177,7 @@ CREATE INDEX IF NOT EXISTS delegation_attestations_approval_idx
   ON delegation_attestations (approval_id, recipient_agent_id);
 
 -- Append-only per-workspace delegation log (§8). Quote text is kept for the
--- org's quote_retention_days (default 90) and then redacted to its SHA-256
+-- org's quote_retention_days (default 90) and then redacted to its keyed digest
 -- (quote_hash stays).
 CREATE TABLE IF NOT EXISTS delegation_audit_events (
   id bigserial PRIMARY KEY,
@@ -205,3 +205,18 @@ CREATE INDEX IF NOT EXISTS delegation_audit_events_owner_idx
   ON delegation_audit_events (workspace_id, owner_user_id, id);
 CREATE INDEX IF NOT EXISTS delegation_audit_events_quote_idx
   ON delegation_audit_events (created_at) WHERE quote IS NOT NULL;
+
+-- Quotes redacted here and still to be redacted in Relaycast's stored
+-- owner_approval (§8, §15.9); retried with back-off until Relaycast confirms.
+CREATE TABLE IF NOT EXISTS delegation_quote_redactions (
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  message_id text NOT NULL,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  relaycast_redacted_at timestamptz,
+  attempts integer NOT NULL DEFAULT 0,
+  last_attempt_at timestamptz,
+  PRIMARY KEY (workspace_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS delegation_quote_redactions_pending_idx
+  ON delegation_quote_redactions (requested_at) WHERE relaycast_redacted_at IS NULL;

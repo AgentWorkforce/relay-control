@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, hkdfSync, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
@@ -291,12 +291,13 @@ export type AuditInput = {
 
 /**
  * §8: a quote's digest is an HMAC-SHA256 under a per-workspace key derived
- * from the server-held quote key, never a plain hash, so a reader of the log
- * cannot test guessed quotes against it. The key never leaves the server.
+ * (HKDF-SHA256) from the server-held quote secret, never a plain hash, so a
+ * reader of the log cannot test guessed quotes against it. Same derivation and
+ * `hmac-sha256:` form as Cloud.
  */
 export function quoteDigest(quoteKey: Buffer, workspaceId: string, quote: string): string {
-  const workspaceKey = createHmac("sha256", quoteKey).update(`relay-delegation-quote:${workspaceId}`).digest();
-  return createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex");
+  const workspaceKey = Buffer.from(hkdfSync("sha256", quoteKey, "relay-delegation-quote-digest-v1", `workspace:${workspaceId}`, 32));
+  return `hmac-sha256:${createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex")}`;
 }
 
 export async function recordDelegationAudit(executor: SqlExecutor, input: AuditInput): Promise<void> {
@@ -333,9 +334,10 @@ export function auditView(row: Record<string, unknown>) {
 
 /**
  * §15.9 retention, as Cloud's sweep: each quote older than its org's
- * `quote_retention_days` (90 without an org policy row) is redacted to its hash.
- * A shorter window applies to existing quotes at the next sweep; a longer one
- * cannot restore a quote already redacted.
+ * `quote_retention_days` (90 without an org policy row) is redacted to its
+ * digest, and its message is queued for redaction in Relaycast. A shorter
+ * window applies to existing quotes at the next sweep; a longer one cannot
+ * restore a quote already redacted.
  *
  * Redaction is per message: once any row's quote for a message is redacted,
  * every other row quoting that message is redacted too. Attestation already
@@ -346,16 +348,21 @@ export function auditView(row: Record<string, unknown>) {
  */
 export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> {
   await executor.query(
-    `UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
-      WHERE e.quote IS NOT NULL
-        AND (e.created_at <= now() - make_interval(days => COALESCE(
-              (SELECT p.quote_retention_days FROM delegation_org_policies p
-                 JOIN workspaces w ON w.organization_id = p.organization_id
-                WHERE w.id = e.workspace_id), $1))
-          OR (e.message_id IS NOT NULL AND EXISTS (
-              SELECT 1 FROM delegation_audit_events r
-               WHERE r.workspace_id = e.workspace_id AND r.message_id = e.message_id
-                 AND r.quote_redacted_at IS NOT NULL)))`,
+    `WITH redacted AS (
+       UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
+        WHERE e.quote IS NOT NULL
+          AND (e.created_at <= now() - make_interval(days => COALESCE(
+                (SELECT p.quote_retention_days FROM delegation_org_policies p
+                   JOIN workspaces w ON w.organization_id = p.organization_id
+                  WHERE w.id = e.workspace_id), $1))
+            OR (e.message_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM delegation_audit_events r
+                 WHERE r.workspace_id = e.workspace_id AND r.message_id = e.message_id
+                   AND r.quote_redacted_at IS NOT NULL)))
+        RETURNING e.workspace_id, e.message_id)
+     INSERT INTO delegation_quote_redactions (workspace_id, message_id)
+     SELECT DISTINCT workspace_id, message_id FROM redacted WHERE message_id IS NOT NULL
+     ON CONFLICT DO NOTHING`,
     [QUOTE_RETENTION_DAYS],
   );
 }
@@ -404,6 +411,9 @@ export async function auditWatermark(executor: SqlExecutor): Promise<string> {
  * short, or empty, while writes are in flight; the next read with the same
  * `after_id` returns the rest.
  */
+/** As Cloud: a paged audit read (after_id) also leaves out the last 30 seconds. */
+export const AUDIT_SETTLE_SECONDS = 30;
+
 export async function listAuditPage(executor: SqlExecutor, input: {
   workspaceId: string; all: boolean; viewerUserId: string; since: string | null; grantId: string | null;
   limit: number; afterId: string | null;
@@ -415,10 +425,12 @@ export async function listAuditPage(executor: SqlExecutor, input: {
         AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
         AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
         AND ($5::text IS NULL OR grant_id = $5)
-        AND ($7::bigint IS NULL OR id > $7::bigint)
+        AND ($7::bigint IS NULL OR (id > $7::bigint
+             AND created_at <= now() - make_interval(secs => $9)))
         AND created_at < $8::timestamptz
       ORDER BY id LIMIT $6`,
-    [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit, input.afterId, watermark],
+    [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit, input.afterId, watermark,
+      AUDIT_SETTLE_SECONDS],
   )).rows;
   if (!rows.length) return rows;
   // An event at or after the watermark below the page's last id (sequence
@@ -430,6 +442,78 @@ export async function listAuditPage(executor: SqlExecutor, input: {
     [input.workspaceId, input.afterId, String(rows.at(-1)!.id), watermark],
   )).rows[0]?.id;
   return cut ? rows.filter(row => BigInt(String(row.id)) < BigInt(cut)) : rows;
+}
+
+/**
+ * The owner (or, asAdmin, an org owner or admin) redacts the quote of one
+ * delegate message (§8, §15.9), as Cloud's redactMessageQuotes: the audit
+ * copies become null (their digests stay), the message is queued for
+ * redaction in Relaycast, and one `quote.redacted` event is written. Returns
+ * how many events were redacted (0: none of the caller's).
+ */
+export async function redactMessageQuotes(database: Database, input: { workspaceId: string; messageId: string;
+  actorUserId: string; authMethod: string; asAdmin: boolean }): Promise<number> {
+  return database.transaction(async (tx) => {
+    const rows = (await tx.query<{ workspace_id: string; message_id: string }>(
+      `UPDATE delegation_audit_events SET quote = NULL, quote_redacted_at = now()
+        WHERE workspace_id = $1 AND message_id = $2 AND quote IS NOT NULL
+          AND ($3::boolean OR owner_user_id = $4)
+        RETURNING workspace_id, message_id`,
+      [input.workspaceId, input.messageId, input.asAdmin, input.actorUserId],
+    )).rows;
+    if (!rows.length) return 0;
+    await tx.query(
+      `INSERT INTO delegation_quote_redactions (workspace_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [input.workspaceId, input.messageId],
+    );
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "quote.redacted",
+      actorUserId: input.actorUserId, authMethod: input.authMethod,
+      ownerUserId: input.asAdmin ? null : input.actorUserId, messageId: input.messageId, data: { events: rows.length } });
+    return rows.length;
+  });
+}
+
+/**
+ * Asks Relaycast to redact one message's stored owner_approval quote; true
+ * only when Relaycast confirmed. Null when no Relaycast internal credential is
+ * configured: redactions then stay queued.
+ */
+export type RelaycastQuoteRedactor = ((relaycastWorkspaceId: string, messageId: string) => Promise<boolean>) | null;
+
+/**
+ * Works through the queued Relaycast redactions that are due a try (retry
+ * back-off doubles per attempt, capped at 6 hours), as Cloud's flush. Returns
+ * how many Relaycast confirmed and how many remain unfinished overall.
+ */
+export async function flushRelaycastRedactions(database: Database, deps: {
+  redact: RelaycastQuoteRedactor;
+  relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string } | null>;
+}): Promise<{ redacted: number; pending: number }> {
+  const unfinished = async () => Number((await database.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM delegation_quote_redactions WHERE relaycast_redacted_at IS NULL",
+  )).rows[0]?.count ?? 0);
+  if (!deps.redact) return { redacted: 0, pending: await unfinished() };
+  const due = (await database.query<{ workspace_id: string; message_id: string }>(
+    `SELECT workspace_id, message_id FROM delegation_quote_redactions
+      WHERE relaycast_redacted_at IS NULL
+        AND (last_attempt_at IS NULL OR last_attempt_at <= now() -
+             make_interval(mins => least(power(2, least(attempts, 9))::int, 360)))
+      ORDER BY requested_at LIMIT 100`,
+  )).rows;
+  let redacted = 0;
+  for (const row of due) {
+    const binding = await deps.relaycastBinding(row.workspace_id).catch(() => null);
+    const done = binding ? await deps.redact(binding.relaycastWorkspaceId, row.message_id).catch(() => false) : false;
+    await database.query(
+      done
+        ? "UPDATE delegation_quote_redactions SET relaycast_redacted_at = now() WHERE workspace_id = $1 AND message_id = $2"
+        : `UPDATE delegation_quote_redactions SET attempts = attempts + 1, last_attempt_at = now()
+            WHERE workspace_id = $1 AND message_id = $2`,
+      [row.workspace_id, row.message_id],
+    );
+    if (done) redacted += 1;
+  }
+  return { redacted, pending: await unfinished() };
 }
 
 /**
@@ -1149,3 +1233,30 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
 }
 
 export { CLAIM_TTL_MS };
+
+/**
+ * Relaycast's Cloud-only internal redaction route (relaycast#710), called
+ * with RELAYCAST_INTERNAL_SECRET:
+ * `POST {relaycast}/internal/workspaces/{id}/messages/{id}/owner-approval/redact` → 2xx `{ok: true}`.
+ * Any other answer leaves the redaction queued.
+ */
+export function relaycastQuoteRedactor(input: { relaycastUrl: string; internalSecret: string | null;
+  fetchImpl?: typeof fetch }): RelaycastQuoteRedactor {
+  const secret = input.internalSecret;
+  if (!secret) return null;
+  const base = input.relaycastUrl.replace(/\/+$/u, "");
+  const fetchImpl = input.fetchImpl ?? globalThis.fetch;
+  return async (relaycastWorkspaceId, messageId) => {
+    try {
+      const response = await fetchImpl(`${base}/internal/workspaces/${encodeURIComponent(relaycastWorkspaceId)}/messages/${
+        encodeURIComponent(messageId)}/owner-approval/redact`, {
+        method: "POST", headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+        body: "{}", redirect: "manual", signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json().catch(() => null) as { ok?: boolean } | null;
+      return response.ok && body?.ok === true;
+    } catch {
+      return false;
+    }
+  };
+}

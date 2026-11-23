@@ -3435,7 +3435,7 @@ paths:
         - name: after_id
           in: query
           required: false
-          description: Resume after this event `id` (as Cloud). Events come in id order, and a page stops before the first event that could still be committing, so resuming after the last id never skips an event committed out of id order. A page can be short or empty while writes are in flight.
+          description: Resume after this event `id` (as Cloud). Events come in id order, and a page stops before the first event that could still be committing, so resuming after the last id never skips an event committed out of id order. A page can be short or empty while writes are in flight. As Cloud, a paged read (start a follow at `0`) also leaves out events from the last 30 seconds.
           schema: { type: string, pattern: "^(0|[1-9][0-9]{0,15})$" }
       responses:
         "200":
@@ -3771,13 +3771,54 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [approval_id, revoked]
+                required: [approval_id, status]
                 properties:
                   approval_id: { type: string }
-                  revoked: { const: true }
+                  status: { const: revoked }
         "401": { description: "`unauthorized`" }
         "403": { description: "`forbidden` or `csrf_rejected`" }
         "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/quotes/redact:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redactDelegationQuote
+      tags: [Owner delegates]
+      description: |
+        Human-only (§8, §15.9). The owner redacts the quote of one delegate
+        message; a workspace owner/admin may redact any. The audit copies
+        become null (their digests stay), `quote.redacted` is audited, and
+        Relaycast is asked to redact its stored owner_approval quote; a
+        failure stays queued for the hourly sweep.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message_id]
+              properties:
+                message_id: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        "200":
+          description: Redacted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message_id, redacted_events, relaycast]
+                properties:
+                  message_id: { type: string }
+                  redacted_events: { type: integer, minimum: 1 }
+                  relaycast: { type: string, enum: [redacted, queued] }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: no quote of the caller's for that message" }
   /api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"

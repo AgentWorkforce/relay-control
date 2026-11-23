@@ -14,11 +14,11 @@ import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
-import { randomUUID, hkdfSync } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
+import { delegationQuoteSecret, SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
@@ -104,6 +104,7 @@ import { identityErrorResponse, type IdentityModule } from "./identity/routes.js
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { createDelegationHandler } from "./delegation/routes.js";
+import { relaycastQuoteRedactor } from "./delegation/service.js";
 import { DelegationSigner } from "./delegation/jws.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
@@ -576,9 +577,9 @@ export function createApp(input: {
   // workspace until an admin turns delegation_enabled on.
   const delegation = createDelegationHandler({
     database: store.database,
-    quoteKey: config.delegationQuoteKey
-      ? Buffer.from(config.delegationQuoteKey, "utf8")
-      : Buffer.from(hkdfSync("sha256", config.encryptionKeyring.active.key, Buffer.alloc(0), "relay-delegation-quote-digest", 32)),
+    quoteKey: delegationQuoteSecret(config),
+    relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: config.relaycastUrl,
+      internalSecret: input.relaycastInternalSecret ?? null, fetchImpl: input.messagingFetch }),
     relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
     signer: config.delegationSigning ? new DelegationSigner(config.delegationSigning) : null,
     gateOnly: Boolean(config.relaygatePublicUrl),

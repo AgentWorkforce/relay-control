@@ -283,12 +283,14 @@ refusal at the commit point signs nothing.
 
 - `DELETE /delegates/approvals/{approval_id}`: the approval's owner (or an
   admin) revokes one approval, tier D or tier O. It is allowed while
-  delegation is off, and is audited as `approval.revoked`.
+  delegation is off, answers `{approval_id, status: "revoked"}`, and is
+  audited as `approval.revoked`.
 - `POST /messaging/delegation/withdraw` takes `{delegate_agent_id,
   delegate_token, approval_id}`. The delegate that sent an approval
   withdraws it, for example when the owner later says no. The proof is the
   delegate's own Relaycast token: it must name an agent in this workspace's
-  relay, and an attestation from this delegate must exist. No person's
+  relay, and the approval must be one this delegate sent (minted under its
+  grant, or attested from it). With delegation off it answers 404. No person's
   credential is needed, because withdrawing only narrows. It is audited as
   `approval.withdrawn`.
 
@@ -318,6 +320,7 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.minted`, `approval.attested`, `approval.refused`
 - `approval.redeemed`, `redeem.refused`
 - `policy.updated`, `target_owners.updated`
+- `approval.revoked`, `approval.withdrawn`, `quote.redacted`
 
 `GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
 their own events and an admin all of them. Events come in id order; resume
@@ -329,14 +332,17 @@ the start of a transaction still in flight on the database (read from
 `pg_stat_activity` before the page's snapshot; a five-minute lag if activity
 tracking is off). A page can be short or empty while writes are in flight;
 the next read with the same `after_id` returns the rest, and nothing is ever
-skipped. Each event is `id, event,
+skipped. As Cloud, a paged read (`after_id`; start a follow at
+`after_id=0`) also leaves out events from the last 30 seconds. Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
-`data`. `quote_hash` is a keyed digest (§8): an HMAC-SHA256 under a
-per-workspace key derived from a server-held key, so a reader of the log
+`data`. `quote_hash` is a keyed digest (§8), `hmac-sha256:<hex>`: an
+HMAC-SHA256 under a per-workspace key (HKDF-SHA256, salt
+`relay-delegation-quote-digest-v1`, info `workspace:<id>`, as Cloud) derived
+from a server-held secret, so a reader of the log
 cannot test guessed quotes against it. The key is `SELFHOST_DELEGATION_QUOTE_KEY`
-(at least 32 bytes) or, when unset, derived from the active encryption key;
+(at least 32 bytes) or, when unset, the active encryption key;
 set it to keep digests stable across encryption key rotations. The quote
 itself is also in the signed claims (`quote`). Quote text is redacted to `quote_hash` (with
 `quote_redacted_at` set) once it is older than the org's
@@ -360,8 +366,22 @@ quote text past its window.
   redacted, attesting that message again signs `quote: null` and stores only
   the digest (with `quote_redacted_at` set), and the next sweep or audit read
   redacts any other event still quoting it (one written concurrently with the
-  redaction). relay-control calls no Relaycast redaction (Cloud's is a
-  Cloud-only internal route), so there is no redaction queue.
+  redaction). Each redacted message is also queued for redaction in
+  Relaycast (see below).
+
+### Redacting one message's quote
+
+`POST /delegates/quotes/redact {message_id}` lets the owner redact the quote
+of one delegate message at any time (§8, §15.9); an org owner or admin may
+redact any. The audit copies become null (their digests stay), one
+`quote.redacted` event is written, and Relaycast is asked to redact the
+quote in its stored `owner_approval` through its internal route (with
+`RELAYCAST_INTERNAL_SECRET`). The answer is `{message_id, redacted_events,
+relaycast: "redacted" | "queued"}`; a Relaycast failure, or no internal
+secret, leaves it queued (`delegation_quote_redactions`) for the hourly
+sweep, which retries with back-off. With no quote of the caller's for that
+message the answer is 404 `not_found`. Expired quotes redacted by retention
+are queued for Relaycast the same way.
 
 ## Migration
 
@@ -391,6 +411,5 @@ All of them are workspace-scoped and cascade on workspace delete.
   - grant expiry reminders;
   - per-grant attestation rate limits and anomaly-triggered tier O;
   - admin co-approval;
-  - owner-initiated quote redaction;
   - SIEM webhooks;
   - the delegate-requested tier O one-tap flow (`approvals/request`).

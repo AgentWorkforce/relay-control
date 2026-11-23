@@ -15,6 +15,7 @@ import {
 } from "../src/delegation/scope.js";
 import { copilotDesktopSetup } from "./support/copilot-desktop.js";
 import { request } from "./support/harness.js";
+import { RELAYCAST_INTERNAL_SECRET } from "./support/relaycast-world.js";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
@@ -23,11 +24,12 @@ const KID = "dlg-2026q4";
 
 type Env = Awaited<ReturnType<typeof setup>>;
 
-async function setup(t: TestContext, options: { signing?: boolean } = {}) {
+async function setup(t: TestContext, options: { signing?: boolean; relaycastInternal?: boolean } = {}) {
   const seed = randomBytes(32);
   /** The app's clock: tests advance `offsetMs` instead of rewriting stored state. */
   const clock = { offsetMs: 0 };
-  const env = await copilotDesktopSetup(t, { now: () => new Date(Date.now() + clock.offsetMs) }, undefined,
+  const env = await copilotDesktopSetup(t, { now: () => new Date(Date.now() + clock.offsetMs),
+    ...(options.relaycastInternal ? { relaycastInternalSecret: RELAYCAST_INTERNAL_SECRET } : {}) }, undefined,
     options.signing === false ? {} : { delegationSigning: { kid: KID, seed, previous: [] } });
   const desktop = await env.desktopSignIn({ hostName: "khaliq-box" });
   const base = `/api/v1/workspaces/${env.workspaceId}`;
@@ -118,8 +120,8 @@ async function setup(t: TestContext, options: { signing?: boolean } = {}) {
 }
 
 /** Owner's coding agent (recipient), owner's claimed bot (delegate), delegation on, one merge grant. */
-async function ready(t: TestContext) {
-  const env = await setup(t);
+async function ready(t: TestContext, options: { relaycastInternal?: boolean } = {}) {
+  const env = await setup(t, options);
   await env.enable();
   const recipient = await env.desktopIdentity("relay-coder");
   const bot = await env.claim("assistant");
@@ -499,7 +501,7 @@ test("attestation: a live delegate's in-scope approval is signed and verifies ag
   assert.equal(event!.jti, claims.jti);
   assert.equal(event!.quote, "yes merge 2250 when green");
   // §8: a keyed digest (HMAC under a server key), never the plain SHA-256 of the quote.
-  assert.match(event!.quote_hash!, /^[0-9a-f]{64}$/);
+  assert.match(event!.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
   assert.notEqual(event!.quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
   // §16.4: the quote is in the signed claims.
   assert.equal(claims.quote, "yes merge 2250 when green");
@@ -764,7 +766,7 @@ test("quote text is redacted to its hash after 90 days", async (t) => {
   const audit = await env.bearer("/delegates/audit");
   const attested = audit.body.events.find((event: { event: string }) => event.event === "approval.attested");
   assert.equal(attested.quote, null);
-  assert.match(attested.quote_hash, /^[0-9a-f]{64}$/);
+  assert.match(attested.quote_hash, /^hmac-sha256:[0-9a-f]{64}$/);
   assert.ok(attested.quote_redacted_at);
   assert.deepEqual(Object.keys(attested).sort(), ["actor_agent_id", "actor_user_id", "approval_id", "auth_method", "created_at",
     "data", "event", "grant_id", "id", "message_id", "owner_id", "quote", "quote_hash", "quote_redacted_at", "reason",
@@ -1011,7 +1013,7 @@ test("quote_retention_days is an org setting (1–3650, default 90) that every w
   let events = await audit();
   assert.equal(byJti(events, old).quote, null);
   assert.ok(byJti(events, old).quote_redacted_at);
-  assert.match(byJti(events, old).quote_hash!, /^[0-9a-f]{64}$/);
+  assert.match(byJti(events, old).quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
   assert.equal(byJti(events, recent).quote, "yes merge 2250 when green");
   assert.equal(byJti(events, recent).quote_redacted_at, null);
 
@@ -1127,10 +1129,15 @@ test("review: tokens act only in their own workspace; oversized bodies get 413; 
   for (let index = 0; index < 3; index += 1) {
     await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: `AgentWorkforce/relay#${50 + index}` }])));
   }
+  // A paged read leaves out the last 30 seconds (a late commit with a lower id is never skipped).
+  assert.deepEqual((await env.bearer("/delegates/audit?after_id=0")).body.events, []);
+  await env.database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute'");
   const all = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
   const first = (await env.bearer("/delegates/audit?limit=2")).body.events as Array<{ id: string }>;
   const rest = (await env.bearer(`/delegates/audit?after_id=${first.at(-1)!.id}`)).body.events as Array<{ id: string }>;
   assert.deepEqual([...first, ...rest].map(event => event.id), all.map(event => event.id));
+  assert.deepEqual(((await env.bearer("/delegates/audit?after_id=0")).body.events as Array<{ id: string }>).map(event => event.id),
+    all.map(event => event.id));
   assert.equal((await env.bearer("/delegates/audit?after_id=abc")).status, 400);
 });
 
@@ -1165,10 +1172,33 @@ test("review: a grant revoked or narrowed during the Relaycast lookups is rechec
       [fresh.grant_id]);
   };
   assert.deepEqual((await env.redeem(recipient, attested.body.claims.approval_id, prod)).body, { ok: false, reason: "out_of_scope" });
-  // Not consumed by the refused redeem.
   // Nothing consumed by the refused redeem.
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
     [attested.body.claims.approval_id])).rows.length, 0);
+
+  // The policy as it is at the decision decides too: tier O required, or delegation turned off, meanwhile.
+  const staging = { class: "deploy", target: "web:staging" };
+  const tierD = await env.attest(recipient, send(env, bot, recipient, env.approval([staging])));
+  assert.equal(tierD.body.verdict, "delegate", tierD.raw);
+  during = async () => {
+    await env.database.query(`UPDATE delegation_policies SET require_tier_o = ARRAY['deploy'] WHERE workspace_id = $1`,
+      [env.workspaceId]);
+  };
+  assert.deepEqual((await env.redeem(recipient, tierD.body.claims.approval_id, staging)).body,
+    { ok: false, reason: "tier_o_required" });
+  await env.database.query(`UPDATE delegation_policies SET require_tier_o = '{}' WHERE workspace_id = $1`, [env.workspaceId]);
+  during = async () => {
+    await env.database.query("UPDATE delegation_policies SET delegation_enabled = false WHERE workspace_id = $1", [env.workspaceId]);
+  };
+  assert.deepEqual((await env.redeem(recipient, tierD.body.claims.approval_id, staging)).body,
+    { ok: false, reason: "not_enabled" });
+  during = null;
+  await env.enable();
+  during = async () => {
+    await env.database.query("UPDATE delegation_policies SET delegation_enabled = false WHERE workspace_id = $1", [env.workspaceId]);
+  };
+  const off = await env.attest(recipient, send(env, bot, recipient, env.approval([staging])));
+  assert.equal(off.body.reason, "not_enabled", off.raw);
   env.world.handle = handle;
 });
 
@@ -1265,7 +1295,7 @@ test("the owner revokes one approval; the delegate that sent one withdraws it", 
   await env.enable({ delegation_enabled: false });
   const revoked = await env.bearer(`/delegates/approvals/${firstId}`, "DELETE");
   assert.equal(revoked.status, 200, revoked.raw);
-  assert.deepEqual(revoked.body, { approval_id: firstId, revoked: true });
+  assert.deepEqual(revoked.body, { approval_id: firstId, status: "revoked" });
   await env.enable();
   assert.deepEqual((await env.redeem(recipient, firstId, merge)).body, { ok: false, reason: "revoked" });
   // Another member cannot revoke the owner's approval; an unknown id is 404.
@@ -1291,6 +1321,55 @@ test("the owner revokes one approval; the delegate that sent one withdraws it", 
   const events = (await env.database.query<{ event: string; reason: string | null }>(
     "SELECT event, reason FROM delegation_audit_events WHERE event IN ('approval.revoked', 'approval.withdrawn') ORDER BY id")).rows;
   assert.deepEqual(events, [{ event: "approval.revoked", reason: "owner_revoked" }, { event: "approval.withdrawn", reason: "delegate_withdrew" }]);
+  // With delegation off there is nothing to withdraw: the same 404 as an unknown approval.
+  const third = await env.attest(recipient, send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#103" }])));
+  await env.enable({ delegation_enabled: false });
+  const off = await withdraw({ delegate_agent_id: bot.id, delegate_token: bot.token, approval_id: third.body.claims.approval_id });
+  assert.equal(off.status, 404, off.raw);
+  assert.equal(off.body.code, "not_found");
+});
+
+test("the owner redacts one message's quote; Relaycast is asked, and a failure stays queued", async (t) => {
+  const { env, recipient, bot } = await ready(t, { relaycastInternal: true });
+  const merge = { class: "merge", target: "AgentWorkforce/relay#120" };
+  const messageId = send(env, bot, recipient, env.approval([merge]));
+  assert.equal((await env.attest(recipient, messageId)).status, 200);
+  // Another member has no quote for that message; an unknown message is the same 404.
+  const memberId = await env.addMember("member@acme.test");
+  const member = await env.desktopSignIn({ hostName: "member-box", userId: memberId });
+  const foreign = await env.bearer("/delegates/quotes/redact", "POST", { message_id: messageId }, member.accessToken);
+  assert.equal(foreign.status, 404, foreign.raw);
+  assert.deepEqual(foreign.body, { error: "No quote of yours for that message", code: "not_found" });
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: messageId, extra: 1 })).status, 400);
+  const done = await env.bearer("/delegates/quotes/redact", "POST", { message_id: messageId });
+  assert.equal(done.status, 200, done.raw);
+  assert.deepEqual(done.body, { message_id: messageId, redacted_events: 1, relaycast: "redacted" });
+  assert.deepEqual(env.world.quoteRedactions, [{ workspaceId: "rw_primary", messageId }]);
+  const rows = (await env.database.query<{ event: string; quote: string | null; quote_hash: string | null; quote_redacted_at: Date | null }>(
+    "SELECT event, quote, quote_hash, quote_redacted_at FROM delegation_audit_events WHERE message_id = $1 ORDER BY id", [messageId])).rows;
+  const attested = rows.find(row => row.event === "approval.attested")!;
+  assert.equal(attested.quote, null);
+  assert.match(attested.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
+  assert.ok(attested.quote_redacted_at);
+  assert.ok(rows.some(row => row.event === "quote.redacted"));
+  // Nothing left to redact for that message.
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: messageId })).status, 404);
+  // Relaycast refuses: the redaction stays queued, and the sweep retries it after its back-off.
+  const second = send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#121" }]));
+  assert.equal((await env.attest(recipient, second)).status, 200);
+  const path = `/internal/workspaces/rw_primary/messages/${second}/owner-approval/redact`;
+  env.world.failNext("POST", path, 503);
+  const queued = await env.bearer("/delegates/quotes/redact", "POST", { message_id: second });
+  assert.deepEqual(queued.body, { message_id: second, redacted_events: 1, relaycast: "queued" });
+  await env.database.query("UPDATE delegation_quote_redactions SET last_attempt_at = now() - interval '1 hour'");
+  const { createDelegationRetention } = await import("../src/delegation/retention.js");
+  const { relaycastQuoteRedactor } = await import("../src/delegation/service.js");
+  const sweep = await createDelegationRetention({ database: env.database,
+    relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: env.config.relaycastUrl, internalSecret: RELAYCAST_INTERNAL_SECRET,
+      fetchImpl: env.messagingFetch }),
+    relaycastBinding: async () => ({ relaycastWorkspaceId: "rw_primary" }) }).sweep();
+  assert.equal(sweep.relaycastPending, 0);
+  assert.deepEqual(env.world.quoteRedactions.map(row => row.messageId), [messageId, second]);
 });
 
 test("routes that run before any caller is proven never provision a Relaycast binding", async (t) => {
@@ -1477,7 +1556,7 @@ test("review: a message whose quote was redacted is never stored or signed again
   assert.equal(rows.length, 2);
   for (const row of rows) {
     assert.equal(row.quote, null);
-    assert.match(row.quote_hash!, /^[0-9a-f]{64}$/);
+    assert.match(row.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
     assert.ok(row.quote_redacted_at);
   }
   assert.equal(rows[1]!.quote_hash, rows[0]!.quote_hash);
@@ -1512,8 +1591,11 @@ test("review: audit pages never run past an event that may still be committing",
   const resumed = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}&format=jsonl`));
   assert.equal(resumed.status, 200, resumed.raw);
   assert.equal(resumed.raw, "");
-  // Once it settles, resuming from the last id returns it and the later event, in id order.
-  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+  // Once it settles (and, as Cloud, is past the 30-second paging hold-back),
+  // resuming from the last id returns it and the later event, in id order.
+  await env.database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute' WHERE id <> $1",
+    [inFlight]);
+  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() - interval '1 minute' WHERE id = $1",
     [inFlight]);
   const rest = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}`)).body.events as Array<{ id: string; event: string }>;
   assert.equal(rest[0]!.id, inFlight);

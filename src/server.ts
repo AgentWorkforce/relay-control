@@ -46,6 +46,7 @@ import {
   emitStopping,
 } from "./analytics/lifecycle.js";
 import { createDelegationRetention } from "./delegation/retention.js";
+import { relaycastQuoteRedactor } from "./delegation/service.js";
 
 const config = loadConfig();
 // An unknown SELFHOST_FEATURES name stops startup.
@@ -206,7 +207,12 @@ emitConfigLoaded(analytics, {
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
 // Owner delegates: quote retention and grant expiry, independent of traffic.
-const delegationRetention = createDelegationRetention({ database: store.database });
+const delegationRetention = createDelegationRetention({
+  database: store.database,
+  relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: config.relaycastUrl,
+    internalSecret: identityConfig.relaycastInternalSecret }),
+  relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
+});
 const app = createApp({
   config,
   store,

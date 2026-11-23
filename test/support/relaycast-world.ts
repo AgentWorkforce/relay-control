@@ -30,6 +30,9 @@ type Subscription = {
 
 export type RelaycastWorld = ReturnType<typeof createRelaycastWorld>;
 
+/** The RELAYCAST_INTERNAL_SECRET the world's internal routes accept. */
+export const RELAYCAST_INTERNAL_SECRET = "relaycast-internal-secret-for-tests-0000000000";
+
 export function createRelaycastWorld(roster: unknown[]) {
   let sequence = 1000;
   const next = () => String(++sequence);
@@ -111,6 +114,9 @@ export function createRelaycastWorld(roster: unknown[]) {
     return { conversation_id: conversation.id, message: { id: created.id, agent_name: sender.name, text, created_at: created.created_at } };
   }
 
+  /** Quote redactions Relaycast confirmed through its internal route. */
+  const quoteRedactions: Array<{ workspaceId: string; messageId: string }> = [];
+
   async function handle(method: string, path: string, query: URLSearchParams, bearer: string, body: Record<string, any> | null,
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
     bodies.push({ method, path, body, query: query.toString() });
@@ -126,6 +132,13 @@ export function createRelaycastWorld(roster: unknown[]) {
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
     const ok = (data: unknown, status = 200) => ({ status, body: { ok: true, data } });
     const fail = (status: number, code: string) => ({ status, body: { ok: false, error: { code } } });
+    const internal = /^\/internal\/workspaces\/([^/]+)\/messages\/([^/]+)\/owner-approval\/redact$/.exec(path);
+    if (internal && method === "POST") {
+      // relaycast#710: Cloud's internal credential only.
+      if (bearer !== RELAYCAST_INTERNAL_SECRET) return fail(401, "unauthorized");
+      quoteRedactions.push({ workspaceId: decodeURIComponent(internal[1]!), messageId: decodeURIComponent(internal[2]!) });
+      return ok({ redacted: true });
+    }
     const workspace = bearer.startsWith("rk_");
     const caller = workspace ? null : byToken(bearer);
     if (!workspace && !caller) return fail(401, "unauthorized");
@@ -399,7 +412,7 @@ export function createRelaycastWorld(roster: unknown[]) {
   }
 
   return {
-    agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
+    quoteRedactions, agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
     nodes, everyStateNodesFailures, nodesHistory, invocations, spawnOutcome, releaseOutcome, leaderPatterns, deliveryWorkspace,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {

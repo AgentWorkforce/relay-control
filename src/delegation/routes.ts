@@ -47,7 +47,10 @@ import {
   QUOTE_RETENTION_DAYS,
   QUOTE_RETENTION_MAX_DAYS,
   recordDelegationAudit,
+  flushRelaycastRedactions,
   redactExpiredQuotes,
+  redactMessageQuotes,
+  type RelaycastQuoteRedactor,
   redeemApproval,
   resolveBinding,
   revokeAllGrants,
@@ -100,6 +103,8 @@ export type DelegationRoutesInput = {
   json: JsonWriter;
   /** A workspace's Relaycast binding, without a person (claims/complete, withdraw). */
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
+  /** Redacts a quote in Relaycast's stored owner_approval; null: redactions stay queued. */
+  relaycastRedact?: RelaycastQuoteRedactor;
   rateLimit: (response: ServerResponse, key: string, rule: { limit: number; windowMs: number }) => void;
   clientKey: (request: IncomingMessage) => string;
   now?: () => Date;
@@ -215,6 +220,7 @@ const withdrawBody = z.object({
   approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
 }).strict();
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
+const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
 const promptDelegatesBody = z.object({
   session_agent_id: z.string().min(1).max(200),
   session_token: z.string().min(12).max(512),
@@ -686,7 +692,20 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
             reason: approval!.owner_user_id === principal.userId ? "owner_revoked" : "admin_revoked" });
         }
       });
-      json(200, { approval_id: approvalId, revoked: true });
+      json(200, { approval_id: approvalId, status: "revoked" });
+      return true;
+    }
+
+    if (sub === "quotes/redact") {
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      const body = parse(redactBody, await readJson(request), "Invalid request");
+      const redacted = await redactMessageQuotes(input.database, { workspaceId: workspace.id, messageId: body.message_id,
+        actorUserId: principal.userId, authMethod: caller.authMethod, asAdmin: caller.admin });
+      if (!redacted) fail("not_found", "No quote of yours for that message", 404);
+      const relaycast = await flushRelaycastRedactions(input.database, { redact: input.relaycastRedact ?? null,
+        relaycastBinding: input.relaycastBinding }).catch(() => ({ redacted: 0, pending: 1 }));
+      json(200, { message_id: body.message_id, redacted_events: redacted,
+        relaycast: relaycast.pending === 0 ? "redacted" : "queued" });
       return true;
     }
 
@@ -733,7 +752,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       // Events are returned in id order and a page never runs past an event
       // that could still be committing (listAuditPage's watermark), so
       // resuming after the last id never skips an event committed out of
-      // id order.
+      // id order. As Cloud, a paged read also leaves out the last 30 seconds.
       const after = params.get("after_id");
       if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
@@ -908,6 +927,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       "SELECT id FROM workspaces WHERE id::text = $1", [workspaceId],
     )).rows[0];
     if (!workspace) return fail("not_found", "Approval not found", 404);
+    // As Cloud: with delegation off there is nothing to withdraw.
+    if (!(await loadPolicy(input.database, workspace.id)).delegation_enabled) return fail("not_found", "Approval not found", 404);
     const binding = await input.relaycastBinding(workspace.id);
     if (input.gateOnly || !binding) return UNAVAILABLE();
     let agent;
@@ -920,11 +941,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     if (!agent || agent.id !== delegateAgentId) return fail("invalid_agent", "The agent token does not prove this agent id", 403);
     const local = await input.relaycast.getRosterAgent(binding.relaycastApiKey, agent.name).catch(() => null);
     if (!local || local.id !== agent.id) return fail("invalid_agent", "The agent is not part of this workspace's relay", 403);
-    // Only an approval this delegate sent: one attested from it.
+    // Only an approval this delegate sent, as Cloud's approvalSentBy: one minted
+    // under its grant (tier D), or one attested from it.
     const sent = (await input.database.query<{ owner_user_id: string }>(
       `SELECT a.owner_user_id FROM delegation_approvals a
         WHERE a.id = $1 AND a.workspace_id = $2
-          AND EXISTS (SELECT 1 FROM delegation_attestations t WHERE t.approval_id = a.id AND t.delegate_agent_id = $3)`,
+          AND (EXISTS (SELECT 1 FROM delegation_grants g WHERE g.id = a.grant_id AND g.delegate_agent_id = $3)
+            OR EXISTS (SELECT 1 FROM delegation_attestations t WHERE t.approval_id = a.id AND t.delegate_agent_id = $3))`,
       [approvalId, workspace.id, agent.id],
     )).rows[0];
     if (!sent) return fail("not_found", "Approval not found", 404);

@@ -29,6 +29,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "delegation_grants",
   "delegation_org_policies",
   "delegation_policies",
+  "delegation_quote_redactions",
   "delegation_target_owners",
   "desktop_attestation_keys",
   "desktop_consent_tokens",

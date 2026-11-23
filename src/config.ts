@@ -716,6 +716,15 @@ export function loadDelegationQuoteKey(env: Env): string | null {
   return key;
 }
 
+/**
+ * The secret quote digests are derived from (HKDF per workspace, as Cloud):
+ * SELFHOST_DELEGATION_QUOTE_KEY when set, else the active credential
+ * encryption key. Rotating it changes the digests of new quotes only.
+ */
+export function delegationQuoteSecret(config: Pick<SelfhostConfig, "delegationQuoteKey" | "encryptionKeyring">): Buffer {
+  return config.delegationQuoteKey ? Buffer.from(config.delegationQuoteKey, "utf8") : config.encryptionKeyring.active.key;
+}
+
 const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;
 
 export function loadDelegationSigning(env: Env): DelegationSigningConfig | null {

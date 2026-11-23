@@ -53,6 +53,8 @@ test("audit pages never skip an event committed out of id order", options, async
     assert.deepEqual(ids(await page(settled.at(-1)!)), []);
     assert.deepEqual(ids(await page(null)), settled);
     await slow.query("COMMIT");
+    // Past Cloud's 30-second paging hold-back.
+    await database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute'");
     // Resuming from the last id returns both, in id order: nothing was skipped.
     assert.deepEqual(ids(await page(settled.at(-1)!)), [pending, fast]);
   } finally {
