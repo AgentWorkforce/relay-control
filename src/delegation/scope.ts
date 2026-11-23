@@ -44,7 +44,7 @@ export const CLAIM_TTL_MS = 10 * 60 * 1000;
 export const REASON_CODES = [
   "not_enabled", "not_delegate", "no_approval", "out_of_scope", "expired", "revoked",
   "recipient_policy", "tier_o_required", "consumed", "not_pending", "unavailable",
-  "condition_unmet", "condition_unavailable",
+  "condition_unmet", "condition_unavailable", "predates_grant",
   // Release-gate redeem (§11a.3).
   "gate_unknown", "oidc_invalid", "gate_mismatch", "target_prefix", "sha_mismatch", "repository_mismatch",
 ] as const;

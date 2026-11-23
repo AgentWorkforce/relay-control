@@ -10269,7 +10269,7 @@ components:
     DelegationReason:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
-        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, gate_unknown, oidc_invalid,
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant, gate_unknown, oidc_invalid,
         gate_mismatch, target_prefix, sha_mismatch, repository_mismatch]
     DelegationCondition:
       oneOf:

@@ -297,11 +297,15 @@ export type AuditInput = {
  * §8: a quote's digest is an HMAC-SHA256 under a per-workspace key derived
  * (HKDF-SHA256) from the server-held quote secret, never a plain hash, so a
  * reader of the log cannot test guessed quotes against it. Same derivation and
- * `hmac-sha256:` form as Cloud.
+ * `hmac-sha256:v1:<64 hex>` form as Cloud. The version names the key
+ * derivation: rotating the secret needs a new version (keep v1's secret to
+ * check older digests), or every stored digest stops matching.
  */
+export const QUOTE_DIGEST_VERSION = "v1";
+
 export function quoteDigest(quoteKey: Buffer, workspaceId: string, quote: string): string {
   const workspaceKey = Buffer.from(hkdfSync("sha256", quoteKey, "relay-delegation-quote-digest-v1", `workspace:${workspaceId}`, 32));
-  return `hmac-sha256:${createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex")}`;
+  return `hmac-sha256:${QUOTE_DIGEST_VERSION}:${createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex")}`;
 }
 
 /**
@@ -484,7 +488,8 @@ export async function listAuditPage(executor: SqlExecutor, input: {
     // reveals nothing about events outside the viewer's view (as Cloud).
     const row = (await executor.query<{ xact_id: string }>(
       `SELECT xact_id::text FROM delegation_audit_events
-        WHERE workspace_id = $1 AND id = $2::bigint AND ($3::boolean OR owner_user_id = $4 OR actor_user_id = $4)`,
+        WHERE workspace_id = $1 AND id = $2::bigint
+          AND ($3::boolean OR owner_user_id = $4 OR (actor_user_id = $4 AND owner_user_id IS NULL))`,
       [input.workspaceId, input.afterId, input.all, input.viewerUserId],
     )).rows[0];
     if (!row) throw new AuditCursorError();
@@ -495,7 +500,12 @@ export async function listAuditPage(executor: SqlExecutor, input: {
     `SELECT *, xact_id::text AS xact_text, pg_snapshot_xmin(pg_current_snapshot())::text AS fence
        FROM delegation_audit_events
       WHERE workspace_id = $1
-        AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
+        -- As Cloud: an owner sees events about their own grants and approvals,
+        -- and events they caused that are filed under no owner (a policy
+        -- change, a refusal before any grant from the claimed owner exists).
+        -- As a recipient's owner they do not see another owner's attestations,
+        -- refusals or redeems.
+        AND ($2::boolean OR owner_user_id = $3 OR (actor_user_id = $3 AND owner_user_id IS NULL))
         AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
         AND ($5::text IS NULL OR grant_id = $5)
         AND ($7::bigint IS NULL OR (xact_id, id) > ($7::bigint, $8::bigint))
@@ -509,7 +519,10 @@ export async function listAuditPage(executor: SqlExecutor, input: {
   const listed = paged ? final : rows;
   const lastFinal = final.at(-1);
   return {
-    events: listed.map(({ fence: _fence, xact_text: _text, xact_id: _xact, ...row }) => row),
+    // A quote belongs to its owner: on a row filed under no owner a non-admin
+    // viewer gets neither quote nor digest (as Cloud).
+    events: listed.map(({ fence: _fence, xact_text: _text, xact_id: _xact, ...row }) =>
+      input.all || row.owner_user_id === input.viewerUserId ? row : { ...row, quote: null, quote_hash: null }),
     nextAfterId: lastFinal ? String(lastFinal.id) : paged ? input.afterId : null,
     complete: rows.length < input.limit && final.length === rows.length,
     heldBack: paged ? rows.length - final.length : 0,
@@ -565,8 +578,12 @@ export type RelaycastQuoteRedactor = ((relaycastWorkspaceId: string, messageId: 
  * cap. `redacted` and `absent` finish a request; `rejected` parks it for an
  * operator (clear `relaycast_outcome` to retry it), still counted unfinished.
  */
+/** One flush stops starting new Relaycast calls after this long (as Cloud). */
+export const FLUSH_BUDGET_MS = 20_000;
+
 export async function flushRelaycastRedactions(database: Database, deps: {
   redact: RelaycastQuoteRedactor;
+  budgetMs?: number;
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string } | null>;
 }): Promise<{ redacted: number; absent: number; rejected: number; pending: number }> {
   const unfinished = async () => Number((await database.query<{ count: number }>(
@@ -582,7 +599,11 @@ export async function flushRelaycastRedactions(database: Database, deps: {
              make_interval(mins => least(power(2, least(attempts, 9))::int, 360)))
       ORDER BY requested_at LIMIT 100`,
   )).rows;
+  const startedAt = Date.now();
   for (const row of due) {
+    // One flush stops starting calls after FLUSH_BUDGET_MS; rows not reached
+    // stay due and the next sweep starts with them (as Cloud).
+    if (Date.now() - startedAt > (deps.budgetMs ?? FLUSH_BUDGET_MS)) break;
     const binding = await deps.relaycastBinding(row.workspace_id).catch(() => null);
     // A workspace whose Relaycast side cannot be resolved right now is retried.
     const answer = binding ? await deps.redact(binding.relaycastWorkspaceId, row.message_id)
@@ -831,6 +852,9 @@ async function standingFor(executor: SqlExecutor, workspaceId: string, input: Om
   return resolveStanding({ ...input, targetOwners: needsTable ? await loadTargetOwners(executor, workspaceId) : [] });
 }
 
+/** Clock skew tolerated between Relaycast's message times and Control's grant timestamps (as Cloud). */
+export const SEND_TIME_SKEW_MS = 2_000;
+
 /** A repeated identical refusal within this window is logged but not written again (as Cloud). */
 export const REFUSAL_DEDUP_MS = 10 * 60 * 1000;
 
@@ -1053,7 +1077,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
 }): Promise<DelegationVerdict> {
   const { workspace } = input;
   const now = deps.now();
-  const context: { ownerUserId?: string; grantId?: string; approvalId?: string; senderId?: string; proven?: boolean } = {};
+  const context: { ownerUserId?: string; claimedOwnerId?: string; grantId?: string; approvalId?: string; senderId?: string;
+    proven?: boolean } = {};
   try {
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
@@ -1079,12 +1104,15 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     if (!parsed.success) refuse("no_approval");
     const approval = parsed.data!;
     if (!UUID.test(approval.owner_id)) refuse("not_delegate");
-    context.ownerUserId = approval.owner_id;
+    // Filed under the claimed owner only once a grant from them exists, as
+    // Cloud: a sender cannot put refusals into someone else's view by naming them.
+    context.claimedOwnerId = approval.owner_id;
 
     const found = liveGrant(await grantsFor(deps.database, workspace.id, approval.owner_id, senderId!), now);
     if (typeof found === "string") return refuse(found);
     const grant = found;
     context.grantId = grant.id;
+    context.ownerUserId = approval.owner_id;
     const unbound = await delegateStillBound(deps, workspace, grant, true);
     if (unbound) refuse(unbound);
 
@@ -1123,7 +1151,9 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       // closed.
       const sentDate = messageSentAt(input.messageId, delivered!.created_at, now);
       if (!sentDate) return refuse("unavailable");
-      if (sentDate.getTime() < time(grant.created_at)) refuse("revoked");
+      // Relaycast's and Control's clocks differ slightly: a message sent within
+      // SEND_TIME_SKEW_MS after the grant's creation is not refused for skew.
+      if (sentDate.getTime() < time(grant.created_at) - SEND_TIME_SKEW_MS) refuse("predates_grant");
       const sentAt = sentDate.getTime();
       // Cloud's approvalExpiry: the sender's expires_at, default 1 hour after
       // the send, at most 24 hours after it, never past the grant. The first
@@ -1255,6 +1285,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
       messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason,
+      data: context.claimedOwnerId && !context.ownerUserId ? { claimed_owner_id: context.claimedOwnerId } : {},
     }).catch((auditError: unknown) => logAuditWriteFailed("attest", auditError, { workspaceId: workspace.id,
       approvalId: context.approvalId ?? null, grantId: context.grantId ?? null, event: "approval.refused", reason }));
     logRefused("attest", { workspaceId: workspace.id, reason });
