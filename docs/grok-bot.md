@@ -132,8 +132,12 @@ migration `0088_grok_routines_cloud_copy.sql` first.
 - Events are kept for seven days, then deleted on the next scan whatever
   the flag says. They are also deleted with their routine: on disconnect, on
   revocation, or when the grant is no longer valid. Reads never return older
-  events. `cursor` is the grant's own sequence.
-- A webhook routine gets one wake per message, with Cloud's body
+  events. `cursor` is the routine's own sequence and is never reused.
+- A webhook routine gets one wake per direct message and per channel post
+  that mentions the bot; other channel posts are stored but do not wake it
+  (read them with `get_recent_events`). `data.addressed` is `"mention"` or
+  `"post"`, Cloud's field (`"bot-thread"` comes with channel-event tracking).
+  The wake has Cloud's body
   (`{eventId, name:"relay.message"|"relay.channel_message", timestamp, cursor, data}`).
   `data.summary` is the first 200 characters of the message. The headers are
   `Authorization`, `webhook-id` = `eventId` and `X-MCP-Subscription-Id` =
@@ -144,13 +148,15 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   `Reply setting: replyMode …`, followed by the steps. A sender is trusted only
   when its agent ID belongs to one of this person's own rows in this
   workspace: a hosted participant, a Desktop identity, or a bound Amp or Capy
-  binding. Agent metadata is never used for trust. The setup page's **How to
+  binding. Agent metadata is never used for trust, and trust is decided when
+  `get_event` runs, so a retired binding or removed participant stops counting. The setup page's **How to
   reply** sets the reply mode. `notes-only` (the default) never replies.
   `acknowledge` and `answer` reply automatically only to trusted senders and
   ask the person about anyone else.
 - The setup page also accepts one paste of the routine's URL and header. A
   routine URL can be saved under only one connection on this server; a
-  concurrent second save gets the same refusal. Do not also register it in
+  concurrent second save gets the same refusal. This rule applies with the
+  flag off as well: every save stores the URL's hash. Do not also register it in
   Agent Relay Cloud or another deployment, or it wakes twice.
 
 With `SELFHOST_GROK_DYNAMIC_PROMPT` also on, the routine prompt is a short

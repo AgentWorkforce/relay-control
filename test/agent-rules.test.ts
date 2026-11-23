@@ -10,6 +10,8 @@ import { AgentRules, grokBootstrapPrompt } from "../src/agent-rules/service.js";
 import { grokRoutinePrompt } from "../src/mcp/grok-routine.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
 import { grokFixture } from "./support/grok-fixture.js";
+import { loadConfig } from "../src/config.js";
+import { GrokRoutines, grokRoutinesOptions } from "../src/mcp/grok-routines.js";
 
 // docs/agent-rules.md; docs/specs/grok-bot-dynamic-prompt.md Phase 2.
 const directory = agentRulesDirectory();
@@ -128,4 +130,18 @@ test("HTTP: members read composed rules with ETag and markdown; only admins writ
   assert.equal(otherOverlay.rows.length, 0);
   assert.equal((await fetch(`${f.base}/api/v1/organizations/${other}/agent-rules/grok-bot`, { headers: headers(owner) })).status, 404);
   assert.equal((await (await put(owner, "")).json() as any).cleared, true);
+});
+
+test("the server's wiring reads SELFHOST_GROK_DYNAMIC_PROMPT from config, so the shipped server pastes the bootstrap", () => {
+  const env = { DATABASE_URL: "postgres://unused", SELFHOST_BOOTSTRAP_TOKEN: "fake-bootstrap-token-at-least-32-bytes",
+    SELFHOST_PUBLIC_URL: "https://relay.example.test", RELAYCAST_URL: "http://relaycast.test",
+    RELAYCAST_PUBLIC_URL: "https://relaycast.selfhosted.company", SESSION_READ_API_URL: "http://history.test",
+    SESSION_READ_API_SECRET: "fake-read-api-secret-at-least-32-bytes", RELAYCONTROL_INTROSPECT_SECRET: "fake-introspect-secret-at-least-32-bytes",
+    SESSION_READ_API_PUBLIC_URL: "https://history.selfhosted.company", SELFHOST_ENCRYPTION_KEY_ID: "fake-key",
+    SELFHOST_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"), SELFHOST_GROK_ROUTINES_CLOUD_COPY: "on" };
+  const deps = { database: undefined as never, tenancyMode: "single" as const, client: undefined as never };
+  const bundle = loadAgentRules();
+  assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig(env), deps)).pastePrompt("fake-grok"), grokRoutinePrompt("fake-grok", { canReply: true }));
+  assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig({ ...env, SELFHOST_GROK_DYNAMIC_PROMPT: "on" }), deps)).pastePrompt("fake-grok"),
+    grokBootstrapPrompt("fake-grok", bundle.bootstrapVersion));
 });

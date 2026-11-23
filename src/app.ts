@@ -693,9 +693,9 @@ export function createApp(input: {
   }) : null;
   // Loaded once: a malformed or unpinned bundle fails start-up.
   const agentRules = input.agentRules ?? new AgentRules({ database: store.database, now: input.now });
-  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({ ...grokRoutinesOptions(config,{
+  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines(grokRoutinesOptions(config,{
       database:store.database,tenancyMode:store.tenancy,client:oauthRelay,fetchImpl:input.messagingFetch,now:input.now,
-    }), ...(config.mcpOAuth?.grokDynamicPrompt ? { dynamicPrompt:{ bootstrapVersion:agentRules.bundle.bootstrapVersion } } : {}) }) : undefined;
+    })) : undefined;
   // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
   const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({
     config:config.cursorCloud,publicOrigin:config.publicBaseUrl,keyring:config.encryptionKeyring,database:store.database,
