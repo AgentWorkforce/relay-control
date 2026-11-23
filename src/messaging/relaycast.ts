@@ -91,6 +91,9 @@ export type Conversation = {
 
 
 /** A live fleet node as Relaycast's GET /v1/nodes reports it (see src/mcp/relay-spawn.ts). */
+/** One page of GET /v1/nodes: listSpawnTargets reads a single page of at most this many nodes. */
+export const RELAY_NODE_PAGE_LIMIT = 100;
+
 export type RelaySpawnTarget = {
   id: string;
   name: string;
@@ -856,8 +859,8 @@ export function createRelaycastClient(input: {
      * workspace or another installation is never listed.
      */
     async listSpawnTargets(workspaceKey: string, options: { includeOffline?: boolean } = {}): Promise<RelaySpawnTarget[]> {
-      const data = await labeled("list_spawn_targets", () =>
-        call("GET", options.includeOffline ? "/v1/nodes?limit=100" : "/v1/nodes?status=online&limit=100", workspaceKey));
+      const data = await labeled("list_spawn_targets", () => call("GET", options.includeOffline
+        ? `/v1/nodes?limit=${RELAY_NODE_PAGE_LIMIT}` : `/v1/nodes?status=online&limit=${RELAY_NODE_PAGE_LIMIT}`, workspaceKey));
       if (!Array.isArray(data)) throw new RelaycastCallError(502, "", true);
       return data.flatMap((value): RelaySpawnTarget[] => {
         const node = record(value);

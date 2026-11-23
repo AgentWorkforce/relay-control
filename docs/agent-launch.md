@@ -88,29 +88,40 @@ with no control, format or line/paragraph separator characters (Unicode `Cc`,
 Relaycast keeps node names unique per workspace, and its spawn selector trims
 the requested name and matches it exactly, case-sensitively, against stored
 names of nodes in every state. This server always sends the stored name of the
-node it resolved, so each node id reaches exactly one machine.
+node it resolved, so each node id seen in the page read reaches exactly one
+machine.
 
 - **Id first.** A value equal to a live node's id selects it; that launch never
   reads offline nodes. On a miss, nodes of every state are read: an offline
   node's id keeps its offline (or not-allowed) refusal and is never reread as
-  another node's name. If that read fails there is no offline information
-  (logged as the counter-only `spawn_every_state_roster_failed`): a single
-  name match is then refused as retryable, since it might be an offline node's
-  id, and a value matching nothing is refused as retryable, still listing the
-  live ids and names.
+  another node's name. If that read fails (logged as the counter-only
+  `spawn_every_state_roster_failed`), or returns a full page of 100 nodes so
+  more may exist, it is treated as incomplete: a live name match is then
+  refused as retryable, since it might be an unseen node's id, and a value
+  matching nothing is refused as retryable, still listing the live ids and
+  names.
 - **Name fallback.** Otherwise the value is compared with node names of every
   state (Relaycast's selector matches stored names of every state) after
   trimming, NFC normalization, curly apostrophes (U+2018, U+2019, U+02BC) as a
   straight `'`, and lowercasing. It resolves only when exactly one node carries
-  that key and the node is live. Admission (permission, harness, capacity,
+  that key and the node is live (see the tiebreak below). Admission (permission, harness, capacity,
   memory) then runs on that node as it would for its id, and the receipt and
   journal record its id. A lone offline match keeps its offline (or
   not-allowed) refusal, so an offline node's own name never launches on a live
-  look-alike.
-- **Ambiguous names.** Several nodes of any state on that key (for example a
-  live `Studio` and an offline `studio`) are refused with
-  `spawn_target_unavailable`, `retryable: false`, listing their `id (name)`
-  pairs; pass one of those ids. Case or apostrophe variants are distinct
+  look-alike; a lone offline match whose stored name is padded gets the
+  padded-name refusal below instead.
+- **Exact-name tiebreak.** When several nodes of any state share the key, the
+  one whose stored name equals the trimmed value exactly (case-sensitive, byte
+  for byte) is used if it is live: that is the node Relaycast's exact selector
+  reaches. With a live `Studio` and an offline `studio`, `Studio` launches on
+  the live node, while `studio` and `STUDIO` stay refused. The trade-off: a
+  caller who types one variant's exact spelling gets that machine without
+  being told a look-alike exists, in exchange for not refusing a value that
+  names exactly one node to Relaycast. An exact match that is offline is never
+  swapped for a live variant.
+- **Ambiguous names.** Otherwise several nodes of any state on that key are
+  refused with `spawn_target_unavailable`, `retryable: false`, listing their
+  `id (name)` pairs; pass one of those ids. Case or apostrophe variants are distinct
   machines to Relaycast, so a launch by either id is fine and live ones remain
   alternatives.
 - **Padded names.** A node whose stored name has surrounding whitespace
@@ -130,8 +141,9 @@ node it resolved, so each node id reaches exactly one machine.
 - **Idempotency.** An `idempotency_key` covers the trimmed `target_node` as
   given, so reusing a key after switching from a node's name to its id (or to
   another spelling of its name) is refused as a different launch.
-- **Limits.** Each roster read is one page of at most 100 nodes; an id or name
-  beyond that page is not seen.
+- **Limits.** Each roster read is one page of at most 100 nodes. Matching is
+  only as complete as the page read: an id or name beyond that page is not
+  seen, which is why a full every-state page is treated as incomplete.
 
 Native clients must retain `Mcp-Session-Id`: their launches belong to that
 session. OAuth launches belong to the exact grant and remain accessible after

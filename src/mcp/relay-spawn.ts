@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { SqlExecutor } from "../database.js";
 import {
-  RELAY_HARNESS_ID_PATTERN, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
+  RELAY_HARNESS_ID_PATTERN, RELAY_NODE_PAGE_LIMIT, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
 } from "../messaging/relaycast.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import type { McpContext } from "./context.js";
@@ -61,8 +61,9 @@ export const spawnInput = z.object({
     .refine(value => !INVISIBLE.test(value), "target_node must not contain control, format or line separator characters.")
     .describe("Required: the target_node id of an allowed live launch target in the current workspace fleet (from list_relay_spawn_targets). " +
       "A value matching no node id is accepted as the name of exactly one live target, compared case-insensitively with curly and " +
-      "straight apostrophes treated alike; leading and trailing spaces are trimmed. A name matching several live nodes, or a value " +
-      "matching nothing, is refused and lists the valid ids and names. An idempotency key covers the exact target_node given, so " +
+      "straight apostrophes treated alike; leading and trailing spaces are trimmed. When several nodes share that name, the one whose " +
+      "stored name matches exactly (case-sensitive) is used if it is live; otherwise the name, like a value matching nothing, is " +
+      "refused and lists the valid ids and names. An idempotency key covers the exact target_node given, so " +
       "switching between a node's name and its id is a different launch."),
   task: z.string().min(1).max(8192).refine(value => value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 8192 && !value.includes("\0"),
     "Task must be nonempty and at most 8192 UTF-8 bytes."),
@@ -414,14 +415,16 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const online = await deps.client.listSpawnTargets(deps.workspaceKey);
         // Ids first. Only an id miss on the live page reads nodes of every state, so offline nodes never displace
         // live ones and a launch by a live id never depends on that read; if it fails there is no offline
-        // information. Each read is one page of at most 100 nodes; anything beyond it is not seen.
+        // information. Each read is one page of at most RELAY_NODE_PAGE_LIMIT nodes; anything beyond it is not seen,
+        // so a full every-state page is treated like a failed read: it cannot rule out an id or name past the page.
         const byId = online.find(item => item.id === input.target_node);
         const everyState = byId ? null : await deps.client.listSpawnTargets(deps.workspaceKey, { includeOffline: true }).catch(() => {
           // Counts only, no names or ids: how often launches run without offline information.
           console.warn("[selfhost-mcp] spawn_every_state_roster_failed");
           return null;
         });
-        const offlineUnread = !byId && everyState === null;
+        const offlineUnread = !byId && (everyState === null || everyState.length >= RELAY_NODE_PAGE_LIMIT);
+        const unreadReason = everyState === null ? "offline nodes could not be read" : "not every node could be read (the node list filled its one-page limit)";
         const idHolder = everyState?.find(item => item.id === input.target_node);
         // Names, on an id miss only: an id held by a node in any state seen is never reread as a name. Relaycast's
         // selector matches stored names of every state, so names are compared over every state: the value resolves
@@ -432,11 +435,19 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const nameKey = nodeNameKey(input.target_node);
         const roster = everyState ? [...online, ...everyState.filter(node => !online.some(live => live.id === node.id))] : listable(online);
         const named = byId || idHolder ? [] : roster.filter(item => item.name !== "self" && nodeNameKey(item.name) === nameKey);
-        const unconfirmed = offlineUnread && named.length === 1;
-        const lone = named.length === 1 ? named[0] : undefined;
+        // Tiebreak: when several nodes share the key, the one whose stored name equals the trimmed input exactly
+        // (case-sensitive, byte for byte) is the node Relaycast's exact selector reaches, so it is used when live.
+        // Otherwise the ambiguity refusal stands: an exact match that is offline is never swapped for a live variant.
+        const exact = named.length > 1 ? named.filter(item => item.name === input.target_node) : [];
+        const tiebreak = exact.length === 1 && online.some(item => item.id === exact[0]!.id && item.live) ? exact[0] : undefined;
+        const lone = named.length === 1 ? named[0] : tiebreak;
         const liveLone = lone ? online.find(item => item.id === lone.id && item.live) : undefined;
+        const ambiguous = named.length > 1 && !tiebreak;
+        // Without a complete every-state read, a live name match cannot rule out an unseen node holding it as an id.
+        const unconfirmed = offlineUnread && liveLone !== undefined;
         const target = byId ?? liveLone;
         const offline = idHolder ?? (lone && !liveLone ? lone : undefined);
+        const offlineByName = !idHolder && offline ? offline : undefined;
         const owners = await deps.owners([...online.filter(eligible), ...(target ? [target] : []), ...(offline ? [offline] : [])]
           .map(item => item.id));
         const options = await placementOptions(input.cli);
@@ -470,7 +481,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           });
         };
         const requested = displayName(input.target_node);
-        if (named.length > 1) {
+        if (ambiguous) {
           // Several nodes share the normalized key (for example case variants), live or offline. Relaycast keeps stored names
           // unique and selects by the exact trimmed name, so each of their ids reaches exactly one machine.
           throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: false, valid_targets: validTargets(online),
@@ -479,7 +490,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         }
         if (unconfirmed) {
           throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: true,
-            message: `target_node "${requested}" matches a live node's name, but offline nodes could not be read to confirm ` +
+            message: `target_node "${requested}" matches a live node's name, but ${unreadReason} to confirm ` +
               "that no node has it as an id. Try again, or pass the node's id." });
         }
         // Permission first, even for an offline node: a node you may not use is never retryable.
@@ -490,16 +501,18 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           const valid = listTargets(listable(online));
           throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: offlineUnread,
             valid_targets: validTargets(online), message: offlineUnread
-              ? `target_node "${requested}" matches no live node id or name, and offline nodes could not be read to check whether ` +
+              ? `target_node "${requested}" matches no live node id or name, and ${unreadReason} to check whether ` +
                 `it is an offline node's id. Try again, or pass one of these live ids and names: ${valid}`
               : `target_node "${requested}" matches no live node id or name; valid ids and names: ${valid}` });
         }
         const placed = ranking.targets.find(item => item.target_node === known.id) ?? rankTargets([known], owners, userId, options).targets[0]!;
         if (!placed.allowed) throw refuse("spawn_target_not_allowed", known, placed);
         // The launch goes out by name and Relaycast trims it, so a padded name cannot select its own node.
-        if (target && padded(target)) {
-          throw refuse("spawn_target_unavailable", target, placed, undefined, { retryable: false,
-            message: `Node "${displayName(target.name)}" (${target.id}) has whitespace around its name. Relaycast trims the name a ` +
+        // A lone offline name match with a padded name gets this refusal too: renaming, not waiting, is what helps.
+        const paddedNode = [target, offlineByName].find(item => item && padded(item));
+        if (paddedNode) {
+          throw refuse("spawn_target_unavailable", paddedNode, placed, undefined, { retryable: false,
+            message: `Node "${displayName(paddedNode.name)}" (${paddedNode.id}) has whitespace around its name. Relaycast trims the name a ` +
               "launch selects by, so this node cannot be chosen and a launch could start on a node named without it. " +
               "The owner must rename it without surrounding whitespace." });
         }

@@ -588,7 +588,8 @@ test("target_node: ambiguity and no-match lists are capped at 20 and say how man
     [..."labnode"].map((char, bit) => (index >> bit) & 1 ? char.toUpperCase() : char).join(""));
   env.world.nodes.set(FIRST_KEY, variants.map((name, index) => node(`lab-${index}`, name)));
   const client = await env.connect();
-  const ambiguous = await refusalOf(client, launch("LabNode"));
+  // All upper case is not among the 22 stored variants, so no exact name breaks the tie.
+  const ambiguous = await refusalOf(client, launch("LABNODE"));
   assert.match(ambiguous.message, /the names of 22 nodes/);
   assert.match(ambiguous.message, /\(and 2 more; call list_relay_spawn_targets\)$/);
   assert.equal(ambiguous.valid_targets.length, 20);
@@ -724,8 +725,8 @@ test("target_node: names match over every state; an offline node's own name neve
   ]);
   for (const id of ["studio-a", "studio-b", "alt", "asleep"]) await env.claim(id);
   const client = await env.connect();
-  // A live and an offline node share the key: ambiguous, never the live one.
-  for (const [value, key] of [["studio", "target-key-1"], ["Studio", "target-key-2"]] as const) {
+  // A live and an offline node share the key: the offline node's exact name, or no exact name, stays ambiguous.
+  for (const [value, key] of [["studio", "target-key-1"], ["STUDIO", "target-key-2"]] as const) {
     const ambiguous = await refusalOf(client, launch(value, { idempotency_key: key }));
     assert.equal(ambiguous.code, "spawn_target_unavailable", value);
     assert.equal(ambiguous.retryable, false, value);
@@ -738,7 +739,64 @@ test("target_node: names match over every state; an offline node's own name neve
   assert.equal(offline.code, "spawn_target_offline");
   assert.equal(offline.node, "lab");
   assert.equal(sentTargets(env).length, 0);
-  // Either id still launches on exactly its node.
-  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("studio-a", { idempotency_key: "target-key-4" }) })).target_node, "studio-a");
-  assert.deepEqual(sentTargets(env), ["Studio"]);
+  // The live node's exact stored name, and its id, launch on exactly that node.
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("Studio", { name: "by-exact", idempotency_key: "target-key-4" }) })).target_node, "studio-a");
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("studio-a", { idempotency_key: "target-key-5" }) })).target_node, "studio-a");
+  assert.deepEqual(sentTargets(env), ["Studio", "Studio"]);
+});
+
+test("target_node: among names sharing a key, an exact case-sensitive stored name that is live wins", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("studio-a", "Studio"), node("studio-b", "studio"), node("studio-c", "STUDIO", { live: false })]);
+  for (const id of ["studio-a", "studio-b", "studio-c"]) await env.claim(id);
+  const client = await env.connect();
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("studio", { name: "lower", idempotency_key: "target-key-1" }) })).target_node, "studio-b");
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch(" Studio ", { name: "title", idempotency_key: "target-key-2" }) })).target_node, "studio-a");
+  // The exact match is offline, or there is none: the ambiguity refusal stands.
+  for (const [value, key] of [["STUDIO", "target-key-3"], ["sTUDIO", "target-key-4"]] as const) {
+    const ambiguous = await refusalOf(client, launch(value, { idempotency_key: key }));
+    assert.equal(ambiguous.retryable, false, value);
+    assert.match(ambiguous.message, /the names of 3 nodes/, value);
+  }
+  assert.deepEqual(sentTargets(env), ["studio", "Studio"]);
+});
+
+test("target_node: a full every-state page is treated like a failed read", async (t) => {
+  const env = await setup(t);
+  const filler = Array.from({ length: 99 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }));
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler]);
+  await env.claim("mine");
+  const client = await env.connect();
+  // A live id never depends on the every-state page.
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine") })).status, "accepted");
+  const lone = await refusalOf(client, launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-2" }));
+  assert.equal(lone.retryable, true);
+  assert.match(lone.message, /matches a live node's name, but not every node could be read \(the node list filled its one-page limit\)/);
+  const missing = await refusalOf(client, launch("nowhere", { idempotency_key: "target-key-3" }));
+  assert.equal(missing.retryable, true);
+  assert.match(missing.message, /not every node could be read/);
+  assert.deepEqual(missing.valid_targets, [{ id: "mine", name: "studio-desktop" }]);
+  // One node short of a full page: the same name launches.
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler.slice(1)]);
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-2" }) })).target_node, "mine");
+});
+
+test("target_node: a lone offline name match with a padded stored name gets the padded-name refusal", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("pad", " lab ", { live: false }), node("alt", "alt-desktop")]);
+  await env.claim("pad");
+  await env.claim("alt");
+  const client = await env.connect();
+  const refused = await refusalOf(client, launch("LAB"));
+  assert.equal(refused.code, "spawn_target_unavailable");
+  assert.equal(refused.retryable, false);
+  assert.match(refused.message, /Node " lab " \(pad\) has whitespace around its name/);
+  assert.deepEqual(targetIds(refused.alternatives), ["alt"]);
+  // By id, an offline node keeps its offline refusal.
+  assert.equal((await refusalOf(client, launch("pad", { idempotency_key: "target-key-2" }))).code, "spawn_target_offline");
+  assert.equal(sentTargets(env).length, 0);
 });
