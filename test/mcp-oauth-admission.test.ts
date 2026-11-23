@@ -1445,3 +1445,24 @@ test("set_relay_agent_card on an OAuth grant writes its approved agent with the 
   assert.equal(metadata.source,HOSTED_SOURCE);
   assert.equal(metadata.owner_hash,ownerHash(f.owner.userId));
 });
+
+test("a pinned OAuth assistant creates a channel as its approved agent and reads thread replies there",async t=>{
+  const f=await relayFixture(t);
+  f.world.addAgent("cousin-grok");
+  // Self-host lets a pinned OAuth connection start a channel (it becomes the owner); pin that.
+  await assert.rejects(f.service.subscribeChannel({channel:"thanksgiving"}),/pass create: true/);
+  const created=await f.service.subscribeChannel({channel:"#Thanksgiving",create:true});
+  assert.deepEqual([created.channel,created.created,created.you],["thanksgiving",true,"approved-agent"]);
+  assert.deepEqual([...f.world.channels.get("thanksgiving")!.members],["approved-agent"]);
+  assert.equal((await f.service.subscribeChannel({channel:"thanksgiving",create:true})).already_subscribed,true);
+  await assert.rejects(f.service.subscribeChannel({channel:"thanksgiving",create:true,as:"cousin-grok"}),/only act as/);
+
+  f.world.channelAs("cousin-grok","thanksgiving");
+  const post=await f.service.postChannel({channel:"thanksgiving",text:"@cousin-grok who brings pie?"});
+  await f.world.handle("POST",`/v1/messages/${post.message_id}/replies`,new URLSearchParams(),f.world.agents.get("cousin-grok")!.token,
+    {text:"I will bring pie"},null);
+  const top=await f.service.readChannel({channel:"thanksgiving",limit:20}) as any;
+  assert.deepEqual(top.messages.map((m:any)=>[m.text,m.reply_count]),[["@cousin-grok who brings pie?",1]]);
+  const thread=await f.service.readChannel({channel:"thanksgiving",limit:20,thread_id:post.message_id}) as any;
+  assert.deepEqual(thread.replies.map((m:any)=>[m.sender,m.text]),[["cousin-grok","I will bring pie"]]);
+});

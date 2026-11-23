@@ -123,6 +123,8 @@ const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent 
 const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
 const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
+/** Replies per post that read_relay_channel include_replies returns; thread_id reads the rest. */
+export const CHANNEL_REPLIES_PER_POST = 10;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const CHANNEL_DELIVERY_REASONS: ReadonlySet<string> = new Set(["message", "mention", "thread-reply"]);
@@ -1858,19 +1860,63 @@ function createRelayService(context: McpContext) {
       })) ?? notSubscribed(channel);
     },
 
-    async readChannel(input: ChannelInput & { channel: string; before?: string; limit: number }) {
+    /**
+     * Top-level posts (oldest first), or one thread with `thread_id`.
+     * `include_replies` adds each listed post's first replies. Thread reads go
+     * through the directory credential, which can see any message, so the
+     * thread's root must be a post in this channel: never a DM or another channel.
+     */
+    async readChannel(input: ChannelInput & { channel: string; before?: string; limit: number; thread_id?: string; after?: string;
+      include_replies?: boolean }) {
       const channel = normalizeChannelName(input.channel);
+      if (input.thread_id && input.before) throw new RelayToolError("before pages top-level posts. To page a thread, pass after (the last reply's message_id).");
+      if (input.after && !input.thread_id) throw new RelayToolError("after pages a thread's replies; pass thread_id with it.");
+      if (input.thread_id && input.include_replies) throw new RelayToolError("include_replies reads top-level posts; with thread_id the whole thread is already returned.");
       return (await channelActor(input, false, async (identity) => {
         // History is read with the workspace key (a gated participant: through relaygate, which checks read
         // itself), so membership is checked here.
-        if (!await membership(identity, channel)) notSubscribed(channel);
+        const member = await membership(identity, channel);
+        if (!member) notSubscribed(channel);
         const dir = directory(identity);
+        const view = (message: { id: string; sender: string | null; text: string; createdAt: string | null; threadId: string | null }) => ({
+          message_id: message.id, sender: message.sender, text: message.text, created_at: message.createdAt,
+          thread_id: message.threadId, mine: message.sender === identity.name });
+        if (input.thread_id) {
+          const notInChannel = () => new RelayToolError(`thread_id must be a message in #${channel}. Use read_relay_channel.`);
+          let thread = await dir.via.getChannelThread(dir.credential, input.thread_id, { limit: input.limit, after: input.after });
+          // A reply's id names its thread: read from the thread's root.
+          const rootId = thread?.parent.threadId;
+          if (thread && rootId && rootId !== input.thread_id) {
+            if (thread.parent.channelId !== member.id) throw notInChannel();
+            thread = await dir.via.getChannelThread(dir.credential, rootId, { limit: input.limit, after: input.after });
+          }
+          if (!thread || thread.parent.threadId || thread.parent.channelId !== member.id) throw notInChannel();
+          const last = thread.replies.at(-1)?.id ?? null;
+          return { you: identity.name, channel, thread_id: thread.parent.id,
+            post: { ...view(thread.parent), reply_count: thread.parent.replyCount },
+            replies: thread.replies.map(view),
+            more_after: thread.replies.length >= input.limit ? last : null,
+            reply_guidance: `Reply in this thread with ${channelReplyHint(channel, thread.parent.id)}.` };
+        }
         const page = await dir.via.listChannelMessages(dir.credential, channel, { before: input.before, limit: input.limit });
+        const replies = new Map<string, { replies: ReturnType<typeof view>[]; truncated: boolean }>();
+        if (input.include_replies) {
+          await Promise.all(page.messages.filter(message => message.replyCount > 0).map(async message => {
+            const thread = await dir.via.getChannelThread(dir.credential, message.id, { limit: CHANNEL_REPLIES_PER_POST });
+            // Never show a thread whose root is not this channel's post.
+            if (!thread || thread.parent.channelId !== member.id) return;
+            replies.set(message.id, { replies: thread.replies.map(view),
+              truncated: thread.parent.replyCount > thread.replies.length || thread.replies.length >= CHANNEL_REPLIES_PER_POST });
+          }));
+        }
         return { you: identity.name, channel,
-          messages: page.messages.map(message => ({ message_id: message.id, sender: message.sender, text: message.text,
-            created_at: message.createdAt, thread_id: message.threadId, reply_count: message.replyCount, mine: message.sender === identity.name })),
+          messages: page.messages.map(message => ({ ...view(message), reply_count: message.replyCount,
+            ...(replies.has(message.id) ? { replies: replies.get(message.id)!.replies,
+              ...(replies.get(message.id)!.truncated ? { replies_truncated: true } : {}) } : {}) })),
           earlier: page.hasEarlier ? page.messages[0]?.id ?? null : null,
-          reply_guidance: CHANNEL_REPLY_GUIDANCE };
+          reply_guidance: input.include_replies
+            ? `${CHANNEL_REPLY_GUIDANCE} When replies_truncated is true, read the rest with read_relay_channel thread_id=<message_id>.`
+            : `${CHANNEL_REPLY_GUIDANCE} Read a post's replies with read_relay_channel thread_id=<message_id>, or include_replies: true.` };
       })) ?? notSubscribed(channel);
     },
   };

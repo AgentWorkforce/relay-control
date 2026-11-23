@@ -851,6 +851,39 @@ export function createRelaycastClient(input: {
     },
 
     /**
+     * One thread: its parent post and the replies after `after`, oldest first.
+     * Read with the workspace key (or a gated token through relaygate):
+     * callers check the parent's channel and their own membership. Null when
+     * the parent does not exist.
+     */
+    async getChannelThread(credential: string, parentId: string, options: { limit: number; after?: string }):
+      Promise<{ parent: ChannelMessage & { channelId: string | null }; replies: ChannelMessage[] } | null> {
+      const query = new URLSearchParams({ limit: String(options.limit) });
+      if (options.after) query.set("after", options.after);
+      const raw = await labeled("read_thread", () =>
+        call("GET", `/v1/messages/${encodeURIComponent(parentId)}/replies?${query}`, credential, undefined, undefined, true));
+      if (raw === null) return null;
+      const data = record(raw);
+      const parent = record(data?.parent);
+      if (!parent || text(parent.id) !== parentId || !Array.isArray(data?.replies)) throw new RelaycastCallError(200, "", true);
+      const row = (message: Record<string, unknown>, id: string): ChannelMessage => ({
+        id, sender: text(message.agent_name), text: typeof message.text === "string" ? message.text : "",
+        threadId: text(message.thread_id),
+        replyCount: Number.isInteger(message.reply_count) ? message.reply_count as number : 0,
+        createdAt: text(message.created_at),
+      });
+      const replies = (data!.replies as unknown[]).flatMap((item): ChannelMessage[] => {
+        const reply = record(item);
+        const id = text(reply?.id);
+        // Only this parent's replies; anything else in the body is not part of the thread.
+        return reply && id && text(reply.thread_id) === parentId ? [row(reply, id)] : [];
+      });
+      replies.sort((left, right) => left.id.length - right.id.length || left.id.localeCompare(right.id));
+      // The engine's thread count can arrive as a string (a SQL count), so it is parsed.
+      return { parent: { ...row(parent, parentId), replyCount: Number(parent.reply_count) || 0, channelId: text(parent.channel_id) }, replies };
+    },
+
+    /**
      * Fleet nodes visible to this workspace key, online only by default. The
      * key belongs to one Relaycast workspace, so a node enrolled in another
      * workspace or another installation is never listed.

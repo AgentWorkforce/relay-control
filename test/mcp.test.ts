@@ -1326,8 +1326,52 @@ test("channels: list, subscribe, post, thread, read, inbox, and unsubscribe", as
   const read = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops" } }));
   assert.deepEqual(read.messages.map((message: any) => [message.text, message.mine, message.reply_count]),
     [["deploying", true, 1], ["ack from peer", false, 0]]);
+  assert.match(read.reply_guidance, /read_relay_channel thread_id=<message_id>, or include_replies: true/);
+  assert.equal(read.messages[0].replies, undefined);
 
-  const left = structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } }));
+  // Thread replies (how Grok Bot and Muse answer) are readable with thread_id, from the root or any reply.
+  const peerToken = env.relay.world.agents.get("peer-bot")!.token;
+  await env.relay.world.handle("POST", `/v1/messages/${posted.message_id}/replies`, new URLSearchParams(), peerToken,
+    { text: "peer answer in thread" }, null);
+  const thread = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id } }));
+  assert.equal(thread.thread_id, posted.message_id);
+  assert.deepEqual([thread.post.text, thread.post.mine, thread.post.reply_count], ["deploying", true, 2]);
+  assert.deepEqual(thread.replies.map((reply: any) => [reply.text, reply.mine]), [["done", true], ["peer answer in thread", false]]);
+  assert.equal(thread.more_after, null);
+  assert.match(thread.reply_guidance, new RegExp(`post_relay_channel channel=ops thread_id=${posted.message_id}`));
+  const fromReply = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: threaded.message_id } }));
+  assert.equal(fromReply.thread_id, posted.message_id);
+  const firstPage = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, limit: 1 } }));
+  assert.deepEqual(firstPage.replies.map((reply: any) => reply.text), ["done"]);
+  assert.equal(firstPage.more_after, threaded.message_id);
+  const secondPage = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, after: firstPage.more_after, limit: 1 } }));
+  assert.deepEqual(secondPage.replies.map((reply: any) => reply.text), ["peer answer in thread"]);
+  // include_replies inlines each post's first replies on a top-level read.
+  const inline = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", include_replies: true } }));
+  assert.deepEqual(inline.messages.map((message: any) => [message.text, message.replies?.map((reply: any) => reply.text) ?? null]),
+    [["deploying", ["done", "peer answer in thread"]], ["ack from peer", null]]);
+  assert.equal(inline.messages[0].replies_truncated, undefined);
+  assert.match(inline.reply_guidance, /replies_truncated/);
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, include_replies: true } })), /include_replies reads top-level posts/);
+  // A thread in another channel, a DM, or a missing message is refused without leaking its contents.
+  const elsewhere = env.relay.world.channelAs("peer-bot", "secret", "private plan")!;
+  const dm = env.relay.world.sendAs("peer-bot", me, "private plan by dm").message;
+  for (const thread_id of [elsewhere.id, dm.id, "999999"]) {
+    const refused = toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", thread_id } }));
+    assert.match(refused, /thread_id must be a message in #ops/);
+    assert.doesNotMatch(refused, /private plan/);
+  }
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", after: posted.message_id } })),
+    /pass thread_id with it/);
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, before: posted.message_id } })), /To page a thread, pass after/);
+
+  const left =structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } }));
   assert.equal(left.already_unsubscribed, false);
   assert.equal(structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } })).already_unsubscribed, true);
   assert.match(toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops" } })), /not subscribed to #ops/);
