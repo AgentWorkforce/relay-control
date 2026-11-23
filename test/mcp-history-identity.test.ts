@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import type { SelfhostConfig } from "../src/config.js";
+import { loadSessionReadPointSummaryWorkspace, type SelfhostConfig } from "../src/config.js";
 import { historyReader, type McpContext } from "../src/mcp/context.js";
 import { buildReadAuditRecord } from "../src/mcp/read-audit.js";
 import { describeCapabilities } from "../src/mcp/catalog.js";
@@ -29,6 +29,8 @@ type Options = {
   reply?: (pair:Record<string,unknown>,path:string)=>Record<string,unknown>;
   /** Status the workspace (History) reader answers; 200 when absent. */
   historyStatus?: (url: URL) => number;
+  /** The workspace header History attests; the queried workspace when absent. */
+  historyAttest?: (workspace: string) => string | null;
 };
 
 function config(on = true) {
@@ -96,7 +98,9 @@ function fake(t: TestContext, options: Options = {}) {
       history.push({ url, bearer });
       const status = options.historyStatus?.(url) ?? 200;
       if (status !== 200) return Response.json({error:{code:"unsupported_by_backend",reason:options.errorReason??"unavailable"}},{status});
-      return Response.json({ from: "history" }, { headers: { [WORKSPACE_HEADER]: url.searchParams.get("workspace") ?? "" } });
+      const queried = url.searchParams.get("workspace") ?? "";
+      const attested = options.historyAttest ? options.historyAttest(queried) : queried;
+      return Response.json({ from: "history" }, { headers: attested === null ? {} : { [WORKSPACE_HEADER]: attested } });
     }
     reads.push({ url, bearer });
     const status = options.readStatus?.(url, bearer) ?? 200;
@@ -603,5 +607,166 @@ test("staff, Desktop and OAuth grants read list and point summary through the sa
     assert.equal(seen.handoffs.length, 1);
     assert.equal(seen.handoffs[0]!.body.workspaceId, "ws-a");
     assert.equal(JSON.stringify([seen.handoffs, seen.history]).includes(token), false);
+  }
+});
+
+// SESSION_READ_API_POINT_SUMMARY_WORKSPACE: one exact workspace's point
+// summary reads through the per-user read API; nothing else moves.
+const SELECTED = "00000000-0000-4000-8000-00000000000a";
+const OTHER = "00000000-0000-4000-8000-00000000000b";
+// The fake Control names the org `org-<workspace minus its first 3 chars>`.
+const orgOf = (ws: string) => `org-${ws.slice(3)}`;
+const LIST_FOR = (ws: string) => `/v1/sessions?limit=20&includeShortSummary=recorded&workspace=${ws}`;
+const POINT_FOR = (ws: string) => `/v1/sessions/s-1/summary?kind=short&source=codex&workspace=${ws}`;
+function selectedConfig(on: boolean, ...override: [selected: string | null | undefined] | []) {
+  const cfg = config(on);
+  // An explicit undefined stays undefined (unset); no argument selects SELECTED.
+  cfg.sessionReadPointSummaryWorkspace = override.length ? override[0] : SELECTED;
+  return cfg;
+}
+const nativeRead = (cfg: SelfhostConfig, ws: string) =>
+  historyReader(cfg, principal("user-a"), workspace(ws, orgOf(ws)), "sh_at_user_a");
+
+test("the point-summary workspace value selects exactly one complete UUID, or nobody", () => {
+  const warnings: string[] = [];
+  const load = (value?: string) => loadSessionReadPointSummaryWorkspace({ SESSION_READ_API_POINT_SUMMARY_WORKSPACE: value },
+    message => warnings.push(message));
+  assert.equal(load(SELECTED), SELECTED);
+  assert.equal(load(`  ${SELECTED}\n`), SELECTED, "surrounding whitespace is trimmed");
+  // Compared in lowercase, the form workspace ids are stored in.
+  assert.equal(load(SELECTED.toUpperCase()), SELECTED);
+  for (const value of [undefined, "", "   ", "*", "all", "true", "00000000-0000-4000-8000", "00000000",
+    `${SELECTED},${OTHER}`, `${SELECTED} ${OTHER}`, `${SELECTED}*`, `{${SELECTED}}`, `${SELECTED}0`,
+    SELECTED.replaceAll("-", ""), "ws-a", "0000000g-0000-4000-8000-00000000000a"]) {
+    warnings.length = 0;
+    assert.equal(load(value), null, `value ${JSON.stringify(value)}`);
+    // Unset or blank stays silent; any other unusable value warns once, never echoing it.
+    assert.equal(warnings.length, value?.trim() ? 1 : 0, `warnings for ${JSON.stringify(value)}`);
+    if (value?.trim()) assert.equal(warnings[0]!.toLowerCase().includes(value.trim().toLowerCase()), false);
+  }
+  warnings.length = 0;
+  assert.equal(load(SELECTED), SELECTED);
+  assert.equal(warnings.length, 0, "a valid value is silent");
+});
+
+test("with the override unset, list and point summary keep one reader, with the setting on and off", async t => {
+  for (const on of [true, false]) for (const selected of [undefined, null]) {
+    const seen = fake(t), cfg = selectedConfig(on, selected);
+    t.after(() => forgetSessionReadTokens(cfg));
+    const read = nativeRead(cfg, SELECTED);
+    const expected = on ? { from: "read-api" } : { from: "history" };
+    assert.deepEqual(await read(LIST_FOR(OTHER)), expected);
+    assert.deepEqual(await read(POINT_FOR(OTHER)), expected);
+    const used = on ? seen.reads : seen.history;
+    assert.equal((on ? seen.history : seen.reads).length, 0, `setting ${on}, override ${selected}`);
+    assert.deepEqual(used.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]),
+      [["/v1/sessions", [SELECTED]], ["/v1/sessions/s-1/summary", [SELECTED]]]);
+  }
+});
+
+test("the override sends only the selected workspace's point summary to the read API", async t => {
+  const seen = fake(t), cfg = selectedConfig(false);
+  t.after(() => forgetSessionReadTokens(cfg));
+  // The caller's workspace parameter names the other workspace each time; only admission decides.
+  const selected = nativeRead(cfg, SELECTED);
+  assert.deepEqual(await selected(LIST_FOR(OTHER)), { from: "history" });
+  assert.deepEqual(await selected(POINT_FOR(OTHER)), { from: "read-api" });
+  const other = nativeRead(cfg, OTHER);
+  assert.deepEqual(await other(LIST_FOR(SELECTED)), { from: "history" });
+  assert.deepEqual(await other(POINT_FOR(SELECTED)), { from: "history" });
+
+  assert.deepEqual(seen.reads.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]),
+    [["/v1/sessions/s-1/summary", [SELECTED]]]);
+  assert.deepEqual(seen.issues.map(({ path }) => path), [`/api/v1/workspaces/${SELECTED}/session-read/session`]);
+  assert.deepEqual(seen.history.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]), [
+    ["/v1/sessions", [SELECTED]], ["/v1/sessions", [OTHER]], ["/v1/sessions/s-1/summary", [OTHER]],
+  ]);
+});
+
+test("the override moves no other route for the selected workspace", async t => {
+  const seen = fake(t), cfg = selectedConfig(false);
+  t.after(() => forgetSessionReadTokens(cfg));
+  const read = nativeRead(cfg, SELECTED);
+  const paths = ["/v1/sessions", "/v1/sessions/activity", "/v1/events?q=x", "/v1/sessions/s-1/events?source=codex",
+    "/v1/sessions/s-1/turns?source=codex", "/v1/sessions/s-1/metadata?source=codex", "/v1/sessions/s-1/timing?source=codex",
+    "/v1/relayfacts", "/v1/relayfacts/topic-1", "/v1/sessions/s-1/summary/extra", "/v1/sessions/summary"];
+  for (const path of paths) assert.deepEqual(await read(path), { from: "history" }, path);
+  assert.equal(seen.reads.length + seen.issues.length, 0);
+  assert.equal(seen.history.length, paths.length);
+});
+
+test("with the setting on, the override changes nothing for either workspace", async t => {
+  const seen = fake(t), cfg = selectedConfig(true);
+  t.after(() => forgetSessionReadTokens(cfg));
+  for (const ws of [SELECTED, OTHER]) {
+    const read = nativeRead(cfg, ws);
+    assert.deepEqual(await read(LIST_FOR(ws)), { from: "read-api" });
+    assert.deepEqual(await read(POINT_FOR(ws)), { from: "read-api" });
+  }
+  assert.equal(seen.history.length, 0);
+  assert.equal(seen.reads.length, 4);
+});
+
+test("staff, Desktop and OAuth grants keep the workspace reader under the override", async t => {
+  const grants: Array<[string, Principal, string]> = [
+    ["staff", principal("user-a"), `sh_sr_${"S".repeat(43)}`],
+    ["desktop", { ...principal("user-a"), scopes: ["rth:read", "mcp:desktop"] } as Principal, `cld_at_${"G".repeat(43)}`],
+    ["oauth", oauth(["relay:mcp", "relay:history"]), OAUTH_TOKEN],
+  ];
+  for (const on of [true, false]) for (const [name, who, token] of grants) {
+    const seen = fake(t), cfg = selectedConfig(on);
+    const read = historyReader(cfg, who, workspace(SELECTED, orgOf(SELECTED)), token);
+    assert.deepEqual(await read(LIST_FOR(OTHER)), { from: "history" });
+    assert.deepEqual(await read(POINT_FOR(OTHER)), { from: "history" });
+    assert.deepEqual(seen.history.map(({ url }) => url.searchParams.getAll("workspace")), [[SELECTED], [SELECTED]]);
+    assert.equal(seen.reads.length + seen.issues.length, 0, `${name} setting ${on} never takes the per-user hop`);
+  }
+});
+
+test("a selected point summary refuses missing, empty or foreign attestation without leaking the body", async t => {
+  const leaked = "fake-summary-text-that-must-not-leak";
+  for (const attest of [() => null, () => "", () => OTHER]) {
+    const seen = fake(t, { attest, readBody: { summary: { text: leaked } } }), cfg = selectedConfig(false);
+    t.after(() => forgetSessionReadTokens(cfg));
+    const error = await nativeRead(cfg, SELECTED)(POINT_FOR(OTHER)).then(() => null, (caught: Error) => caught);
+    assert.ok(error, "the read is refused");
+    assert.match(error.message, /not available yet/);
+    assert.equal(JSON.stringify([error.message, error.stack, { ...error }]).includes(leaked), false);
+    assert.equal(seen.reads.length, 1);
+    assert.equal(seen.history.length + seen.handoffs.length, 0, "no other backend is tried");
+  }
+});
+
+test("a malformed selected point-summary body fails closed with no other backend", async t => {
+  for (const readBody of [[], "text", 42]) {
+    const seen = fake(t, { readBody }), cfg = selectedConfig(false);
+    t.after(() => forgetSessionReadTokens(cfg));
+    await assert.rejects(nativeRead(cfg, SELECTED)(POINT_FOR(OTHER)), /temporarily unavailable/);
+    assert.equal(seen.history.length + seen.handoffs.length, 0);
+  }
+});
+
+test("a selected point summary keeps terminal 403/404/501 outcomes and tries no other backend", async t => {
+  for (const [status, outcome] of [[403, /temporarily unavailable/], [404, /temporarily unavailable/],
+    [501, /unsupported_by_backend/], [503, /temporarily unavailable/]] as const) {
+    const seen = fake(t, { readStatus: () => status }), cfg = selectedConfig(false);
+    t.after(() => forgetSessionReadTokens(cfg));
+    await assert.rejects(nativeRead(cfg, SELECTED)(POINT_FOR(OTHER)), outcome);
+    assert.equal(seen.reads.length, 1, `status ${status}`);
+    assert.equal(seen.reads[0]!.url.pathname, "/v1/sessions/s-1/summary");
+    assert.deepEqual(seen.reads[0]!.url.searchParams.getAll("workspace"), [SELECTED]);
+    assert.equal(seen.history.length + seen.handoffs.length, 0, "never History");
+  }
+});
+
+test("per-session events and turns still refuse mis-attestation on either reader under the override", async t => {
+  for (const on of [false, true]) for (const attest of [() => null, () => "", () => OTHER]) {
+    for (const path of ["/v1/sessions/s-1/events?source=codex", "/v1/sessions/s-1/turns?source=codex"]) {
+      const seen = fake(t, on ? { attest } : { historyAttest: attest }), cfg = selectedConfig(on);
+      t.after(() => forgetSessionReadTokens(cfg));
+      await assert.rejects(nativeRead(cfg, SELECTED)(path), /not available yet/, `${path} setting ${on}`);
+      assert.equal((on ? seen.reads : seen.history).length, 1);
+      assert.equal((on ? seen.history : seen.reads).length, 0, "no other backend is tried");
+    }
   }
 });

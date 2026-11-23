@@ -198,6 +198,8 @@ export function historyReader(
       // grant (staff or Desktop provider) by shape, so a grant always reads
       // through the workspace reader. So does OAuth: that hop presents the
       // caller token to Control, and an mcp_at_ token must never leave here.
+      // readViaSessionRead decides selection (SESSION_READ_API_MCP_READS, or
+      // the one-workspace point-summary override) and answers null otherwise.
       const result = (staffGrant || desktopGrant || oauthGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {

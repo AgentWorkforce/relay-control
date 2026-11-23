@@ -99,9 +99,23 @@ session reads both through the per-user session-read route when
 reader otherwise; staff, Desktop and OAuth grants always read both through the
 workspace-scoped reader. Either way the reader replaces any caller `workspace`
 parameter with the admitted workspace and refuses a response that attests
-another one. Self-host has no per-workspace or per-route selector: that one
-install-wide setting decides for every workspace, and a failed read is never
-retried on the other reader.
+another one. A failed read is never retried on the other reader.
+
+By default that one install-wide setting decides for every workspace, and
+self-host stays a single reader for both tools. An install may additionally
+set `SESSION_READ_API_POINT_SUMMARY_WORKSPACE` to one complete workspace UUID.
+When the workspace admitted for the request (from MCP admission, never a tool
+argument) equals that id, a native user session's `get_session_summary`
+(`GET /v1/sessions/:id/summary`) reads through the per-user session-read route
+even with `SESSION_READ_API_MCP_READS` off. Nothing else moves: the list, the
+per-session events, turns, metadata and timing reads, relayfacts, every other
+workspace, and staff, Desktop and OAuth grants keep the selection above. The
+value is trimmed and compared in lowercase (the form workspace ids are stored
+in); an empty, malformed, wildcard, prefix or comma-separated value selects no
+workspace; a set but unusable value logs one startup warning that never
+includes the value. A selected read keeps every rule above: the forced workspace,
+required attestation, final 403/404/501 outcomes, fail-closed refusal of a
+malformed body, and no fallback to History. Unset, behaviour is unchanged.
 
 Calls are recorded in `shared_session_read_audit`, including filters and
 returned session/owner IDs, never summary text or the raw person name/email

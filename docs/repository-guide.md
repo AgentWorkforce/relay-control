@@ -125,6 +125,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SESSION_READ_API_URL` | Internal HTTP(S) origin of the sessions pipeline read API; the credential handoff and every History read go here ([docs/sessions-read-api.md](sessions-read-api.md)) |
 | `SESSION_READ_API_PUBLIC_URL` | Public origin of the read API and ingest edge: read token audience, default introspection audience and the `baseUrl` returned to clients; bare HTTPS public DNS origin |
 | `SESSION_READ_API_SECRET` | At least 32 bytes (`_FILE` supported). Dedicated Control-to-reader handoff secret; never sent to clients |
+| `SESSION_READ_API_POINT_SUMMARY_WORKSPACE` | Optional, default unset. One complete workspace UUID whose native MCP point-summary reads (`GET /v1/sessions/{id}/summary`) take the per-user read pair even with `SESSION_READ_API_MCP_READS` off; every other route and workspace is unchanged. Any value that is not exactly one UUID selects nobody ([docs/session-summaries.md](session-summaries.md#authority-and-failures)) |
 | `RELAYHISTORY_URL`, `RELAYHISTORY_PUBLIC_URL` | Optional aliases; if set they must equal `SESSION_READ_API_URL` and `SESSION_READ_API_PUBLIC_URL` |
 | `RELAYHISTORY_BACKEND` | Optional; unset or `native` (the only backend). Any other value refuses startup |
 | `RELAYCONTROL_INTROSPECT_SECRET` | At least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with the sessions pipeline ingest edge (and relayfile) |

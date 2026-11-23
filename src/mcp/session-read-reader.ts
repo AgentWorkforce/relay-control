@@ -12,12 +12,14 @@ import { isRecord, unsupportedReason, WORKSPACE_ATTESTATION_HEADER, type History
  * public session-read route that this hop is the MCP reader, so the mint names
  * reader kind `mcp`. It is never logged.
  */
-type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> & {
+type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"|"sessionReadPointSummaryWorkspace"> & {
   sessionReadApi?: Pick<NonNullable<SelfhostConfig["sessionReadApi"]>,"publicUrl"> | null;
 };
 
 /** Per-user reader client. Only Control sees the reader's internal issuer secret. */
 const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary|timing))?|relayfacts(?:\/[^/]+)?)$/;
+/** The point summary route alone; the optional one-workspace override selects nothing else. */
+const POINT_SUMMARY_ROUTE = /^\/v1\/sessions\/[^/]+\/summary$/;
 const READ_API_CURSOR = /^b96[a-z][0-9]+:/;
 /** relayfacts topic pages issue their own opaque cursors (md1: today), never session cursors. */
 const RELAYFACTS_ROUTE = /^\/v1\/relayfacts(?:\/|$)/;
@@ -118,9 +120,21 @@ async function heldSession(config:ReaderConfig,identity:HistoryIdentity,marker:s
   return pending;
 }
 
+/**
+ * SESSION_READ_API_POINT_SUMMARY_WORKSPACE: the admitted workspace (never a
+ * tool argument; identity comes from MCP admission) must equal the one
+ * configured id exactly, and only the point summary route is selected. Lists
+ * and every other route keep the install-wide selection.
+ */
+function pointSummaryOverride(config:ReaderConfig,identity:HistoryIdentity,path:string):boolean {
+  const selectedWorkspace=config.sessionReadPointSummaryWorkspace;
+  return Boolean(selectedWorkspace) && identity.workspaceId===selectedWorkspace && POINT_SUMMARY_ROUTE.test(path);
+}
+
 export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIdentity,path:string,params:URLSearchParams,marker:string):Promise<HistoryRead|null> {
   const cursor=params.get("cursor");
-  const selected=Boolean(config.sessionReadMcpReads && config.sessionReadApi && READ_ROUTES.test(path));
+  const selected=Boolean(config.sessionReadApi && (
+    (config.sessionReadMcpReads && READ_ROUTES.test(path)) || pointSummaryOverride(config,identity,path)));
   // Every History reader is the read API, so its cursors stay valid either way.
   if(!selected) return null;
   // A foreign/legacy cursor cannot silently switch the selected backend.
