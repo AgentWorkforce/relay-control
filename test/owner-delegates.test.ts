@@ -181,6 +181,15 @@ test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
   assert.equal(ownerDisplay("k@example.com"), "the owner");
   assert.equal(ownerDisplay(""), "the owner");
   assert.equal([...ownerDisplay("x".repeat(200))].length, 80);
+  // Cut at 80 UTF-16 units on a character boundary: an emoji (a surrogate
+  // pair) straddling the boundary is dropped whole, never split.
+  const straddling = ownerDisplay(`${"a".repeat(79)}\u{1F600}tail`);
+  assert.equal(straddling, "a".repeat(79));
+  assert.equal(straddling.length, 79);
+  const fits = ownerDisplay(`${"a".repeat(78)}\u{1F600}tail`);
+  assert.equal(fits, `${"a".repeat(78)}\u{1F600}`);
+  assert.equal(fits.length, 80);
+  assert.ok(!/[\uD800-\uDBFF]$/.test(ownerDisplay(`${"b".repeat(79)}\u{1F680}\u{1F680}`)));
 });
 
 test("signing key config: seed and kid together, previous keys validated", () => {
@@ -246,12 +255,11 @@ test("human-only routes refuse agent, CLI and enrollment credentials; off by def
   assert.equal(crossSite.status, 403, crossSite.raw);
   assert.equal(crossSite.body.code, "csrf_rejected");
 
-  // Step-up: a browser session signed in more than 15 minutes ago cannot change delegates.
-  await env.database.query("UPDATE token_sessions SET created_at = now() - interval '20 minutes'");
-  const stale = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true });
-  assert.equal(stale.status, 403, stale.raw);
-  assert.equal(stale.body.code, "reauthentication_required");
-  // The Desktop-verified bearer is not a browser session and needs no step-up.
+  // No step-up (§4.1): an old browser session still changes delegates, and so
+  // does a verified Desktop sign-in.
+  await env.database.query("UPDATE token_sessions SET created_at = now() - interval '20 days'");
+  const old = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true });
+  assert.equal(old.status, 200, old.raw);
   const viaDesktop = await env.bearer("/delegates/policy", "PUT", { delegation_enabled: true });
   assert.equal(viaDesktop.status, 200, viaDesktop.raw);
   assert.equal(viaDesktop.body.delegation_enabled, true);

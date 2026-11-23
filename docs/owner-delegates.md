@@ -40,10 +40,8 @@ a follow-up (§15.4).
 `claims`, `approvals`, `audit`, `policy`, `target-owners`) take one of two
 credentials:
 
-- the browser account session (the `/cloud` cookie with scope `account`). For
-  writes other than revocation, the session must have signed in within the last
-  15 minutes; otherwise the answer is `403 reauthentication_required`. Cookie
-  writes need JSON from an allowed Origin, as on every cookie route.
+- the browser account session (the `/cloud` cookie with scope `account`).
+  Cookie writes need JSON from an allowed Origin, as on every cookie route.
 - a verified Agent Relay Desktop bearer: a session redeemed with S256 from a
   browser-consent handoff that named the Desktop host
   (`token_sessions.desktop_verified_at`). This is relay-control's equivalent
@@ -56,8 +54,12 @@ unauthorized`, or `403 forbidden`). A caller who is not a current member of
 the workspace's organization is `403 forbidden`. Audit records the method as
 `session` or `desktop_bearer`, as in Cloud. While delegation is off, everything except `GET`
 and revocation answers `403 not_enabled`. `PUT /delegates/policy` is exempt,
-because it is how delegation is turned on. Revocation (`DELETE`, `revoke-all`)
-never needs a recent sign-in.
+because it is how delegation is turned on.
+
+Either credential is enough for every owner action: creating or changing a
+grant, minting a tier O approval, setting policy or target owners, and starting
+a claim. There is no recent-sign-in requirement and no browser confirmation
+step (§4.1, Khaliq's decision). Every owner action is audited.
 
 **Agent routes**:
 
@@ -150,7 +152,7 @@ Control workspace id. A tier D `approval_id` is `apv_` followed by base62 (alpha
 `0-9A-Za-z`, big-endian, no padding) of `SHA-256(ws|message_id)[0..16]`.
 `owner_display` is the person's name on one line, at most 80 characters, or
 "the owner" when it is empty or looks like an email address. Brackets are
-stripped, and the result is trimmed after the cut, exactly as in Cloud.
+stripped. The cut is at 80 UTF-16 units on a character boundary, so an emoji is never split. The result is trimmed after the cut, as in Cloud.
 
 ### Standing (§5.4)
 
@@ -244,8 +246,8 @@ quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,
   default 90. It is set with `GET`/`PUT /api/v1/orgs/{org}/delegation-policy`
   `{quote_retention_days}`.
-- Only org owners and admins can call that route, by browser session (signed
-  in within 15 minutes, for changes) or verified Desktop bearer.
+- Only org owners and admins can call that route, by browser session or
+  verified Desktop bearer.
 - It applies to every workspace in the org, and no workspace policy overrides
   it. A change is audited as `org_policy.updated` in each workspace of the
   org.

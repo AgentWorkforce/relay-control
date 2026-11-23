@@ -3183,9 +3183,8 @@ paths:
       operationId: createDelegateGrant
       tags: [Owner delegates]
       description: |
-        Human-only; refused with `not_enabled` while delegation is off. A
-        browser session must have signed in within the last 15 minutes
-        (`reauthentication_required`). The delegate must be bound to the
+        Human-only; refused with `not_enabled` while delegation is off. The
+        delegate must be bound to the
         caller by exactly one Control binding (Desktop identity, hosted
         participant, ready spawn, person identity or completed claim).
         Expiry defaults to 30 days, at most min(90, policy max_expiry_days).
@@ -3208,7 +3207,7 @@ paths:
               schema: { $ref: "#/components/schemas/DelegateGrant" }
         "400": { description: "`invalid_request` (unknown field, unknown class, invalid target pattern, duplicate class) or `invalid_expiry`" }
         "401": { description: "`unauthorized`" }
-        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `not_delegate` (agent not bound to the caller), `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `not_delegate` (agent not bound to the caller) or `csrf_rejected`" }
         "409": { description: "`grant_exists`" }
         "503": { description: "`unavailable`" }
   /api/v1/workspaces/{workspaceId}/delegates/{grantId}:
@@ -3219,7 +3218,7 @@ paths:
       operationId: narrowDelegateGrant
       tags: [Owner delegates]
       description: |
-        Human-only, the grant's owner, delegation on, recent browser sign-in.
+        Human-only, the grant's owner, delegation on.
         Narrowing only: every new target must be covered by an existing
         pattern of its class, expiry may only move earlier and
         `require_tier_o` may only grow; anything wider is
@@ -3240,7 +3239,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DelegateGrant" }
         "400": { description: "`invalid_request`, `invalid_expiry` or `widening_not_allowed`" }
-        "403": { description: "`forbidden`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
         "404": { description: "`not_found` (unknown, or not the caller's grant)" }
         "409": { description: "`not_active`" }
     delete:
@@ -3248,7 +3247,7 @@ paths:
       tags: [Owner delegates]
       description: |
         Human-only revocation by the grant's owner or a workspace owner/admin.
-        Allowed while delegation is off and without a recent sign-in.
+        Allowed while delegation is off.
         Invalidates every unredeemed approval under the grant. Idempotent.
         Audited `grant.revoked`.
       security:
@@ -3304,7 +3303,7 @@ paths:
       operationId: startDelegateClaim
       tags: [Owner delegates]
       description: |
-        Human-only, delegation on, recent browser sign-in. Starts a claim:
+        Human-only, delegation on. Starts a claim:
         a one-time code (`dlg_` + 24 random bytes base64url, shown once,
         stored as SHA-256) valid for 10 minutes, that an agent with no other Control binding presents with
         its own Relaycast token to bind its immutable agent id to the caller.
@@ -3323,7 +3322,7 @@ paths:
                   claim_id: { type: string, pattern: "^clm_[A-Za-z0-9]+$" }
                   code: { type: string, pattern: "^dlg_[A-Za-z0-9_-]{32}$" }
                   expires_at: { type: string, format: date-time }
-        "403": { description: "`forbidden`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
   /api/v1/workspaces/{workspaceId}/delegates/claims/complete:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -3411,7 +3410,7 @@ paths:
                 properties:
                   approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
         "400": { description: "`invalid_request` or `invalid_expiry`" }
-        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy) or `csrf_rejected`" }
   /api/v1/workspaces/{workspaceId}/delegates/audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -3453,7 +3452,7 @@ paths:
       operationId: putDelegationPolicy
       tags: [Owner delegates]
       description: |
-        Human-only, workspace owner/admin, recent browser sign-in. The
+        Human-only, workspace owner/admin. The
         workspace switch (`delegation_enabled`, off by default) and limits.
         A full replace: omitted optional fields take their defaults
         (`max_expiry_days` 90, `allowed_classes` null, `require_tier_o` [],
@@ -3484,7 +3483,7 @@ paths:
                     properties:
                       revoked_grants: { type: array, items: { type: string } }
         "400": { description: "`invalid_request`" }
-        "403": { description: "`forbidden`, `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
   /api/v1/orgs/{organizationId}/delegation-policy:
     parameters:
       - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
@@ -3515,7 +3514,7 @@ paths:
         Replace the org's settings: `{quote_retention_days}`, an integer from 1
         to 3650 (§15.9, Khaliq's decision; default 90). A shorter window
         redacts existing older quotes at the next sweep; a longer one restores
-        nothing. A browser session must have signed in within 15 minutes.
+        nothing.
         Audited `org_policy.updated` in every workspace of the org.
       security:
         - bearerAuth: []
@@ -3533,7 +3532,7 @@ paths:
               schema: { $ref: "#/components/schemas/DelegationOrgPolicy" }
         "400": { description: "`invalid_request`" }
         "401": { description: "`unauthorized`" }
-        "403": { description: "`forbidden`, `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
         "404": { description: "`not_found`" }
   /api/v1/workspaces/{workspaceId}/delegates/target-owners:
     parameters:
@@ -3577,7 +3576,7 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
         "400": { description: "`invalid_request`: invalid pattern or repo, or an entry naming neither a repo nor people" }
-        "403": { description: "`forbidden`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
   /api/v1/workspaces/{workspaceId}/messaging/delegation:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"

@@ -64,16 +64,15 @@ import {
  * Human-only routes take the browser account session (the /cloud cookie) or
  * a Desktop-verified bearer (a redeemed browser-consent Desktop sign-in). A
  * device-flow CLI login, an enrollment-key session, a workspace API token
- * and any agent token are refused. relay-control additionally requires a
- * browser session signed in within 15 minutes for changes other than
- * revocation (§4.1 step-up) and JSON from an allowed Origin for cookie writes.
+ * and any agent token are refused. Either a browser session or a verified
+ * Desktop sign-in is enough for every owner action (§4.1, no step-up).
+ * Cookie writes need JSON from an allowed Origin (CSRF).
  *
  * Agent routes prove the agent with its own Relaycast token. Attest, redeem
  * and prompt-delegates also take the recipient owner's Desktop-verified
  * bearer, exactly as Cloud's native-authority route does.
  */
 
-const STEP_UP_MS = 15 * 60 * 1000;
 const CLAIM_COMPLETE_RATE = { limit: 20, windowMs: 60_000 };
 const AGENT_ROUTE_RATE = { limit: 120, windowMs: 60_000 };
 const MAX_AUDIT_EVENTS = 1000;
@@ -270,7 +269,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
 
   /** Human-only routes: browser account session or Desktop-verified bearer, never an agent or plain CLI token. */
   async function human(request: IncomingMessage, publicPath: string, workspaceId: string,
-    options: { write: boolean; stepUp: boolean }): Promise<Human> {
+    options: { write: boolean }): Promise<Human> {
     const headerToken = bearer(request);
     let principal: Principal | null;
     let authMethod: AuthMethod;
@@ -288,12 +287,6 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       if (options.write && !cookieRequestAllowed(request, input.browserOrigins)) {
         fail("csrf_rejected", "Cross-origin request refused", 403);
-      }
-      if (options.stepUp) {
-        const facts = await sessionFacts(cookie!);
-        if (!facts || now().getTime() - time(facts.created_at) > STEP_UP_MS) {
-          fail("reauthentication_required", "Sign in again (within the last 15 minutes) to change delegates", 403);
-        }
       }
       authMethod = "session";
     }
@@ -336,12 +329,6 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       if (write && !cookieRequestAllowed(request, input.browserOrigins)) {
         fail("csrf_rejected", "Cross-origin request refused", 403);
-      }
-      if (write) {
-        const facts = await sessionFacts(cookie!);
-        if (!facts || now().getTime() - time(facts.created_at) > STEP_UP_MS) {
-          fail("reauthentication_required", "Sign in again (within the last 15 minutes) to change delegation policy", 403);
-        }
       }
       authMethod = "session";
     }
@@ -529,9 +516,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     }
 
     // Human-only routes ------------------------------------------------
-    const read = method === "GET";
-    const revoking = method === "DELETE" || (method === "POST" && sub === "revoke-all");
-    const caller = await human(request, publicPath, workspaceId, { write: !read, stepUp: !read && !revoking });
+    const caller = await human(request, publicPath, workspaceId, { write: method !== "GET" });
     const { principal, workspace } = caller;
     const actor = { actorUserId: principal.userId, authMethod: caller.authMethod };
 
