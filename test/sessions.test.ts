@@ -722,6 +722,161 @@ test("list, search, transcript, timing, and subagent catalog for the dashboard",
   assert.equal(env.history.requests.length, before, "invalid requests never reach History");
 });
 
+/**
+ * Agent Relay Desktop reads a session's transcript from Cloud's
+ * `reflex/sessions/:id/events` path, with no `source`. A self-hosted desktop
+ * calls the same path here. It is served with the same auth, workspace scope
+ * and attestation check as `sessions/:id/events`, and in the shape Cloud
+ * returns (AgentWorkforce/cloud#6464). These cases mirror that PR's route tests.
+ */
+const reflexEvents = (workspaceId: string, rest: string) =>
+  `/api/v1/workspaces/${workspaceId}/reflex/sessions/${rest}`;
+const lastEventsRead = (requests: UpstreamRequest[]) =>
+  lastRequest(requests, (entry) => /^\/v1\/sessions\/[^/]+\/events$/.test(entry.path));
+
+test("reflex session events: the desktop's read, scoped to the canonical workspace", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+
+  // The desktop's call: no source, newest first, a page limit.
+  const page = await call(env.origin, reflexEvents(env.alpha, "alpha-1/events?order=desc&limit=50"), { token });
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get("cache-control"), "no-store");
+  assert.deepEqual(page.body, {
+    sessionId: "alpha-1",
+    // Upstream order is kept: the desktop asked for desc.
+    events: [
+      { eventId: "e2", ts: "2026-11-02T18:00:02.000Z", kind: "assistant", content: "done" },
+      { eventId: "e1", ts: "2026-11-02T18:00:01.000Z", kind: "prompt", content: "Alpha work" },
+    ],
+    nextCursor: "events-next",
+  });
+  const read = lastEventsRead(env.history.requests);
+  assert.equal(read?.path, "/v1/sessions/alpha-1/events");
+  assert.deepEqual(read?.query, { workspace: env.alpha, order: "desc", limit: "50" });
+  assert.deepEqual(read?.workspaceParams, [env.alpha]);
+
+  // The overview's call carries no query; the read still names the workspace.
+  const bare = await call(env.origin, reflexEvents(env.alpha, "alpha-1/events"), { token });
+  assert.equal(bare.status, 200);
+  assert.deepEqual(lastEventsRead(env.history.requests)?.query, { workspace: env.alpha });
+
+  // The /cloud prefix serves the same route.
+  const prefixed = await call(env.origin, `/cloud${reflexEvents(env.alpha, "alpha-1/events?limit=1")}`, { token });
+  assert.equal(prefixed.status, 200);
+  assert.equal(prefixed.body.sessionId, "alpha-1");
+});
+
+test("reflex session events: a caller's workspace selector is discarded, never forwarded", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+
+  const spoofed = await call(
+    env.origin,
+    reflexEvents(env.alpha, "alpha-1/events?workspace=spoof&limit=6&order=desc&source=codex"),
+    { token },
+  );
+  assert.equal(spoofed.status, 200);
+  const read = lastEventsRead(env.history.requests);
+  assert.deepEqual(read?.workspaceParams, [env.alpha]);
+  assert.deepEqual(read?.query, { workspace: env.alpha, source: "codex", order: "desc", limit: "6" });
+
+  // Repeated selectors, one naming another real workspace, are discarded too.
+  const repeated = await call(
+    env.origin,
+    reflexEvents(env.alpha, `alpha-1/events?workspace=${env.beta}&workspace=rw_other12`),
+    { token },
+  );
+  assert.equal(repeated.status, 200);
+  assert.deepEqual(lastEventsRead(env.history.requests)?.workspaceParams, [env.alpha]);
+});
+
+test("reflex session events: cursor, limit, order and source pass through", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  env.history.overrides.set("/v1/sessions/alpha-1/events", () => ({
+    body: {
+      sessionId: "alpha-1",
+      events: [{ eventId: "e3", ts: "2026-11-02T18:00:03.000Z", kind: "tool", toolName: "Bash" }],
+      nextCursor: "b96e1:next",
+    },
+  }));
+
+  const page = await call(
+    env.origin,
+    reflexEvents(env.alpha, `alpha-1/events?cursor=${encodeURIComponent("b96e1:abc/def")}&limit=1000&order=asc&source=codex`),
+    { token },
+  );
+  assert.equal(page.status, 200);
+  assert.deepEqual(page.body, {
+    sessionId: "alpha-1",
+    events: [{ eventId: "e3", ts: "2026-11-02T18:00:03.000Z", kind: "tool", toolName: "Bash" }],
+    nextCursor: "b96e1:next",
+  });
+  assert.deepEqual(lastEventsRead(env.history.requests)?.query, {
+    workspace: env.alpha,
+    source: "codex",
+    order: "asc",
+    limit: "1000",
+    cursor: "b96e1:abc/def",
+  });
+
+  // An expired cursor is the same restart signal as on sessions/:id/events.
+  env.history.overrides.set("/v1/sessions/alpha-1/events", () => ({ status: 410, body: {} }));
+  const expired = await call(env.origin, reflexEvents(env.alpha, "alpha-1/events?cursor=old"), { token });
+  assert.equal(expired.status, 410);
+
+  // Bad input is refused before any upstream read.
+  const before = env.history.requests.length;
+  for (const rest of [
+    "alpha-1/events?limit=0",
+    "alpha-1/events?limit=1001",
+    "alpha-1/events?order=sideways",
+    "alpha-1/events?source=a&source=b",
+    "alpha-1/events?cursor=a&cursor=b",
+    "alpha-1/events?bogus=1",
+  ]) {
+    const response = await call(env.origin, reflexEvents(env.alpha, rest), { token });
+    assert.equal(response.status, 400, rest);
+  }
+  assert.equal(env.history.requests.length, before, "invalid requests never reach History");
+});
+
+test("reflex session events: other workspaces stay isolated and unattested pages are refused", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+
+  // Another workspace's session id read through one's own workspace finds nothing.
+  const cross = await call(env.origin, reflexEvents(env.alpha, "beta-1/events"), { token });
+  assert.equal(cross.status, 200);
+  assert.deepEqual(cross.body, { sessionId: "beta-1", events: [], nextCursor: null });
+
+  // A workspace the token is not bound to is indistinguishable from a missing
+  // one, and unauthenticated callers are refused, before any upstream read.
+  const before = env.history.requests.length;
+  const foreign = await call(env.origin, reflexEvents(env.beta, "beta-1/events"), { token });
+  assert.equal(foreign.status, 404);
+  assert.equal(foreign.body.error, "workspace_not_found");
+  const anonymous = await call(env.origin, reflexEvents(env.alpha, "alpha-1/events"));
+  assert.equal(anonymous.status, 401);
+  assert.equal(env.history.requests.length, before);
+
+  // A page attested for another workspace, or not attested, is never returned.
+  for (const attestation of [env.beta, ""]) {
+    env.history.overrides.set("/v1/sessions/alpha-1/events", () => ({
+      headers: { "x-relayhistory-workspace-id": attestation },
+      body: {
+        sessionId: "alpha-1",
+        events: [{ eventId: "x", ts: "2026-11-02T18:00:00.000Z", content: "Beta secret" }],
+        nextCursor: null,
+      },
+    }));
+    const refused = await call(env.origin, reflexEvents(env.alpha, "alpha-1/events"), { token });
+    assert.equal(refused.status, 502, `attestation=${attestation}`);
+    assert(!JSON.stringify(refused.body).includes("Beta secret"));
+  }
+});
+
 test("team activity reads History in 92-day windows and validates totals", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
