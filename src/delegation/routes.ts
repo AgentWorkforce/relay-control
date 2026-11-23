@@ -8,7 +8,7 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
-import { gateView, redeemThroughGate, type GateRow } from "./gates.js";
+import { gateRedeemStatus, gateView, redeemThroughGate, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -31,7 +31,7 @@ import {
   type ActionClass,
   type Scope,
 } from "./scope.js";
-import { logAuditFenced } from "./observe.js";
+import { logAuditFenced, logUnavailable } from "./observe.js";
 import {
   anyBinding,
   attestDelegation,
@@ -253,6 +253,13 @@ const gateBody = z.object({
   // (never pull_request* or workflow_run).
   event: z.enum(["push", "workflow_dispatch", "release", "schedule"]),
   target_prefix: z.string().min(1).max(256),
+  /**
+   * Candidate-run release targets name the candidate's source commit, which a
+   * promote workflow may legitimately not be running on. Only then, opt out
+   * of requiring the target's sha to be the run's `sha` claim. Land and iOS
+   * targets are always bound. As Cloud.
+   */
+  allow_source_sha_mismatch: z.boolean().optional(),
 }).strict().superRefine((gate, context) => {
   if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
     context.addIssue({ code: "custom", message: "set exactly one of ref and ref_pattern" });
@@ -273,8 +280,9 @@ const gateBody = z.object({
     }
   }
   // A prefix not anchored to this repository would let one gate redeem another repo's releases.
-  if (!gate.target_prefix.startsWith(`${gate.repo}:`) || /\s|\*/u.test(gate.target_prefix)) {
-    context.addIssue({ code: "custom", message: "target_prefix must start with <repo>: and contain no wildcard" });
+  // It ends at a segment boundary (`:`), so `repo:stable:` never covers `repo:stable-canary:…`.
+  if (!gate.target_prefix.startsWith(`${gate.repo}:`) || !gate.target_prefix.endsWith(":") || /\s|\*/u.test(gate.target_prefix)) {
+    context.addIssue({ code: "custom", message: "target_prefix must start with <repo>:, end with : and contain no wildcard" });
   }
 });
 const gateRedeemBody = z.object({
@@ -570,16 +578,18 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         "SELECT id, organization_id FROM workspaces WHERE id::text = $1", [workspaceId],
       )).rows[0];
       if (!row) {
-        json(200, { ok: false, reason: "not_enabled", ...(body.dry_run ? { dry_run: true } : {}) });
+        json(body.dry_run ? 200 : 403, { ok: false, reason: "not_enabled", ...(body.dry_run ? { dry_run: true } : {}) });
         return true;
       }
       const binding = await input.relaycastBinding(row.id);
       const workspace: DelegationWorkspace = { id: row.id, organizationId: row.organization_id,
         relaycastWorkspaceId: binding?.relaycastWorkspaceId ?? "", relaycastApiKey: binding?.relaycastApiKey ?? "" };
-      json(200, await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
+      // Status codes fail closed for a plain `curl -f` step (gateRedeemStatus); the body is unchanged.
+      const result = await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
         workspace, verifyOidc: input.workflowOidc, oidcToken: token, approvalId: body.approval_id, action: body.action,
         dryRun: body.dry_run === true,
-      }));
+      });
+      json(gateRedeemStatus(result), result);
       return true;
     }
 
@@ -730,6 +740,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     }
 
     if (sub === "gates") {
+      return await gateRegistry().catch((error: unknown) => {
+        // A refusal is answered as is; anything else is an outage, logged (op gate_registry), as Cloud.
+        const known = error as { status?: unknown; code?: unknown };
+        if (!(error instanceof DelegationHttpError) && !(typeof known?.status === "number" && typeof known.code === "string")) {
+          logUnavailable("gate_registry", error, { workspaceId: workspace.id });
+        }
+        throw error;
+      });
+    }
+    async function gateRegistry(): Promise<boolean> {
       if (method === "GET") {
         const all = new URL(request.url ?? "/", "http://localhost").searchParams.get("all") === "1";
         if (all && !caller.admin) fail("forbidden", "Only org owners and admins can list every gate", 403);
@@ -753,10 +773,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
                (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
-                target_prefix, created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+                target_prefix, allow_source_sha_mismatch, created_auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
             [mintId("gate"), workspace.id, principal.userId, issuer, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
-              body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, caller.authMethod],
+              body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, body.allow_source_sha_mismatch === true,
+              caller.authMethod],
           )).rows[0]!;
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
             ownerUserId: principal.userId, data: gateView(created) });

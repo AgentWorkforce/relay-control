@@ -35,6 +35,8 @@ export type WorkflowClaims = {
   /** GitHub's stable repository and owner ids, when the issuer sends them (a gate pins them on first match). */
   repository_id: string | null;
   repository_owner_id: string | null;
+  /** The commit the run is on: lower-case hex, 40 (or 64 for a SHA-256 repository). Required. */
+  sha: string;
 };
 
 export class OidcInvalid extends Error {
@@ -188,6 +190,9 @@ export function workflowOidcVerifier(input: {
     if (!/^[1-9][0-9]{0,19}$/.test(runId) || !Number.isSafeInteger(runAttempt) || runAttempt < 1) {
       throw new OidcInvalid("claim_run");
     }
+    // GitHub sets `sha` on every Actions token: the commit the run is on. As Cloud, it is required.
+    const sha = typeof claims.sha === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(claims.sha) ? claims.sha.toLowerCase() : null;
+    if (!sha) throw new OidcInvalid("claim_sha");
     return {
       issuer,
       repository: text("repository"),
@@ -197,6 +202,7 @@ export function workflowOidcVerifier(input: {
       event_name: text("event_name"),
       run_id: runId,
       run_attempt: runAttempt,
+      sha,
       repository_id: optionalId("repository_id"),
       repository_owner_id: optionalId("repository_owner_id"),
     };

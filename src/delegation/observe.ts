@@ -22,7 +22,7 @@
  * the Worker's waitUntil for the same reason).
  */
 export type DelegationOp = "attest" | "redeem" | "gate_redeem" | "prompt_delegates" | "conditions" | "standing" |
-  "github_oidc_jwks" | "retention" | "audit";
+  "github_oidc_jwks" | "retention" | "audit" | "gate_registry";
 
 export type SafeContext = {
   workspaceId?: string | null;

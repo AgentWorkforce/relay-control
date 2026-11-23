@@ -1,7 +1,7 @@
 import type { SqlExecutor } from "../database.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims, type WorkflowOidcVerifier } from "./oidc.js";
 import { logAuditWriteFailed, logRefused, logUnavailable } from "./observe.js";
-import { actionIsValid, canonicalAction, type Action, type ActionClass, type Condition, type ReasonCode } from "./scope.js";
+import { actionIsValid, canonicalAction, releaseTargetSha, type Action, type ActionClass, type Condition, type ReasonCode } from "./scope.js";
 import {
   actionConsumed,
   consumeAction,
@@ -48,6 +48,8 @@ export type GateRow = {
   target_prefix: string;
   repository_id: string | null;
   repository_owner_id: string | null;
+  /** Candidate-run release targets may name a source commit the run is not on (only when true). */
+  allow_source_sha_mismatch: boolean;
   created_auth_method: string;
   created_at: Date | string;
   deleted_at: Date | string | null;
@@ -69,6 +71,8 @@ export function gateView(row: GateRow) {
     target_prefix: row.target_prefix,
     ...(row.repository_id ? { repository_id: row.repository_id } : {}),
     ...(row.repository_owner_id ? { repository_owner_id: row.repository_owner_id } : {}),
+    // Present (true) only when the gate opted out of binding candidate-run release targets to the run's commit, as Cloud.
+    ...(row.allow_source_sha_mismatch ? { allow_source_sha_mismatch: true as const } : {}),
     created_at: new Date(row.created_at).toISOString(),
   };
 }
@@ -157,7 +161,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       data: { action: input.action, gate_id: gate?.id ?? null,
         ...(claims ? { issuer: claims.issuer, repository: claims.repository, workflow_ref: claims.workflow_ref,
           job_workflow_ref: claims.job_workflow_ref,
-          ref: claims.ref, event_name: claims.event_name, run_id: claims.run_id, run_attempt: claims.run_attempt } : {}),
+          ref: claims.ref, event_name: claims.event_name, run_id: claims.run_id, run_attempt: claims.run_attempt, sha: claims.sha } : {}),
         ...(dryRun ? { dry_run: true } : {}), ...extra },
     });
   // Before a verified token matches one of this workspace's pinned gates the
@@ -171,7 +175,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (audited) await bestEffort("gate.refused", reason, unmet ? { unmet } : {});
     // Counted per reason. A token no trusted issuer signed is not counted, so
     // forged calls cannot drive events.
-    if (reason !== "oidc_invalid") logRefused("gate_redeem", { workspaceId: workspace.id, reason, gateId: gate?.id ?? null });
+    // Not `gate_unknown` either: any GitHub account can mint a genuine token for this audience.
+    if (reason !== "oidc_invalid" && reason !== "gate_unknown") logRefused("gate_redeem", { workspaceId: workspace.id, reason, gateId: gate?.id ?? null });
     return { ok: false, reason, ...(unmet ? { unmet } : {}), ...(dryRun ? { dry_run: true as const } : {}) };
   };
   try {
@@ -216,7 +221,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (!policy.delegation_enabled) return await refuse("not_enabled");
     // Several owners may register the same workflow with overlapping
     // prefixes; any of them whose owner has standing can serve (below).
-    const candidates = exact.filter(item => input.action.target.startsWith(item.target_prefix));
+    let candidates = exact.filter(item => input.action.target.startsWith(item.target_prefix));
     if (!candidates.length) return await refuse("target_prefix");
     gate = candidates[0]!;
 
@@ -229,6 +234,18 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     const action = approval.actions.find(item => item.class === input.action.class && item.target === input.action.target);
     if (!action || !actionIsValid(action)) return await refuse("out_of_scope");
     if (approval.invalidated_at) return await refuse("revoked");
+    // A release names its commit; the run must be on it (the token's `sha`).
+    // Only a candidate-run target (whose source commit a promote run may not
+    // be on) can be redeemed off-commit, and only through a gate that opted out.
+    if (action.class === "release") {
+      const named = releaseTargetSha(action.target);
+      if (!named) return await refuse("out_of_scope");
+      if (named.sha.toLowerCase() !== claims.sha) {
+        candidates = named.form === "candidate" ? candidates.filter(item => item.allow_source_sha_mismatch === true) : [];
+        if (!candidates.length) return await refuse("sha_mismatch");
+        gate = candidates[0]!;
+      }
+    }
 
     // Tier D rests on a live grant and a still-bound delegate; both tiers on a current owner.
     if (approval.tier === "D") {
@@ -293,7 +310,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     const oidc = claims;
     const outcome = await decideUnderLocks(deps.database, { workspaceId: workspace.id,
       memberUserIds: approval.tier === "O" ? [servingGate.owner_user_id, approval.owner_user_id] : [servingGate.owner_user_id],
-      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id }, async (state, tx) => {
+      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true },
+      async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action], tier: approval.tier, policy, recipientAgentId: "",
         nowMs: deps.now().getTime(), memberGone: approval.tier === "O" ? "revoked" : "recipient_policy",
         noGrant: approval.tier === "O" });
@@ -324,7 +342,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
 async function pinGateRepository(executor: SqlExecutor, gateId: string, repositoryId: string, repositoryOwnerId: string):
   Promise<{ repository_id: string | null; repository_owner_id: string | null } | null> {
   await executor.query(
-    "UPDATE delegation_gates SET repository_id = $2, repository_owner_id = $3 WHERE id = $1 AND repository_id IS NULL",
+    `UPDATE delegation_gates SET repository_id = $2, repository_owner_id = $3
+      WHERE id = $1 AND repository_id IS NULL AND deleted_at IS NULL`,
     [gateId, repositoryId, repositoryOwnerId],
   );
   return (await executor.query<{ repository_id: string | null; repository_owner_id: string | null }>(
@@ -403,4 +422,16 @@ async function currentGateAuthority(executor: SqlExecutor, workspaceId: string, 
   }
   if (!await memberRole(executor, workspaceId, gateOwnerId)) return "recipient_policy";
   return null;
+}
+
+/**
+ * The redeem route's HTTP status, as Cloud's gateRedeemStatus: 200 for a
+ * redeem or any dry run (report-only); otherwise 401 (`oidc_invalid`), 503
+ * (`unavailable`, `condition_unavailable`: retry) or 403 (final). The body is
+ * the same either way, so a plain `curl -f` step fails closed.
+ */
+export function gateRedeemStatus(result: GateRedeemResult): number {
+  if (result.ok || ("dry_run" in result && result.dry_run)) return 200;
+  if (result.reason === "oidc_invalid") return 401;
+  return result.reason === "unavailable" || result.reason === "condition_unavailable" ? 503 : 403;
 }

@@ -98,7 +98,8 @@ async function setup(t: TestContext) {
     const now = Math.floor(Date.now() / 1000);
     return { iss: GITHUB, aud: env.origin, sub: `repo:${REPO}:ref:refs/heads/main`, repository: REPO,
       workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "workflow_dispatch", run_id: "777000111",
-      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", iat: now - 5, nbf: now - 5, exp: now + 300, ...extra };
+      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", sha: SHA, iat: now - 5, nbf: now - 5, exp: now + 300,
+      ...extra };
   };
   const redeem = (token: string | null, approvalId: string, target = STABLE, extra: Record<string, unknown> = {}) =>
     request(env.origin, `${base}/delegates/gates/redeem`, {
@@ -204,7 +205,7 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
   ];
   for (const [name, token] of cases) {
     const refused = await env.redeem(token, approvalId);
-    assert.equal(refused.status, 200, `${name} ${refused.raw}`);
+    assert.equal(refused.status, 401, `${name} ${refused.raw}`);
     assert.deepEqual(refused.body, { ok: false, reason: "oidc_invalid" }, name);
   }
   // No bearer at all is 401, before anything is read.
@@ -653,7 +654,7 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   const seconds = Math.floor(clock.ms / 1000);
   const token = (kid = github.kid) => mint({ ...github, kid }, { iss: GITHUB, aud: "https://control.example.test", sub: "repo:x",
     repository: REPO, workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "push",
-    run_id: "1", run_attempt: "1", iat: seconds, nbf: seconds, exp: seconds + 600 });
+    run_id: "1", run_attempt: "1", sha: SHA, iat: seconds, nbf: seconds, exp: seconds + 600 });
   // No keys yet and the issuer is down: an outage, not a forged token.
   await assert.rejects(verify(token()), OidcKeysUnavailable);
   const afterFirst = fetches;
@@ -676,4 +677,64 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   assert.equal((await verify(token())).repository, REPO);
   const stale = lines.map(line => JSON.parse(line) as Record<string, unknown>).filter(line => line.message === "delegation.dependency_failed").at(-1)!;
   assert.equal(stale.stale_cache_served, true);
+});
+
+test("gate redeem: a release is bound to the run's commit (sha claim); status codes fail closed", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  const token = (extra: Record<string, unknown> = {}) => mint(env.github, env.workflowClaims({ run_id: "900", ...extra }));
+  const dry = { dry_run: true };
+  // The sha claim is required: missing or malformed is oidc_invalid (401).
+  for (const sha of [undefined, "abc", "z".repeat(40)]) {
+    const refused = await env.redeem(token({ sha }), approvalId);
+    assert.equal(refused.status, 401, refused.raw);
+    assert.deepEqual(refused.body, { ok: false, reason: "oidc_invalid" });
+  }
+  // Upper-case hex is accepted and compared lower-cased.
+  assert.deepEqual((await env.redeem(token({ sha: SHA.toUpperCase() }), approvalId, STABLE, dry)).body,
+    { ok: true, consumed: false, dry_run: true });
+  // A run on another commit: sha_mismatch (403), unless the gate opted out for candidate targets.
+  const other = "b".repeat(40);
+  const mismatch = await env.redeem(token({ sha: other }), approvalId);
+  assert.equal(mismatch.status, 403, mismatch.raw);
+  assert.deepEqual(mismatch.body, { ok: false, reason: "sha_mismatch" });
+  // A dry run always answers 200 with its verdict.
+  const dryMismatch = await env.redeem(token({ sha: other }), approvalId, STABLE, dry);
+  assert.equal(dryMismatch.status, 200, dryMismatch.raw);
+  assert.deepEqual(dryMismatch.body, { ok: false, reason: "sha_mismatch", dry_run: true });
+  const refusedEvent = (await env.events("gate.refused")).find(row => row.reason === "sha_mismatch")!;
+  assert.equal(refusedEvent.data.sha, other);
+  // A gate that opts out (shown on the gate only when true) serves a candidate target from another commit.
+  const optOut = await env.gate({ target_prefix: `${REPO}:stable:`, allow_source_sha_mismatch: true });
+  assert.equal(optOut.allow_source_sha_mismatch, true);
+  assert.equal((await env.bearer("/delegates/gates")).body.gates.filter((gate: Record<string, unknown>) =>
+    gate.allow_source_sha_mismatch === true).length, 1);
+  const served = await env.redeem(token({ sha: other }), approvalId);
+  assert.equal(served.status, 200, served.raw);
+  assert.deepEqual(served.body, { ok: true, consumed: true });
+  assert.equal((await env.events("gate.redeemed")).at(-1)!.data.sha, other);
+  // Land and iOS targets are always bound, even through an opted-out gate.
+  const ios = `${REPO}:ios:testflight:42:${SHA}`;
+  const iosApproval = await env.approval([ios]);
+  await env.gate({ target_prefix: `${REPO}:ios:`, allow_source_sha_mismatch: true });
+  assert.deepEqual((await env.redeem(token({ sha: other, run_id: "901" }), iosApproval, ios)).body,
+    { ok: false, reason: "sha_mismatch" });
+  assert.deepEqual((await env.redeem(token({ run_id: "901" }), iosApproval, ios)).body, { ok: true, consumed: true });
+  // Other refusals are 403; a gate_unknown from a stranger repository too.
+  const unknown = await env.redeem(token({ repository: "someone/else" }), approvalId);
+  assert.equal(unknown.status, 403, unknown.raw);
+});
+
+test("gates: target_prefix ends at a segment boundary; a case-variant duplicate is 409", async (t) => {
+  const env = await setup(t);
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch" };
+  const open = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable` });
+  assert.equal(open.status, 400, open.raw);
+  await env.gate({ target_prefix: `${REPO}:stable:` });
+  const lower = REPO.toLowerCase();
+  const duplicate = await env.browser("/delegates/gates", "POST", { ...body, repo: lower,
+    workflow_ref: WORKFLOW.replace(REPO, lower), target_prefix: `${lower}:stable:` });
+  assert.equal(duplicate.status, 409, duplicate.raw);
+  assert.equal(duplicate.body.code, "gate_exists");
 });

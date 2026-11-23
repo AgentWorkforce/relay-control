@@ -381,13 +381,18 @@ workflow, the gate also sets `job_workflow_ref` (that workflow's file and a
 full ref, the gate's `ref_pattern`, or a 40-hex lowercase commit SHA, which
 may be in another repo), and the token's `job_workflow_ref` must match it
 exactly too.
-`target_prefix` must start with `<repo>:` and contain no `*`. `event` is one
+`target_prefix` must start with `<repo>:`, end with `:` (a segment
+boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
+no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
+true) lets candidate-run release targets name a source commit the run is not
+on (see step 5). `event` is one
 of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
 the gated ref's own workflow code (never `pull_request*` or `workflow_run`).
 Registering needs delegation on and a current member (the membership is
 held until the insert commits). The same live gate (owner, repo,
 `workflow_ref`, `job_workflow_ref`, event, `target_prefix`) cannot be
-registered twice: 409 `gate_exists`. Each change is audited
+registered twice, in any letter case: 409 `gate_exists`. A registry outage is
+logged as `delegation.unavailable` (op `gate_registry`). Each change is audited
 (`gate.registered`, `gate.deleted`).
 
 **Redeeming.** The job calls `POST /delegates/gates/redeem` with
@@ -402,6 +407,8 @@ dry_run?}`. Control checks, in order:
      URLs, at most 8; for example a GitHub Enterprise Server issuer).
    - The audience is this deployment's origin (`SELFHOST_PUBLIC_URL`).
    - The token is within its validity window, with 60 seconds of clock skew.
+   - Its `sha` (the commit the run is on) is 40 or 64 hex digits, any case,
+     kept lower-cased.
    - Failing any of these is `oidc_invalid`. When the issuer's keys cannot be
      read and none are cached, the answer is `unavailable` (an outage, not a
      forged token). After a failed key fetch no refetch starts for 30
@@ -439,6 +446,13 @@ dry_run?}`. Control checks, in order:
      recipient's owner would);
    - conditions (`not_before`; GitHub conditions are `condition_unavailable`).
 
+   Right after the action is found, a `release` is bound to the run's commit,
+   as Cloud: the target's sha (the last segment for land and iOS, the source
+   sha for a candidate) must equal the token's `sha`. On a mismatch only gates
+   with `allow_source_sha_mismatch` keep serving a candidate target, land and
+   iOS targets keep none, and with none left the answer is `sha_mismatch`.
+   Other classes are not sha-bound. Every gate event carries the run's `sha`.
+
    A `release` action must name exactly one release (§11a.2), or the
    approval is malformed (`no_approval` at attestation, `out_of_scope` here):
    - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
@@ -463,6 +477,13 @@ dry_run?}`. Control checks, in order:
 
 `dry_run: true` runs every check and never consumes. It answers
 `{ok:true, consumed:false, dry_run:true}` or `{ok:false, reason, dry_run:true}`.
+
+HTTP status, as Cloud: 200 for a redeem or any dry run; otherwise 401
+(`oidc_invalid`), 503 (`unavailable`, `condition_unavailable`: retry) or 403
+(every other reason: final). The body is the same either way. A consuming
+redeem locks the approval `FOR NO KEY UPDATE`, so redeems of one approval run
+one at a time; a dry run takes no locks (it answers from the fresh re-read). `gate_unknown`, like `oidc_invalid`,
+is not counted as `delegation.refused`.
 `gate.redeemed` (with the run, attempt, repository, workflow refs, ref,
 event, action and `same_run`, auth method `github_oidc`) is written in the
 consuming transaction: if the write fails, the consumption and run binding

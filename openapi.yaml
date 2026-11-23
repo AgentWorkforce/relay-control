@@ -3562,7 +3562,10 @@ paths:
                 dry_run: { type: boolean }
       responses:
         "200":
-          description: Result
+          description: >-
+            A redeem (`ok: true`), or any dry run (report-only), with its verdict. Status codes fail closed for a
+            plain `curl -f` step, as Cloud: a refusal is 401 (`oidc_invalid`), 503 (`unavailable`,
+            `condition_unavailable`: retry) or 403 (every other reason: final), with the same body.
           content:
             application/json:
               schema:
@@ -3587,9 +3590,10 @@ paths:
                       unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
                       dry_run: { const: true }
         "400": { description: "`invalid_request`" }
-        "401": { description: "`unauthorized`: no bearer" }
+        "401": { description: "`unauthorized`: no bearer; or a refusal `{ok:false, reason:\"oidc_invalid\"}`" }
+        "403": { description: "A final refusal `{ok:false, reason}` (not a dry run)" }
         "429": { description: "`rate_limited`" }
-        "503": { description: "`unavailable`" }
+        "503": { description: "`unavailable`, or a retryable refusal `{ok:false, reason}` (`unavailable`, `condition_unavailable`)" }
   /api/v1/workspaces/{workspaceId}/delegates/audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10264,7 +10268,7 @@ components:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
         consumed, not_pending, unavailable, condition_unmet, condition_unavailable, gate_unknown, oidc_invalid,
-        gate_mismatch, target_prefix]
+        gate_mismatch, target_prefix, sha_mismatch]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
@@ -10304,6 +10308,7 @@ components:
         target_prefix: { type: string }
         repository_id: { type: string, description: "GitHub's repository id, pinned from the first verified match" }
         repository_owner_id: { type: string, description: "GitHub's repository owner id, pinned with repository_id" }
+        allow_source_sha_mismatch: { const: true, description: "Present only when true: candidate-run release targets may name a source commit other than the run's sha" }
         owner_id: { type: string }
         created_at: { type: string, format: date-time }
     DelegationGateInput:
@@ -10319,7 +10324,8 @@ components:
         ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
         ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
         event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
-        target_prefix: { type: string, maxLength: 256, example: "AgentWorkforce/relay-app:" }
+        target_prefix: { type: string, maxLength: 256, description: "Starts with <repo>: and ends with : (a segment boundary); no wildcard", example: "AgentWorkforce/relay-app:" }
+        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false." }
     DelegationAction:
       type: object
       description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.

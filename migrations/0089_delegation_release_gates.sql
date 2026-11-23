@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   -- rename, transfer or delete) never matches.
   repository_id text,
   repository_owner_id text,
+  -- Candidate-run release targets name the candidate's source commit, which a
+  -- promote workflow may not be running on: only a gate that opts out lets
+  -- such a target differ from the run's sha claim. Land and iOS never may.
+  allow_source_sha_mismatch boolean NOT NULL DEFAULT false,
   created_auth_method text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz,
@@ -37,11 +41,11 @@ CREATE INDEX IF NOT EXISTS delegation_gates_repo_idx
   ON delegation_gates (workspace_id, lower(repo)) WHERE deleted_at IS NULL;
 
 -- One live gate per owner and workflow identity (as Cloud, plus the issuer):
--- registering the same one twice is 409 gate_exists. Two reusable workflows
--- behind one caller are distinct gates.
+-- registering the same one twice, in any letter case, is 409 gate_exists.
+-- Two reusable workflows behind one caller are distinct gates.
 CREATE UNIQUE INDEX IF NOT EXISTS delegation_gates_live_unique
-  ON delegation_gates (workspace_id, owner_user_id, issuer, repo, workflow_ref, COALESCE(job_workflow_ref, ''), event,
-    target_prefix)
+  ON delegation_gates (workspace_id, owner_user_id, issuer, lower(repo), lower(workflow_ref),
+    lower(COALESCE(job_workflow_ref, '')), event, lower(target_prefix))
   WHERE deleted_at IS NULL;
 
 -- The run a gate redeem consumed an action for (single use is per action,
