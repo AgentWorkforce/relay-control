@@ -21,10 +21,6 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   CONSTRAINT delegation_gates_ref CHECK ((ref IS NULL) <> (ref_pattern IS NULL))
 );
 
--- One live gate per owner and exact workflow identity.
-CREATE UNIQUE INDEX IF NOT EXISTS delegation_gates_identity
-  ON delegation_gates (workspace_id, owner_user_id, repo, job_workflow_ref, COALESCE(ref, ''), COALESCE(ref_pattern, ''), event)
-  WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS delegation_gates_repo_idx
   ON delegation_gates (workspace_id, repo) WHERE deleted_at IS NULL;
 

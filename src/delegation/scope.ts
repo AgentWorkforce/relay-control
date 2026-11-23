@@ -138,6 +138,7 @@ export function actionIsValid(action: Pick<Action, "class" | "target" | "conditi
   if (action.class === "prompt_approval" && !PROMPT_TARGET.test(action.target)) return false;
   if (action.class === "config_change" && !configTarget(action.target)) return false;
   if (action.class === "pr_ops" && !prOpsTarget(action.target)) return false;
+  if (action.class === "release" && !validReleaseTarget(action.target)) return false;
   const conditions = action.conditions ?? [];
   if (conditions.length > MAX_CONDITIONS) return false;
   if (new Set(conditions.map(condition => condition.type)).size !== conditions.length) return false;
@@ -377,24 +378,22 @@ export function sha256Hex(value: string): string {
 
 // Release targets (§11a.2) --------------------------------------------------
 
-const REPO = "[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}";
-const SHA = "[0-9a-f]{40}";
-/** `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]` */
-const RELEASE_TARGET = new RegExp(`^${REPO}:[a-z][a-z0-9-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA}:[1-9][0-9]{0,19}(:[A-Za-z0-9_.-]{1,64})?$`, "u");
-/** `<repo>:land:<branch>:<head sha>` */
-const LAND_TARGET = new RegExp(`^${REPO}:land:[A-Za-z0-9._/-]{1,200}:${SHA}$`, "u");
-/** `<repo>:ios:<distribution>:<build number>:<sha>` */
-const IOS_TARGET = new RegExp(`^${REPO}:ios:[a-z][a-z0-9-]{0,31}:[0-9][0-9.]{0,31}:${SHA}$`, "u");
-
+const REPO_PART = "[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}";
+const SHA40 = "[0-9a-f]{40}";
 /**
- * §11a.2: a `release` action names exactly one release: a channel release, a
- * branch landing or an iOS distribution. "Ship everything" names nothing and
- * permits nothing.
+ * Release targets (§11a.2), as Cloud's RELEASE_TARGETS. A `release` action
+ * names exactly one release:
+ * - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
+ * - landing a branch: `<repo>:land:<branch>:<head sha>`
+ * - TestFlight and App Store: `<repo>:ios:<distribution>:<build number>:<sha>`
+ * "Ship everything" names nothing, so it matches none of these.
  */
+export const RELEASE_TARGETS: readonly RegExp[] = [
+  new RegExp(`^${REPO_PART}:(?!land:|ios:)[a-z][a-z0-9_-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA40}:[1-9][0-9]{0,19}(?::[A-Za-z0-9_.-]{1,64})?$`, "u"),
+  new RegExp(`^${REPO_PART}:land:[A-Za-z0-9._/-]{1,200}:${SHA40}$`, "u"),
+  new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:[0-9][0-9.]{0,31}:${SHA40}$`, "u"),
+];
+
 export function validReleaseTarget(target: string): boolean {
-  if (target.length > MAX_TARGET_CHARS) return false;
-  const land = LAND_TARGET.test(target);
-  const ios = IOS_TARGET.test(target);
-  // A land or ios target is never also read as a channel release.
-  return land || ios || (RELEASE_TARGET.test(target) && !/^[^:]+:(land|ios):/u.test(target));
+  return RELEASE_TARGETS.some(pattern => pattern.test(target));
 }

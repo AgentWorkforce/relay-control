@@ -133,6 +133,7 @@ export function workflowOidcVerifier(input: {
       if (typeof value !== "string" || !value || value.length > 512) throw new OidcInvalid(`claim_${name}`);
       return value;
     };
+    text("sub");
     const runAttempt = Number(text("run_attempt"));
     const runId = text("run_id");
     if (!/^[1-9][0-9]{0,19}$/.test(runId) || !Number.isSafeInteger(runAttempt) || runAttempt < 1) {

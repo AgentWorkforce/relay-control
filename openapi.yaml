@@ -3442,11 +3442,13 @@ paths:
       operationId: registerDelegationGate
       tags: [Owner delegates]
       description: |
-        Register exactly which workflow may redeem an approval of the caller's:
-        `repo`, `job_workflow_ref`, `event`, and either an exact `ref` or a
+        Register exactly which workflow may redeem: `repo`,
+        `job_workflow_ref` (a workflow in that repo, pinned to a ref), `event`,
+        and either an exact `ref` (`refs/heads/...` or `refs/tags/...`) or a
         `ref_pattern` of the form `refs/tags/<literal prefix>*` (one trailing
-        `*`). `target_prefix` must start with `<repo>:`. Human-only, delegation
-        on. Audited `gate.registered`.
+        `*`). `target_prefix` must start with `<repo>:` and contain no
+        whitespace or `*`. Human-only (browser session or verified Desktop
+        bearer), delegation on. Audited `gate.registered`.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -3464,24 +3466,37 @@ paths:
         "400": { description: "`invalid_request`" }
         "401": { description: "`unauthorized`" }
         "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
-        "409": { description: "`gate_exists`: the caller already has a gate for this exact workflow identity" }
-  /api/v1/workspaces/{workspaceId}/delegates/gates/{gateId}:
-    parameters:
-      - $ref: "#/components/parameters/WorkspaceId"
-      - { name: gateId, in: path, required: true, schema: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" } }
     delete:
       operationId: deleteDelegationGate
       tags: [Owner delegates]
-      description: Human-only. The gate's owner, or a workspace owner/admin. Allowed while delegation is off. Audited `gate.deleted`.
+      description: |
+        Remove a gate named by `?gate_id=` or `{"gate_id": ...}`: its owner, or
+        a workspace owner/admin. Allowed while delegation is off. Audited
+        `gate.deleted`.
       security:
         - bearerAuth: []
         - cookieAuth: []
+      parameters:
+        - { name: gate_id, in: query, required: false, schema: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gate_id: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" }
       responses:
         "200":
-          description: The deleted gate
+          description: Deleted
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/DelegationGate" }
+              schema:
+                type: object
+                required: [gate_id, deleted]
+                properties:
+                  gate_id: { type: string }
+                  deleted: { const: true }
         "404": { description: "`not_found`" }
   /api/v1/workspaces/{workspaceId}/delegates/gates/redeem:
     parameters:
@@ -3496,18 +3511,21 @@ paths:
         SELFHOST_DELEGATION_OIDC_ISSUERS), its issuer, its audience (this
         deployment's origin) and its validity window. `repository`,
         `job_workflow_ref`, `ref` (or the gate's `ref_pattern`) and
-        `event_name` must match one of the approval owner's gates exactly.
-        Then the normal redeem checks run (approval, grant, delegate binding,
-        scope, policy, tier O, expiry, revocation, conditions), the action's
-        target must start with the gate's `target_prefix`, and a `release`
-        target must name exactly one release (§11a.2).
+        `event_name` must match a registered gate exactly (`gate_unknown` when
+        the repository has no gate, `gate_mismatch` otherwise), and the
+        action's target must start with that gate's `target_prefix`
+        (`target_prefix`). Then the normal redeem checks run (approval, grant,
+        delegate binding, scope, policy, tier O, revocation, expiry, the gate
+        owner's standing, conditions). A `release` target must name exactly
+        one release (§11a.2); any other approval is malformed.
 
         The first redeem consumes the approval and binds it to the token's
         `run_id`. Any later redeem in the same run (another job, or a later
         attempt) answers `{ok:true, consumed:true, same_run:true}`; any other
         run gets `consumed`. `dry_run: true` runs every check, never consumes,
-        and answers `{ok, reason?, dry_run:true}`. Audited `gate.redeemed`,
-        `gate.refused` or `gate.dry_run`.
+        and answers `{ok, reason?, dry_run:true}`. Audited `gate.redeemed` or
+        `gate.refused` (with `dry_run: true` in the event data for a dry run),
+        auth method `github_oidc`.
       security:
         - bearerAuth: []
       requestBody:
@@ -10244,13 +10262,14 @@ components:
         code: { type: string, description: Stable machine-readable code }
     DelegationGate:
       type: object
-      required: [gate_id, repo, job_workflow_ref, ref, ref_pattern, event, target_prefix, owner_id, created_at]
+      required: [gate_id, owner_id, repo, job_workflow_ref, event, target_prefix, created_at]
+      description: Exactly one of `ref` and `ref_pattern` is present.
       properties:
         gate_id: { type: string }
         repo: { type: string }
         job_workflow_ref: { type: string }
-        ref: { type: [string, "null"] }
-        ref_pattern: { type: [string, "null"] }
+        ref: { type: string }
+        ref_pattern: { type: string }
         event: { type: string }
         target_prefix: { type: string }
         owner_id: { type: string }
@@ -10263,9 +10282,9 @@ components:
       properties:
         repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
         job_workflow_ref: { type: string, maxLength: 512, example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
-        ref: { type: string, example: "refs/heads/main" }
-        ref_pattern: { type: string, pattern: "^refs/tags/[A-Za-z0-9_./-]{1,200}\\*$", example: "refs/tags/v2026.*" }
-        event: { type: string, pattern: "^[a-z_]{1,64}$", example: workflow_dispatch }
+        ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
+        ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
+        event: { type: string, pattern: "^[a-z][a-z_]{0,63}$", example: workflow_dispatch }
         target_prefix: { type: string, maxLength: 256, example: "AgentWorkforce/relay-app:" }
     DelegationAction:
       type: object

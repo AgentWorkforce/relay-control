@@ -144,6 +144,9 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   const env = await setup(t);
   for (const bad of [
     { repo: REPO, job_workflow_ref: "desktop-promote.yml", ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` },
+    { repo: REPO, job_workflow_ref: "Other/repo/.github/workflows/x.yml@refs/heads/main", ref: "refs/heads/main",
+      event: "workflow_dispatch", target_prefix: `${REPO}:` },
+    { repo: REPO, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:*` },
     { repo: REPO, job_workflow_ref: WORKFLOW, ref: "main", event: "workflow_dispatch", target_prefix: `${REPO}:` },
     { repo: REPO, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "Workflow Dispatch", target_prefix: `${REPO}:` },
     { repo: REPO, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: "Other/repo:" },
@@ -160,20 +163,20 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   assert.equal(viaDesktop.status, 201, viaDesktop.raw);
   assert.match(viaDesktop.body.gate_id, /^gate_[A-Za-z0-9]+$/);
   assert.deepEqual(Object.keys(viaDesktop.body).sort(),
-    ["created_at", "event", "gate_id", "job_workflow_ref", "owner_id", "ref", "ref_pattern", "repo", "target_prefix"]);
-  assert.equal(viaDesktop.body.ref_pattern, null);
-  const duplicate = await env.browser("/delegates/gates", "POST", body);
-  assert.equal(duplicate.status, 409, duplicate.raw);
-  assert.equal(duplicate.body.code, "gate_exists");
+    ["created_at", "event", "gate_id", "job_workflow_ref", "owner_id", "ref", "repo", "target_prefix"]);
   const listed = await env.bearer("/delegates/gates");
   assert.deepEqual(listed.body.gates.map((gate: { gate_id: string }) => gate.gate_id), [viaDesktop.body.gate_id]);
   // Another member neither sees nor deletes it.
   const memberId = await env.addMember("member@acme.test");
   const member = await env.desktopSignIn({ hostName: "member-box", userId: memberId });
   assert.deepEqual((await env.bearer("/delegates/gates", "GET", undefined, member.accessToken)).body.gates, []);
-  assert.equal((await env.bearer(`/delegates/gates/${viaDesktop.body.gate_id}`, "DELETE", undefined, member.accessToken)).status, 404);
-  const deleted = await env.bearer(`/delegates/gates/${viaDesktop.body.gate_id}`, "DELETE");
+  assert.equal((await env.bearer(`/delegates/gates?gate_id=${viaDesktop.body.gate_id}`, "DELETE", undefined,
+    member.accessToken)).status, 404);
+  // DELETE takes `?gate_id=` or `{gate_id}`, as Cloud.
+  const deleted = await env.bearer("/delegates/gates", "DELETE", { gate_id: viaDesktop.body.gate_id });
   assert.equal(deleted.status, 200, deleted.raw);
+  assert.deepEqual(deleted.body, { gate_id: viaDesktop.body.gate_id, deleted: true });
+  assert.equal((await env.bearer(`/delegates/gates?gate_id=${viaDesktop.body.gate_id}`, "DELETE")).status, 404);
   assert.deepEqual((await env.bearer("/delegates/gates")).body.gates, []);
   // Registering needs delegation on.
   await env.browser("/delegates/policy", "PUT", { delegation_enabled: false });
@@ -295,11 +298,12 @@ test("gate redeem: dry_run runs every check, never consumes, and is audited as d
   assert.deepEqual((await env.redeem(token("600"), approvalId)).body, { ok: true, consumed: true });
   assert.deepEqual((await env.redeem(token("600"), approvalId, STABLE, dry)).body, { ok: true, dry_run: true });
   assert.deepEqual((await env.redeem(token("601"), approvalId, STABLE, dry)).body, { ok: false, reason: "consumed", dry_run: true });
-  const dryEvents = await env.events("gate.dry_run");
+  // Dry runs are audited with `dry_run: true` in the event data, as Cloud.
+  const all = (await env.database.query<{ event: string; reason: string | null; data: Record<string, unknown> }>(
+    "SELECT event, reason, data FROM delegation_audit_events WHERE event IN ('gate.redeemed', 'gate.refused') ORDER BY id")).rows;
+  const dryEvents = all.filter(event => event.data.dry_run === true);
   assert.deepEqual(dryEvents.map(event => event.reason), [null, null, "target_prefix", "oidc_invalid", "gate_mismatch", null, "consumed"]);
-  assert.ok(dryEvents.every(event => event.data.dry_run === true));
-  assert.equal((await env.events("gate.redeemed")).length, 1);
-  assert.equal((await env.events("gate.refused")).length, 0);
+  assert.deepEqual(all.filter(event => event.data.dry_run !== true).map(event => event.event), ["gate.redeemed"]);
 });
 
 test("gate ref_pattern: refs/tags/<literal prefix>* only, matched against the token's ref; event still exact", async (t) => {
@@ -322,7 +326,7 @@ test("gate ref_pattern: refs/tags/<literal prefix>* only, matched against the to
   assert.equal(created.status, 400, created.raw);
   const gate = await env.browser("/delegates/gates", "POST", { ...body, ref_pattern: "refs/tags/v2026.*" });
   assert.equal(gate.status, 201, gate.raw);
-  assert.equal(gate.body.ref, null);
+  assert.equal(gate.body.ref, undefined);
   assert.equal(gate.body.ref_pattern, "refs/tags/v2026.*");
   const tag = (ref: string, extra: Record<string, unknown> = {}) => mint(env.github, env.workflowClaims({
     job_workflow_ref: body.job_workflow_ref, ref, event_name: "push", run_id: `${Math.floor(Math.random() * 1e9) + 1}`, ...extra }));
@@ -348,9 +352,13 @@ test("gate redeem: target prefix, release grammar, normal checks and tier O thro
   // The action must be one the approval names.
   const stable = await env.approval([STABLE]);
   assert.deepEqual((await env.redeem(token("2"), stable, `${STABLE}:other`)).body, { ok: false, reason: "out_of_scope" });
-  // A release target that names no single release (§11a.2) is refused.
-  const vague = await env.approval([REPO]);
-  assert.deepEqual((await env.redeem(token("3"), vague, REPO)).body, { ok: false, reason: "out_of_scope" });
+  // A release target that names no single release (§11a.2) is not an approval at all.
+  const vagueMessage = env.world.sendApprovalAs("assistant", "relay-coder", "ship everything", {
+    v: 1, owner_id: env.ownerId, actions: [{ class: "release", target: REPO }] }).message.id;
+  const vague = await request(env.origin, `${env.base}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
+    body: { recipient_agent_id: env.world.agents.get("relay-coder")!.id, recipient_token: env.world.agents.get("relay-coder")!.token,
+      message_id: vagueMessage } });
+  assert.equal(vague.body.reason, "no_approval", vague.raw);
   // Unknown approval.
   assert.deepEqual((await env.redeem(token("4"), "apv_doesnotexist0", STABLE)).body, { ok: false, reason: "no_approval" });
   // Revocation is re-checked.
@@ -378,8 +386,7 @@ test("gate redeem: target prefix, release grammar, normal checks and tier O thro
 test("every gate route is documented in openapi.yaml", () => {
   const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8")) as { paths: Record<string, Record<string, unknown>> };
   const expected: Record<string, string[]> = {
-    "/api/v1/workspaces/{workspaceId}/delegates/gates": ["get", "post"],
-    "/api/v1/workspaces/{workspaceId}/delegates/gates/{gateId}": ["delete"],
+    "/api/v1/workspaces/{workspaceId}/delegates/gates": ["get", "post", "delete"],
     "/api/v1/workspaces/{workspaceId}/delegates/gates/redeem": ["post"],
   };
   for (const [path, methods] of Object.entries(expected)) {

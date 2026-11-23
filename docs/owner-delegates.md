@@ -302,9 +302,9 @@ The job that publishes redeems the approval itself, under its own short-lived
 workflow OIDC token, right before its first publish step. Whatever starts the
 job therefore cannot skip the check. No stored secret is involved.
 
-**Registering a gate.** `GET`/`POST /delegates/gates` and
-`DELETE /delegates/gates/{gate_id}` are for the owner, by browser session or
-verified Desktop bearer. A gate is `{gate_id, repo, job_workflow_ref, ref,
+**Registering a gate.** `GET`/`POST`/`DELETE /delegates/gates` are for the
+owner, by browser session or verified Desktop bearer. `DELETE` names the gate
+with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, job_workflow_ref, ref,
 ref_pattern, event, target_prefix}`. For example:
 
 - `repo`: `AgentWorkforce/relay-app`
@@ -313,17 +313,19 @@ ref_pattern, event, target_prefix}`. For example:
 - `event`: `workflow_dispatch`
 - `target_prefix`: `AgentWorkforce/relay-app:`
 
-A gate sets exactly one of `ref` (exact) and `ref_pattern`. A `ref_pattern` is
-`refs/tags/<literal prefix>*`, with one trailing `*` and nothing else wild,
-and it is matched against the token's `ref`. `target_prefix` must start with
-`<repo>:`. Registering needs delegation on. Each change is audited
+A gate sets exactly one of `ref` (exact, `refs/heads/...` or `refs/tags/...`)
+and `ref_pattern`. A `ref_pattern` is `refs/tags/<literal prefix>*`, with one
+trailing `*` and nothing else wild, and it is matched against the token's `ref`.
+`job_workflow_ref` must be a workflow in the gate's repo, pinned to a ref.
+`target_prefix` must start with `<repo>:` and contain no `*`. Registering needs delegation on. Each change is audited
 (`gate.registered`, `gate.deleted`).
 
 **Redeeming.** The job calls `POST /delegates/gates/redeem` with
 `Authorization: Bearer <workflow OIDC token>` and `{approval_id, action,
 dry_run?}`. Control checks, in order:
 
-1. **The token.**
+1. **Delegation on**, otherwise `not_enabled`.
+2. **The token.**
    - Its signature verifies against the issuer's JWKS, found by OpenID
      discovery, cached for 10 minutes and refetched for an unknown `kid`.
    - The issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
@@ -333,30 +335,30 @@ dry_run?}`. Control checks, in order:
    - The token is within its validity window, with 60 seconds of clock skew.
    - Failing any of these is `oidc_invalid`, and an unverified token's claims
      are never logged.
-2. **The gate.**
+3. **The gate**, matched against the token:
    - No gate for the token's `repository` is `gate_unknown`.
-   - The gate must belong to the approval's owner, otherwise `gate_unknown`.
-   - Its `job_workflow_ref`, `ref` (or `ref_pattern`) and `event` must match
-     the token's `job_workflow_ref`, `ref` and `event_name` exactly, otherwise
-     `gate_mismatch`. Matching the repository alone is not enough.
-3. **The approval.** The normal redeem checks run:
-   - revocation and the owner's membership;
-   - the action must be in the approval;
-   - policy classes;
+   - A gate's `job_workflow_ref`, `ref` (or `ref_pattern`) and `event` must
+     match the token's `job_workflow_ref`, `ref` and `event_name` exactly,
+     otherwise `gate_mismatch`. Matching the repository alone is not enough.
+   - The action's target must start with the matching gate's
+     `target_prefix`, otherwise `target_prefix`.
+4. **The approval.** The normal redeem checks run:
+   - the approval exists, and the action is one it names;
+   - revocation;
    - for a delegate's (tier D) approval: its grant, the delegate's binding,
      scope and tier O requirements;
+   - for an owner-minted (tier O) approval: the owner's membership and
+     policy classes;
    - expiry;
+   - the gate owner's standing (§5.4; the gate's owner stands where a
+     recipient's owner would);
    - conditions (`not_before`; GitHub conditions are `condition_unavailable`).
 
-   An owner-minted (tier O) approval goes through the gate the same way.
-4. **The target.**
-   - The action's target must start with the gate's `target_prefix`,
-     otherwise `target_prefix`.
-   - A `release` target must name exactly one release (§11a.2), otherwise
-     `out_of_scope`:
-     - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
-     - `<repo>:land:<branch>:<head sha>`
-     - `<repo>:ios:<distribution>:<build number>:<sha>`
+   A `release` action must name exactly one release (§11a.2), or the
+   approval is malformed (`no_approval` at attestation, `out_of_scope` here):
+   - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
+   - `<repo>:land:<branch>:<head sha>`
+   - `<repo>:ios:<distribution>:<build number>:<sha>`
 5. **Single use per run.**
    - The first redeem consumes the approval and binds it to the token's
      `run_id` (and repository and issuer).
@@ -365,9 +367,10 @@ dry_run?}`. Control checks, in order:
    - Any other run gets `consumed`.
 
 `dry_run: true` runs every check and never consumes. It answers
-`{ok:true, dry_run:true}` or `{ok:false, reason, dry_run:true}` and is
-audited as `gate.dry_run`. Real redeems are audited as `gate.redeemed` or
-`gate.refused`, with the run, workflow and action.
+`{ok:true, dry_run:true}` or `{ok:false, reason, dry_run:true}`. Redeems are
+audited as `gate.redeemed` or `gate.refused`, with the run, workflow and
+action and auth method `github_oidc`. A dry run carries `dry_run: true` in the
+event data, as in Cloud.
 
 Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
 `delegation_gate_redemptions`.
