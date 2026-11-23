@@ -29,10 +29,18 @@ Attestation also needs a signing key (below).
 
 The first two are required together. Without them, attestation answers
 `{"verdict":"none","reason":"unavailable"}` and the JWKS is `{"keys":[]}`.
-Rotate quarterly. Start signing with a new seed and kid, and move the old
-public `x` (from the JWKS) into `SELFHOST_DELEGATION_PREVIOUS_KEYS` for at
-least the attestation TTL plus the relay-node JWKS cache hour. A KMS-held key is
-a follow-up (§15.4).
+Rotate quarterly, publishing the new key before signing with it, so that
+relay-nodes with a cached JWKS (an hour) already know the new `kid`:
+
+1. Generate a new seed and kid. Add the new public `{kid, x}` to
+   `SELFHOST_DELEGATION_PREVIOUS_KEYS` (which publishes any extra keys) and
+   redeploy. Wait at least one JWKS cache hour.
+2. Switch `SELFHOST_DELEGATION_SIGNING_KEY`/`_KID` to the new key, and replace
+   its entry in `SELFHOST_DELEGATION_PREVIOUS_KEYS` with the old key's public
+   `{kid, x}` (from the JWKS).
+3. After the attestation TTL plus a cache hour, drop the old key.
+
+Every published kid must be distinct.
 
 ## Who may call what
 
@@ -139,9 +147,12 @@ Control then:
    `approval.attested` with the quote and its SHA-256. The route then
    re-checks the bearer.
 
-Every failure, including an outage, is HTTP 200
-`{"verdict":"none","reason":…}` plus an `approval.refused` event. Positive
-verdicts are never cached.
+Once the request is authenticated and well formed, every failure, including
+an outage, is HTTP 200 `{"verdict":"none","reason":…}`, and an
+`approval.refused` event is written on a best-effort basis. Credential and
+body errors come earlier, as HTTP errors without an audit event: `401`
+without a credential, `403` for a plain CLI token or another workspace's
+token, and `400` for a malformed body. Positive verdicts are never cached.
 
 The JWS header is `{"alg":"EdDSA","typ":"relay-delegation+jws","kid":…}`. The
 claims are exactly `v, ws, owner_id, owner_display, delegate_agent_id,
@@ -253,14 +264,16 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.redeemed`, `redeem.refused`
 - `policy.updated`, `target_owners.updated`
 
-`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=` shows a member
+`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after=` shows a member
 their own events and an admin all of them. Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
 `data`. Quote text is redacted to `quote_hash` (with
 `quote_redacted_at` set) once it is older than the org's
-`quote_retention_days`.
+`quote_retention_days`. An hourly sweep (started with the server) also runs the
+redaction and marks lapsed grants `expired`, so a quiet workspace does not keep
+quote text past its window.
 
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,
   default 90. It is set with `GET`/`PUT /api/v1/orgs/{org}/delegation-policy`
@@ -272,8 +285,8 @@ quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
   org.
 - A shorter window redacts existing older quotes at the next sweep. A longer
   one restores nothing.
-- relay-control has no cron, so the sweep runs on every attestation and every
-  audit read. The hash and the event itself are kept.
+- The redaction runs hourly from the server, and also on every attestation
+  and every audit read. The hash and the event itself are kept.
 
 ## Migration
 

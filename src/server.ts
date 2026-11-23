@@ -45,6 +45,7 @@ import {
   emitServiceStarted,
   emitStopping,
 } from "./analytics/lifecycle.js";
+import { createDelegationRetention } from "./delegation/retention.js";
 
 const config = loadConfig();
 // An unknown SELFHOST_FEATURES name stops startup.
@@ -204,6 +205,8 @@ emitConfigLoaded(analytics, {
   flowsEnabled: features.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
+// Owner delegates: quote retention and grant expiry, independent of traffic.
+const delegationRetention = createDelegationRetention({ database: store.database });
 const app = createApp({
   config,
   store,
@@ -237,6 +240,7 @@ async function start(): Promise<void> {
   flowsWorkspaceDeletions?.start();
   replicasSync?.start();
   eventsShimSweeper?.start();
+  delegationRetention.start();
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
     mcpOAuthTeardown.start();
@@ -308,6 +312,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await flowsWorkspaceDeletions?.stop();
   await replicasSync?.stop();
   await eventsShimSweeper?.stop();
+  delegationRetention.stop();
   await mcpOAuthTeardown.stop();
   await grokRoutines.stop();
   await factory.stop();

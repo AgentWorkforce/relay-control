@@ -590,6 +590,21 @@ function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: Deleg
 }
 
 /**
+ * Rechecks a grant under a row lock at a commit boundary: still active,
+ * unexpired, within policy and covering every action. Grant revocation and
+ * narrowing lock the same row, so they serialize with this check.
+ */
+async function recheckGrant(tx: SqlExecutor, workspaceId: string, grantId: string, actions: readonly Action[],
+  policy: DelegationPolicy, nowMs: number): Promise<void> {
+  const current = (await tx.query<GrantRow>(
+    "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [grantId, workspaceId],
+  )).rows[0];
+  if (!current || current.status === "revoked") refuse("revoked");
+  if (current!.status === "expired" || time(current!.expires_at) <= nowMs) refuse("expired");
+  if (!grantFitsPolicy(current!, policy) || !actionsCovered(current!.scopes, actions)) refuse("out_of_scope");
+}
+
+/**
  * POST .../messaging/delegation. The route has already proven a
  * Desktop-verified bearer of a current member of `workspace`;
  * `stillAuthorized` re-proves it after the network lookups.
@@ -709,7 +724,11 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     const owner = (await deps.database.query<{ name: string | null }>(
       "SELECT name FROM users WHERE id = $1", [approval.owner_id],
     )).rows[0];
-    const iat = Math.floor(now.getTime() / 1000);
+    // Time the claims at signing, after every wait above: an attestation is
+    // never signed already expired.
+    const signedAt = deps.now().getTime();
+    if (expiresAt <= signedAt) refuse("expired");
+    const iat = Math.floor(signedAt / 1000);
     const claims: AttestationClaims = {
       v: 1,
       ws: workspace.id,
@@ -728,8 +747,13 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
       jti: randomUUID(),
     };
+    if (claims.exp <= iat) refuse("expired");
     const attestation = deps.signer!.sign(claims);
     await deps.database.transaction(async (tx) => {
+      // The grant may have changed during the Relaycast lookups: recheck it
+      // under a row lock (revocation and narrowing take the same lock) before
+      // recording anything a redeem could rely on.
+      await recheckGrant(tx, workspace.id, grant.id, actions, policy, now.getTime());
       await tx.query(
         `INSERT INTO delegation_attestations
            (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id, delegate_agent_id, kid, accept,
@@ -842,8 +866,13 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
         (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
     const singleUse = approval!.single_use || highRisk(action!);
-    if (singleUse) {
-      const consumed = (await deps.database.query<{ id: string }>(
+    await deps.database.transaction(async (tx) => {
+      // The grant may have been narrowed or revoked during the Relaycast
+      // lookups: recheck it under its row lock in both paths, then consume a
+      // single-use approval in the same transaction.
+      await recheckGrant(tx, workspace.id, grant!.id, [action!], policy, deps.now().getTime());
+      if (!singleUse) return;
+      const consumed = (await tx.query<{ id: string }>(
         `UPDATE delegation_approvals
             SET consumed_at = now(), consumed_by_agent_id = $3, consumed_action = $4::jsonb
           WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NULL AND invalidated_at IS NULL
@@ -851,7 +880,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
         [input.approvalId, workspace.id, input.recipientAgentId, JSON.stringify(canonicalAction(action!))],
       )).rows[0];
       if (!consumed) refuse("consumed");
-    }
+    });
     // The consumption above is the authority; a failed log write must not turn
     // a spent approval into a refusal the agent would retry.
     await recordDelegationAudit(deps.database, {
@@ -909,7 +938,8 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
     // Not the session's own agent: a delegate never answers its own prompts.
     if (grant.delegate_agent_id === session.agentId) continue;
     if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:any` }])) continue;
-    if (await delegateStillBound(deps, workspace, grant, false)) continue;
+    // A released or re-bound agent is never offered (its grant is revoked, as at attestation).
+    if (await delegateStillBound(deps, workspace, grant, true)) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });
   }
   return { delegates };

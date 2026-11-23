@@ -25,7 +25,9 @@ type Env = Awaited<ReturnType<typeof setup>>;
 
 async function setup(t: TestContext, options: { signing?: boolean } = {}) {
   const seed = randomBytes(32);
-  const env = await copilotDesktopSetup(t, {}, undefined,
+  /** The app's clock: tests advance `offsetMs` instead of rewriting stored state. */
+  const clock = { offsetMs: 0 };
+  const env = await copilotDesktopSetup(t, { now: () => new Date(Date.now() + clock.offsetMs) }, undefined,
     options.signing === false ? {} : { delegationSigning: { kid: KID, seed, previous: [] } });
   const desktop = await env.desktopSignIn({ hostName: "khaliq-box" });
   const base = `/api/v1/workspaces/${env.workspaceId}`;
@@ -112,7 +114,7 @@ async function setup(t: TestContext, options: { signing?: boolean } = {}) {
     )).rows;
   }
 
-  return { ...env, seed, desktop, base, browser, bearer, desktopIdentity, enable, claim, grant, approval, attest, redeem, jwks, events };
+  return { ...env, clock, seed, desktop, base, browser, bearer, desktopIdentity, enable, claim, grant, approval, attest, redeem, jwks, events };
 }
 
 /** Owner's coding agent (recipient), owner's claimed bot (delegate), delegation on, one merge grant. */
@@ -155,7 +157,9 @@ test("scope matching follows §16.1", () => {
   assert.ok(!validTargetPattern("a".repeat(257)));
   // Subsumption (PATCH narrowing).
   assert.ok(targetCovered("owner/*", "owner/repo", true));
-  assert.ok(targetCovered("owner/repo", "owner/repo#*", true));
+  // `owner/repo#*` would also cover `owner/repo#draft`: never narrower than `owner/repo`.
+  assert.ok(!targetCovered("owner/repo", "owner/repo#*", true));
+  assert.ok(targetCovered("owner/repo", "owner/repo#12", true));
   assert.ok(!targetCovered("owner/repo", "owner/*", true));
   // The whole set is judged.
   const scopes = [{ class: "merge" as const, targets: ["owner/*"] }];
@@ -205,6 +209,11 @@ test("signing key config: seed and kid together, previous keys validated", () =>
   assert.throws(() => loadDelegationSigning({
     SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k1",
     SELFHOST_DELEGATION_PREVIOUS_KEYS: JSON.stringify([{ kid: "k1", x: seed }]),
+  }), /distinct kids/);
+  // Two retired keys may not share a kid.
+  assert.throws(() => loadDelegationSigning({
+    SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k3",
+    SELFHOST_DELEGATION_PREVIOUS_KEYS: JSON.stringify([{ kid: "k1", x: seed }, { kid: "k1", x: seed }]),
   }), /distinct kids/);
   const rotated = loadDelegationSigning({
     SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k2",
@@ -648,8 +657,11 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
 
   // Concurrent redeems: exactly one wins.
   const results = await Promise.all([1, 2, 3, 4].map(() => env.redeem(recipient, approvalId, prod)));
+  // Every answer is HTTP 200: exactly one success and three `consumed`, never an error.
+  assert.deepEqual(results.map(result => result.status), [200, 200, 200, 200], JSON.stringify(results.map(r => r.raw)));
   assert.equal(results.filter(result => result.body.ok === true).length, 1, JSON.stringify(results.map(r => r.body)));
-  assert.ok(results.filter(result => result.body.ok === false).every(result => result.body.reason === "consumed"));
+  assert.deepEqual(results.filter(result => result.body.ok !== true).map(result => result.body),
+    [1, 2, 3].map(() => ({ ok: false, reason: "consumed" })));
   // Replay after consumption: refused, and re-attestation says consumed.
   assert.deepEqual((await env.redeem(recipient, approvalId, prod)).body, { ok: false, reason: "consumed" });
   assert.equal((await env.attest(recipient, messageId)).body.reason, "consumed");
@@ -856,7 +868,7 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
 
 test("conditions: not_before is checked at redeem without consuming; GitHub conditions are unavailable", async (t) => {
   const { env, recipient, bot } = await ready(t);
-  const future = new Date(Date.now() + 3_600_000).toISOString();
+  const future = new Date(Date.now() + 20 * 60_000).toISOString();
   const release = { class: "release", target: "AgentWorkforce/relay", conditions: [{ type: "not_before", at: future }] };
   const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([release])));
   assert.equal(attested.body.verdict, "delegate", attested.raw);
@@ -865,11 +877,9 @@ test("conditions: not_before is checked at redeem without consuming; GitHub cond
   const action = { class: "release", target: "AgentWorkforce/relay" };
   const unmet = await env.redeem(recipient, approvalId, action);
   assert.deepEqual(unmet.body, { ok: false, reason: "condition_unmet", unmet: [{ type: "not_before", at: future }] });
-  // Not consumed: once the time has come, the same approval redeems once.
-  await env.database.query(
-    `UPDATE delegation_approvals SET actions = jsonb_set(actions, '{0,conditions,0,at}', to_jsonb($2::text)) WHERE id = $1`,
-    [approvalId, new Date(Date.now() - 1000).toISOString()],
-  );
+  // Not consumed: once the time has come (the clock moves, the approval is
+  // unchanged and not yet expired), the same approval redeems once.
+  env.clock.offsetMs = 21 * 60_000;
   assert.deepEqual((await env.redeem(recipient, approvalId, action)).body, { ok: true, consumed: true });
   assert.deepEqual((await env.redeem(recipient, approvalId, action)).body, { ok: false, reason: "consumed" });
 
@@ -1048,4 +1058,145 @@ test("config_change: one exact setting of the recipient's own session, single-us
     actions: [{ class: "config_change", target: `${session.id}:spawn_delegate_approvals=true` }] });
   assert.equal(minted.status, 403, minted.raw);
   assert.equal(minted.body.code, "out_of_scope");
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes (#277 review threads)
+
+test("review: dates must be real calendar dates; quotes cannot hold NUL; owner UUIDs are case-insensitive", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const merge = [{ class: "merge", target: "AgentWorkforce/relay#41" }];
+  // 2026-02-30 and 24:00 are refused, not normalized.
+  for (const bad of ["2026-02-30T12:00:00Z", "2026-04-31T00:00:00Z", "2026-01-01T24:00:00Z", "2026-01-01T00:00:00+24:00"]) {
+    assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval(merge, { expires_at: bad })))).body.reason,
+      "no_approval", bad);
+    const grant = await env.browser("/delegates", "POST", { delegate_agent_id: "x", scopes: [{ class: "merge", targets: ["a/b"] }],
+      expires_at: bad });
+    assert.equal(grant.status, 400, `${bad} ${grant.raw}`);
+  }
+  // A leap day and a numeric offset are fine.
+  const leap = await env.attest(recipient, send(env, bot, recipient, env.approval(merge, {
+    quoted_at: "2028-02-29T10:00:00+05:30" })));
+  assert.equal(leap.body.verdict, "delegate", leap.raw);
+  // NUL in quote text is a malformed approval, never a database outage.
+  assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval(merge, { quote: "yes\u0000merge" })))).body.reason,
+    "no_approval");
+  // An uppercase owner UUID is the same owner, and does not revoke the grant as a binding change.
+  const upper = await env.attest(recipient, send(env, bot, recipient, env.approval(merge, { owner_id: env.ownerId.toUpperCase() })));
+  assert.equal(upper.body.verdict, "delegate", upper.raw);
+  assert.equal(upper.body.claims.owner_id, env.ownerId);
+  assert.equal((await env.bearer("/delegates")).body.grants[0].status, "active");
+});
+
+test("review: tokens act only in their own workspace; oversized bodies get 413; audit pages with after", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  // The owner's Desktop bearer is issued for the primary workspace; the other workspace is refused.
+  const other = `/api/v1/workspaces/${env.otherWorkspaceId}`;
+  assert.equal((await request(env.origin, `${other}/delegates`, { token: env.desktop.accessToken })).status, 403);
+  const attestOther = await request(env.origin, `${other}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
+    body: { recipient_agent_id: recipient.id, recipient_token: recipient.token, message_id: "1" } });
+  assert.equal(attestOther.status, 403, attestOther.raw);
+  assert.equal(attestOther.body.code, "forbidden");
+  // A body past 256 KiB answers 413 instead of dropping the connection.
+  const big = await request(env.origin, `${env.base}/delegates/target-owners`, { method: "PUT", token: env.desktop.accessToken,
+    rawBody: JSON.stringify([{ pattern: "a:b", owner_ids: [env.ownerId], pad: "x".repeat(300 * 1024) }]), contentType: "application/json" });
+  assert.equal(big.status, 413, big.raw);
+  assert.equal(big.body.code, "payload_too_large");
+  // Audit pages resume after an event id, without skipping events that share a timestamp.
+  for (let index = 0; index < 3; index += 1) {
+    await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: `AgentWorkforce/relay#${50 + index}` }])));
+  }
+  const all = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
+  const first = (await env.bearer("/delegates/audit?limit=2")).body.events as Array<{ id: string }>;
+  const rest = (await env.bearer(`/delegates/audit?after=${first.at(-1)!.id}`)).body.events as Array<{ id: string }>;
+  assert.deepEqual([...first, ...rest].map(event => event.id), all.map(event => event.id));
+  assert.equal((await env.bearer("/delegates/audit?after=abc")).status, 400);
+});
+
+test("review: a grant revoked or narrowed during the Relaycast lookups is rechecked under its lock", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  // Revoke the grant while attestation waits on the delegate's roster lookup.
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  during = async () => {
+    await env.database.query("UPDATE delegation_grants SET status = 'revoked', revoked_at = now() WHERE id = $1", [grantId]);
+  };
+  const revoked = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#60" }])));
+  assert.equal(revoked.body.reason, "revoked", revoked.raw);
+  // Nothing a redeem could rely on was recorded.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length, 0);
+
+  // A fresh grant, narrowed while a redeem waits: the redeem uses the current scope.
+  const fresh = await env.grant(bot.id, [{ class: "deploy", targets: ["*:prod", "*:staging"] }]);
+  const prod = { class: "deploy", target: "web:prod" };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([prod])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  during = async () => {
+    await env.database.query(`UPDATE delegation_grants SET scopes = '[{"class":"deploy","targets":["*:staging"]}]'::jsonb WHERE id = $1`,
+      [fresh.grant_id]);
+  };
+  assert.deepEqual((await env.redeem(recipient, attested.body.claims.approval_id, prod)).body, { ok: false, reason: "out_of_scope" });
+  // Not consumed by the refused redeem.
+  const row = await env.database.query<{ consumed_at: Date | null }>(
+    "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [attested.body.claims.approval_id]);
+  assert.equal(row.rows[0]!.consumed_at, null);
+  env.world.handle = handle;
+});
+
+test("review: PATCH applies to the locked current row; a new grant re-checks the committed policy", async (t) => {
+  const { env, bot, grantId } = await ready(t);
+  // Two PATCHes: one narrows scopes, one only shortens expiry. Neither restores the other's change.
+  const narrow = env.browser(`/delegates/${grantId}`, "PATCH", { scopes: [{ class: "merge", targets: ["AgentWorkforce/relay"] }] });
+  const shorten = env.browser(`/delegates/${grantId}`, "PATCH", {
+    expires_at: new Date(Date.now() + 5 * 86_400_000).toISOString() });
+  const [a, b] = await Promise.all([narrow, shorten]);
+  assert.equal(a.status, 200, a.raw);
+  assert.equal(b.status, 200, b.raw);
+  const grant = (await env.bearer("/delegates")).body.grants.find((item: { grant_id: string }) => item.grant_id === grantId);
+  assert.deepEqual(grant.scopes, [{ class: "merge", targets: ["AgentWorkforce/relay"] }]);
+  assert.ok(Date.parse(grant.expires_at) <= Date.now() + 5 * 86_400_000 + 1000);
+  // A policy that no longer allows a class refuses a new grant of it, read under the policy lock.
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  await env.enable({ allowed_classes: ["merge"] });
+  const refused = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "deploy", targets: ["*:staging"] }] });
+  assert.equal(refused.status, 403, refused.raw);
+  assert.equal(refused.body.code, "out_of_scope");
+});
+
+test("review: the retention sweep redacts quotes and expires grants without delegation traffic", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#70" }])));
+  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  await env.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [grantId]);
+  const { createDelegationRetention } = await import("../src/delegation/retention.js");
+  const sweep = await createDelegationRetention({ database: env.database }).sweep();
+  assert.equal(sweep.expired, 1);
+  const quote = await env.database.query<{ quote: string | null; quote_redacted_at: Date | null }>(
+    "SELECT quote, quote_redacted_at FROM delegation_audit_events WHERE event = 'approval.attested'");
+  assert.equal(quote.rows[0]!.quote, null);
+  assert.ok(quote.rows[0]!.quote_redacted_at);
+  const expired = await env.database.query<{ status: string }>("SELECT status FROM delegation_grants WHERE id = $1", [grantId]);
+  assert.equal(expired.rows[0]!.status, "expired");
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'grant.expired'")).rows.length, 1);
+});
+
+test("review: prompt-delegates omits a released agent", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const session = await env.desktopIdentity("relay-coder");
+  const bot = await env.claim("assistant");
+  await env.grant(bot.id, [{ class: "prompt_approval", targets: ["*"] }]);
+  const list = () => request(env.origin, `${env.base}/messaging/delegation/prompt-delegates`, {
+    method: "POST", token: env.desktop.accessToken, body: { session_agent_id: session.id, session_token: session.token } });
+  assert.equal((await list()).body.delegates.length, 1);
+  env.world.agents.get("assistant")!.status = "released";
+  assert.deepEqual((await list()).body, { delegates: [] });
 });

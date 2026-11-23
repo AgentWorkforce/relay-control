@@ -726,11 +726,16 @@ export function loadDelegationSigning(env: Env): DelegationSigningConfig | null 
     } catch {
       throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of {kid, x}");
     }
+    // Every published kid is distinct (the active one included): a verifier
+    // uses the first key with a matching kid, so a duplicate would hide one.
+    const seen = new Set<string>([kid]);
     if (!Array.isArray(parsed) || parsed.length > 8 || !parsed.every((item: unknown) => {
       const key = item as Record<string, unknown> | null;
-      return Boolean(key) && typeof key === "object" && Object.keys(key!).sort().join(",") === "kid,x"
-        && typeof key!.kid === "string" && DELEGATION_KID.test(key!.kid) && key!.kid !== kid
+      const ok = Boolean(key) && typeof key === "object" && Object.keys(key!).sort().join(",") === "kid,x"
+        && typeof key!.kid === "string" && DELEGATION_KID.test(key!.kid) && !seen.has(key!.kid)
         && typeof key!.x === "string" && /^[A-Za-z0-9_-]{43}$/.test(key!.x);
+      if (ok) seen.add(key!.kid as string);
+      return ok;
     })) {
       throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of at most 8 {kid, x} with distinct kids");
     }

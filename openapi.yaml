@@ -3432,6 +3432,11 @@ paths:
         - { name: grant_id, in: query, required: false, schema: { type: string, pattern: "^grt_[A-Za-z0-9]{8,64}$" } }
         - { name: format, in: query, required: false, schema: { type: string, enum: [json, jsonl] } }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000 } }
+        - name: after
+          in: query
+          required: false
+          description: Resume after this event `id`. Events are returned in id order, so paging never skips events that share a timestamp.
+          schema: { type: string, pattern: "^[1-9][0-9]{0,18}$" }
       responses:
         "200":
           description: Events
@@ -3568,7 +3573,14 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+            schema:
+              oneOf:
+                - { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+                - type: object
+                  additionalProperties: false
+                  required: [target_owners]
+                  properties:
+                    target_owners: { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
       responses:
         "200":
           description: Stored entries (the bare list)
@@ -3591,9 +3603,12 @@ paths:
         immutable `owner_approval` from Relaycast's
         `GET /v1/deliveries/by-message/:id` for that token, checks the live
         grant, delegate binding, policy, scope, tier, standing (`accept`) and
-        expiry, then signs a 300-second EdDSA JWS. Every failure, including an
-        outage, is `{"verdict": "none", "reason": ...}` with HTTP 200 and an
-        `approval.refused` audit event. Never cached.
+        expiry, then signs a 300-second EdDSA JWS. Once the request is
+        authenticated and well formed, every failure, including an outage, is
+        `{"verdict": "none", "reason": ...}` with HTTP 200, and an
+        `approval.refused` audit event is written on a best-effort basis (it
+        may be absent if the audit insert itself fails). Credential and body
+        errors are the HTTP errors below, without an audit event. Never cached.
       security:
         - bearerAuth: []
       requestBody:
@@ -10042,7 +10057,10 @@ components:
       type: object
       additionalProperties: false
       required: [pattern]
-      description: Names a repo, people, or both.
+      description: Names a repo, people, or both (at least one).
+      anyOf:
+        - required: [repo]
+        - required: [owner_ids]
       properties:
         pattern: { type: string, minLength: 1, maxLength: 256 }
         repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }

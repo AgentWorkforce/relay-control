@@ -46,7 +46,7 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
 export type DesktopGate = { url: string; fetch: (relaycast: typeof fetch, world: RelaycastWorld) => typeof fetch };
 
 export async function copilotDesktopSetup(t: TestContext,
-  modules: Pick<Parameters<typeof createApp>[0], "capy" | "features"> = {}, gate?: DesktopGate,
+  modules: Pick<Parameters<typeof createApp>[0], "capy" | "features" | "now"> = {}, gate?: DesktopGate,
   overrides: Partial<SelfhostConfig> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);

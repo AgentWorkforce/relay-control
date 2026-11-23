@@ -24,6 +24,7 @@ import {
   sha256Hex,
   validConfigPattern,
   validPromptPattern,
+  validRfc3339,
   validTargetPattern,
   type ActionClass,
   type Scope,
@@ -132,8 +133,7 @@ const UNAVAILABLE = () => fail("unavailable", "Delegation is unavailable", 503);
 const NOT_ENABLED = () => fail("not_enabled", "Delegation is off for this workspace", 403);
 
 // Request bodies, strict as Cloud's lib/delegation/requests.ts.
-const rfc3339 = z.string().max(64).refine(value => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i.test(value)
-  && Number.isFinite(Date.parse(value)));
+const rfc3339 = z.string().max(64).refine(validRfc3339, "must be RFC 3339 with a real date");
 const classList = z.array(actionClass).max(ACTION_CLASSES.length);
 const scopeSchema = z.object({
   class: actionClass,
@@ -213,12 +213,14 @@ const promptDelegatesBody = z.object({
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
+  // Past the limit, keep draining without buffering so the stream (and the
+  // socket) stays open for the 413 answer.
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 256 * 1024) fail("payload_too_large", "Body exceeds 256 KiB", 413);
-    chunks.push(buffer);
+    if (size <= 256 * 1024) chunks.push(buffer);
   }
+  if (size > 256 * 1024) fail("payload_too_large", "Body exceeds 256 KiB", 413);
   const raw = Buffer.concat(chunks).toString("utf8");
   try {
     return JSON.parse(raw) as unknown;
@@ -264,8 +266,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       && (allowProvisioned || !facts.provisioned_by_token_id));
   }
 
-  /** A current member of `workspaceId` in the token's own organization, or 403 forbidden as in Cloud. */
+  /**
+   * A current member of `workspaceId`, which must be the workspace the
+   * credential was issued for (as every other relay-control workspace route
+   * requires), or 403 forbidden.
+   */
   async function memberWorkspace(principal: Principal, workspaceId: string) {
+    if (principal.workspaceId !== workspaceId) return fail("forbidden", "Forbidden", 403);
     const workspace = await input.workspaceForUser(workspaceId, principal.userId).catch(() => null);
     if (!workspace || workspace.organizationId !== principal.organizationId) return fail("forbidden", "Forbidden", 403);
     return workspace;
@@ -554,6 +561,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       let row: GrantRow;
       try {
         row = await input.database.transaction(async (tx) => {
+          // Serialize with policy writers: lock the policy row and check the
+          // committed policy, so a concurrent policy change cannot miss this grant.
+          const locked = (await tx.query("SELECT 1 FROM delegation_policies WHERE workspace_id = $1 FOR UPDATE",
+            [workspace.id])).rows.length > 0;
+          const current = await loadPolicy(tx, workspace.id);
+          if (!locked || !current.delegation_enabled) NOT_ENABLED();
+          policyRefusal(scopes.map(scope => scope.class), current);
+          if (expiresAt.getTime() > now().getTime() + Math.min(GRANT_MAX_DAYS, current.max_expiry_days) * 86_400_000) {
+            fail("invalid_expiry", `expires_at may be at most ${Math.min(GRANT_MAX_DAYS, current.max_expiry_days)} days away`, 400);
+          }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
           const existing = await tx.query(
             `SELECT 1 FROM delegation_grants
@@ -577,6 +594,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           return created;
         });
       } catch (error) {
+        if (error instanceof DelegationHttpError) throw error;
         if (error instanceof GrantConflict || (error as { code?: string })?.code === "23505") {
           return fail("grant_exists", "This agent already has an active grant; narrow it or revoke it first", 409);
         }
@@ -652,6 +670,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
+      // Resume after an event id: events are returned in id order, so this
+      // never skips events that share a timestamp.
+      const after = params.get("after");
+      if (after && !/^[1-9][0-9]{0,18}$/.test(after)) fail("invalid_request", "after must be an event id", 400);
       const format = params.get("format") ?? "json";
       if (format !== "json" && format !== "jsonl") fail("invalid_request", "format is json or jsonl", 400);
       const limit = Math.min(MAX_AUDIT_EVENTS,
@@ -663,8 +685,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
             AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
             AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
             AND ($5::text IS NULL OR grant_id = $5)
+            AND ($7::bigint IS NULL OR id > $7::bigint)
           ORDER BY id LIMIT $6`,
-        [workspace.id, caller.admin, principal.userId, since || null, grantId || null, limit],
+        [workspace.id, caller.admin, principal.userId, since || null, grantId || null, limit, after || null],
       )).rows.map(auditView);
       if (format === "jsonl") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });
@@ -688,6 +711,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         code_owner_match: body.code_owner_match ?? "any_path",
       };
       const revoked = await input.database.transaction(async (tx) => {
+        // Serialize policy writers and grant creation on the workspace row
+        // (this also covers the first insert of the policy row).
+        await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspace.id]);
+        await tx.query("SELECT 1 FROM delegation_policies WHERE workspace_id = $1 FOR UPDATE", [workspace.id]);
         const before = await loadPolicy(tx, workspace.id);
         await tx.query(
           `INSERT INTO delegation_policies
@@ -765,21 +792,25 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (!body.success || !GRANT_ID.test(sub)) fail("invalid_request", "Invalid grant change", 400);
       const patch = body.data!;
       await requireEnabled(workspace.id);
-      const grant = await grantFor(workspace.id, sub);
-      if (!grant || grant.owner_user_id !== principal.userId) return fail("not_found", "Grant not found", 404);
-      const at = now();
-      if (grant.status !== "active" || time(grant.expires_at) <= at.getTime()) {
-        fail("not_active", "Only an active grant can be changed", 409);
-      }
-      const scopes: Scope[] | undefined = patch.scopes?.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }));
-      const expiresAt = patch.expires_at ? new Date(patch.expires_at) : undefined;
-      if (expiresAt && expiresAt.getTime() <= at.getTime()) fail("invalid_expiry", "expires_at must be in the future", 400);
-      const requireTierO = patch.require_tier_o ? uniqueClasses(patch.require_tier_o) : undefined;
-      narrowingRefusal(grant, { scopes, expiresAt, requireTierO });
-      const nextScopes = scopes ?? grant.scopes;
-      const nextTierO = requireTierO ?? grant.require_tier_o;
-      const nextExpiry = expiresAt ?? new Date(grant.expires_at);
       const row = await input.database.transaction(async (tx) => {
+        // Lock and reread the grant, so concurrent changes apply to the
+        // current row and can never restore a narrowed scope or expiry.
+        const grant = (await tx.query<GrantRow>(
+          "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [sub, workspace.id],
+        )).rows[0];
+        if (!grant || grant.owner_user_id !== principal.userId) return fail("not_found", "Grant not found", 404);
+        const at = now();
+        if (grant.status !== "active" || time(grant.expires_at) <= at.getTime()) {
+          fail("not_active", "Only an active grant can be changed", 409);
+        }
+        const scopes: Scope[] | undefined = patch.scopes?.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }));
+        const expiresAt = patch.expires_at ? new Date(patch.expires_at) : undefined;
+        if (expiresAt && expiresAt.getTime() <= at.getTime()) fail("invalid_expiry", "expires_at must be in the future", 400);
+        const requireTierO = patch.require_tier_o ? uniqueClasses(patch.require_tier_o) : undefined;
+        narrowingRefusal(grant, { scopes, expiresAt, requireTierO });
+        const nextScopes = scopes ?? grant.scopes;
+        const nextTierO = requireTierO ?? grant.require_tier_o;
+        const nextExpiry = expiresAt ?? new Date(grant.expires_at);
         const updated = (await tx.query<GrantRow>(
           `UPDATE delegation_grants SET scopes = $3::jsonb, expires_at = $4, require_tier_o = $5, updated_at = now()
             WHERE id = $1 AND workspace_id = $2 AND status = 'active' AND expires_at > now() RETURNING *`,

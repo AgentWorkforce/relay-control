@@ -50,14 +50,35 @@ export type ReasonCode = typeof REASON_CODES[number];
 
 export const MAX_CONDITIONS = 5;
 
+const RFC3339_PARTS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/i;
+
+/**
+ * An RFC 3339 timestamp with a real calendar date and clock: `2026-02-30`
+ * or `24:00` are refused instead of being normalized by Date.parse. Leap days
+ * and numeric offsets are accepted.
+ */
+export function validRfc3339(value: string): boolean {
+  if (value.length > 64) return false;
+  const parts = RFC3339_PARTS.exec(value);
+  if (!parts) return false;
+  const [year, month, day, hour, minute, second] = parts.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (!days || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return false;
+  if (parts[9] && (Number(parts[10]) > 23 || Number(parts[11]) > 59)) return false;
+  return Number.isFinite(Date.parse(value));
+}
+
+/** PostgreSQL text cannot hold NUL; such text is refused at validation, never at the database. */
+const noNul = (value: string) => !value.includes("\u0000");
+
 /** §5.5 / §16.1: the closed set of structured conditions. */
 export const conditionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ci_green") }).strict(),
   z.object({ type: z.literal("head_sha"), sha: z.string().regex(/^[0-9a-f]{40}$/) }).strict(),
   z.object({ type: z.literal("reviews_approved"), min: z.number().int().min(1).max(10) }).strict(),
   z.object({ type: z.literal("mergeable") }).strict(),
-  z.object({ type: z.literal("not_before"), at: z.string().max(64).refine(value =>
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i.test(value) && Number.isFinite(Date.parse(value))) }).strict(),
+  z.object({ type: z.literal("not_before"), at: z.string().max(64).refine(validRfc3339) }).strict(),
 ]);
 export type Condition = z.infer<typeof conditionSchema>;
 export const GITHUB_CONDITIONS: ReadonlySet<string> = new Set(["ci_green", "head_sha", "reviews_approved", "mergeable"]);
@@ -65,9 +86,7 @@ export const GITHUB_CONDITIONS: ReadonlySet<string> = new Set(["ci_green", "head
 export type Action = { class: ActionClass; target: string; conditions?: Condition[]; note?: string | null };
 export type Scope = { class: ActionClass; targets: string[] };
 
-const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i;
-const rfc3339 = z.string().max(64).refine(value => RFC3339.test(value) && Number.isFinite(Date.parse(value)),
-  { message: "must be RFC 3339" });
+const rfc3339 = z.string().max(64).refine(validRfc3339, { message: "must be RFC 3339 with a real date" });
 export const APPROVAL_REF = /^apv_[A-Za-z0-9]{8,64}$/;
 
 export const actionClass = z.enum(ACTION_CLASSES);
@@ -124,18 +143,23 @@ export const mintActionsSchema = z.array(actionSchema).min(1).max(MAX_ACTIONS)
  * send. Control re-validates what Relaycast returns and treats anything that
  * fails as no approval at all.
  */
+const UUID_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export const ownerApprovalSchema = z.object({
   v: z.literal(1),
-  owner_id: z.string().min(1).max(MAX_OWNER_ID_CHARS),
+  // A UUID is canonicalized to lowercase, as PostgreSQL returns it, so a
+  // case-only difference is never read as a different owner.
+  owner_id: z.string().min(1).max(MAX_OWNER_ID_CHARS)
+    .transform(value => UUID_ID.test(value) ? value.toLowerCase() : value),
   actions: z.array(z.object({
     class: actionClass,
     target,
     conditions: z.array(conditionSchema).max(MAX_CONDITIONS).nullish().transform(value => value ?? undefined),
-    note: z.string().max(MAX_NOTE_CHARS).nullish(),
+    note: z.string().max(MAX_NOTE_CHARS).refine(noNul).nullish(),
   }).strict().refine(actionIsValid)).min(1).max(MAX_ACTIONS).refine(uniqueActions, { message: "one entry per class and target" }),
-  quote: z.string().max(MAX_QUOTE_CHARS).nullable().optional(),
+  quote: z.string().max(MAX_QUOTE_CHARS).refine(noNul).nullable().optional(),
   quoted_at: rfc3339.nullable().optional(),
-  quote_source: z.string().max(MAX_QUOTE_SOURCE_CHARS).nullable().optional(),
+  quote_source: z.string().max(MAX_QUOTE_SOURCE_CHARS).refine(noNul).nullable().optional(),
   expires_at: rfc3339.nullable().optional(),
   approval_ref: z.string().regex(APPROVAL_REF).nullable().optional(),
 }).strict();
@@ -210,7 +234,9 @@ export function targetCovered(pattern: string, target: string, subsumes = false)
   const prTarget = got.segments.length === 3 && got.separators[0] === "/" && got.separators[1] === "#";
   if (repoPattern && prTarget) {
     const number = got.segments[2]!;
-    if (!/^[0-9]{1,12}$/.test(number) && !(subsumes && number === "*")) return false;
+    // Only a numeric PR suffix: `owner/repo#*` would also cover `owner/repo#draft`,
+    // so it is never narrower than an `owner/repo` grant.
+    if (!/^[0-9]{1,12}$/.test(number)) return false;
     return segmentsMatch(want.segments, want.separators, got.segments.slice(0, 2), got.separators.slice(0, 1), subsumes);
   }
   return false;
