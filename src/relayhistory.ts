@@ -10,6 +10,8 @@ export class UpstreamError extends Error {
     readonly status?: number,
     message = `Session read API ${stage} failed`,
     readonly retryable = false,
+    /** A retryable upstream refusal's own numeric `Retry-After`, passed through to the caller. */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }
