@@ -54,7 +54,7 @@ export function createDelegationRetention(input: {
       const rows = (await tx.query<{ id: string; workspace_id: string; owner_user_id: string; delegate_agent_id: string }>(
         `UPDATE delegation_grants SET status = 'expired', updated_at = now()
           WHERE id IN (SELECT id FROM delegation_grants WHERE status = 'active' AND expires_at <= now() LIMIT $1)
-            AND status = 'active'
+            AND status = 'active' AND expires_at <= now()
           RETURNING id, workspace_id, owner_user_id, delegate_agent_id`,
         [limit],
       )).rows;

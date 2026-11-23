@@ -97,3 +97,14 @@ would otherwise swallow, as one JSON line each with a fixed message
 These lines carry only `op`, `workspaceId`, approval, grant and gate ids,
 `reason`, the error class and the Postgres SQLSTATE. They never carry tokens,
 quotes, message text or error messages.
+
+## Audit export paging
+
+Cursor pages of `GET /delegates/audit?after_id=` are fenced at the database's
+oldest running transaction (the snapshot xmin), so no event is ever skipped.
+A long transaction anywhere on the database holds back every cursor page,
+with `complete: false`, until it ends; an exporter that polls until
+`complete` waits that long. Each held-back page logs
+`delegation.audit_fenced` with `held_back`. Find the long transaction with
+`SELECT pid, xact_start, state FROM pg_stat_activity WHERE backend_xid IS NOT NULL ORDER BY xact_start;`
+(never select query text into shared logs).

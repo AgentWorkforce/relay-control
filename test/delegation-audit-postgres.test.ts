@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
 import { PostgresDatabase } from "../src/database.js";
-import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit } from "../src/delegation/service.js";
+import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit, redactExpiredQuotes } from "../src/delegation/service.js";
+import { createDelegationRetention } from "../src/delegation/retention.js";
 import { migrate } from "../src/migrations.js";
 import { isolatedPostgresPool } from "./support/postgres.js";
 
@@ -169,4 +170,54 @@ test("consuming redeems of one approval serialize (FOR NO KEY UPDATE); share loc
   const row = (await database.query<{ consumed_at: Date | null }>(
     "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [serialized])).rows[0]!;
   assert.ok(row.consumed_at);
+});
+
+test("the retention sweep skips a row another transaction holds, and never expires a grant revoked meanwhile", options, async (t) => {
+  const { pool, database, workspaceId, ownerId } = await fixture(t);
+  // Two expired quotes; another transaction (an owner's redaction, say) holds one of them.
+  const quoteRow = async (messageId: string) => (await database.query<{ id: string }>(
+    `INSERT INTO delegation_audit_events (workspace_id, event, owner_user_id, message_id, quote, quote_hash, created_at)
+     VALUES ($1, 'approval.attested', $2, $3, 'old words', 'h', now() - interval '91 days') RETURNING id::text`,
+    [workspaceId, ownerId, messageId])).rows[0]!.id;
+  const held = await quoteRow("m-held");
+  const free = await quoteRow("m-free");
+  const holder = await pool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT 1 FROM delegation_audit_events WHERE id = $1 FOR UPDATE", [held]);
+    // The sweep neither waits on nor fails for the held row: it redacts the other.
+    const started = Date.now();
+    assert.equal(await redactExpiredQuotes(database, 100), 1);
+    assert.ok(Date.now() - started < 5_000);
+    await holder.query("ROLLBACK");
+  } finally {
+    holder.release();
+  }
+  const quotes = (await database.query<{ id: string; quote: string | null }>(
+    "SELECT id::text, quote FROM delegation_audit_events WHERE id IN ($1, $2) ORDER BY id", [held, free])).rows;
+  assert.equal(quotes.find(row => row.id === free)!.quote, null);
+  assert.equal(quotes.find(row => row.id === held)!.quote, "old words");
+  // The next sweep redacts the row that was held.
+  assert.equal(await redactExpiredQuotes(database, 100), 1);
+
+  // A lapsed grant revoked by a concurrent transaction is never overwritten as expired.
+  await database.query("INSERT INTO delegation_policies (workspace_id, delegation_enabled) VALUES ($1, true)", [workspaceId]);
+  await database.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, expires_at, created_auth_method)
+     SELECT 'grt_lapsedrevoked1', $1, w.organization_id, $2, 'ag_x', 'x', '[]'::jsonb, now() - interval '1 minute', 'session'
+       FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId]);
+  const revoker = await pool.connect();
+  try {
+    await revoker.query("BEGIN");
+    await revoker.query("UPDATE delegation_grants SET status = 'revoked', revoked_at = now() WHERE id = 'grt_lapsedrevoked1'");
+    const sweep = createDelegationRetention({ database }).sweep();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await revoker.query("COMMIT");
+    assert.equal((await sweep).expired, 0);
+  } finally {
+    revoker.release();
+  }
+  const grant = (await database.query<{ status: string }>("SELECT status FROM delegation_grants WHERE id = 'grt_lapsedrevoked1'")).rows[0]!;
+  assert.equal(grant.status, "revoked");
 });
