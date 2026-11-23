@@ -314,6 +314,17 @@ export function createRelaycastWorld(roster: unknown[]) {
       const found = messages.get(match[1]!);
       return found ? ok(found) : fail(404, "not_found");
     }
+    if ((match = /^\/v1\/messages\/([^/]+)\/replies$/.exec(path)) && method === "GET") {
+      // The engine's getThread: any workspace message as the parent, replies oldest first after `after`.
+      const parent = messages.get(match[1]!);
+      if (!parent) return fail(404, "message_not_found");
+      const after = query.get("after");
+      const limit = Number(query.get("limit") ?? 50);
+      const all = [...messages.values()].filter(row => row.thread_id === parent.id);
+      const replies = all.filter(row => !after || BigInt(row.id) > BigInt(after)).slice(0, limit);
+      // Postgres serves the engine's count(*) as a string.
+      return ok({ parent: { ...parent, reply_count: String(all.length) }, replies });
+    }
     if ((match = /^\/v1\/messages\/([^/]+)\/replies$/.exec(path)) && method === "POST" && caller) {
       const parent = messages.get(match[1]!);
       if (!parent) return fail(404, "not_found");
@@ -364,8 +375,9 @@ export function createRelaycastWorld(roster: unknown[]) {
         const limit = Number(query.get("limit") ?? 50);
         const rows = [...messages.values()].filter(row => row.channel_id === channel.id && !row.thread_id
           && (!before || BigInt(row.id) < BigInt(before)));
+        // Postgres serves the engine's count(*) as a string.
         return ok(rows.slice(-limit).reverse().map(row => ({ ...row,
-          reply_count: [...messages.values()].filter(reply => reply.thread_id === row.id).length })));
+          reply_count: String([...messages.values()].filter(reply => reply.thread_id === row.id).length) })));
       }
     }
     return null;

@@ -133,6 +133,12 @@ const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent 
 const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
 const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
+/** Replies per post that read_relay_channel include_replies returns; thread_id reads the rest. */
+export const CHANNEL_REPLIES_PER_POST = 10;
+/** Thread reads include_replies runs at once. */
+const CHANNEL_REPLY_READ_BATCH = 5;
+/** Channels one agent of an MCP OAuth assistant connection may create per clock hour (Cloud's limit). */
+export const CHANNEL_CREATE_LIMIT_PER_HOUR = 5;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const CHANNEL_DELIVERY_REASONS: ReadonlySet<string> = new Set(["message", "mention", "thread-reply"]);
@@ -1422,6 +1428,30 @@ function createRelayService(context: McpContext) {
     return fn(hosted);
   }
 
+  /**
+   * Counts one channel creation for this workspace's agent in the current clock hour; true while within
+   * CHANNEL_CREATE_LIMIT_PER_HOUR. A failed count refuses (fails closed). The count is taken before the
+   * create, so a refused or failed create still uses one.
+   */
+  async function admitChannelCreate(agentName: string): Promise<boolean> {
+    try {
+      return await database.transaction(async tx => {
+        await tx.query("DELETE FROM relay_channel_creations WHERE workspace_id=$1 AND window_start < date_trunc('hour', now()) - interval '1 hour'",
+          [workspaceId]);
+        const row = (await tx.query<{ count: number }>(`INSERT INTO relay_channel_creations(workspace_id,agent_name,window_start,count)
+            VALUES ($1,$2,date_trunc('hour', now()),1)
+            ON CONFLICT (workspace_id,agent_name,window_start) DO UPDATE SET count=relay_channel_creations.count+1
+            RETURNING count`, [workspaceId, agentName])).rows[0];
+        return Boolean(row) && Number(row!.count) <= CHANNEL_CREATE_LIMIT_PER_HOUR;
+      });
+    } catch (error) {
+      // Fail closed, but let an operator see a broken counter: no names or content, only the error class.
+      console.warn("[relay-channel]", JSON.stringify({ step: "channel_create_counter_unavailable",
+        error: error instanceof Error ? error.name : "unknown" }));
+      return false;
+    }
+  }
+
   async function membership(identity: Identity, channel: string) {
     return (await clientFor(identity).authenticatedAgent(identity.token)).channels.find(row => row.name === channel) ?? null;
   }
@@ -1892,6 +1922,14 @@ function createRelayService(context: McpContext) {
         } catch (error) {
           if (!(error instanceof RelaycastCallError) || error.status !== 404) throw error;
           if (!input.create) throw new RelayToolError(`No channel #${channel} exists. Use list_relay_channels, or pass create: true to start it.`);
+          // An OAuth assistant (ChatGPT, Grok Bot, Muse...) acting as its approved agent can be talked into
+          // creating channels by the posts it reads, so its creations are rate limited per agent, failing closed.
+          // A linked Desktop identity is the person's own session and is not limited.
+          if (oauth && !identity.desktop && !await admitChannelCreate(identity.name)) {
+            // Caller-chosen names (the channel, the agent) stay out of logs.
+            console.info("[relay-channel]", JSON.stringify({ step: "channel_create_limited" }));
+            throw new RelayToolError(`${identity.name} has created too many channels recently, so #${channel} was not created. Join an existing channel (list_relay_channels), or try again later.`);
+          }
           try {
             // The creator becomes the channel's owner, which is membership.
             await clientFor(identity).createChannel(identity.token, channel);
@@ -1944,19 +1982,78 @@ function createRelayService(context: McpContext) {
       })) ?? notSubscribed(channel);
     },
 
-    async readChannel(input: ChannelInput & { channel: string; before?: string; limit: number }) {
+    /**
+     * Top-level posts (oldest first), or one thread with `thread_id`.
+     * `include_replies` adds each listed post's first replies. Thread reads go
+     * through the directory credential, which can see any message, so the
+     * thread's root must be a post in this channel: never a DM or another channel.
+     */
+    async readChannel(input: ChannelInput & { channel: string; before?: string; limit: number; thread_id?: string; after?: string;
+      include_replies?: boolean }) {
       const channel = normalizeChannelName(input.channel);
+      if (input.thread_id && input.before) throw new RelayToolError("before pages top-level posts. To page a thread, pass after (the last reply's message_id).");
+      if (input.after && !input.thread_id) throw new RelayToolError("after pages a thread's replies; pass thread_id with it.");
+      if (input.thread_id && input.include_replies) throw new RelayToolError("include_replies reads top-level posts; with thread_id the whole thread is already returned.");
       return (await channelActor(input, false, async (identity) => {
         // History is read with the workspace key (a gated participant: through relaygate, which checks read
         // itself), so membership is checked here.
-        if (!await membership(identity, channel)) notSubscribed(channel);
+        const member = await membership(identity, channel);
+        if (!member) notSubscribed(channel);
         const dir = directory(identity);
+        const view = (message: { id: string; sender: string | null; text: string; createdAt: string | null; threadId: string | null }) => ({
+          message_id: message.id, sender: message.sender, text: message.text, created_at: message.createdAt,
+          thread_id: message.threadId, mine: message.sender === identity.name });
+        if (input.thread_id) {
+          const notInChannel = () => new RelayToolError(`thread_id must be a message in #${channel}. Use read_relay_channel.`);
+          let thread = await dir.via.getChannelThread(dir.credential, input.thread_id, { limit: input.limit, after: input.after });
+          // A reply's id names its thread: read from the thread's root.
+          const rootId = thread?.parent.threadId;
+          if (thread && rootId && rootId !== input.thread_id) {
+            if (thread.parent.channelId !== member.id) throw notInChannel();
+            thread = await dir.via.getChannelThread(dir.credential, rootId, { limit: input.limit, after: input.after });
+          }
+          if (!thread || thread.parent.threadId || thread.parent.channelId !== member.id) throw notInChannel();
+          const last = thread.replies.at(-1)?.id ?? null;
+          return { you: identity.name, channel, thread_id: thread.parent.id,
+            post: { ...view(thread.parent), reply_count: thread.parent.replyCount },
+            replies: thread.replies.map(view),
+            more_after: thread.replies.length >= input.limit ? last : null,
+            reply_guidance: `Reply in this thread with ${channelReplyHint(channel, thread.parent.id)}.` };
+        }
         const page = await dir.via.listChannelMessages(dir.credential, channel, { before: input.before, limit: input.limit });
+        const replies = new Map<string, { replies: ReturnType<typeof view>[]; truncated: boolean }>();
+        const unread = new Set<string>();
+        if (input.include_replies) {
+          // In batches of CHANNEL_REPLY_READ_BATCH to bound upstream concurrency. A thread that fails to load is
+          // reported on its post (replies_unavailable) instead of failing the whole read.
+          const threaded = page.messages.filter(message => message.replyCount > 0);
+          for (let i = 0; i < threaded.length; i += CHANNEL_REPLY_READ_BATCH) {
+            await Promise.all(threaded.slice(i, i + CHANNEL_REPLY_READ_BATCH).map(async message => {
+              let thread: Awaited<ReturnType<typeof dir.via.getChannelThread>>;
+              try {
+                thread = await dir.via.getChannelThread(dir.credential, message.id, { limit: CHANNEL_REPLIES_PER_POST });
+              } catch (error) {
+                unread.add(message.id);
+                // Ids and the error class only.
+                console.info("[relay-channel]", JSON.stringify({ step: "thread_read_failed", message_id: message.id,
+                  error: error instanceof RelaycastCallError ? `${error.operation ?? "unknown"}:${error.status}` : error instanceof Error ? error.name : "unknown" }));
+                return;
+              }
+              // Never show a thread whose root is not this channel's post.
+              if (!thread || thread.parent.channelId !== member.id) return;
+              replies.set(message.id, { replies: thread.replies.map(view), truncated: thread.parent.replyCount > thread.replies.length });
+            }));
+          }
+        }
         return { you: identity.name, channel,
-          messages: page.messages.map(message => ({ message_id: message.id, sender: message.sender, text: message.text,
-            created_at: message.createdAt, thread_id: message.threadId, reply_count: message.replyCount, mine: message.sender === identity.name })),
+          messages: page.messages.map(message => ({ ...view(message), reply_count: message.replyCount,
+            ...(replies.has(message.id) ? { replies: replies.get(message.id)!.replies,
+              ...(replies.get(message.id)!.truncated ? { replies_truncated: true } : {}) } : {}),
+            ...(unread.has(message.id) ? { replies_unavailable: true } : {}) })),
           earlier: page.hasEarlier ? page.messages[0]?.id ?? null : null,
-          reply_guidance: CHANNEL_REPLY_GUIDANCE };
+          reply_guidance: input.include_replies
+            ? `${CHANNEL_REPLY_GUIDANCE} When replies_truncated or replies_unavailable is true, read that thread with read_relay_channel thread_id=<message_id>.`
+            : `${CHANNEL_REPLY_GUIDANCE} Read a post's replies with read_relay_channel thread_id=<message_id>, or include_replies: true.` };
       })) ?? notSubscribed(channel);
     },
   };

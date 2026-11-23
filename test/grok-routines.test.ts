@@ -401,3 +401,21 @@ test("gate-only: a routine re-enrolment answered with another relaygate agent is
   f.advance(); await routines.tick();
   assert.equal(f.calls.length, 0);
 });
+
+test("a post in a channel the bot subscribed to wakes its routine, and its thread replies are readable", async t => {
+  const f = await fixture(t, "/mcp");
+  await f.tool("connect_grok_bot_routine"); await f.save();
+  const subscribed = (await f.tool("subscribe_relay_channel", { channel: "family", create: true })).structuredContent as any;
+  assert.deepEqual([subscribed.created, subscribed.you], [true, "fake-grok"]);
+  f.world.addAgent("aunt-gpt"); const post = f.world.channelAs("aunt-gpt", "family", "@fake-grok PRIVATE_CHANNEL_BODY")!;
+  await f.routines.tick();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0]!.body.name, "relay.inbox");
+  assert.ok(!JSON.stringify(f.calls[0]!.body).includes("PRIVATE_CHANNEL_BODY"));
+  const inbox = (await f.tool("check_relay_inbox")).structuredContent as any;
+  assert.deepEqual([inbox.messages[0].kind, inbox.messages[0].channel], ["channel", "family"]);
+  const reply = (await f.tool("post_relay_channel", { channel: "family", text: "on it", thread_id: post.id })).structuredContent as any;
+  assert.equal(reply.thread_id, post.id);
+  const thread = (await f.tool("read_relay_channel", { channel: "family", thread_id: post.id })).structuredContent as any;
+  assert.deepEqual(thread.replies.map((m: any) => [m.sender, m.text, m.mine]), [["fake-grok", "on it", true]]);
+});
