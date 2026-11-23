@@ -276,8 +276,9 @@ const gateBody = z.object({
 }).strict().superRefine((gate, context) => {
   // A tag gate trusts whatever commit a tag is pushed at; only binding the run
   // to the approved commit keeps an unreviewed workflow out. It cannot opt out (as Cloud).
-  if (gate.allow_source_sha_mismatch === true && gate.ref_pattern !== undefined) {
-    context.addIssue({ code: "custom", message: "allow_source_sha_mismatch needs an exact ref, not ref_pattern" });
+  // An exact tag can be moved too: the opt-out needs an exact branch ref (as Cloud).
+  if (gate.allow_source_sha_mismatch === true && (gate.ref_pattern !== undefined || !gate.ref?.startsWith("refs/heads/"))) {
+    context.addIssue({ code: "custom", message: "allow_source_sha_mismatch needs an exact branch ref (refs/heads/…)" });
   }
   if ((gate.repository_id === undefined) !== (gate.repository_owner_id === undefined)) {
     context.addIssue({ code: "custom", message: "set repository_id and repository_owner_id together" });

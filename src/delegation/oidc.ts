@@ -90,22 +90,23 @@ export function workflowOidcVerifier(input: {
    * (with none) throws OidcKeysUnavailable; either way it is logged
    * (`delegation.dependency_failed`, op github_oidc_jwks).
    */
-  async function keys(issuer: string, refresh: boolean): Promise<Jwk[]> {
+  /** `stale`: the issuer could not be reached and these are the last good keys (as Cloud). */
+  async function keys(issuer: string, refresh: boolean): Promise<{ keys: Jwk[]; stale: boolean }> {
     const cached = cache.get(issuer);
     const at = now().getTime();
     const age = cached ? at - cached.at : Number.POSITIVE_INFINITY;
-    if (cached && (refresh ? age < REFRESH_COOLDOWN_MS : age < JWKS_TTL_MS)) return cached.keys;
+    if (cached && (refresh ? age < REFRESH_COOLDOWN_MS : age < JWKS_TTL_MS)) return { keys: cached.keys, stale: false };
     if (at - (failedAt.get(issuer) ?? Number.NEGATIVE_INFINITY) < FAILURE_BACKOFF_MS) {
-      if (cached) return cached.keys;
+      if (cached) return { keys: cached.keys, stale: true };
       throw new OidcKeysUnavailable();
     }
     try {
-      return await fetchKeys(issuer);
+      return { keys: await fetchKeys(issuer), stale: false };
     } catch (error) {
       failedAt.set(issuer, at);
       logDependencyFailed("github_oidc_jwks", error, { stale_cache_served: Boolean(cached), refresh,
         ...(error instanceof OidcKeysUnavailable && error.status !== null ? { status: error.status } : {}) });
-      if (cached) return cached.keys;
+      if (cached) return { keys: cached.keys, stale: true };
       throw error instanceof OidcKeysUnavailable ? error : new OidcKeysUnavailable();
     }
   }
@@ -168,8 +169,14 @@ export function workflowOidcVerifier(input: {
     // The issuer is checked before any network call, so a token cannot point
     // the server at a URL of its choosing.
     if (!issuers.has(issuer)) throw new OidcInvalid("issuer");
-    let jwk = (await keys(issuer, false)).find(key => key.kid === header.kid);
-    if (!jwk) jwk = (await keys(issuer, true)).find(key => key.kid === header.kid);
+    let jwk = (await keys(issuer, false)).keys.find(key => key.kid === header.kid);
+    if (!jwk) {
+      const refreshed = await keys(issuer, true);
+      jwk = refreshed.keys.find(key => key.kid === header.kid);
+      // An unknown kid while the issuer cannot be reached may be a key it just
+      // rotated in: that is `unavailable` (retry), never a forged token (as Cloud).
+      if (!jwk && refreshed.stale) throw new OidcKeysUnavailable();
+    }
     if (!jwk || (jwk.use && jwk.use !== "sig") || (jwk.alg && jwk.alg !== alg)) throw new OidcInvalid("unknown_key");
     const key = publicKey(jwk);
     if ((alg === "RS256") !== (jwk.kty === "RSA")) throw new OidcInvalid("unknown_key");

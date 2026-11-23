@@ -691,10 +691,53 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   // The issuer goes down again: an unknown kid refetches (after the cooldown), fails, and the last good keys still serve.
   down = true;
   clock.ms += 61_000;
-  await assert.rejects(verify(token("rotated-kid")), /oidc_invalid: unknown_key/);
+  // An unknown kid while only stale keys can be served may be a key just rotated in: unavailable, not oidc_invalid.
+  await assert.rejects(verify(token("rotated-kid")), OidcKeysUnavailable);
   assert.equal((await verify(token())).repository, REPO);
   const stale = lines.map(line => JSON.parse(line) as Record<string, unknown>).filter(line => line.message === "delegation.dependency_failed").at(-1)!;
   assert.equal(stale.stale_cache_served, true);
+  // On a fresh answer an unknown kid is a forged token: oidc_invalid.
+  down = false;
+  clock.ms += 61_000;
+  await assert.rejects(verify(token("forged-kid")), /oidc_invalid: unknown_key/);
+});
+
+test("gate redeem: releases only; a gate without job_workflow_ref covers its own file's jobs; same_run by repository id", async (t) => {
+  const env = await setup(t);
+  // A deploy approval whose target happens to start with the gate's prefix is never spent through a gate.
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  const assistant = (await env.database.query<{ agent_id: string }>(
+    "SELECT agent_id FROM delegation_agent_bindings LIMIT 1")).rows[0]!.agent_id;
+  const grant = await env.browser("/delegates", "POST", { delegate_agent_id: assistant, scopes: [
+    { class: "release", targets: [`${REPO}:*:*:*:*`, REPO] }, { class: "deploy", targets: [`${REPO}:*`] }] });
+  assert.equal(grant.status, 201, grant.raw);
+  await env.gate();
+  const deployTarget = `${REPO}:prod`;
+  const messageId = env.world.sendApprovalAs("assistant", "relay-coder", "ship it",
+    { v: 1, owner_id: env.ownerId, actions: [{ class: "deploy", target: deployTarget }] }).message.id;
+  const recipient = (await env.database.query<{ agent_remote_id: string }>(
+    "SELECT agent_remote_id FROM desktop_relay_identities LIMIT 1")).rows[0]!.agent_remote_id;
+  const coder = env.world.agents.get("relay-coder")!;
+  const attested = await request(env.origin, `${env.base}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
+    body: { recipient_agent_id: recipient, recipient_token: coder.token, message_id: messageId } });
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const deploy = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "950" })), attested.body.claims.approval_id, deployTarget);
+  assert.equal(deploy.status, 403, deploy.raw);
+  assert.deepEqual(deploy.body, { ok: false, reason: "out_of_scope" });
+  // A job inside a reusable workflow the gate does not name: gate_mismatch.
+  const approvalId = await env.approval([STABLE]);
+  const reusable = "AgentWorkforce/workflows/.github/workflows/publish.yml@refs/heads/main";
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ run_id: "951", job_workflow_ref: reusable })),
+    approvalId, STABLE, { dry_run: true })).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  // same_run compares GitHub's repository id: a renamed repository (same id) is still the same run.
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ run_id: "952" })), approvalId)).body, { ok: true, consumed: true });
+  const stored = (await env.database.query<{ repository_id: string }>(
+    "SELECT repository_id FROM delegation_gate_redemptions WHERE approval_id = $1", [approvalId])).rows[0]!;
+  assert.equal(stored.repository_id, "70151234");
+  // The opt-out needs an exact branch ref: an exact tag is refused.
+  const tag = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: `${REPO}/.github/workflows/release.yml@refs/tags/v1`,
+    ref: "refs/tags/v1", event: "push", target_prefix: `${REPO}:`, allow_source_sha_mismatch: true });
+  assert.equal(tag.status, 400, tag.raw);
 });
 
 test("gate redeem: a release is bound to the run's commit (sha claim); status codes fail closed", async (t) => {

@@ -59,8 +59,14 @@ CREATE TABLE IF NOT EXISTS delegation_gate_redemptions (
   gate_id text NOT NULL REFERENCES delegation_gates(id) ON DELETE CASCADE,
   issuer text NOT NULL,
   repository text NOT NULL,
+  -- GitHub's repository id from the run's token: same_run compares it, not
+  -- the name, so a rename changes nothing.
+  repository_id text NOT NULL,
   run_id text NOT NULL,
   run_attempt integer NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (approval_id, class, target)
 );
+
+CREATE INDEX IF NOT EXISTS delegation_gate_redemptions_workspace_idx ON delegation_gate_redemptions (workspace_id);
+CREATE INDEX IF NOT EXISTS delegation_gate_redemptions_gate_idx ON delegation_gate_redemptions (gate_id);

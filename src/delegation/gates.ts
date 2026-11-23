@@ -139,7 +139,12 @@ function gateMatchesByName(gate: GateMatchFields, claims: ClaimMatchFields): boo
   return gate.issuer === claims.issuer && gate.repo.toLowerCase() === claims.repository.toLowerCase() &&
     gate.event === claims.event_name && refMatches &&
     workflowMatches(gate.workflow_ref, claims.workflow_ref, gate, claims.ref) &&
-    (gate.job_workflow_ref === null || workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref));
+    // A gate without job_workflow_ref covers the jobs defined in its own file
+    // only: a job inside some reusable workflow it calls (GitHub then sets
+    // job_workflow_ref to that workflow) must be named on the gate explicitly (as Cloud).
+    (gate.job_workflow_ref === null ?
+      !claims.job_workflow_ref || claims.job_workflow_ref === claims.workflow_ref :
+      workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref));
 }
 
 /**
@@ -253,6 +258,10 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     const action = approval.actions.find(item => item.class === input.action.class && item.target === input.action.target);
     if (!action || !actionIsValid(action)) return await refuse("out_of_scope");
     if (approval.invalidated_at) return await refuse("revoked");
+    // Release gates redeem releases only (§11a), as Cloud: a gate never spends a
+    // deploy, destructive, secret_change or spend approval whose target happens
+    // to start with its prefix, since only releases are bound to the run's commit.
+    if (action.class !== "release") return await refuse("out_of_scope");
     // A release names its commit; the run must be on it (the token's `sha`).
     // Only a candidate-run target (whose source commit a promote run may not
     // be on) can be redeemed off-commit, and only through a gate that opted out.
@@ -260,9 +269,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       const named = releaseTargetSha(action.target);
       if (!named) return await refuse("out_of_scope");
       if (named.sha.toLowerCase() !== claims.sha) {
-        // Never through a tag gate: anyone who can push a tag picks the commit, and with it the workflow.
-        candidates = named.form === "candidate" ?
-          candidates.filter(item => item.allow_source_sha_mismatch === true && item.ref_pattern === null) : [];
+        // Only through an exact-branch gate: a tag, exact or pattern, can be moved to any commit.
+        candidates = named.form === "candidate" ? candidates.filter(mayOptOutOfSourceSha) : [];
         if (!candidates.length) return await refuse("sha_mismatch");
         gate = candidates[0]!;
       }
@@ -363,14 +371,14 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
 /** Whether a consumed action was consumed by this same run (another job, or a later attempt, of it). */
 async function boundRun(executor: SqlExecutor, approvalId: string, action: Pick<Action, "class" | "target">,
   claims: WorkflowClaims): Promise<boolean> {
-  const prior = (await executor.query<{ run_id: string; repository: string; issuer: string }>(
-    `SELECT run_id, repository, issuer FROM delegation_gate_redemptions
+  const prior = (await executor.query<{ run_id: string; repository_id: string; issuer: string }>(
+    `SELECT run_id, repository_id, issuer FROM delegation_gate_redemptions
       WHERE approval_id = $1 AND class = $2 AND target = $3`,
     [approvalId, action.class, action.target],
   )).rows[0];
-  // GitHub repository names are case-insensitive; gates match them that way too.
-  return Boolean(prior && prior.run_id === claims.run_id &&
-    prior.repository.toLowerCase() === claims.repository.toLowerCase() && prior.issuer === claims.issuer);
+  // The same run of the same repository, by GitHub's id (a rename changes nothing), as Cloud.
+  return Boolean(prior && prior.run_id === claims.run_id && prior.repository_id === claims.repository_id &&
+    prior.issuer === claims.issuer);
 }
 
 /**
@@ -380,21 +388,24 @@ async function boundRun(executor: SqlExecutor, approvalId: string, action: Pick<
  */
 async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: string; approvalId: string; gateId: string;
   claims: WorkflowClaims; action: Action }): Promise<"consumed" | "same_run" | "taken" | "gate_gone" | "revoked"> {
-  const gateLive = (await tx.query("SELECT 1 FROM delegation_gates WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
-    [input.gateId])).rows.length > 0;
+  // Both scoped to the workspace, as Cloud.
+  const gateLive = (await tx.query(
+    "SELECT 1 FROM delegation_gates WHERE workspace_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE",
+    [input.workspaceId, input.gateId])).rows.length > 0;
   if (!gateLive) return "gate_gone";
-  const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR SHARE",
-    [input.approvalId])).rows.length > 0;
+  const live = (await tx.query(
+    "SELECT 1 FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL FOR SHARE",
+    [input.workspaceId, input.approvalId])).rows.length > 0;
   // A revoked approval at consume is `revoked`, as Cloud.
   if (!live) return "revoked";
   if (await consumeAction(tx, { approvalId: input.approvalId, workspaceId: input.workspaceId, action: input.action,
     consumedBy: `github-run:${input.claims.run_id}` })) {
     await tx.query(
       `INSERT INTO delegation_gate_redemptions
-         (approval_id, class, target, workspace_id, gate_id, issuer, repository, run_id, run_attempt)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+         (approval_id, class, target, workspace_id, gate_id, issuer, repository, repository_id, run_id, run_attempt)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [input.approvalId, input.action.class, input.action.target, input.workspaceId, input.gateId, input.claims.issuer,
-        input.claims.repository, input.claims.run_id, input.claims.run_attempt],
+        input.claims.repository, input.claims.repository_id, input.claims.run_id, input.claims.run_attempt],
     );
     return "consumed";
   }
@@ -485,4 +496,9 @@ export async function resolveGateRepository(input: { repo: string; token: string
       typeof fullName !== "string") throw new GithubUnavailable();
   return fullName.toLowerCase() === input.repo.toLowerCase()
     ? { repositoryId: String(id), repositoryOwnerId: String(ownerId), fullName } : null;
+}
+
+/** The source-sha opt-out only ever applies to an exact branch ref (as Cloud): a tag, exact or pattern, can be moved to any commit. */
+export function mayOptOutOfSourceSha(gate: Pick<GateRow, "allow_source_sha_mismatch" | "ref" | "ref_pattern">): boolean {
+  return gate.allow_source_sha_mismatch === true && gate.ref_pattern === null && Boolean(gate.ref?.startsWith("refs/heads/"));
 }

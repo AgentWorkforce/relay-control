@@ -394,13 +394,15 @@ for a tag the pattern covers. When the publishing job runs inside a reusable
 workflow, the gate also sets `job_workflow_ref` (that workflow's file and a
 full ref, the gate's `ref_pattern`, or a 40-hex lowercase commit SHA, which
 may be in another repo), and the token's `job_workflow_ref` must match it
-exactly too.
+exactly too. A gate without `job_workflow_ref` covers only the jobs defined
+in its own file: the token's `job_workflow_ref` must be absent or equal its
+`workflow_ref` (a job inside a reusable workflow must be named on the gate).
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
 true) lets candidate-run release targets name a source commit the run is not
-on (see step 5). A tag gate (`ref_pattern`) cannot set it (400): anyone who can
-push a tag picks the commit, and with it the workflow.
+on (see step 5). Only an exact branch gate (`ref` under `refs/heads/`) can set
+it (400 otherwise): a tag, exact or pattern, can be moved to any commit.
 
 **Pinned at registration, as Cloud.** Registering resolves the repository's
 GitHub ids through the workspace's GitHub connection (App installation or
@@ -438,8 +440,11 @@ dry_run?}`. Control checks, in order:
      kept lower-cased.
    - Failing any of these is `oidc_invalid`. When the issuer's keys cannot be
      read and none are cached, the answer is `unavailable` (an outage, not a
-     forged token). After a failed key fetch no refetch starts for 30
-     seconds; meanwhile the last good keys serve, or the call fails fast.
+     forged token), and so is a `kid` the cached keys don't know while the
+     issuer can't be reached (it may be a key just rotated in); on a fresh
+     answer an unknown `kid` is `oidc_invalid`. After a failed key fetch no
+     refetch starts for 30 seconds; meanwhile the last good keys serve, or
+     the call fails fast.
      Each failure is logged (`delegation.dependency_failed`, op
      `github_oidc_jwks`, with `stale_cache_served` and `status`).
 2. **The gate**, matched against the token:
@@ -461,7 +466,9 @@ dry_run?}`. Control checks, in order:
 3. **Delegation on**, otherwise `not_enabled`.
 4. **The target prefix**: the action's target must start with a matching
    gate's `target_prefix`, otherwise `target_prefix`.
-5. **The approval.** The normal redeem checks run:
+5. **The approval.** Release gates redeem releases only: an action of any
+   other class is `out_of_scope`, before the commit check, standing and
+   conditions. Then the normal redeem checks run:
    - the approval exists, and the action is one it names;
    - revocation;
    - for a delegate's (tier D) approval: its grant, the delegate's binding,
@@ -476,7 +483,7 @@ dry_run?}`. Control checks, in order:
    Right after the action is found, a `release` is bound to the run's commit,
    as Cloud: the target's sha (the last segment for land and iOS, the source
    sha for a candidate) must equal the token's `sha` (a 64-hex sha never equals
-   a 40-hex target). On a mismatch only exact-ref gates with
+   a 40-hex target). On a mismatch only exact-branch gates with
    `allow_source_sha_mismatch` keep serving a candidate target, land and
    iOS targets keep none, and with none left the answer is `sha_mismatch`.
    Other classes are not sha-bound. Every gate event carries the run's `sha`.
@@ -496,8 +503,8 @@ dry_run?}`. Control checks, in order:
    gate row). A departed gate owner is `recipient_policy` for tier D and a
    departed approval owner `revoked` for tier O.
    - The first redeem of an action consumes that action and binds it to the
-     token's `run_id` (and repository, compared case-insensitively, and
-     issuer). Other actions of the same approval are unaffected. Once every
+     token's `run_id`, GitHub repository id (so a rename changes nothing)
+     and issuer. Other actions of the same approval are unaffected. Once every
      single-use action is spent the approval is stamped `consumed_at`.
    - Any later redeem in the same run, by another job or a later attempt,
      answers `{ok:true, consumed:true, same_run:true}`.
