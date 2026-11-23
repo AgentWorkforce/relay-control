@@ -113,6 +113,44 @@ test("refresh CAS has one winner, persists retired hash atomically, and preserve
   assert.equal(receipt.organization_id,f.owner.organizationId);
 });
 
+test("first bearer use of a pair is recorded once and every rotation clears it", async t=>{
+  const f=await fixture(t), pair=await f.issue();
+  const used=async()=>(await f.database.query<{ current_pair_used_at:Date|null }>("SELECT current_pair_used_at FROM mcp_oauth_sessions")).rows[0]!.current_pair_used_at;
+  assert.equal(await used(),null);
+  assert.ok(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE));
+  const first=await used(); assert.ok(first);
+  f.advance(5_000);
+  assert.ok(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE));
+  assert.equal((await used())!.getTime(),first.getTime());
+  const next=await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner));
+  assert.ok(next);
+  assert.equal(await used(),null);
+  const retired=(await f.database.query<{ successor_token_hash:string; refresh_token_expires_at:Date }>(
+    "SELECT successor_token_hash,refresh_token_expires_at FROM mcp_oauth_retired_refresh_tokens")).rows[0]!;
+  assert.equal(retired.successor_token_hash,hashSecret(next.refreshToken));
+  assert.equal(retired.refresh_token_expires_at.toISOString(),pair.refreshTokenExpiresAt);
+  assert.equal(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE),null);
+  assert.equal(await used(),null);
+});
+
+test("a bearer request that loses to a rotation is refused and does not mark the successor pair used", async t=>{
+  const f=await fixture(t), pair=await f.issue();
+  let rotated=false;
+  const racing: Database={
+    query: async <T extends Record<string,unknown>>(sql:string,params?:unknown[])=>{
+      const result=await f.database.query<T>(sql,params);
+      if(!rotated && sql.includes("WHERE s.access_token_hash=$1")) {
+        rotated=true; assert.ok(await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner)));
+      }
+      return result;
+    },
+    exec: sql=>f.database.exec(sql), transaction: run=>f.database.transaction(run), close: async()=>{},
+  };
+  assert.equal(await new McpOAuthSessions(racing,f.sessions.options).resolveAccessToken(pair.accessToken,RESOURCE),null);
+  assert.ok(rotated);
+  assert.equal((await f.database.query("SELECT current_pair_used_at FROM mcp_oauth_sessions")).rows[0]!.current_pair_used_at,null);
+});
+
 test("rotation rollback keeps the old pair and no retired receipt", async t=>{
   const f=await fixture(t), pair=await f.issue();
   await assert.rejects(f.database.transaction(async tx=>{

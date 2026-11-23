@@ -72,7 +72,8 @@ async function startHistory(t: TestContext) {
   const overrides = new Map<string, (request: IncomingMessage, url: URL) => {
     status?: number;
     body?: unknown;
-    headers?: Record<string, string>;
+    /** A null value removes the header (for example, the workspace attestation). */
+    headers?: Record<string, string | null>;
   } | undefined>();
   /** Handoff request bodies, in order. */
   const handoffs: Array<Record<string, any>> = [];
@@ -147,7 +148,8 @@ async function startHistory(t: TestContext) {
       if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
       if (response.destroyed || response.writableEnded) return;
       for (const [name, value] of Object.entries(override.headers ?? {})) {
-        response.setHeader(name, value);
+        if (value === null) response.removeHeader(name);
+        else response.setHeader(name, value);
       }
       send(override.status ?? 200, override.body ?? {});
       return;
@@ -382,10 +384,32 @@ test("session reads stay inside the caller's workspace", async (t) => {
   });
   assert.deepEqual(betaList.body.items.map((row: any) => row.sessionId), ["beta-1"]);
 
+  for (const [workspaceId, sessionId, source, token] of [
+    [env.alpha, "alpha-1", "codex", alphaToken],
+    [env.beta, "beta-1", "claude", betaToken],
+  ] as const) {
+    for (const resource of ["events", "turns"]) {
+      const response = await call(
+        env.origin,
+        `/cloud/api/v1/workspaces/${workspaceId}/sessions/${sessionId}/${resource}?source=${source}`,
+        { token },
+      );
+      assert.equal(response.status, 200, `${sessionId} ${resource}`);
+    }
+  }
+
   // Every upstream read names exactly the authorized workspace.
   const reads = env.history.requests.filter((entry) => entry.path.startsWith("/v1/"));
   assert(reads.length > 0);
   for (const read of reads) assert.equal(read.workspaceParams.length, 1, read.path);
+  // Per-session events and turns forward the path workspace as that one value.
+  const detail = reads.filter((entry) => /^\/v1\/sessions\/[^/]+\/(?:events|turns)$/.test(entry.path));
+  assert.deepEqual(detail.map((entry) => [entry.path, entry.workspaceParams]), [
+    ["/v1/sessions/alpha-1/events", [env.alpha]],
+    ["/v1/sessions/alpha-1/turns", [env.alpha]],
+    ["/v1/sessions/beta-1/events", [env.beta]],
+    ["/v1/sessions/beta-1/turns", [env.beta]],
+  ]);
 
   // A workspace the token is not bound to is indistinguishable from a missing
   // one, for every session route, and never reaches RelayHistory.
@@ -490,6 +514,37 @@ test("an unattested or mis-attested History response is never returned", async (
   );
   assert.equal(unattested.status, 502);
   assert(!JSON.stringify(unattested.body).includes("Beta secret"));
+});
+
+test("per-session events and turns with a missing or different attestation give 502 without the upstream body", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const bodies = {
+    events: { sessionId: "alpha-1", events: [{ eventId: "x", ts: "2026-11-02T18:00:00.000Z", kind: "assistant", content: "Beta secret" }], nextCursor: null },
+    turns: { sessionId: "alpha-1", turns: [{ id: "t1", role: "user", content: "Beta secret", ts: "2026-11-02T18:00:00.000Z", metadata: {} }] },
+  };
+  for (const resource of ["events", "turns"] as const) {
+    for (const attestation of [null, "", env.beta]) {
+      env.history.overrides.set(`/v1/sessions/alpha-1/${resource}`, () => ({
+        headers: { "x-relayhistory-workspace-id": attestation },
+        body: bodies[resource],
+      }));
+      const before = env.history.requests.length;
+      const response = await call(
+        env.origin,
+        `/cloud/api/v1/workspaces/${env.alpha}/sessions/alpha-1/${resource}?source=codex`,
+        { token },
+      );
+      const label = `${resource} attested ${JSON.stringify(attestation)}`;
+      assert.equal(response.status, 502, label);
+      assert(!JSON.stringify(response.body).includes("Beta secret"), label);
+      // One upstream read, scoped to the path workspace, and no retry elsewhere.
+      const forwarded = env.history.requests.slice(before).filter((entry) => entry.path.startsWith("/v1/"));
+      assert.deepEqual(forwarded.map((entry) => [entry.path, entry.workspaceParams]),
+        [[`/v1/sessions/alpha-1/${resource}`, [env.alpha]]], label);
+    }
+    env.history.overrides.delete(`/v1/sessions/alpha-1/${resource}`);
+  }
 });
 
 test("members: names for the dashboard without a History read", async (t) => {

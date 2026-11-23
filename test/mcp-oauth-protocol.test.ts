@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  createMcpOAuthProtocol, isAllowedRedirectUri, isValidCodeChallenge, isValidCodeVerifier,
-  parseClientRegistration, pkceS256, type McpOAuthEndpoint,
+  createMcpOAuthProtocol, isAllowedRedirectUri, isGoogleConnectedAppsRedirectUri, isValidCodeChallenge, isValidCodeVerifier,
+  parseClientRegistration, pkceS256, usesGoogleConnectedAppsPersistentRefresh, type McpOAuthEndpoint,
 } from "../src/mcp/oauth/protocol.js";
 
 const ORIGIN = "https://relay.example.test";
@@ -95,6 +95,23 @@ test("public client registration bounds redirect metadata and accepts no secret 
     { redirect_uris: [REDIRECT], id_token_signed_response_alg: "none" }, { redirect_uris: [REDIRECT], sector_identifier_uri: "https://other.test" }]) {
     assert.equal(parseClientRegistration(body).ok, false, JSON.stringify(body));
   }
+});
+
+test("stable refresh applies only to exact Google Connected Apps callbacks", () => {
+  const google = "https://oauth-redirect.googleusercontent.com/r/fake-project";
+  for (const uri of [google, "https://oauth-redirect.googleusercontent.com/a/fake-project",
+    "https://oauth-redirect-sandbox.googleusercontent.com/r/fake-project", "https://oauth-redirect-test.googleusercontent.com/a/fake-project",
+    "https://OAUTH-REDIRECT.googleusercontent.com/r/fake-project"]) assert.equal(isGoogleConnectedAppsRedirectUri(uri), true, uri);
+  for (const uri of ["http://oauth-redirect.googleusercontent.com/r/fake-project", `${google}/extra`,
+    "https://oauth-redirect.googleusercontent.com/r/", "https://oauth-redirect.googleusercontent.com/b/fake-project",
+    "https://oauth-redirect.googleusercontent.com/r/a/b", `${google}?x=1`, `${google}#x`,
+    "https://user:secret@oauth-redirect.googleusercontent.com/r/fake-project",
+    "https://other.googleusercontent.com/r/fake-project", "https://oauth-redirect.googleusercontent.com.attacker.test/r/fake-project",
+    "https://oauth-redirect.attacker.test/r/fake-project", "not a url"]) assert.equal(isGoogleConnectedAppsRedirectUri(uri), false, uri);
+  assert.equal(usesGoogleConnectedAppsPersistentRefresh([google]), true);
+  assert.equal(usesGoogleConnectedAppsPersistentRefresh([google, "https://oauth-redirect-sandbox.googleusercontent.com/r/fake-project"]), true);
+  assert.equal(usesGoogleConnectedAppsPersistentRefresh([]), false);
+  assert.equal(usesGoogleConnectedAppsPersistentRefresh([google, REDIRECT]), false);
 });
 
 test("PKCE S256 matches the RFC vector and rejects malformed verifier/challenge lengths", () => {

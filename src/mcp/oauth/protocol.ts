@@ -60,6 +60,11 @@ const MAX_STATE_LENGTH = 4 * 1024;
 const MAX_NONCE_LENGTH = 1024;
 // WHATWG URL keeps IPv6 brackets in `hostname`; the bare form is accepted defensively.
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+const GOOGLE_CONNECTED_APPS_REDIRECT_HOSTS = new Set([
+  "oauth-redirect.googleusercontent.com",
+  "oauth-redirect-sandbox.googleusercontent.com",
+  "oauth-redirect-test.googleusercontent.com",
+]);
 
 export function isValidCodeChallenge(value: string): boolean {
   return CODE_CHALLENGE_PATTERN.test(value);
@@ -89,6 +94,24 @@ function parseSafeOAuthUrl(raw: string): URL | null {
 /** Redirect URIs must be absolute https (or loopback http), without fragments or credentials. */
 export function isAllowedRedirectUri(raw: string): boolean {
   return parseSafeOAuthUrl(raw) !== null;
+}
+
+/** Google Connected Apps callback families that require stable refresh tokens. */
+export function isGoogleConnectedAppsRedirectUri(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" &&
+      GOOGLE_CONNECTED_APPS_REDIRECT_HOSTS.has(url.hostname.toLowerCase()) &&
+      (/^\/r\/[^/]+$/u.test(url.pathname) || /^\/a\/[^/]+$/u.test(url.pathname)) &&
+      !url.search && !url.hash && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+/** True only when every registered callback is a Google Connected Apps callback. */
+export function usesGoogleConnectedAppsPersistentRefresh(redirectUris: readonly string[]): boolean {
+  return redirectUris.length > 0 && redirectUris.every(isGoogleConnectedAppsRedirectUri);
 }
 
 /** OIDC pairwise-subject sector when no sector_identifier_uri is registered. */

@@ -16,10 +16,26 @@ import { loadDesktopReleasesRepo } from "./desktop-releases.js";
 import type { GithubAppConfig } from "./admin/github-app.js";
 import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
 
+/** One extra site: a dashboard origin and an API origin (may be equal). */
+export type ExtraSite = { dashboardOrigin: string; apiOrigin: string };
+
 export type SelfhostConfig = {
   githubApp?: GithubAppConfig | null;
   databaseUrl: string;
   publicBaseUrl: string;
+  /**
+   * SELFHOST_ROUTED_SITE_URL: a third site origin whose edge router forwards
+   * <site>/cloud/... here and sets x-original-host. Desktop/CLI sign-in
+   * answers name it when that header matches; null (unset) keeps the
+   * Host-selected origin everywhere.
+   */
+  routedSiteOrigin?: string | null;
+  /**
+   * SELFHOST_EXTRA_SITES: more public host sets in front of this deployment.
+   * Browser origin checks accept them and Host-selected answers name the one a
+   * request arrived on. Absent or empty: only dashboardUrl + publicBaseUrl.
+   */
+  extraSites?: readonly ExtraSite[];
   relaycastUrl: string;
   relaycastPublicUrl: string;
   /**
@@ -357,6 +373,76 @@ export function serviceUrl(env: Env, name: string): string {
   return value.replace(/\/+$/, "");
 }
 
+// Optional third site origin (an edge router's site that forwards /cloud
+// here). https only: Desktop is told to call it as its API base.
+function loadRoutedSiteOrigin(env: Env): string | null {
+  const name = "SELFHOST_ROUTED_SITE_URL";
+  const value = env[name]?.trim();
+  if (!value) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must be an https origin without credentials, path, query, or fragment`);
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    (url.pathname !== "" && url.pathname !== "/")
+  ) {
+    throw new Error(`${name} must be an https origin without credentials, path, query, or fragment`);
+  }
+  return url.origin;
+}
+
+const MAX_EXTRA_SITES = 8;
+
+// More public host sets in front of this same deployment, each
+// "<dashboard origin>|<API origin>". A host belongs to one site only, so the
+// Host header picks exactly one site. Errors name the entry by position, never
+// echo it (it could carry credentials).
+function loadExtraSites(env: Env, reservedOrigins: readonly (string | null)[]): ExtraSite[] {
+  const name = "SELFHOST_EXTRA_SITES";
+  const value = env[name]?.trim();
+  if (!value) return [];
+  const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (entries.length > MAX_EXTRA_SITES) throw new Error(`${name} allows at most ${MAX_EXTRA_SITES} sites`);
+  const taken = new Set(reservedOrigins.flatMap((origin) => (origin ? [new URL(origin).host] : [])));
+  return entries.map((entry, index) => {
+    const label = `${name} entry ${index + 1}`;
+    const sides = entry.split("|").map((side) => side.trim());
+    if (sides.length !== 2) throw new Error(`${label} must be <dashboard origin>|<API origin>`);
+    const [dashboardOrigin, apiOrigin] = sides.map((side) => {
+      let url: URL;
+      try {
+        url = new URL(side);
+      } catch {
+        throw new Error(`${label} must name https origins without credentials, path, query, or fragment`);
+      }
+      if (
+        url.protocol !== "https:" ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash ||
+        (url.pathname !== "" && url.pathname !== "/")
+      ) {
+        throw new Error(`${label} must name https origins without credentials, path, query, or fragment`);
+      }
+      return url.origin;
+    }) as [string, string];
+    // Both sides may be one origin (a single-host site), as the primary site allows.
+    for (const host of new Set([new URL(dashboardOrigin).host, new URL(apiOrigin).host])) {
+      if (taken.has(host)) throw new Error(`${label} reuses host ${host}, which already belongs to another site`);
+      taken.add(host);
+    }
+    return { dashboardOrigin, apiOrigin };
+  });
+}
+
 function publicServiceUrl(env: Env, name: string): string {
   const value = required(env, name);
   const maxOriginLength = 253 + "https://".length + ":65535".length;
@@ -502,6 +588,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
+    routedSiteOrigin: loadRoutedSiteOrigin(env),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
     relayhistoryUrl: sessionReadApi.url,
@@ -536,6 +623,12 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
+    // Last, so the primary site settings it is checked against validate first.
+    extraSites: loadExtraSites(env, [
+      serviceUrl(env, "SELFHOST_PUBLIC_URL"),
+      absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${serviceUrl(env, "SELFHOST_PUBLIC_URL")}/`),
+      loadRoutedSiteOrigin(env),
+    ]),
   };
 }
 

@@ -1530,6 +1530,36 @@ test("multi DG-002: operator-assigned domains, verified emails only, invites and
   assert.notEqual(await currentOrganization(ctx.origin, late.cookie), acme);
 });
 
+test("multi: an invited person's first SSO or Microsoft sign-in joins the inviting organization, never a personal one", async (t) => {
+  const ctx = await setup(t, { multi: true, microsoft: {} });
+  const acme = await orgId(ctx);
+  const organizationCount = async () =>
+    (await ctx.database.query<{ count: number }>("SELECT count(*)::int AS count FROM organizations")).rows[0]!.count;
+  for (const provider of ["oidc", "microsoft"] as const) {
+    for (const withLink of [true, false]) {
+      const email = `${provider}.${withLink ? "link" : "plain"}@outlook.com`;
+      const { token } = await inviteFor(ctx, email, "member");
+      const organizations = await organizationCount();
+      const creates = ctx.relaycast.state.creates;
+      const query = withLink ? `?invite=${token}` : "";
+      // The provider may report the address in any case.
+      const shown = email.toUpperCase();
+      const signedIn = provider === "oidc"
+        ? await oidcSignIn(ctx, { email: shown, name: "Invitee" }, query)
+        : await microsoftSignIn(ctx, { ...msAccount(shown), name: "Invitee" }, query);
+      assert(signedIn.cookie, signedIn.callback.text);
+      assert.equal(await currentOrganization(ctx.origin, signedIn.cookie), acme, `${provider} ${withLink}`);
+      const memberships = await ctx.database.query<{ organization_id: string; role: string }>(
+        `SELECT m.organization_id, m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1`,
+        [email],
+      );
+      assert.deepEqual(memberships.rows, [{ organization_id: acme, role: "member" }]);
+      assert.equal(await organizationCount(), organizations, "no personal organization");
+      assert.equal(ctx.relaycast.state.creates, creates, "no Relaycast workspace provisioned");
+    }
+  }
+});
+
 test("single DG-002/DG-004: SELFHOST_AUTO_JOIN_DOMAINS is the authority; the domain routes refuse changes", async (t) => {
   const ctx = await setup(t, { env: { SELFHOST_AUTO_JOIN_DOMAINS: "acme.test" } });
   const acme = await orgId(ctx);

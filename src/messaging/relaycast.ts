@@ -91,6 +91,14 @@ export type Conversation = {
 
 
 /** A live fleet node as Relaycast's GET /v1/nodes reports it (see src/mcp/relay-spawn.ts). */
+/** GET /v1/nodes?status=online honors `limit`: listSpawnTargets reads one page of at most this many live nodes. */
+export const RELAY_NODE_PAGE_LIMIT = 100;
+/**
+ * Relaycast's maximum `limit` for the paginated every-state read (`GET /v1/nodes?history=true`,
+ * NODE_LIST_HISTORY_MAX_LIMIT; it answers `{ nodes, next_cursor }`). listAllSpawnTargets reads one such page.
+ */
+export const RELAY_NODE_HISTORY_LIMIT = 500;
+
 export type RelaySpawnTarget = {
   id: string;
   name: string;
@@ -191,6 +199,28 @@ function payload(parsed: unknown): unknown {
   return parsed;
 }
 
+/** One node as GET /v1/nodes serves it, or nothing when it is malformed. */
+function spawnTargetFrom(value: unknown): RelaySpawnTarget[] {
+  const node = record(value);
+  const id = text(node?.id);
+  const name = text(node?.name);
+  if (!node || !id || !name || !Array.isArray(node.capabilities) || !Number.isInteger(node.active_agents)
+    || !Number.isInteger(node.max_agents) || (node.max_agents as number) < 0 || (node.active_agents as number) < 0) return [];
+  // An absent count means no reservations; a malformed one means capacity is unknown.
+  const reserved = node.reserved_agents ?? 0;
+  const reservedValid = Number.isInteger(reserved) && (reserved as number) >= 0;
+  const capabilities = [...new Set((node.capabilities as unknown[])
+    .map(item => typeof item === "string" ? item : text(record(item)?.name))
+    .filter((item): item is string => typeof item === "string" && isRelayHarnessCapability(item)))];
+  return [{
+    id, name, live: node.live === true, handlersLive: node.handlers_live === true, capabilities,
+    activeAgents: node.active_agents as number, reservedAgents: reservedValid ? reserved as number : 0,
+    maxAgents: node.max_agents as number,
+    stale: node.live !== true || node.active_agents_stale === true || !reservedValid,
+    raw: node,
+  }];
+}
+
 /** Server-side Relaycast calls. Registration and revocation use the workspace key. */
 export function createRelaycastClient(input: {
   internalOrigin: string;
@@ -224,7 +254,13 @@ export function createRelaycastClient(input: {
     } catch {
       throw new RelaycastCallError(0, "", true);
     }
-    const raw = await response.text();
+    let raw: string;
+    try {
+      raw = await response.text();
+    } catch {
+      // A body lost after the status (an abort mid-read) leaves the outcome unknown under the same rule as below.
+      throw new RelaycastCallError(response.status, "", response.ok || response.status >= 500);
+    }
     if (allowNotFound && response.status === 404) return null;
     if (!response.ok) {
       const unknown = response.status === 0 || response.status >= 500;
@@ -845,34 +881,31 @@ export function createRelaycastClient(input: {
     },
 
     /**
-     * Fleet nodes visible to this workspace key, online only by default. The
-     * key belongs to one Relaycast workspace, so a node enrolled in another
-     * workspace or another installation is never listed.
+     * Live fleet nodes visible to this workspace key (one page of at most RELAY_NODE_PAGE_LIMIT). The key
+     * belongs to one Relaycast workspace, so a node enrolled in another workspace or another installation is
+     * never listed.
      */
-    async listSpawnTargets(workspaceKey: string, options: { includeOffline?: boolean } = {}): Promise<RelaySpawnTarget[]> {
+    async listSpawnTargets(workspaceKey: string): Promise<RelaySpawnTarget[]> {
       const data = await labeled("list_spawn_targets", () =>
-        call("GET", options.includeOffline ? "/v1/nodes?limit=100" : "/v1/nodes?status=online&limit=100", workspaceKey));
+        call("GET", `/v1/nodes?status=online&limit=${RELAY_NODE_PAGE_LIMIT}`, workspaceKey));
       if (!Array.isArray(data)) throw new RelaycastCallError(502, "", true);
-      return data.flatMap((value): RelaySpawnTarget[] => {
-        const node = record(value);
-        const id = text(node?.id);
-        const name = text(node?.name);
-        if (!node || !id || !name || !Array.isArray(node.capabilities) || !Number.isInteger(node.active_agents)
-          || !Number.isInteger(node.max_agents) || (node.max_agents as number) < 0 || (node.active_agents as number) < 0) return [];
-        // An absent count means no reservations; a malformed one means capacity is unknown.
-        const reserved = node.reserved_agents ?? 0;
-        const reservedValid = Number.isInteger(reserved) && (reserved as number) >= 0;
-        const capabilities = [...new Set((node.capabilities as unknown[])
-          .map(item => typeof item === "string" ? item : text(record(item)?.name))
-          .filter((item): item is string => typeof item === "string" && isRelayHarnessCapability(item)))];
-        return [{
-          id, name, live: node.live === true, handlersLive: node.handlers_live === true, capabilities,
-          activeAgents: node.active_agents as number, reservedAgents: reservedValid ? reserved as number : 0,
-          maxAgents: node.max_agents as number,
-          stale: node.live !== true || node.active_agents_stale === true || !reservedValid,
-          raw: node,
-        }];
-      });
+      return data.flatMap(spawnTargetFrom);
+    },
+
+    /**
+     * Nodes of every state visible to this workspace key: one page of the paginated history read, at most
+     * RELAY_NODE_HISTORY_LIMIT. `complete` is false when Relaycast reports a next page (`next_cursor`).
+     * Relaycast has served `{ nodes, next_cursor }` here since @relaycast/engine 8.9.0; any other shape,
+     * including the older bare array, is an invalid response, which callers treat as a failed read.
+     */
+    async listAllSpawnTargets(workspaceKey: string): Promise<{ targets: RelaySpawnTarget[]; complete: boolean }> {
+      const data = await labeled("list_spawn_targets", () =>
+        call("GET", `/v1/nodes?history=true&limit=${RELAY_NODE_HISTORY_LIMIT}`, workspaceKey));
+      const page = Array.isArray(data) ? null : record(data);
+      if (!page || !Array.isArray(page.nodes)) throw new RelaycastCallError(502, "", true);
+      const cursor = page.next_cursor;
+      if (cursor !== null && cursor !== undefined && typeof cursor !== "string") throw new RelaycastCallError(502, "", true);
+      return { targets: page.nodes.flatMap(spawnTargetFrom), complete: !cursor };
     },
 
     /**
