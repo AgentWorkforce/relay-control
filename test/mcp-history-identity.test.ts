@@ -628,7 +628,9 @@ const nativeRead = (cfg: SelfhostConfig, ws: string) =>
   historyReader(cfg, principal("user-a"), workspace(ws, orgOf(ws)), "sh_at_user_a");
 
 test("the point-summary workspace value selects exactly one complete UUID, or nobody", () => {
-  const load = (value?: string) => loadSessionReadPointSummaryWorkspace({ SESSION_READ_API_POINT_SUMMARY_WORKSPACE: value });
+  const warnings: string[] = [];
+  const load = (value?: string) => loadSessionReadPointSummaryWorkspace({ SESSION_READ_API_POINT_SUMMARY_WORKSPACE: value },
+    message => warnings.push(message));
   assert.equal(load(SELECTED), SELECTED);
   assert.equal(load(`  ${SELECTED}\n`), SELECTED, "surrounding whitespace is trimmed");
   // Compared in lowercase, the form workspace ids are stored in.
@@ -636,8 +638,15 @@ test("the point-summary workspace value selects exactly one complete UUID, or no
   for (const value of [undefined, "", "   ", "*", "all", "true", "00000000-0000-4000-8000", "00000000",
     `${SELECTED},${OTHER}`, `${SELECTED} ${OTHER}`, `${SELECTED}*`, `{${SELECTED}}`, `${SELECTED}0`,
     SELECTED.replaceAll("-", ""), "ws-a", "0000000g-0000-4000-8000-00000000000a"]) {
+    warnings.length = 0;
     assert.equal(load(value), null, `value ${JSON.stringify(value)}`);
+    // Unset or blank stays silent; any other unusable value warns once, never echoing it.
+    assert.equal(warnings.length, value?.trim() ? 1 : 0, `warnings for ${JSON.stringify(value)}`);
+    if (value?.trim()) assert.equal(warnings[0]!.toLowerCase().includes(value.trim().toLowerCase()), false);
   }
+  warnings.length = 0;
+  assert.equal(load(SELECTED), SELECTED);
+  assert.equal(warnings.length, 0, "a valid value is silent");
 });
 
 test("with the override unset, list and point summary keep one reader, with the setting on and off", async t => {

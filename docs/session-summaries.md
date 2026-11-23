@@ -112,7 +112,8 @@ per-session events, turns, metadata and timing reads, relayfacts, every other
 workspace, and staff, Desktop and OAuth grants keep the selection above. The
 value is trimmed and compared in lowercase (the form workspace ids are stored
 in); an empty, malformed, wildcard, prefix or comma-separated value selects no
-workspace. A selected read keeps every rule above: the forced workspace,
+workspace; a set but unusable value logs one startup warning that never
+includes the value. A selected read keeps every rule above: the forced workspace,
 required attestation, final 403/404/501 outcomes, fail-closed refusal of a
 malformed body, and no fallback to History. Unset, behaviour is unchanged.
 

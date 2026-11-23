@@ -48,6 +48,12 @@ export type McpContext = {
   desktopCall: DesktopCallContext;
   /** Present only after the MCP-only OAuth resolver admits its exact resource. */
   oauth?: McpOAuthConnection;
+  /**
+   * Present only when a workspace agent identity token was admitted
+   * (authMode "agent_identity"): the identity the Relay tools act as. The
+   * principal's userId is then this identity's id, never a person's.
+   */
+  agentIdentity?: { id: string; name: string };
   grokRoutines?: GrokRoutines;
   /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
   cursorCloud?: CursorCloudDeps;

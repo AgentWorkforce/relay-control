@@ -686,11 +686,15 @@ const WORKSPACE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
  * Exactly one workspace, or nobody. The trimmed value must be one complete
  * UUID (compared in lowercase, the form workspace ids are stored in); an
  * empty, malformed, wildcard, prefix or comma-separated value selects no
- * workspace, leaving every read on today's single-reader selection.
+ * workspace, leaving every read on today's single-reader selection. A set
+ * but unusable value logs one warning that never includes the value.
  */
-export function loadSessionReadPointSummaryWorkspace(env: Env): string | null {
+export function loadSessionReadPointSummaryWorkspace(env: Env, warn: (message: string) => void = console.warn): string | null {
   const value = env.SESSION_READ_API_POINT_SUMMARY_WORKSPACE?.trim().toLowerCase() ?? "";
-  return WORKSPACE_UUID.test(value) ? value : null;
+  if (WORKSPACE_UUID.test(value)) return value;
+  // One startup warning for a set but unusable value; the value is never echoed.
+  if (value) warn("[selfhost-api] SESSION_READ_API_POINT_SUMMARY_WORKSPACE is not one complete workspace UUID; no workspace is selected");
+  return null;
 }
 
 function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureApi"] {
