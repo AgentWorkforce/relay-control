@@ -50,6 +50,8 @@ export type GateRow = {
   repository_owner_id: string | null;
   /** Candidate-run release targets may name a source commit the run is not on (only when true). */
   allow_source_sha_mismatch: boolean;
+  /** The repository's default branch as GitHub reported it at registration (or the owner named, for a self-host issuer). */
+  default_branch: string;
   created_auth_method: string;
   created_at: Date | string;
   deleted_at: Date | string | null;
@@ -73,6 +75,7 @@ export function gateView(row: GateRow) {
     ...(row.repository_owner_id ? { repository_owner_id: row.repository_owner_id } : {}),
     // Present (true) only when the gate opted out of binding candidate-run release targets to the run's commit, as Cloud.
     ...(row.allow_source_sha_mismatch ? { allow_source_sha_mismatch: true as const } : {}),
+    default_branch: row.default_branch,
     created_at: new Date(row.created_at).toISOString(),
   };
 }
@@ -264,16 +267,14 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (action.class !== "release") return await refuse("out_of_scope");
     // A release names its commit; the run must be on it (the token's `sha`).
     // Only a candidate-run target (whose source commit a promote run may not
-    // be on) can be redeemed off-commit, and only through a gate that opted out.
-    if (action.class === "release") {
-      const named = releaseTargetSha(action.target);
-      if (!named) return await refuse("out_of_scope");
-      if (named.sha.toLowerCase() !== claims.sha) {
-        // Only through an exact-branch gate: a tag, exact or pattern, can be moved to any commit.
-        candidates = named.form === "candidate" ? candidates.filter(mayOptOutOfSourceSha) : [];
-        if (!candidates.length) return await refuse("sha_mismatch");
-        gate = candidates[0]!;
-      }
+    // be on) can be redeemed off-commit, and only through a gate on the
+    // repository's default branch that opted out.
+    const named = releaseTargetSha(action.target);
+    if (!named) return await refuse("out_of_scope");
+    if (named.sha.toLowerCase() !== claims.sha) {
+      candidates = named.form === "candidate" ? candidates.filter(mayOptOutOfSourceSha) : [];
+      if (!candidates.length) return await refuse("sha_mismatch");
+      gate = candidates[0]!;
     }
 
     // Tier D rests on a live grant and a still-bound delegate; both tiers on a current owner.
@@ -457,8 +458,8 @@ export function gateRedeemStatus(result: GateRedeemResult): number {
   return result.reason === "unavailable" || result.reason === "condition_unavailable" ? 503 : 403;
 }
 
-/** GitHub's stable ids for a repository, and its canonical `owner/name`. */
-export type RepositoryIds = { repositoryId: string; repositoryOwnerId: string; fullName: string };
+/** GitHub's stable ids for a repository, its canonical `owner/name`, and its default branch. */
+export type RepositoryIds = { repositoryId: string; repositoryOwnerId: string; fullName: string; defaultBranch: string };
 
 /** GitHub could not answer (network, 5xx, rate limit, a malformed body): registration answers 503. */
 export class GithubUnavailable extends Error {
@@ -470,10 +471,12 @@ export class GithubUnavailable extends Error {
 /**
  * GitHub's ids for the repository a gate is registered for, resolved before
  * the gate exists, as Cloud's resolveGateRepository: through the workspace's
- * GitHub connection when it has one (its token), else GitHub's public API.
- * Null when GitHub knows no such repository the caller can see (404), or the
- * canonical name differs from the one registered (case-insensitive). Throws
- * GithubUnavailable when GitHub cannot answer.
+ * GitHub connection when it has one (its token; a 404 or redirect there is
+ * unresolved, without asking the public API), else GitHub's public API. Null
+ * when GitHub knows no such repository the caller can see (404), the name
+ * moved (a 3xx, never followed), or the canonical name differs from the one
+ * registered (case-insensitive). Throws GithubUnavailable when GitHub cannot
+ * answer, or omits the default branch.
  */
 export async function resolveGateRepository(input: { repo: string; token: string | null; fetchImpl: typeof fetch }):
   Promise<RepositoryIds | null> {
@@ -483,22 +486,32 @@ export async function resolveGateRepository(input: { repo: string; token: string
     response = await input.fetchImpl(`https://api.github.com/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}`, {
       headers: { accept: "application/vnd.github+json", "user-agent": "relay-control", "x-github-api-version": "2022-11-28",
         ...(input.token ? { authorization: `Bearer ${input.token}` } : {}) },
-      redirect: "error", signal: AbortSignal.timeout(10_000),
+      redirect: "manual", signal: AbortSignal.timeout(10_000),
     });
   } catch {
     throw new GithubUnavailable();
   }
-  if (response.status === 404) return null;
+  // A redirect means the name moved; it is never followed.
+  if (response.status === 404 || (response.status >= 300 && response.status < 400) || response.type === "opaqueredirect") {
+    return null;
+  }
   if (!response.ok) throw new GithubUnavailable();
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   const id = body?.id, ownerId = (body?.owner as Record<string, unknown> | undefined)?.id, fullName = body?.full_name;
+  const defaultBranch = body?.default_branch;
   if (typeof id !== "number" || !Number.isSafeInteger(id) || typeof ownerId !== "number" || !Number.isSafeInteger(ownerId) ||
-      typeof fullName !== "string") throw new GithubUnavailable();
+      typeof fullName !== "string" || typeof defaultBranch !== "string" || !defaultBranch) throw new GithubUnavailable();
   return fullName.toLowerCase() === input.repo.toLowerCase()
-    ? { repositoryId: String(id), repositoryOwnerId: String(ownerId), fullName } : null;
+    ? { repositoryId: String(id), repositoryOwnerId: String(ownerId), fullName, defaultBranch } : null;
 }
 
-/** The source-sha opt-out only ever applies to an exact branch ref (as Cloud): a tag, exact or pattern, can be moved to any commit. */
-export function mayOptOutOfSourceSha(gate: Pick<GateRow, "allow_source_sha_mismatch" | "ref" | "ref_pattern">): boolean {
-  return gate.allow_source_sha_mismatch === true && gate.ref_pattern === null && Boolean(gate.ref?.startsWith("refs/heads/"));
+/**
+ * The source-sha opt-out applies only to a gate on the repository's default
+ * branch, as stored at registration (as Cloud): its workflow is the reviewed,
+ * protected code that checks the candidate itself. A tag, exact or pattern,
+ * or any other branch can carry an edited workflow.
+ */
+export function mayOptOutOfSourceSha(gate: Pick<GateRow, "allow_source_sha_mismatch" | "ref" | "ref_pattern" | "default_branch">): boolean {
+  return gate.allow_source_sha_mismatch === true && gate.ref_pattern === null && Boolean(gate.default_branch) &&
+    gate.ref === `refs/heads/${gate.default_branch}`;
 }

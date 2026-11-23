@@ -90,7 +90,7 @@
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
     {"name":"0088_owner_delegates.sql","sha256":"5e882f3949a5a8348b5c018b145569a8b05839374bc67474bc661175938230df"},
-    {"name":"0089_delegation_release_gates.sql","sha256":"2f0e36eb9fb8f602dc3bec7ddcfd9c1cc86506fa4080c3fa7040302231d51543"},
+    {"name":"0089_delegation_release_gates.sql","sha256":"fc5f957be07598c5093a9f852028280e69754180c489f26f9d8325e37195292d"},
     {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
@@ -366,9 +366,10 @@
     {"kind":"column","name":"public.delegation_gate_redemptions.target","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
     {"kind":"column","name":"public.delegation_gate_redemptions.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_gates.allow_source_sha_mismatch","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":14,"type":"boolean"}},
-    {"kind":"column","name":"public.delegation_gates.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":16,"type":"timestamp with time zone"}},
-    {"kind":"column","name":"public.delegation_gates.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":15,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.deleted_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":17,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_gates.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":17,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_gates.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":16,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.default_branch","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":15,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.deleted_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":18,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_gates.event","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.issuer","definition":{"collation":"pg_catalog.default","default":"'https://token.actions.githubusercontent.com'::text","generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
@@ -2464,5 +2465,5 @@
   "optional":{
 
   },
-  "sha256":"97f9eb3cb009467b483380121d9605151245c4f690a3fc224c43031ec4f22c97"
+  "sha256":"59d178594b4fd5c2b064463cfa4f6ab729acb11d037db56ca51bd5e349647571"
 }

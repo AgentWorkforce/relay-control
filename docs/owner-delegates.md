@@ -401,19 +401,24 @@ in its own file: the token's `job_workflow_ref` must be absent or equal its
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
 true) lets candidate-run release targets name a source commit the run is not
-on (see step 5). Only an exact branch gate (`ref` under `refs/heads/`) can set
-it (400 otherwise): a tag, exact or pattern, can be moved to any commit.
+on (see step 5). Only a gate on the repository's default branch
+(`ref` = `refs/heads/<default_branch>`) can set it (400 otherwise): a tag,
+exact or pattern, or any other branch can carry an edited workflow.
 
 **Pinned at registration, as Cloud.** Registering resolves the repository's
 GitHub ids through the workspace's GitHub connection (App installation or
 OAuth) when it has one, else GitHub's public API. GitHub's canonical
 `full_name` must equal the registered `repo` (case-insensitive). The gate
-stores `repository_id` and `repository_owner_id`, and `gate.pinned`
+stores `repository_id`, `repository_owner_id` and `default_branch` (shown on
+the gate), and `gate.pinned`
 (`{gate_id, repo, repository_id, repository_owner_id, source: "registration"}`)
 is audited after `gate.registered`. A repository GitHub doesn't know (or
 can't show this workspace, or that was renamed) is 422 `repository_unresolved`;
-a GitHub outage is 503 `unavailable`. relay-control only: a gate on a self-host
-issuer names `repository_id` and `repository_owner_id` itself, because Control
+a GitHub outage is 503 `unavailable`. A 404 or redirect (never followed)
+through the workspace's connection is 422 without asking the public API; no
+connection falls back to the public API, but a connection that fails is 503
+with no fallback. GitHub omitting `default_branch` is 503. relay-control only: a gate on a self-host
+issuer names `repository_id`, `repository_owner_id` and `default_branch` itself, because Control
 cannot look those repositories up on github.com; a GitHub Actions gate cannot. `event` is one
 of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
 the gated ref's own workflow code (never `pull_request*` or `workflow_run`).

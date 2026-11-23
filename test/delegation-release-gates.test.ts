@@ -51,8 +51,9 @@ async function setup(t: TestContext) {
   const ghes = issuer(GHES);
   const seed = randomBytes(32);
   /** GitHub's REST API: the gated repository resolves to stable ids; anything else is 404. Tests change `github.repos`. */
-  const githubApi = { repos: new Map<string, { id: number; owner: number; full_name: string } | "down">([
-    [REPO.toLowerCase(), { id: 70151234, owner: 90122, full_name: REPO }],
+  const githubApi = { repos: new Map<string, { id: number; owner: number; full_name: string; default_branch?: string } | "down" |
+    "moved">([
+    [REPO.toLowerCase(), { id: 70151234, owner: 90122, full_name: REPO, default_branch: "main" }],
   ]), calls: [] as Array<{ url: string; authorization: string | null }> };
   const githubFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -60,8 +61,10 @@ async function setup(t: TestContext) {
     const match = /^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)$/.exec(url);
     const repo = match ? githubApi.repos.get(`${decodeURIComponent(match[1]!)}/${decodeURIComponent(match[2]!)}`.toLowerCase()) : undefined;
     if (repo === "down") return new Response("unavailable", { status: 503 });
+    if (repo === "moved") return new Response(null, { status: 301, headers: { location: "https://api.github.com/repositories/1" } });
     if (!repo) return Response.json({ message: "Not Found" }, { status: 404 });
-    return Response.json({ id: repo.id, full_name: repo.full_name, owner: { id: repo.owner } });
+    return Response.json({ id: repo.id, full_name: repo.full_name, owner: { id: repo.owner },
+      ...(repo.default_branch !== undefined ? { default_branch: repo.default_branch } : {}) });
   }) as typeof fetch;
   const env = await copilotDesktopSetup(t, { delegationOidcFetch: oidcFetch([github, ghes]), delegationGithubFetch: githubFetch }, undefined,
     { delegationSigning: { kid: "dlg-test", seed, previous: [] }, delegationOidcIssuers: [GHES] });
@@ -178,8 +181,8 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   assert.equal(viaDesktop.status, 201, viaDesktop.raw);
   assert.match(viaDesktop.body.gate_id, /^gate_[A-Za-z0-9]+$/);
   assert.deepEqual(Object.keys(viaDesktop.body).sort(),
-    ["created_at", "event", "gate_id", "owner_id", "ref", "repo", "repository_id", "repository_owner_id", "target_prefix",
-      "workflow_ref"]);
+    ["created_at", "default_branch", "event", "gate_id", "owner_id", "ref", "repo", "repository_id", "repository_owner_id",
+      "target_prefix", "workflow_ref"]);
   const listed = await env.bearer("/delegates/gates");
   assert.deepEqual(listed.body.gates.map((gate: { gate_id: string }) => gate.gate_id), [viaDesktop.body.gate_id]);
   // Another member neither sees nor deletes it.
@@ -235,7 +238,7 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
   // A same-named repository on another issuer is another repository: the GitHub gate does not match it.
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: false, reason: "gate_mismatch" });
   // A self-host issuer's repository is not on github.com: its owner names the ids.
-  const ghesGate = await env.gate({ issuer: GHES, repository_id: "70151234", repository_owner_id: "90122" });
+  const ghesGate = await env.gate({ issuer: GHES, repository_id: "70151234", repository_owner_id: "90122", default_branch: "main" });
   assert.equal(ghesGate.issuer, GHES);
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: true, consumed: true });
   assert.equal((await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main",
@@ -813,7 +816,7 @@ test("gates: registration pins the repository on GitHub; tag gates cannot opt ou
   assert.equal(unresolved.status, 422, unresolved.raw);
   assert.equal(unresolved.body.code, "repository_unresolved");
   // A renamed repository (canonical name differs) is unresolved too.
-  env.githubApi.repos.set(ghost.toLowerCase(), { id: 1, owner: 2, full_name: "AgentWorkforce/renamed" });
+  env.githubApi.repos.set(ghost.toLowerCase(), { id: 1, owner: 2, full_name: "AgentWorkforce/renamed", default_branch: "main" });
   assert.equal((await env.browser("/delegates/gates", "POST", { repo: ghost,
     workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push",
     target_prefix: `${ghost}:` })).status, 422);
@@ -823,6 +826,20 @@ test("gates: registration pins the repository on GitHub; tag gates cannot opt ou
     workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push", target_prefix: `${ghost}:` });
   assert.equal(down.status, 503, down.raw);
   assert.equal((await env.bearer("/delegates/gates")).body.gates.length, 0);
+  // A name that moved (GitHub answers a redirect, never followed) is unresolved.
+  env.githubApi.repos.set(ghost.toLowerCase(), "moved");
+  assert.equal((await env.browser("/delegates/gates", "POST", { repo: ghost,
+    workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push",
+    target_prefix: `${ghost}:` })).status, 422);
+  // GitHub omitting the default branch is an outage.
+  env.githubApi.repos.set(ghost.toLowerCase(), { id: 1, owner: 2, full_name: ghost });
+  assert.equal((await env.browser("/delegates/gates", "POST", { repo: ghost,
+    workflow_ref: `${ghost}/.github/workflows/release.yml@refs/heads/main`, ref: "refs/heads/main", event: "push",
+    target_prefix: `${ghost}:` })).status, 503);
+  // The source-sha opt-out needs a gate on the default branch (main here).
+  const devBranch = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW.replace("refs/heads/main", "refs/heads/dev"),
+    ref: "refs/heads/dev", event: "workflow_dispatch", target_prefix: `${REPO}:`, allow_source_sha_mismatch: true });
+  assert.equal(devBranch.status, 400, devBranch.raw);
   // A GitHub Actions gate cannot name its own ids.
   assert.equal((await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:`,
     repository_id: "1", repository_owner_id: "2" })).status, 400);
@@ -835,4 +852,24 @@ test("gates: registration pins the repository on GitHub; tag gates cannot opt ou
   const duplicate = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable:` });
   assert.equal(duplicate.status, 409, duplicate.raw);
   assert.equal(duplicate.body.code, "gate_exists");
+});
+
+test("gate repository resolution: a connection's 404 or redirect is unresolved without asking the public API", async () => {
+  const { resolveGateRepository, GithubUnavailable } = await import("../src/delegation/gates.js");
+  const calls: Array<string | null> = [];
+  const answer = (status: number, body?: unknown) => (async (_url: string | URL | Request, init?: RequestInit) => {
+    calls.push(new Headers(init?.headers).get("authorization"));
+    return body === undefined ? new Response(null, { status, headers: status >= 300 && status < 400 ? { location: "x" } : {} })
+      : Response.json(body, { status });
+  }) as typeof fetch;
+  assert.equal(await resolveGateRepository({ repo: REPO, token: "ghs_x", fetchImpl: answer(404, { message: "Not Found" }) }), null);
+  assert.deepEqual(calls, ["Bearer ghs_x"]);
+  calls.length = 0;
+  assert.equal(await resolveGateRepository({ repo: REPO, token: "ghs_x", fetchImpl: answer(302) }), null);
+  assert.equal(calls.length, 1);
+  // A full answer resolves with the default branch; a server error is an outage.
+  assert.deepEqual(await resolveGateRepository({ repo: REPO, token: null,
+    fetchImpl: answer(200, { id: 5, owner: { id: 6 }, full_name: REPO, default_branch: "trunk" }) }),
+  { repositoryId: "5", repositoryOwnerId: "6", fullName: REPO, defaultBranch: "trunk" });
+  await assert.rejects(resolveGateRepository({ repo: REPO, token: null, fetchImpl: answer(502, {}) }), GithubUnavailable);
 });

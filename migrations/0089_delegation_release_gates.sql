@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   -- promote workflow may not be running on: only a gate that opts out lets
   -- such a target differ from the run's sha claim. Land and iOS never may.
   allow_source_sha_mismatch boolean NOT NULL DEFAULT false,
+  -- The repository's default branch as GitHub reported it at registration:
+  -- the source-sha opt-out applies only to a gate on it.
+  default_branch text NOT NULL,
   created_auth_method text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz,

@@ -10311,6 +10311,7 @@ components:
         repository_id: { type: string, description: "GitHub's repository id, pinned from the first verified match" }
         repository_owner_id: { type: string, description: "GitHub's repository owner id, pinned with repository_id" }
         allow_source_sha_mismatch: { const: true, description: "Present only when true: candidate-run release targets may name a source commit other than the run's sha" }
+        default_branch: { type: string, description: "The repository's default branch, as GitHub reported it at registration" }
         owner_id: { type: string }
         created_at: { type: string, format: date-time }
     DelegationGateInput:
@@ -10327,9 +10328,10 @@ components:
         ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
         event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
         target_prefix: { type: string, maxLength: 256, description: "Starts with <repo>: and ends with : (a segment boundary); no wildcard", example: "AgentWorkforce/relay-app:" }
-        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false. Refused (400) with ref_pattern." }
+        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false. Only on a gate whose ref is refs/heads/<the repository's default branch> (400 otherwise)." }
         repository_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "relay-control only, for a gate on a self-host issuer (required there, refused for GitHub Actions): the repository's id, pinned as given. A GitHub Actions gate is resolved on GitHub." }
         repository_owner_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "With repository_id." }
+        default_branch: { type: string, maxLength: 250, description: "relay-control only, with repository_id for a self-host issuer: the repository's default branch." }
     DelegationAction:
       type: object
       description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.

@@ -104,6 +104,8 @@ import { identityErrorResponse, type IdentityModule } from "./identity/routes.js
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { createDelegationHandler } from "./delegation/routes.js";
+import { ConnectionError } from "./admin/connections.js";
+import { GithubUnavailable } from "./delegation/gates.js";
 import { relaycastQuoteRedactor } from "./delegation/service.js";
 import { DelegationSigner } from "./delegation/jws.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER, workflowOidcVerifier } from "./delegation/oidc.js";
@@ -601,12 +603,15 @@ export function createApp(input: {
     oidcIssuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
     githubFetch: input.delegationGithubFetch ?? globalThis.fetch,
     // The workspace's GitHub connection (App installation or OAuth), when it has one, as Cloud's installation reader.
+    // No connection (404 connection_not_found) is "not installed": registration may fall back to the public API.
+    // Any other failure is an outage: no fallback (registration answers 503).
     githubToken: async (workspaceId, userId) => {
       if (!admin) return null;
       try {
         return (await admin.connections.runtimeToken({ workspaceId, provider: "github", actor: { kind: "user", userId } })).accessToken;
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ConnectionError && error.status === 404) return null;
+        throw new GithubUnavailable();
       }
     },
     // Never provisions: these lookups can run before any caller is proven.

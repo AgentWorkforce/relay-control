@@ -169,10 +169,12 @@ export function workflowOidcVerifier(input: {
     // The issuer is checked before any network call, so a token cannot point
     // the server at a URL of its choosing.
     if (!issuers.has(issuer)) throw new OidcInvalid("issuer");
-    let jwk = (await keys(issuer, false)).keys.find(key => key.kid === header.kid);
+    // Only signing keys (`use` is "sig" or absent) are candidates (as Cloud).
+    const pick = (set: { keys: Jwk[] }) => set.keys.find(key => key.kid === header.kid && (key.use === undefined || key.use === "sig"));
+    let jwk = pick(await keys(issuer, false));
     if (!jwk) {
       const refreshed = await keys(issuer, true);
-      jwk = refreshed.keys.find(key => key.kid === header.kid);
+      jwk = pick(refreshed);
       // An unknown kid while the issuer cannot be reached may be a key it just
       // rotated in: that is `unavailable` (retry), never a forged token (as Cloud).
       if (!jwk && refreshed.stale) throw new OidcKeysUnavailable();
