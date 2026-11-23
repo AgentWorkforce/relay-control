@@ -321,7 +321,9 @@ unrecorded. Refusal events (`approval.refused`, `redeem.refused`) are
 written only once the recipient is proven; a refusal before that (delegation
 off, no key, a bad token) is logged as `delegation.refused`, never audited.
 An identical `approval.refused` (message, recipient, reason) is written once
-per 10 minutes; repeats are still logged.
+per 10 minutes; repeats are still logged. A refusal row keeps the sender's quote and its
+keyed digest like any other row, as Cloud, so it ages out on the org window,
+can be redacted, and its redaction queues the Relaycast copy's removal.
 They stay best-effort; a failed write is logged
 (`delegation.audit_write_failed`), as is every `unavailable` caused by an
 exception (`delegation.unavailable`). See

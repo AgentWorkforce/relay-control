@@ -1078,7 +1078,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
   const { workspace } = input;
   const now = deps.now();
   const context: { ownerUserId?: string; claimedOwnerId?: string; grantId?: string; approvalId?: string; senderId?: string;
-    proven?: boolean } = {};
+    quote?: string | null; proven?: boolean } = {};
   try {
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
@@ -1107,6 +1107,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // Filed under the claimed owner only once a grant from them exists, as
     // Cloud: a sender cannot put refusals into someone else's view by naming them.
     context.claimedOwnerId = approval.owner_id;
+    context.quote = approval.quote ?? null;
 
     const found = liveGrant(await grantsFor(deps.database, workspace.id, approval.owner_id, senderId!), now);
     if (typeof found === "string") return refuse(found);
@@ -1280,13 +1281,19 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // dedup window is logged but not written again, as Cloud.
     const repeated = context.proven && await refusedRecently(deps.database, { workspaceId: workspace.id,
       messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason }).catch(() => false);
-    if (context.proven && !repeated) await recordDelegationAudit(deps.database, {
+    // The refusal row keeps the sender's quote (and its keyed digest) like any
+    // other row, as Cloud: it ages out on the org window and is redactable,
+    // and its redaction queues the Relaycast copy's removal. The quote write
+    // takes the message's quote lock in its own transaction.
+    if (context.proven && !repeated) await deps.database.transaction(tx => recordDelegationAudit(tx, {
       workspaceId: workspace.id, event: "approval.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
       messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason,
       data: context.claimedOwnerId && !context.ownerUserId ? { claimed_owner_id: context.claimedOwnerId } : {},
-    }).catch((auditError: unknown) => logAuditWriteFailed("attest", auditError, { workspaceId: workspace.id,
+      quote: context.quote ?? null,
+      quoteHash: context.quote ? quoteDigest(deps.quoteKey, workspace.id, context.quote) : null,
+    })).catch((auditError: unknown) => logAuditWriteFailed("attest", auditError, { workspaceId: workspace.id,
       approvalId: context.approvalId ?? null, grantId: context.grantId ?? null, event: "approval.refused", reason }));
     logRefused("attest", { workspaceId: workspace.id, reason });
     return { verdict: "none", reason };

@@ -1922,3 +1922,37 @@ test("review: without a signing key the empty JWKS is not cached", async (t) => 
   assert.deepEqual(keys.body, { keys: [] });
   assert.equal(keys.headers.get("cache-control"), "no-store");
 });
+
+test("review: a grant-less refusal keeps its quote, which retention redacts (queueing Relaycast) and admin redaction finds", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const strangerId = await env.addMember("claimed@acme.test");
+  const words = "the stranger said yes";
+  const refusedId = send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#280" }],
+    { owner_id: strangerId, quote: words }));
+  assert.deepEqual((await env.attest(recipient, refusedId)).body, { verdict: "none", reason: "not_delegate" });
+  const row = async (messageId: string) => (await env.database.query<{ owner_user_id: string | null; quote: string | null;
+    quote_hash: string | null; quote_redacted_at: Date | null }>(
+    "SELECT owner_user_id, quote, quote_hash, quote_redacted_at FROM delegation_audit_events WHERE event = 'approval.refused' AND message_id = $1",
+    [messageId])).rows[0]!;
+  const stored = await row(refusedId);
+  assert.equal(stored.owner_user_id, null);
+  assert.equal(stored.quote, words);
+  assert.match(stored.quote_hash!, /^hmac-sha256:v1:[0-9a-f]{64}$/);
+  // Retention redacts it and queues the Relaycast copy's removal.
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE message_id = $1", [refusedId]);
+  const { createDelegationRetention } = await import("../src/delegation/retention.js");
+  await createDelegationRetention({ database: env.database }).sweep();
+  const aged = await row(refusedId);
+  assert.equal(aged.quote, null);
+  assert.ok(aged.quote_redacted_at);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_quote_redactions WHERE message_id = $1", [refusedId])).rows.length, 1);
+  // An admin's redaction finds another grant-less refusal's quote.
+  const second = send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#281" }],
+    { owner_id: strangerId, quote: words }));
+  assert.equal((await env.attest(recipient, second)).body.reason, "not_delegate");
+  const redacted = await env.bearer("/delegates/quotes/redact", "POST", { message_id: second });
+  assert.equal(redacted.status, 200, redacted.raw);
+  assert.equal(redacted.body.redacted_events, 1);
+  assert.equal((await row(second)).quote, null);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_quote_redactions WHERE message_id = $1", [second])).rows.length, 1);
+});
