@@ -26,6 +26,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "delegation_audit_events",
   "delegation_claims",
   "delegation_grants",
+  "delegation_org_policies",
   "delegation_policies",
   "delegation_target_owners",
   "desktop_attestation_keys",
@@ -128,6 +129,7 @@ export const CONTROL_TABLES: readonly string[] = [
 ];
 
 export const CONTROL_SEQUENCES: readonly string[] = [
+  "delegation_audit_events_id_seq",
   "desktop_feed_publish_seq",
   "desktop_feed_publisher_tokens_seq_seq",
 ];

@@ -6,9 +6,14 @@ Control checks each such approval and signs an attestation. The recipient's
 relay-node verifies that attestation and writes a delegate line that only
 Relay can write. This is the self-hosted twin of Agent Relay Cloud's surface.
 The wire contract is AgentWorkforce/relay
-`docs/design/owner-trusted-delegates.md` §16. Request and response shapes,
-reason codes, JWS claims and the JWKS path match Cloud's, so a relay-node works
-against either.
+`docs/design/owner-trusted-delegates.md` §16. Paths, request bodies, status
+codes, response shapes, reason codes, JWS claims and the JWKS path match
+Cloud's implementation (cloud#6501), so a relay-node or dashboard works against
+either.
+
+**Error body.** Unlike the rest of this API, every refusal on these routes
+uses Cloud's delegation error body, `{"error": "<message>", "code": "<code>"}`,
+with `Cache-Control: no-store`. An unexpected failure is `503 unavailable`.
 
 **Off by default.** Nothing changes until a workspace owner or admin sets
 `delegation_enabled` with `PUT /api/v1/workspaces/{ws}/delegates/policy`.
@@ -46,8 +51,10 @@ credentials:
   machine credentials and are refused here.
 
 A device-flow CLI login, an unexchanged handoff, a workspace API token, the
-bootstrap bearer and any Relaycast agent token are refused (`401`, or `403
-human_session_required`). While delegation is off, everything except `GET`
+bootstrap bearer and any Relaycast agent token are refused (`401
+unauthorized`, or `403 forbidden`). A caller who is not a current member of
+the workspace's organization is `403 forbidden`. Audit records the method as
+`session` or `desktop_bearer`, as in Cloud. While delegation is off, everything except `GET`
 and revocation answers `403 not_enabled`. `PUT /delegates/policy` is exempt,
 because it is how delegation is turned on. Revocation (`DELETE`, `revoke-all`)
 never needs a recent sign-in.
@@ -72,7 +79,33 @@ A delegate must be bound to its owner by exactly one Control record across
 (`ready` only; other states still count toward ambiguity), `person_identities`
 and `delegation_agent_bindings` (a completed claim). This is Cloud's
 binding-uniqueness rule, with relay-control's own tables. Any duplicate means
-no binding. A claim is refused for an agent that already has any binding.
+no binding. A claim is refused for an agent that already has any binding
+(`409 already_bound`).
+
+Claims: `POST /delegates/claims` returns `{claim_id, code, expires_at}`. The
+code is `dlg_` followed by 24 random bytes in base64url. It is valid for 10
+minutes and stored only as its SHA-256. `claims/complete` answers
+`{claim_id, agent_id, owner_id}`. It refuses with:
+
+- `404 invalid_code` for an unknown, used or expired code;
+- `403 invalid_agent` when the token does not prove `agent_id`;
+- `409 already_bound`.
+
+## Grants
+
+There is one active grant per (owner, delegate), as in Cloud. A second grant
+answers `409 grant_exists`. A grant that has lapsed is marked `expired`
+(audited `grant.expired`) when the pair gets a new grant.
+
+`PATCH` only narrows. Anything wider is `400 widening_not_allowed`: revoke
+the grant and create a new one.
+
+Grant JSON is `grant_id, owner_id, delegate_agent_id, scopes, require_tier_o,
+expires_at, status, created_at, updated_at, revoked_at, revoked_reason`.
+
+`PUT /delegates/policy` replaces the whole policy. Omitted optional fields take
+their defaults. The answer is the policy plus `revoked_grants` (the ids of
+grants revoked because they no longer fit).
 
 ## Attestation
 
@@ -90,12 +123,16 @@ Control then:
    `binding_changed`, `agent_released`);
 5. for tier O (`approval_ref`), loads the owner-minted approval, whose actions
    (with conditions) must equal the message's;
-6. checks policy classes, then grant scope for every action (the whole
-   approval or nothing), then tier O requirements (defaults `secret_change`,
-   `destructive`, `spend`, plus policy and grant), then standing (§5.4) for
-   every action under `accept`;
-7. fixes a tier D approval's expiry at first sight: its `expires_at`, default
-   1 hour, never past 24 hours or the grant;
+6. checks expiry, then that the grant still fits the policy, policy classes
+   and grant scope for every action (the whole approval or nothing). Next it
+   checks tier O requirements (defaults `secret_change`, `destructive`,
+   `spend`, plus the policy's and the grant's). Last, standing (§5.4) for
+   every action under `accept` (default `code_owners`);
+7. fixes a tier D approval's expiry at its first attestation, as Cloud's
+   `approvalExpiry` does. The base time is Relaycast's `created_at` when it
+   reports one, otherwise now. The expiry is the approval's `expires_at`
+   (default base + 1 hour), capped at base + 24 hours and at the grant's
+   expiry. Later attestations keep the stored value;
 8. re-checks the caller's membership, signs, records the `jti`, and writes
    `approval.attested` with the quote and its SHA-256. The route then
    re-checks the bearer.
@@ -108,11 +145,12 @@ The JWS header is `{"alg":"EdDSA","typ":"relay-delegation+jws","kid":…}`. The
 claims are exactly `v, ws, owner_id, owner_display, delegate_agent_id,
 grant_id, message_id, recipient_agent_id, approval_id, tier, actions (with
 conditions), standing, single_use, iat, exp, jti`. `exp` is `iat + 300`, or
-the approval's expiry when that comes sooner. `ws` is the Control workspace
-id. A tier D `approval_id` is `apv_` followed by base62 (alphabet
+the approval's expiry when that comes sooner. `jti` is a UUID. `ws` is the
+Control workspace id. A tier D `approval_id` is `apv_` followed by base62 (alphabet
 `0-9A-Za-z`, big-endian, no padding) of `SHA-256(ws|message_id)[0..16]`.
 `owner_display` is the person's name on one line, at most 80 characters, or
-"the owner" when it is empty or looks like an email address.
+"the owner" when it is empty or looks like an email address. Brackets are
+stripped, and the result is trimmed after the cut, exactly as in Cloud.
 
 ### Standing (§5.4)
 
@@ -141,8 +179,9 @@ A grant target is `*` or `<agent id>:*`. An approval target is
 `<session agent id>:<request ref>` and must name the recipient itself. Only
 the machine owner's delegates count. `prompt-delegates` lists the machine
 owner's delegates whose live grants cover the session (excluding the session
-itself). It returns an empty list when delegation is off, the class is not
-allowed by policy, or the session proof fails.
+itself). It returns an empty list when delegation is off or the class is not
+allowed by policy. A session that is not the caller's, or a failed token
+proof, is `403 forbidden`.
 
 ## Redeem
 
@@ -151,7 +190,9 @@ high-risk action: `release`, `secret_change`, `destructive`, `spend`, or
 `deploy` to `:prod`/`:production`) or when the action has conditions.
 Control:
 
-- requires an earlier attestation of that approval to this recipient;
+- requires an earlier attestation of that approval to this recipient
+  (otherwise `no_approval`), and re-checks standing under that attestation's
+  `accept`;
 - re-checks revocation, the delegate's binding, scope, policy and expiry;
 - evaluates conditions:
   - `not_before` is checked here.
@@ -176,6 +217,8 @@ Revocation happens in these cases:
 - automatically at use time (see Attestation step 4).
 
 Revoking invalidates every unredeemed approval under the grant at once.
+`revoke-all` also invalidates the owner's (or, with `all`, the workspace's)
+unredeemed tier O approvals, and answers `{revoked: [grant ids]}`.
 Turning `delegation_enabled` off makes every attestation and redeem
 `not_enabled` without deleting grants.
 
@@ -189,16 +232,34 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.redeemed`, `redeem.refused`
 - `policy.updated`, `target_owners.updated`
 
-`GET /delegates/audit?since=&grant_id=&format=jsonl` shows a member their own
-events and an admin all of them. Quote text is redacted to `quote_sha256`
-after 90 days (§15.9, pending Khaliq's decision); the sweep runs on each
-attestation and audit read.
+`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=` shows a member
+their own events and an admin all of them. Each event is `id, event,
+created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
+approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
+quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
+`data`. Quote text is redacted to `quote_hash` (with
+`quote_redacted_at` set) once it is older than the org's
+`quote_retention_days`.
+
+- This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,
+  default 90. It is set with `GET`/`PUT /api/v1/orgs/{org}/delegation-policy`
+  `{quote_retention_days}`.
+- Only org owners and admins can call that route, by browser session (signed
+  in within 15 minutes, for changes) or verified Desktop bearer.
+- It applies to every workspace in the org, and no workspace policy overrides
+  it. A change is audited as `org_policy.updated` in each workspace of the
+  org.
+- A shorter window redacts existing older quotes at the next sweep. A longer
+  one restores nothing.
+- relay-control has no cron, so the sweep runs on every attestation and every
+  audit read. The hash and the event itself are kept.
 
 ## Migration
 
 `0088_owner_delegates.sql` adds these tables:
 
 - `delegation_policies`
+- `delegation_org_policies`
 - `delegation_target_owners`
 - `delegation_claims`
 - `delegation_agent_bindings`

@@ -5,23 +5,21 @@ import { bearer } from "../auth/bearer.js";
 import { controlSessionToken } from "../auth/session-cookie.js";
 import { hashSecret } from "../crypto.js";
 import type { Database } from "../database.js";
-import { MessagingHttpError } from "../messaging/http.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
 import {
   ACTION_CLASSES,
   actionClass,
-  actionSchema,
   APPROVAL_DEFAULT_MS,
   APPROVAL_MAX_MS,
-  CLAIM_TTL_MS,
+  canonicalAction,
+  classTargetCovered,
   GRANT_DEFAULT_DAYS,
   GRANT_MAX_DAYS,
-  classTargetCovered,
   highRisk,
-  MAX_ACTIONS,
-  canonicalAction,
+  mintActionsSchema,
+  sha256Hex,
   validPromptPattern,
   validTargetPattern,
   type ActionClass,
@@ -30,22 +28,28 @@ import {
 import {
   anyBinding,
   attestDelegation,
-  claimCodeHash,
+  auditView,
+  CLAIM_TTL_MS,
+  expireLapsed,
   grantView,
+  loadOrgPolicy,
   loadPolicy,
   loadTargetOwners,
   memberRole,
-  newApprovalId,
+  mintId,
   newClaimCode,
-  newClaimId,
-  newGrantId,
+  promptDelegates,
+  QUOTE_RETENTION_DAYS,
+  QUOTE_RETENTION_MAX_DAYS,
   recordDelegationAudit,
   redactExpiredQuotes,
-  promptDelegates,
   redeemApproval,
   resolveBinding,
+  revokeAllGrants,
   revokeGrants,
+  time,
   type DelegationDeps,
+  type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
 } from "./service.js";
@@ -53,23 +57,27 @@ import {
 /**
  * HTTP surface for owner-named trusted delegates (relay
  * docs/design/owner-trusted-delegates.md §16.3), the self-hosted twin of
- * Cloud's. See docs/owner-delegates.md.
+ * Cloud's (cloud#6501): the same paths, bodies, status codes and response
+ * shapes, and Cloud's error body `{error: <message>, code}`. See
+ * docs/owner-delegates.md.
  *
- * Human-only routes take the browser account session (the /cloud cookie,
- * signed in within 15 minutes for writes other than revocation) or a
- * Desktop-verified bearer (a redeemed browser-consent Desktop sign-in). A
+ * Human-only routes take the browser account session (the /cloud cookie) or
+ * a Desktop-verified bearer (a redeemed browser-consent Desktop sign-in). A
  * device-flow CLI login, an enrollment-key session, a workspace API token
- * and any agent token are refused.
+ * and any agent token are refused. relay-control additionally requires a
+ * browser session signed in within 15 minutes for changes other than
+ * revocation (§4.1 step-up) and JSON from an allowed Origin for cookie writes.
  *
- * Agent routes prove the agent with its own Relaycast token. Attest and
- * redeem also take the recipient owner's Desktop-verified bearer, exactly
- * as Cloud's native-authority route does.
+ * Agent routes prove the agent with its own Relaycast token. Attest, redeem
+ * and prompt-delegates also take the recipient owner's Desktop-verified
+ * bearer, exactly as Cloud's native-authority route does.
  */
 
 const STEP_UP_MS = 15 * 60 * 1000;
 const CLAIM_COMPLETE_RATE = { limit: 20, windowMs: 60_000 };
 const AGENT_ROUTE_RATE = { limit: 120, windowMs: 60_000 };
-const AUDIT_LIMIT = 1000;
+const MAX_AUDIT_EVENTS = 1000;
+const GRANT_ID = /^grt_[A-Za-z0-9]{8,64}$/u;
 
 type JsonWriter = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
 
@@ -83,17 +91,18 @@ export type DelegationRoutesInput = {
   workspaceForUser: (workspaceId: string, userId: string) => Promise<{
     id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; role: Principal["role"];
   } | null>;
-  requestObject: (request: IncomingMessage) => Promise<Record<string, unknown>>;
   json: JsonWriter;
   rateLimit: (response: ServerResponse, key: string, rule: { limit: number; windowMs: number }) => void;
   clientKey: (request: IncomingMessage) => string;
   now?: () => Date;
 };
 
+type AuthMethod = "session" | "desktop_bearer";
+
 type Human = {
   principal: Principal;
   workspace: DelegationWorkspace & { role: Principal["role"] };
-  authMethod: "browser" | "desktop";
+  authMethod: AuthMethod;
   admin: boolean;
 };
 
@@ -106,20 +115,32 @@ type SessionFacts = {
   scopes: string[];
 };
 
-const fail = (status: number, code: string, message: string): never => {
-  throw new MessagingHttpError(status, code, message);
-};
+/** A refusal rendered as Cloud's delegation error body `{error: <message>, code}`. */
+export class DelegationHttpError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = "DelegationHttpError";
+  }
+}
 
+const fail = (code: string, error: string, status: number): never => {
+  throw new DelegationHttpError(status, code, error);
+};
+const UNAVAILABLE = () => fail("unavailable", "Delegation is unavailable", 503);
+const NOT_ENABLED = () => fail("not_enabled", "Delegation is off for this workspace", 403);
+
+// Request bodies, strict as Cloud's lib/delegation/requests.ts.
 const rfc3339 = z.string().max(64).refine(value => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i.test(value)
   && Number.isFinite(Date.parse(value)));
 const classList = z.array(actionClass).max(ACTION_CLASSES.length);
 const scopeSchema = z.object({
   class: actionClass,
-  targets: z.array(z.string().refine(validTargetPattern, { message: "invalid target pattern" })).min(1).max(32),
-}).strict().refine(scope => scope.class !== "prompt_approval" || scope.targets.every(validPromptPattern),
-  { message: "prompt_approval targets are * or <agent id>:*" });
+  targets: z.array(z.string().max(256)).min(1).max(50),
+}).strict().refine(scope => scope.targets.every(target =>
+  scope.class === "prompt_approval" ? validPromptPattern(target) : validTargetPattern(target)),
+"`*` may only stand for a whole segment; prompt_approval targets are `<agent id>:*` or `*`");
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
-  .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, { message: "one scope per class" });
+  .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
 const createGrantBody = z.object({
   delegate_agent_id: z.string().min(1).max(200),
@@ -131,10 +152,10 @@ const patchGrantBody = z.object({
   scopes: scopesSchema.optional(),
   expires_at: rfc3339.optional(),
   require_tier_o: classList.optional(),
-}).strict().refine(body => Object.keys(body).length > 0, { message: "nothing to change" });
+}).strict().refine(body => Object.keys(body).length > 0, "nothing to change");
 const revokeAllBody = z.object({ all: z.boolean().optional() }).strict();
 const mintBody = z.object({
-  actions: z.array(actionSchema).min(1).max(MAX_ACTIONS),
+  actions: mintActionsSchema,
   expires_at: rfc3339.optional(),
   single_use: z.boolean().optional(),
 }).strict();
@@ -145,14 +166,24 @@ const policyBody = z.object({
   require_tier_o: classList.optional(),
   code_owner_match: z.enum(["any_path", "all_paths"]).optional(),
 }).strict();
-const targetOwnersBody = z.array(z.object({
-  pattern: z.string().refine(validTargetPattern, { message: "invalid target pattern" }),
-  repo: z.string().regex(/^[^/:#\s*]+\/[^/:#\s*]+$/).optional(),
+/** `PUT /orgs/{org}/delegation-policy` (§16.3): org-wide settings no workspace policy overrides. */
+const orgPolicyBody = z.object({
+  quote_retention_days: z.number().int().min(1).max(QUOTE_RETENTION_MAX_DAYS),
+}).strict();
+const ORG_POLICY_PATH = /^\/api\/v1\/orgs\/([^/]+)\/delegation-policy$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const targetOwnerSchema = z.object({
+  pattern: z.string().min(1).max(256).refine(validTargetPattern, "`*` may only stand for a whole segment"),
+  repo: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u).optional(),
   owner_ids: z.array(z.string().uuid()).min(1).max(50).optional(),
-}).strict().refine(entry => (entry.repo === undefined) !== (entry.owner_ids === undefined),
-  { message: "exactly one of repo or owner_ids" })).max(200);
+}).strict().refine(entry => Boolean(entry.repo || entry.owner_ids), "an entry names a repo or people");
+/** The bare array of §16.3; `{target_owners: [...]}` is also accepted, as in Cloud. */
+const targetOwnersBody = z.union([
+  z.array(targetOwnerSchema).max(200),
+  z.object({ target_owners: z.array(targetOwnerSchema).max(200) }).strict().transform(body => body.target_owners),
+]);
 const claimCompleteBody = z.object({
-  code: z.string().min(8).max(64),
+  code: z.string().min(16).max(128),
   agent_id: z.string().min(1).max(200),
   agent_token: z.string().min(12).max(512),
 }).strict();
@@ -163,41 +194,33 @@ const recipientFields = {
 const attestBody = z.object({
   ...recipientFields,
   message_id: z.string().min(1).max(200),
-  accept: z.enum(["code_owners", "own_owner"]),
+  accept: z.enum(["code_owners", "own_owner"]).optional(),
+}).strict();
+const redeemBody = z.object({
+  ...recipientFields,
+  approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
+  action: z.object({ class: actionClass, target: z.string().min(1).max(256) }).strict(),
 }).strict();
 const promptDelegatesBody = z.object({
   session_agent_id: z.string().min(1).max(200),
   session_token: z.string().min(12).max(512),
 }).strict();
-const redeemBody = z.object({
-  ...recipientFields,
-  approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/),
-  action: z.object({ class: actionClass, target: z.string().min(1).max(256) }).strict(),
-}).strict();
 
-function parse<T>(schema: z.ZodType<T>, body: unknown): T {
-  const parsed = schema.safeParse(body);
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    return fail(400, "invalid_request", issue ? `${issue.path.join(".") || "body"}: ${issue.message}` : "Invalid request");
-  }
-  return parsed.data;
-}
-
-/** A JSON body that may be an array (PUT target-owners takes a bare list). */
-async function jsonBody(request: IncomingMessage): Promise<unknown> {
+/** The body as JSON, or null when it is empty or not JSON (Cloud's readJson). */
+async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 256 * 1024) fail(413, "payload_too_large", "Body exceeds 256 KiB");
+    if (size > 256 * 1024) fail("payload_too_large", "Body exceeds 256 KiB", 413);
     chunks.push(buffer);
   }
+  const raw = Buffer.concat(chunks).toString("utf8");
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "null") as unknown;
+    return JSON.parse(raw) as unknown;
   } catch {
-    return fail(400, "invalid_request", "Body must be valid JSON");
+    return raw.trim() ? null : undefined;
   }
 }
 
@@ -205,8 +228,14 @@ function uniqueClasses(values: readonly ActionClass[] | undefined): ActionClass[
   return [...new Set(values ?? [])];
 }
 
+/** Cloud's policyRefusal: classes the policy does not allow. */
+function policyRefusal(classes: readonly ActionClass[], policy: DelegationPolicy): void {
+  const refused = policy.allowed_classes ? classes.filter(item => !policy.allowed_classes!.includes(item)) : [];
+  if (refused.length) fail("out_of_scope", `Policy does not allow delegating: ${uniqueClasses(refused).join(", ")}`, 403);
+}
+
 export function isDelegationPath(path: string): boolean {
-  return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}`
+  return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}` || ORG_POLICY_PATH.test(path)
     || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates)?)$/.test(path);
 }
 
@@ -232,10 +261,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       && (allowProvisioned || !facts.provisioned_by_token_id));
   }
 
-  async function workspaceFor(principal: Principal, workspaceId: string) {
-    if (principal.organizationId === undefined) return null;
-    const workspace = await input.workspaceForUser(workspaceId, principal.userId);
-    if (!workspace || workspace.organizationId !== principal.organizationId) return null;
+  /** A current member of `workspaceId` in the token's own organization, or 403 forbidden as in Cloud. */
+  async function memberWorkspace(principal: Principal, workspaceId: string) {
+    const workspace = await input.workspaceForUser(workspaceId, principal.userId).catch(() => null);
+    if (!workspace || workspace.organizationId !== principal.organizationId) return fail("forbidden", "Forbidden", 403);
     return workspace;
   }
 
@@ -243,84 +272,155 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
   async function human(request: IncomingMessage, publicPath: string, workspaceId: string,
     options: { write: boolean; stepUp: boolean }): Promise<Human> {
     const headerToken = bearer(request);
-    let principal: Principal | null = null;
-    let authMethod: Human["authMethod"];
+    let principal: Principal | null;
+    let authMethod: AuthMethod;
     if (headerToken) {
       principal = await input.authenticateAccessToken(headerToken);
-      if (!principal) fail(401, "unauthorized", "Invalid or expired token");
-      if (!desktopVerified(await sessionFacts(headerToken), false)) {
-        fail(403, "human_session_required", "Delegation is managed only from a browser session or a verified Agent Relay Desktop sign-in");
-      }
-      authMethod = "desktop";
+      if (!principal) return fail("unauthorized", "Unauthorized", 401);
+      if (!desktopVerified(await sessionFacts(headerToken), false)) fail("forbidden", "Forbidden", 403);
+      authMethod = "desktop_bearer";
     } else {
       const cookie = publicPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
-      if (!cookie) return fail(401, "unauthorized", "Authentication required");
-      principal = await input.authenticateAccessToken(cookie);
-      if (!principal) fail(401, "unauthorized", "Invalid or expired token");
-      if (!principal!.scopes.includes(ACCOUNT_SCOPE) || principal!.pendingHandoff || principal!.handoff) {
-        fail(403, "human_session_required", "Delegation is managed only from a browser session or a verified Agent Relay Desktop sign-in");
+      principal = cookie ? await input.authenticateAccessToken(cookie) : null;
+      if (!principal) return fail("unauthorized", "Unauthorized", 401);
+      if (!principal.scopes.includes(ACCOUNT_SCOPE) || principal.pendingHandoff || principal.handoff) {
+        fail("forbidden", "Forbidden", 403);
       }
       if (options.write && !cookieRequestAllowed(request, input.browserOrigins)) {
-        fail(403, "csrf_rejected", "Cross-origin request refused");
+        fail("csrf_rejected", "Cross-origin request refused", 403);
       }
       if (options.stepUp) {
-        const facts = await sessionFacts(cookie);
-        if (!facts || now().getTime() - new Date(facts.created_at).getTime() > STEP_UP_MS) {
-          fail(403, "reauthentication_required", "Sign in again (within the last 15 minutes) to change delegates");
+        const facts = await sessionFacts(cookie!);
+        if (!facts || now().getTime() - time(facts.created_at) > STEP_UP_MS) {
+          fail("reauthentication_required", "Sign in again (within the last 15 minutes) to change delegates", 403);
         }
       }
-      authMethod = "browser";
+      authMethod = "session";
     }
-    const workspace = await workspaceFor(principal!, workspaceId);
-    if (!workspace || principal!.workspaceId !== workspaceId) fail(404, "workspace_not_found", "Workspace not found");
-    return {
-      principal: principal!,
-      workspace: workspace!,
-      authMethod: authMethod!,
-      admin: workspace!.role === "owner" || workspace!.role === "admin",
-    };
+    const workspace = await memberWorkspace(principal, workspaceId);
+    return { principal, workspace, authMethod, admin: workspace.role === "owner" || workspace.role === "admin" };
   }
 
-  /** Attest and redeem: the recipient owner's Desktop-verified bearer, read live, for a current member. */
+  /** Attest, redeem, prompt-delegates: the recipient owner's Desktop-verified bearer (Cloud's desktopBearer). */
   async function desktopCaller(request: IncomingMessage, workspaceId: string) {
     const token = bearer(request);
-    if (!token) return fail(401, "unauthorized", "Authentication required");
+    if (!token) return fail("unauthorized", "Unauthorized", 401);
     const principal = await input.authenticateAccessToken(token);
-    if (!principal) return fail(401, "unauthorized", "Invalid or expired token");
-    if (!desktopVerified(await sessionFacts(token), true)) fail(403, "forbidden", "A verified Agent Relay Desktop sign-in is required");
-    const workspace = await workspaceFor(principal, workspaceId);
-    if (!workspace) fail(403, "forbidden", "Not a member of this workspace");
-    return { principal, workspace: workspace!, token };
+    if (!principal) return fail("unauthorized", "Unauthorized", 401);
+    if (!desktopVerified(await sessionFacts(token), true)) fail("forbidden", "Forbidden", 403);
+    const workspace = await memberWorkspace(principal, workspaceId);
+    return { principal, workspace, stillAuthorized: async () => desktopVerified(await sessionFacts(token), true) };
   }
 
-  async function requireEnabled(workspaceId: string) {
+  /**
+   * `/orgs/{org}/delegation-policy` (Cloud's orgAdminCaller): a browser
+   * session or a Desktop-verified bearer of an active owner or admin of that
+   * org, read now. A token acts only in the organization it was issued for.
+   */
+  async function orgAdmin(request: IncomingMessage, publicPath: string, organizationId: string,
+    write: boolean): Promise<{ userId: string; authMethod: AuthMethod }> {
+    const headerToken = bearer(request);
+    let principal: Principal | null;
+    let authMethod: AuthMethod;
+    if (headerToken) {
+      principal = await input.authenticateAccessToken(headerToken);
+      if (!principal) return fail("unauthorized", "Unauthorized", 401);
+      if (!desktopVerified(await sessionFacts(headerToken), false)) fail("forbidden", "Forbidden", 403);
+      authMethod = "desktop_bearer";
+    } else {
+      const cookie = publicPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
+      principal = cookie ? await input.authenticateAccessToken(cookie) : null;
+      if (!principal) return fail("unauthorized", "Unauthorized", 401);
+      if (!principal.scopes.includes(ACCOUNT_SCOPE) || principal.pendingHandoff || principal.handoff) {
+        fail("forbidden", "Forbidden", 403);
+      }
+      if (write && !cookieRequestAllowed(request, input.browserOrigins)) {
+        fail("csrf_rejected", "Cross-origin request refused", 403);
+      }
+      if (write) {
+        const facts = await sessionFacts(cookie!);
+        if (!facts || now().getTime() - time(facts.created_at) > STEP_UP_MS) {
+          fail("reauthentication_required", "Sign in again (within the last 15 minutes) to change delegation policy", 403);
+        }
+      }
+      authMethod = "session";
+    }
+    const role = (await input.database.query<{ role: string }>(
+      `SELECT m.role FROM organization_memberships m JOIN organizations o ON o.id = m.organization_id
+        WHERE m.organization_id = $1 AND m.user_id = $2`,
+      [organizationId, principal.userId],
+    )).rows[0]?.role;
+    if (principal.organizationId !== organizationId || (role !== "owner" && role !== "admin")) {
+      fail("forbidden", "Only org owners and admins can set org delegation policy", 403);
+    }
+    return { userId: principal.userId, authMethod };
+  }
+
+  async function requireEnabled(workspaceId: string): Promise<DelegationPolicy> {
     const policy = await loadPolicy(input.database, workspaceId);
-    if (!policy.delegation_enabled) fail(403, "not_enabled", "Delegation is turned off for this workspace");
+    if (!policy.delegation_enabled) NOT_ENABLED();
     return policy;
   }
 
-  async function grantFor(workspaceId: string, grantId: string): Promise<GrantRow> {
-    const row = (await input.database.query<GrantRow>(
-      "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [grantId, workspaceId],
-    )).rows[0];
-    return row ?? fail(404, "grant_not_found", "Grant not found");
+  function parse<T>(schema: z.ZodType<T>, body: unknown, error: string): T {
+    const parsed = schema.safeParse(body);
+    return parsed.success ? parsed.data : fail("invalid_request", error, 400);
   }
 
-  function expiryWithin(value: string | undefined, maxDays: number, defaultDays: number, from = now()): Date {
+  function grantExpiry(value: string | undefined, policy: DelegationPolicy, from: Date): Date {
+    const maxDays = Math.min(GRANT_MAX_DAYS, policy.max_expiry_days);
     const max = from.getTime() + maxDays * 86_400_000;
-    if (value === undefined) return new Date(Math.min(from.getTime() + defaultDays * 86_400_000, max));
-    const at = Date.parse(value);
-    if (at <= from.getTime()) fail(400, "invalid_request", "expires_at must be in the future");
-    if (at > max) fail(400, "invalid_request", `expires_at may be at most ${maxDays} days away`);
+    const at = value ? Date.parse(value) : from.getTime() + Math.min(GRANT_DEFAULT_DAYS, maxDays) * 86_400_000;
+    if (at <= from.getTime()) fail("invalid_expiry", "expires_at must be in the future", 400);
+    if (at > max) fail("invalid_expiry", `expires_at may be at most ${maxDays} days away`, 400);
     return new Date(at);
   }
 
-  return async function handleDelegation(request: IncomingMessage, response: ServerResponse,
-    path: string, publicPath: string, method: string): Promise<boolean> {
+  async function route(request: IncomingMessage, response: ServerResponse, path: string, publicPath: string,
+    method: string): Promise<boolean> {
     if (path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}`) {
-      if (method !== "GET") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
       response.setHeader("cache-control", "public, max-age=300");
       input.json(response, 200, input.signer ? input.signer.jwks() : { keys: [] });
+      return true;
+    }
+    const orgMatch = ORG_POLICY_PATH.exec(path);
+    if (orgMatch) {
+      if (method !== "GET" && method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(orgMatch[1]!);
+      } catch {
+        return fail("not_found", "Organization not found", 404);
+      }
+      if (!UUID.test(organizationId)) fail("not_found", "Organization not found", 404);
+      const caller = await orgAdmin(request, publicPath, organizationId, method === "PUT");
+      if (method === "GET") {
+        input.json(response, 200, await loadOrgPolicy(input.database, organizationId), true);
+        return true;
+      }
+      const body = parse(orgPolicyBody, await readJson(request), "quote_retention_days must be an integer from 1 to 3650");
+      const policy = { quote_retention_days: body.quote_retention_days };
+      await input.database.transaction(async (tx) => {
+        const before = await loadOrgPolicy(tx, organizationId);
+        await tx.query(
+          `INSERT INTO delegation_org_policies (organization_id, quote_retention_days, updated_by, updated_at)
+           VALUES ($1, $2, $3, now())
+           ON CONFLICT (organization_id) DO UPDATE SET quote_retention_days = EXCLUDED.quote_retention_days,
+             updated_by = EXCLUDED.updated_by, updated_at = now()`,
+          [organizationId, policy.quote_retention_days, caller.userId],
+        );
+        // Logged as org_policy.updated in each of the org's workspaces, as Cloud.
+        const workspaces = (await tx.query<{ id: string }>(
+          "SELECT id FROM workspaces WHERE organization_id = $1", [organizationId],
+        )).rows;
+        for (const workspace of workspaces) {
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "org_policy.updated",
+            actorUserId: caller.userId, authMethod: caller.authMethod,
+            data: { organization_id: organizationId, before, after: policy } });
+        }
+      });
+      input.json(response, 200, policy, true);
       return true;
     }
     const match = /^\/api\/v1\/workspaces\/([^/]+)\/(delegates(?:\/(.*))?|messaging\/delegation(\/redeem|\/prompt-delegates)?)$/.exec(path);
@@ -329,103 +429,102 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     try {
       workspaceId = decodeURIComponent(match[1]!);
     } catch {
-      return fail(400, "invalid_request", "Malformed path");
+      return fail("invalid_request", "Malformed path", 400);
     }
     const sub = match[3];
     const json = (status: number, body: unknown) => input.json(response, status, body, true);
 
     // Agent routes ------------------------------------------------------
     if (match[2]!.startsWith("messaging/delegation")) {
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       const caller = await desktopCaller(request, workspaceId);
       input.rateLimit(response, `delegation-attest:${caller.principal.userId}`, AGENT_ROUTE_RATE);
-      const workspace = caller.workspace;
-      const recheckBearer = async () => desktopVerified(await sessionFacts(caller.token), true);
+      const common = { workspace: caller.workspace, callerUserId: caller.principal.userId };
       if (match[4] === "/prompt-delegates") {
-        const body = parse(promptDelegatesBody, await input.requestObject(request));
-        json(200, await promptDelegates(deps, {
-          workspace, callerUserId: caller.principal.userId, recipientAgentId: body.session_agent_id,
-          recipientToken: body.session_token,
-        }));
-        return true;
-      }
-      if (match[4]) {
-        const body = parse(redeemBody, await input.requestObject(request));
-        const result = await redeemApproval(deps, {
-          workspace, callerUserId: caller.principal.userId, recipientAgentId: body.recipient_agent_id,
-          recipientToken: body.recipient_token, approvalId: body.approval_id, action: body.action,
-        });
+        const body = parse(promptDelegatesBody, await readJson(request), "Invalid request");
+        let result;
+        try {
+          result = await promptDelegates(deps, { ...common, recipientAgentId: body.session_agent_id,
+            recipientToken: body.session_token });
+        } catch {
+          return UNAVAILABLE();
+        }
+        if (!result) fail("forbidden", "The session is not yours", 403);
         json(200, result);
         return true;
       }
-      const body = parse(attestBody, await input.requestObject(request));
-      const result = await attestDelegation(deps, {
-        workspace, callerUserId: caller.principal.userId, recipientAgentId: body.recipient_agent_id,
-        recipientToken: body.recipient_token, messageId: body.message_id, accept: body.accept,
-      });
-      // Token revocation during the Relaycast calls decides the verdict.
-      if (result.verdict === "delegate" && !await recheckBearer()) {
-        json(200, { verdict: "none", reason: "unavailable" });
+      if (match[4] === "/redeem") {
+        const body = parse(redeemBody, await readJson(request), "Invalid request");
+        json(200, await redeemApproval(deps, { ...common, recipientAgentId: body.recipient_agent_id,
+          recipientToken: body.recipient_token, approvalId: body.approval_id, action: body.action,
+          authMethod: "desktop_bearer", stillAuthorized: caller.stillAuthorized }));
         return true;
       }
-      json(200, result);
+      const body = parse(attestBody, await readJson(request), "Invalid request");
+      json(200, await attestDelegation(deps, { ...common, recipientAgentId: body.recipient_agent_id,
+        recipientToken: body.recipient_token, messageId: body.message_id, accept: body.accept ?? "code_owners",
+        authMethod: "desktop_bearer", stillAuthorized: caller.stillAuthorized }));
       return true;
     }
 
     if (sub === "claims/complete") {
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       input.rateLimit(response, `delegation-claim:${input.clientKey(request)}`, CLAIM_COMPLETE_RATE);
-      const body = parse(claimCompleteBody, await input.requestObject(request));
-      if (input.gateOnly) fail(503, "unavailable", "Delegation is not available on a gate-only install");
+      const body = parse(claimCompleteBody, await readJson(request), "Invalid claim");
       const workspace = (await input.database.query<{ id: string; relaycast_workspace_id: string | null }>(
         "SELECT id, relaycast_workspace_id FROM workspaces WHERE id::text = $1", [workspaceId],
       )).rows[0];
-      if (!workspace?.relaycast_workspace_id) return fail(404, "claim_not_found", "No pending claim matches that code");
+      if (!workspace) return NOT_ENABLED();
       await requireEnabled(workspace.id);
+      // Unknown, used and expired codes look the same.
       const claim = (await input.database.query<{ id: string; user_id: string }>(
         `SELECT id, user_id FROM delegation_claims
           WHERE workspace_id = $1 AND code_hash = $2 AND consumed_at IS NULL AND expires_at > now()`,
-        [workspace.id, claimCodeHash(body.code)],
+        [workspace.id, sha256Hex(body.code)],
       )).rows[0];
-      if (!claim) return fail(404, "claim_not_found", "No pending claim matches that code");
+      if (!claim) return fail("invalid_code", "Claim code is invalid or expired", 404);
+      if (input.gateOnly || !workspace.relaycast_workspace_id) {
+        return fail("unavailable", "Messaging is not provisioned for this workspace", 503);
+      }
+      const relaycastWorkspaceId = workspace.relaycast_workspace_id;
       let agent;
       try {
         agent = await input.relaycast.authenticatedAgent(body.agent_token);
       } catch (error) {
-        if (error instanceof RelaycastCallError && [401, 403, 404].includes(error.status)) {
-          return fail(403, "agent_not_proven", "The agent token does not prove that agent id");
-        }
-        return fail(502, "unavailable", "The relay is not reachable right now");
+        if (!(error instanceof RelaycastCallError) || ![401, 403, 404].includes(error.status)) return UNAVAILABLE();
+        agent = null;
       }
-      if (agent.id !== body.agent_id || (agent.workspaceId && agent.workspaceId !== workspace.relaycast_workspace_id)) {
-        fail(403, "agent_not_proven", "The agent token does not prove that agent id");
+      if (!agent || agent.id !== body.agent_id || (agent.workspaceId && agent.workspaceId !== relaycastWorkspaceId)) {
+        return fail("invalid_agent", "The agent token does not prove this agent id", 403);
       }
+      const proven = agent;
       if (!await memberRole(input.database, workspace.id, claim.user_id)) {
-        fail(404, "claim_not_found", "No pending claim matches that code");
+        fail("invalid_code", "Claim code is invalid or expired", 404);
       }
-      const relaycastWorkspaceId = workspace.relaycast_workspace_id;
+      if (await anyBinding(input.database, workspace.id, relaycastWorkspaceId, proven.id)) {
+        fail("already_bound", "This agent already has a Control binding", 409);
+      }
       const bound = await input.database.transaction(async (tx) => {
-        if (await anyBinding(tx, workspace.id, relaycastWorkspaceId, agent.id)) return "already_bound" as const;
+        if (await anyBinding(tx, workspace.id, relaycastWorkspaceId, proven.id)) return false;
         const consumed = (await tx.query(
           `UPDATE delegation_claims SET consumed_at = now(), agent_id = $2
             WHERE id = $1 AND consumed_at IS NULL AND expires_at > now() RETURNING id`,
-          [claim.id, agent.id],
+          [claim.id, proven.id],
         )).rows[0];
-        if (!consumed) return "claim_not_found" as const;
+        if (!consumed) return false;
         await tx.query(
           `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [workspace.id, relaycastWorkspaceId, agent.id, agent.name, claim.user_id, claim.id],
+          [workspace.id, relaycastWorkspaceId, proven.id, proven.name, claim.user_id, claim.id],
         );
         await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "delegate.claimed", actorAgentId: agent.id, ownerUserId: claim.user_id,
-          details: { agent_id: agent.id, agent_name: agent.name, claim_id: claim.id, method: "claim_code" },
+          workspaceId: workspace.id, event: "delegate.claimed", ownerUserId: claim.user_id, actorAgentId: proven.id,
+          authMethod: "agent_token", data: { agent_id: proven.id, claim_method: "code", claim_id: claim.id },
         });
-        return "bound" as const;
+        return true;
       });
-      if (bound === "already_bound") fail(409, "already_bound", "That agent already has an owner in this workspace");
-      if (bound === "claim_not_found") fail(404, "claim_not_found", "No pending claim matches that code");
-      json(200, { claim_id: claim.id, owner_id: claim.user_id, agent_id: agent.id, agent_name: agent.name });
+      if (!bound) fail("already_bound", "The claim was used, or this agent is already claimed", 409);
+      json(200, { claim_id: claim.id, agent_id: proven.id, owner_id: claim.user_id });
       return true;
     }
 
@@ -439,194 +538,163 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     if (sub === undefined) {
       if (method === "GET") {
         const all = new URL(request.url ?? "/", "http://localhost").searchParams.get("all") === "1";
-        if (all && !caller.admin) fail(403, "forbidden", "Workspace admin role required");
+        if (all && !caller.admin) fail("forbidden", "Only org owners and admins can list every grant", 403);
         const rows = (await input.database.query<GrantRow>(
           `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND ($2::boolean OR owner_user_id = $3)
-            ORDER BY created_at DESC LIMIT 500`,
+            ORDER BY created_at DESC`,
           [workspace.id, all, principal.userId],
         )).rows;
-        json(200, { grants: rows.map(row => grantView(row, now())), policy: await loadPolicy(input.database, workspace.id) });
+        const at = now();
+        json(200, { grants: rows.map(row => grantView(row, at)) });
         return true;
       }
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      const body = parse(createGrantBody, await readJson(request), "Invalid grant");
       const policy = await requireEnabled(workspace.id);
-      const body = parse(createGrantBody, await input.requestObject(request));
-      const classes = body.scopes.map(scope => scope.class);
-      if (policy.allowed_classes && classes.some(item => !policy.allowed_classes!.includes(item))) {
-        fail(403, "class_not_allowed", "The workspace policy does not allow delegating one of these classes");
-      }
-      const expiresAt = expiryWithin(body.expires_at, Math.min(GRANT_MAX_DAYS, policy.max_expiry_days),
-        Math.min(GRANT_DEFAULT_DAYS, policy.max_expiry_days));
+      const scopes: Scope[] = body.scopes.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }));
+      policyRefusal(scopes.map(scope => scope.class), policy);
+      const expiresAt = grantExpiry(body.expires_at, policy, now());
+      // The delegate must have exactly one Control binding, owned by this
+      // person. A name is never accepted, only the immutable agent id.
       const binding = await resolveBinding(input.database, workspace.id, workspace.relaycastWorkspaceId,
         body.delegate_agent_id, true);
       if (!binding || binding.userId !== principal.userId) {
-        fail(409, "delegate_not_bound", "That agent is not bound to you. Bind it first (Desktop, a spawn, or a claim).");
+        fail("not_delegate", "The agent must be bound to you; claim it first", 403);
       }
-      const scopes: Scope[] = body.scopes.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }));
-      const id = newGrantId();
-      const row = await input.database.transaction(async (tx) => {
-        const created = (await tx.query<GrantRow>(
-          `INSERT INTO delegation_grants
-             (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
-              scopes, require_tier_o, expires_at, created_auth_method)
-           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10) RETURNING *`,
-          [id, workspace.id, workspace.organizationId, principal.userId, binding!.agentId, binding!.name,
-            JSON.stringify(scopes), uniqueClasses(body.require_tier_o), expiresAt, caller.authMethod],
-        )).rows[0]!;
-        await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "grant.created", ...actor, ownerUserId: principal.userId, grantId: id,
-          details: { delegate_agent_id: binding!.agentId, scopes, require_tier_o: created.require_tier_o,
-            expires_at: expiresAt.toISOString() },
+      const requireTierO = uniqueClasses(body.require_tier_o);
+      let row: GrantRow;
+      try {
+        row = await input.database.transaction(async (tx) => {
+          await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
+          const existing = await tx.query(
+            `SELECT 1 FROM delegation_grants
+              WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'`,
+            [workspace.id, principal.userId, binding!.agentId],
+          );
+          if (existing.rows.length) throw new GrantConflict();
+          const created = (await tx.query<GrantRow>(
+            `INSERT INTO delegation_grants
+               (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+                scopes, require_tier_o, expires_at, created_auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10) RETURNING *`,
+            [mintId("grt"), workspace.id, workspace.organizationId, principal.userId, binding!.agentId, binding!.name,
+              JSON.stringify(scopes), requireTierO, expiresAt, caller.authMethod],
+          )).rows[0]!;
+          await recordDelegationAudit(tx, {
+            workspaceId: workspace.id, event: "grant.created", ...actor, ownerUserId: principal.userId, grantId: created.id,
+            data: { delegate_agent_id: binding!.agentId, scope_diff: { added: scopes, removed: [] },
+              require_tier_o: requireTierO, expires_at: expiresAt.toISOString() },
+          });
+          return created;
         });
-        return created;
-      });
+      } catch (error) {
+        if (error instanceof GrantConflict || (error as { code?: string })?.code === "23505") {
+          return fail("grant_exists", "This agent already has an active grant; narrow it or revoke it first", 409);
+        }
+        throw error;
+      }
       json(201, grantView(row, now()));
       return true;
     }
 
     if (sub === "revoke-all") {
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
-      const body = parse(revokeAllBody, await input.requestObject(request));
-      if (body.all && !caller.admin) fail(403, "forbidden", "Workspace admin role required");
-      const revoked = await input.database.transaction(async (tx) => {
-        const ids = (await tx.query<{ id: string }>(
-          `SELECT id FROM delegation_grants
-            WHERE workspace_id = $1 AND revoked_at IS NULL AND ($2::boolean OR owner_user_id = $3) FOR UPDATE`,
-          [workspace.id, Boolean(body.all), principal.userId],
-        )).rows.map(row => row.id);
-        return revokeGrants(tx, { workspaceId: workspace.id, grantIds: ids, actorUserId: principal.userId,
-          reason: body.all ? "admin_revoke_all" : "owner_revoke_all", authMethod: caller.authMethod });
-      });
-      json(200, { revoked: revoked.length, grant_ids: revoked.map(row => row.id) });
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      const raw = await readJson(request);
+      const body = parse(revokeAllBody, raw === undefined ? {} : raw, "Invalid request");
+      if (body.all && !caller.admin) fail("forbidden", "Only org owners and admins can revoke every grant", 403);
+      const revoked = await input.database.transaction(tx => revokeAllGrants(tx, {
+        workspaceId: workspace.id, ownerUserId: body.all ? null : principal.userId, actorUserId: principal.userId,
+        reason: body.all ? "admin_revoke_all" : "owner_revoke_all", authMethod: caller.authMethod,
+      }));
+      json(200, { revoked });
       return true;
     }
 
     if (sub === "claims") {
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       await requireEnabled(workspace.id);
-      parse(z.object({}).strict(), await input.requestObject(request));
-      const id = newClaimId();
+      const id = mintId("clm");
       const code = newClaimCode();
       const expiresAt = new Date(now().getTime() + CLAIM_TTL_MS);
       await input.database.query(
         `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4, $5)`,
-        [id, workspace.id, principal.userId, claimCodeHash(code), expiresAt],
+        [id, workspace.id, principal.userId, sha256Hex(code), expiresAt],
       );
       json(201, { claim_id: id, code, expires_at: expiresAt.toISOString() });
       return true;
     }
 
     if (sub === "approvals") {
-      if (method !== "POST") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      const body = parse(mintBody, await readJson(request), "Invalid approval");
       const policy = await requireEnabled(workspace.id);
-      const body = parse(mintBody, await input.requestObject(request));
-      if (policy.allowed_classes && body.actions.some(action => !policy.allowed_classes!.includes(action.class))) {
-        fail(403, "class_not_allowed", "The workspace policy does not allow delegating one of these classes");
-      }
-      const from = now();
-      const requested = body.expires_at ? Date.parse(body.expires_at) : from.getTime() + APPROVAL_DEFAULT_MS;
-      if (requested <= from.getTime()) fail(400, "invalid_request", "expires_at must be in the future");
-      if (requested > from.getTime() + APPROVAL_MAX_MS) fail(400, "invalid_request", "expires_at may be at most 24 hours away");
       const actions = body.actions.map(canonicalAction);
+      policyRefusal(actions.map(action => action.class), policy);
+      const from = now().getTime();
+      const expiresAt = body.expires_at ? Date.parse(body.expires_at) : from + APPROVAL_DEFAULT_MS;
+      if (expiresAt <= from) fail("invalid_expiry", "expires_at must be in the future", 400);
+      if (expiresAt > from + APPROVAL_MAX_MS) fail("invalid_expiry", "expires_at may be at most 24 hours away", 400);
       const singleUse = body.single_use === true || actions.some(highRisk);
-      const id = newApprovalId();
+      const id = mintId("apv");
       await input.database.transaction(async (tx) => {
         await tx.query(
           `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
            VALUES ($1, $2, $3, 'O', $4::jsonb, $5, $6)`,
-          [id, workspace.id, principal.userId, JSON.stringify(actions), singleUse, new Date(requested)],
+          [id, workspace.id, principal.userId, JSON.stringify(actions), singleUse, new Date(expiresAt)],
         );
         await recordDelegationAudit(tx, {
           workspaceId: workspace.id, event: "approval.minted", ...actor, ownerUserId: principal.userId, approvalId: id,
-          details: { actions, single_use: singleUse, expires_at: new Date(requested).toISOString() },
+          data: { actions, single_use: singleUse, expires_at: new Date(expiresAt).toISOString() },
         });
       });
-      json(201, { approval_id: id, actions, single_use: singleUse, expires_at: new Date(requested).toISOString() });
+      json(201, { approval_id: id });
       return true;
     }
 
     if (sub === "audit") {
-      if (method !== "GET") fail(405, "method_not_allowed", "Method not allowed");
+      if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
       const params = new URL(request.url ?? "/", "http://localhost").searchParams;
       const since = params.get("since");
-      if (since !== null && !Number.isFinite(Date.parse(since))) fail(400, "invalid_request", "since must be a timestamp");
+      if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
-      const format = params.get("format");
-      if (format !== null && format !== "json" && format !== "jsonl") fail(400, "invalid_request", "format must be json or jsonl");
+      if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
+      const format = params.get("format") ?? "json";
+      if (format !== "json" && format !== "jsonl") fail("invalid_request", "format is json or jsonl", 400);
+      const limit = Math.min(MAX_AUDIT_EVENTS,
+        Math.max(1, Number.parseInt(params.get("limit") ?? `${MAX_AUDIT_EVENTS}`, 10) || MAX_AUDIT_EVENTS));
       await redactExpiredQuotes(input.database);
-      const rows = (await input.database.query<Record<string, unknown>>(
-        `SELECT id, occurred_at, event, actor_user_id, actor_agent_id, auth_method, owner_user_id, grant_id,
-                approval_id, message_id, recipient_agent_id, reason, jti, details, quote, quote_sha256
-           FROM delegation_audit_events
+      const events = (await input.database.query<Record<string, unknown>>(
+        `SELECT * FROM delegation_audit_events
           WHERE workspace_id = $1
             AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
-            AND ($4::timestamptz IS NULL OR occurred_at > $4::timestamptz)
+            AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
             AND ($5::text IS NULL OR grant_id = $5)
-          ORDER BY occurred_at, id LIMIT ${AUDIT_LIMIT}`,
-        [workspace.id, caller.admin, principal.userId, since, grantId],
-      )).rows.map(row => ({ ...row, occurred_at: new Date(row.occurred_at as string).toISOString() }));
+          ORDER BY id LIMIT $6`,
+        [workspace.id, caller.admin, principal.userId, since || null, grantId || null, limit],
+      )).rows.map(auditView);
       if (format === "jsonl") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });
-        response.end(rows.map(row => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
+        response.end(events.map(event => JSON.stringify(event)).join("\n") + (events.length ? "\n" : ""));
         return true;
       }
-      json(200, { events: rows });
-      return true;
-    }
-
-    if (sub === "target-owners") {
-      if (method !== "GET" && method !== "PUT") fail(405, "method_not_allowed", "Method not allowed");
-      if (!caller.admin) fail(403, "forbidden", "Workspace admin role required");
-      const view = (entries: Awaited<ReturnType<typeof loadTargetOwners>>) => entries.map(entry => ({
-        pattern: entry.pattern, ...(entry.repo ? { repo: entry.repo } : {}), ...(entry.owner_ids ? { owner_ids: entry.owner_ids } : {}),
-      }));
-      if (method === "GET") {
-        json(200, { target_owners: view(await loadTargetOwners(input.database, workspace.id)) });
-        return true;
-      }
-      await requireEnabled(workspace.id);
-      const raw = await jsonBody(request);
-      const entries = parse(targetOwnersBody, Array.isArray(raw) ? raw
-        : raw && typeof raw === "object" ? (raw as Record<string, unknown>).target_owners : undefined);
-      for (const entry of entries) {
-        for (const ownerId of entry.owner_ids ?? []) {
-          if (!await memberRole(input.database, workspace.id, ownerId)) {
-            fail(400, "invalid_request", "owner_ids must name members of this workspace's organization");
-          }
-        }
-      }
-      await input.database.transaction(async (tx) => {
-        await tx.query("DELETE FROM delegation_target_owners WHERE workspace_id = $1", [workspace.id]);
-        for (const [position, entry] of entries.entries()) {
-          await tx.query(
-            `INSERT INTO delegation_target_owners (workspace_id, position, pattern, repo, owner_ids, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [workspace.id, position, entry.pattern, entry.repo ?? null, entry.owner_ids ? [...new Set(entry.owner_ids)] : null,
-              principal.userId],
-          );
-        }
-        await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "target_owners.updated", ...actor, details: { target_owners: entries },
-        });
-      });
-      json(200, { target_owners: view(await loadTargetOwners(input.database, workspace.id)) });
+      json(200, { events });
       return true;
     }
 
     if (sub === "policy") {
-      if (method !== "PUT") fail(405, "method_not_allowed", "Method not allowed");
-      if (!caller.admin) fail(403, "forbidden", "Workspace admin role required");
-      const body = parse(policyBody, await input.requestObject(request));
-      const current = await loadPolicy(input.database, workspace.id);
-      const next = {
+      if (method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
+      if (!caller.admin) fail("forbidden", "Only org owners and admins can set delegation policy", 403);
+      const body = parse(policyBody, await readJson(request), "Invalid policy");
+      // Cloud's PUT replaces the policy: omitted optional fields take their defaults.
+      const next: DelegationPolicy = {
         delegation_enabled: body.delegation_enabled,
-        max_expiry_days: body.max_expiry_days ?? current.max_expiry_days,
-        allowed_classes: body.allowed_classes === undefined ? current.allowed_classes
-          : body.allowed_classes === null ? null : uniqueClasses(body.allowed_classes),
-        require_tier_o: body.require_tier_o === undefined ? current.require_tier_o : uniqueClasses(body.require_tier_o),
-        code_owner_match: body.code_owner_match ?? current.code_owner_match,
+        max_expiry_days: body.max_expiry_days ?? GRANT_MAX_DAYS,
+        allowed_classes: body.allowed_classes ? uniqueClasses(body.allowed_classes) : null,
+        require_tier_o: uniqueClasses(body.require_tier_o),
+        code_owner_match: body.code_owner_match ?? "any_path",
       };
       const revoked = await input.database.transaction(async (tx) => {
+        const before = await loadPolicy(tx, workspace.id);
         await tx.query(
           `INSERT INTO delegation_policies
              (workspace_id, delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match,
@@ -639,80 +707,160 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           [workspace.id, next.delegation_enabled, next.max_expiry_days, next.allowed_classes, next.require_tier_o,
             next.code_owner_match, principal.userId],
         );
-        await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "policy.updated", ...actor, details: { before: current, after: next },
-        });
-        // §7: a grant that no longer fits the policy is revoked.
-        const live = (await tx.query<GrantRow>(
-          "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND revoked_at IS NULL FOR UPDATE", [workspace.id],
+        await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "policy.updated", ...actor,
+          data: { before, after: next } });
+        // §7: an active grant the new policy no longer admits is revoked.
+        const active = (await tx.query<GrantRow>(
+          "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND status = 'active' FOR UPDATE", [workspace.id],
         )).rows;
-        const misfit = live.filter(grant =>
+        const misfits = active.filter(grant =>
           (next.allowed_classes && grant.scopes.some(scope => !next.allowed_classes!.includes(scope.class))) ||
-          new Date(grant.expires_at).getTime() - new Date(grant.created_at).getTime() > next.max_expiry_days * 86_400_000);
-        return revokeGrants(tx, { workspaceId: workspace.id, grantIds: misfit.map(grant => grant.id),
+          time(grant.expires_at) - time(grant.created_at) > next.max_expiry_days * 86_400_000 + 60_000);
+        return revokeGrants(tx, { workspaceId: workspace.id, grantIds: misfits.map(grant => grant.id),
           actorUserId: principal.userId, reason: "policy_changed", authMethod: caller.authMethod });
       });
-      json(200, { ...await loadPolicy(input.database, workspace.id), revoked_grant_ids: revoked.map(row => row.id) });
+      json(200, { ...next, revoked_grants: revoked.map(row => row.id) });
       return true;
     }
 
-    // /delegates/{grant_id}
-    if (sub && /^grt_[A-Za-z0-9]{8,64}$/.test(sub)) {
-      const grant = await grantFor(workspace.id, sub);
-      const own = grant.owner_user_id === principal.userId;
-      if (method === "DELETE") {
-        if (!own && !caller.admin) fail(404, "grant_not_found", "Grant not found");
-        await input.database.transaction(tx => revokeGrants(tx, {
-          workspaceId: workspace.id, grantIds: [grant.id], actorUserId: principal.userId,
-          reason: own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod,
-        }));
-        json(200, grantView(await grantFor(workspace.id, grant.id), now()));
-        return true;
+    if (sub === "target-owners") {
+      if (method !== "GET" && method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
+      if (!caller.admin) {
+        fail("forbidden", `Only org owners and admins can ${method === "GET" ? "read" : "set"} target owners`, 403);
       }
       if (method === "GET") {
-        if (!own && !caller.admin) fail(404, "grant_not_found", "Grant not found");
-        json(200, grantView(grant, now()));
+        json(200, await loadTargetOwners(input.database, workspace.id));
         return true;
       }
-      if (method !== "PATCH") fail(405, "method_not_allowed", "Method not allowed");
-      if (!own) fail(404, "grant_not_found", "Grant not found");
+      const entries = parse(targetOwnersBody, await readJson(request), "Invalid target owners")
+        .map(entry => ({ pattern: entry.pattern, ...(entry.repo ? { repo: entry.repo } : {}),
+          ...(entry.owner_ids ? { owner_ids: [...new Set(entry.owner_ids)] } : {}) }));
       await requireEnabled(workspace.id);
-      const body = parse(patchGrantBody, await input.requestObject(request));
-      if (grant.revoked_at || new Date(grant.expires_at).getTime() <= now().getTime()) {
-        fail(409, "grant_not_active", "Only an active grant can be changed");
+      await input.database.transaction(async (tx) => {
+        await tx.query("DELETE FROM delegation_target_owners WHERE workspace_id = $1", [workspace.id]);
+        for (const [position, entry] of entries.entries()) {
+          await tx.query(
+            `INSERT INTO delegation_target_owners (workspace_id, position, pattern, repo, owner_ids, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [workspace.id, position, entry.pattern, entry.repo ?? null, entry.owner_ids ?? null, principal.userId],
+          );
+        }
+        await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "target_owners.updated", ...actor,
+          data: { entries } });
+      });
+      json(200, entries);
+      return true;
+    }
+
+    // /delegates/{grant_id}: PATCH and DELETE, as Cloud.
+    if (sub !== undefined && !sub.includes("/")) {
+      if (method === "DELETE") {
+        if (!GRANT_ID.test(sub)) fail("not_found", "Grant not found", 404);
+        const grant = await grantFor(workspace.id, sub);
+        if (!grant || (grant.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Grant not found", 404);
+        const own = grant!.owner_user_id === principal.userId;
+        await input.database.transaction(tx => revokeGrants(tx, {
+          workspaceId: workspace.id, grantIds: [grant!.id], actorUserId: principal.userId,
+          reason: own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod,
+        }));
+        json(200, grantView((await grantFor(workspace.id, grant!.id)) ?? grant!, now()));
+        return true;
       }
-      // Narrowing only: every new pattern is covered by an existing one of its class.
-      const scopes: Scope[] = body.scopes
-        ? body.scopes.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }))
-        : grant.scopes;
-      const widened = scopes.some(scope => scope.targets.some(target => !grant.scopes.some(old =>
-        old.class === scope.class && old.targets.some(pattern => classTargetCovered(scope.class, pattern, target, true)))));
-      const expiresAt = body.expires_at ? new Date(body.expires_at) : new Date(grant.expires_at);
-      if (expiresAt.getTime() <= now().getTime()) fail(400, "invalid_request", "expires_at must be in the future");
-      const requireTierO = body.require_tier_o ? uniqueClasses(body.require_tier_o) : grant.require_tier_o;
-      if (widened || expiresAt.getTime() > new Date(grant.expires_at).getTime() ||
-          grant.require_tier_o.some(item => !requireTierO.includes(item))) {
-        fail(400, "widening_refused", "A grant can only be narrowed; widening needs a new grant");
+      if (method !== "PATCH") fail("method_not_allowed", "Method not allowed", 405);
+      const body = patchGrantBody.safeParse(await readJson(request));
+      if (!body.success || !GRANT_ID.test(sub)) fail("invalid_request", "Invalid grant change", 400);
+      const patch = body.data!;
+      await requireEnabled(workspace.id);
+      const grant = await grantFor(workspace.id, sub);
+      if (!grant || grant.owner_user_id !== principal.userId) return fail("not_found", "Grant not found", 404);
+      const at = now();
+      if (grant.status !== "active" || time(grant.expires_at) <= at.getTime()) {
+        fail("not_active", "Only an active grant can be changed", 409);
       }
+      const scopes: Scope[] | undefined = patch.scopes?.map(scope => ({ class: scope.class, targets: [...new Set(scope.targets)] }));
+      const expiresAt = patch.expires_at ? new Date(patch.expires_at) : undefined;
+      if (expiresAt && expiresAt.getTime() <= at.getTime()) fail("invalid_expiry", "expires_at must be in the future", 400);
+      const requireTierO = patch.require_tier_o ? uniqueClasses(patch.require_tier_o) : undefined;
+      narrowingRefusal(grant, { scopes, expiresAt, requireTierO });
+      const nextScopes = scopes ?? grant.scopes;
+      const nextTierO = requireTierO ?? grant.require_tier_o;
+      const nextExpiry = expiresAt ?? new Date(grant.expires_at);
       const row = await input.database.transaction(async (tx) => {
         const updated = (await tx.query<GrantRow>(
           `UPDATE delegation_grants SET scopes = $3::jsonb, expires_at = $4, require_tier_o = $5, updated_at = now()
-            WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL RETURNING *`,
-          [grant.id, workspace.id, JSON.stringify(scopes), expiresAt, requireTierO],
+            WHERE id = $1 AND workspace_id = $2 AND status = 'active' AND expires_at > now() RETURNING *`,
+          [grant.id, workspace.id, JSON.stringify(nextScopes), nextExpiry, nextTierO],
         )).rows[0];
-        if (!updated) return fail(409, "grant_not_active", "Only an active grant can be changed");
+        if (!updated) return null;
+        const key = (scope: Scope) => scope.targets.map(target => `${scope.class} ${target}`);
+        const before = new Set(grant.scopes.flatMap(key));
+        const after = new Set(nextScopes.flatMap(key));
         await recordDelegationAudit(tx, {
           workspaceId: workspace.id, event: "grant.updated", ...actor, ownerUserId: grant.owner_user_id, grantId: grant.id,
-          details: {
-            before: { scopes: grant.scopes, expires_at: new Date(grant.expires_at).toISOString(), require_tier_o: grant.require_tier_o },
-            after: { scopes, expires_at: expiresAt.toISOString(), require_tier_o: requireTierO },
+          data: {
+            scope_diff: { removed: [...before].filter(item => !after.has(item)), added: [...after].filter(item => !before.has(item)) },
+            require_tier_o: { before: grant.require_tier_o, after: nextTierO },
+            expires_at: { before: new Date(grant.expires_at).toISOString(), after: nextExpiry.toISOString() },
           },
         });
         return updated;
       });
-      json(200, grantView(row, now()));
+      if (!row) fail("not_active", "Only an active grant can be changed", 409);
+      json(200, grantView(row!, now()));
       return true;
     }
-    return fail(404, "not_found", "Route not found");
+    return fail("not_found", "Route not found", 404);
+  }
+
+  async function grantFor(workspaceId: string, grantId: string): Promise<GrantRow | null> {
+    return (await input.database.query<GrantRow>(
+      "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [grantId, workspaceId],
+    )).rows[0] ?? null;
+  }
+
+  /**
+   * Every route answers a refusal as Cloud does: `{error: <message>, code}`
+   * with no-store, and an unexpected failure as 503 `unavailable`.
+   */
+  return async function handleDelegation(request: IncomingMessage, response: ServerResponse,
+    path: string, publicPath: string, method: string): Promise<boolean> {
+    if (!isDelegationPath(path)) return false;
+    try {
+      return await route(request, response, path, publicPath, method);
+    } catch (error) {
+      if (response.headersSent) throw error;
+      // DelegationHttpError, and the app's rate limiter (429 rate_limited).
+      const known = error as { status?: unknown; code?: unknown; message?: unknown };
+      if (error instanceof DelegationHttpError || (typeof known?.status === "number" && typeof known.code === "string")) {
+        input.json(response, known.status as number, { error: String(known.message), code: known.code }, true);
+        return true;
+      }
+      input.json(response, 503, { error: "Delegation is unavailable", code: "unavailable" }, true);
+      return true;
+    }
   };
+}
+
+class GrantConflict extends Error {}
+
+/**
+ * PATCH may only narrow (Cloud's narrowingRefusal): every new pattern sits
+ * inside an old pattern of the same class, expiry does not move later, and
+ * Tier O requirements are only added.
+ */
+function narrowingRefusal(grant: GrantRow, patch: { scopes?: Scope[]; expiresAt?: Date; requireTierO?: ActionClass[] }): void {
+  const widen = (error: string) => fail("widening_not_allowed", error, 400);
+  for (const scope of patch.scopes ?? []) {
+    const old = grant.scopes.find(item => item.class === scope.class);
+    if (!old) widen(`Grant does not cover class ${scope.class}; create a new grant to widen`);
+    for (const target of scope.targets) {
+      if (!old!.targets.some(pattern => classTargetCovered(scope.class, pattern, target, true))) {
+        widen(`Target ${target} is not inside the grant; create a new grant to widen`);
+      }
+    }
+  }
+  if (patch.expiresAt && patch.expiresAt.getTime() > time(grant.expires_at)) widen("expires_at may only move earlier");
+  if (patch.requireTierO && grant.require_tier_o.some(item => !patch.requireTierO!.includes(item))) {
+    widen("require_tier_o may only gain classes");
+  }
 }

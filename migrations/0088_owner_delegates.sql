@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS delegation_policies (
   CONSTRAINT delegation_policies_code_owner_match CHECK (code_owner_match IN ('any_path', 'all_paths'))
 );
 
+-- Org-wide delegation settings (§16.3 GET/PUT /api/v1/orgs/{org}/delegation-policy),
+-- set by org owners and admins. They apply to every workspace in the org and
+-- no workspace policy overrides them. No row means the defaults.
+CREATE TABLE IF NOT EXISTS delegation_org_policies (
+  organization_id uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+  -- §15.9 (Khaliq): days audit quotes are kept before redaction to their hash.
+  quote_retention_days integer NOT NULL DEFAULT 90,
+  updated_by uuid,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT delegation_org_policies_quote_retention CHECK (quote_retention_days BETWEEN 1 AND 3650)
+);
+
 -- §5.4: owners of targets that are not repos (service:env, secret paths,
 -- channels). Each pattern maps to a repo (whose CODEOWNERS applies) or to a
 -- list of people. Admin-only (GET/PUT .../delegates/target-owners). A target
@@ -39,7 +51,7 @@ CREATE TABLE IF NOT EXISTS delegation_target_owners (
   updated_by uuid,
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (workspace_id, position),
-  CONSTRAINT delegation_target_owners_kind CHECK ((repo IS NULL) <> (owner_ids IS NULL))
+  CONSTRAINT delegation_target_owners_kind CHECK (repo IS NOT NULL OR owner_ids IS NOT NULL)
 );
 
 -- One-time claim codes: the owner starts a claim, and an agent with no other
@@ -88,6 +100,9 @@ CREATE TABLE IF NOT EXISTS delegation_grants (
   -- [{ "class": "merge", "targets": ["owner/*"] }, ...]
   scopes jsonb NOT NULL,
   require_tier_o text[] NOT NULL DEFAULT '{}',
+  -- active, revoked or expired (a lapsed grant is marked expired when the
+  -- pair gets a new grant; expiry is also checked at every use).
+  status text NOT NULL DEFAULT 'active',
   expires_at timestamptz NOT NULL,
   created_auth_method text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -95,12 +110,14 @@ CREATE TABLE IF NOT EXISTS delegation_grants (
   revoked_at timestamptz,
   revoked_by uuid,
   revoked_reason text,
-  CONSTRAINT delegation_grants_auth_method CHECK (created_auth_method IN ('browser', 'desktop'))
+  CONSTRAINT delegation_grants_auth_method CHECK (created_auth_method IN ('session', 'desktop_bearer')),
+  CONSTRAINT delegation_grants_status CHECK (status IN ('active', 'revoked', 'expired'))
 );
 
-CREATE INDEX IF NOT EXISTS delegation_grants_lookup_idx
+-- One active grant per (owner, delegate); widening is a new grant after revoking.
+CREATE UNIQUE INDEX IF NOT EXISTS delegation_grants_active_pair
   ON delegation_grants (workspace_id, owner_user_id, delegate_agent_id)
-  WHERE revoked_at IS NULL;
+  WHERE status = 'active';
 
 -- Approvals Control knows about: tier O approvals minted by the owner, and
 -- tier D approvals recorded at their first attestation (approval_id derived
@@ -137,6 +154,10 @@ CREATE TABLE IF NOT EXISTS delegation_attestations (
   message_id text NOT NULL,
   recipient_agent_id text NOT NULL,
   delegate_agent_id text NOT NULL,
+  kid text NOT NULL,
+  -- The recipient's accept mode and the standing found; redeem re-checks standing.
+  accept text NOT NULL,
+  standing text NOT NULL,
   issued_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL
 );
@@ -144,12 +165,12 @@ CREATE TABLE IF NOT EXISTS delegation_attestations (
 CREATE INDEX IF NOT EXISTS delegation_attestations_approval_idx
   ON delegation_attestations (approval_id, recipient_agent_id);
 
--- Append-only per-workspace delegation log (§8). Quote text is kept for 90
--- days and then redacted to its SHA-256 (quote_sha256 stays).
+-- Append-only per-workspace delegation log (§8). Quote text is kept for the
+-- org's quote_retention_days (default 90) and then redacted to its SHA-256
+-- (quote_hash stays).
 CREATE TABLE IF NOT EXISTS delegation_audit_events (
-  id uuid PRIMARY KEY,
+  id bigserial PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   event text NOT NULL,
   actor_user_id uuid,
   actor_agent_id text,
@@ -160,13 +181,16 @@ CREATE TABLE IF NOT EXISTS delegation_audit_events (
   message_id text,
   recipient_agent_id text,
   reason text,
-  jti text,
-  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  data jsonb NOT NULL DEFAULT '{}'::jsonb,
   quote text,
-  quote_sha256 text
+  quote_hash text,
+  quote_redacted_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
 CREATE INDEX IF NOT EXISTS delegation_audit_events_workspace_idx
-  ON delegation_audit_events (workspace_id, occurred_at);
+  ON delegation_audit_events (workspace_id, id);
+CREATE INDEX IF NOT EXISTS delegation_audit_events_owner_idx
+  ON delegation_audit_events (workspace_id, owner_user_id, id);
 CREATE INDEX IF NOT EXISTS delegation_audit_events_quote_idx
-  ON delegation_audit_events (occurred_at) WHERE quote IS NOT NULL;
+  ON delegation_audit_events (created_at) WHERE quote IS NOT NULL;

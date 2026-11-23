@@ -582,7 +582,6 @@ export function createApp(input: {
     browserOrigins,
     authenticateAccessToken: (token) => store.authenticateAccessToken(token),
     workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
-    requestObject,
     json,
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
     clientKey: (request) => limiterKey(clientIp(request)),

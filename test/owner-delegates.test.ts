@@ -78,7 +78,7 @@ async function setup(t: TestContext, options: { signing?: boolean } = {}) {
   }
 
   function approval(actions: unknown, extra: Record<string, unknown> = {}) {
-    return { v: 1, owner_id: env.ownerId, actions, quote: "yes merge 2250 when green", quote_source: "grok:dm", ...extra };
+    return { v: 1, owner_id: env.ownerId, actions, quote: "yes merge 2250 when green", quote_source: "chat:dm", ...extra };
   }
 
   async function attest(recipient: { id: string; token: string }, messageId: string,
@@ -105,9 +105,9 @@ async function setup(t: TestContext, options: { signing?: boolean } = {}) {
 
   async function events(event?: string) {
     return (await env.database.query<{ event: string; reason: string | null; grant_id: string | null; quote: string | null;
-      quote_sha256: string | null; jti: string | null; approval_id: string | null }>(
-      `SELECT event, reason, grant_id, quote, quote_sha256, jti, approval_id FROM delegation_audit_events
-        WHERE ($1::text IS NULL OR event = $1) ORDER BY occurred_at`,
+      quote_hash: string | null; jti: string | null; approval_id: string | null }>(
+      `SELECT event, reason, grant_id, quote, quote_hash, data->>'jti' AS jti, approval_id FROM delegation_audit_events
+        WHERE ($1::text IS NULL OR event = $1) ORDER BY id`,
       [event ?? null],
     )).rows;
   }
@@ -120,7 +120,7 @@ async function ready(t: TestContext) {
   const env = await setup(t);
   await env.enable();
   const recipient = await env.desktopIdentity("relay-coder");
-  const bot = await env.claim("kjgrok");
+  const bot = await env.claim("assistant");
   const created = await env.grant(bot.id, [
     { class: "merge", targets: ["AgentWorkforce/*"] },
     { class: "deploy", targets: ["*:staging", "relay:prod"] },
@@ -212,19 +212,18 @@ test("human-only routes refuse agent, CLI and enrollment credentials; off by def
   // Default: delegation_enabled is off. GET works and says so; writes are refused.
   const listed = await env.bearer("/delegates");
   assert.equal(listed.status, 200, listed.raw);
-  assert.equal(listed.body.policy.delegation_enabled, false);
-  assert.deepEqual(listed.body.grants, []);
+  assert.deepEqual(listed.body, { grants: [] });
   const refusedOff = await env.browser("/delegates", "POST", { delegate_agent_id: recipient.id, scopes: [{ class: "merge", targets: ["a/b"] }] });
   assert.equal(refusedOff.status, 403, refusedOff.raw);
-  assert.equal(refusedOff.body.error, "not_enabled");
-  assert.equal((await env.browser("/delegates/claims", "POST")).body.error, "not_enabled");
-  assert.equal((await env.browser("/delegates/approvals", "POST", { actions: [{ class: "merge", target: "a/b" }] })).body.error, "not_enabled");
+  assert.equal(refusedOff.body.code, "not_enabled");
+  assert.equal((await env.browser("/delegates/claims", "POST")).body.code, "not_enabled");
+  assert.equal((await env.browser("/delegates/approvals", "POST", { actions: [{ class: "merge", target: "a/b" }] })).body.code, "not_enabled");
 
   // A plain device-flow CLI login is not a human session for this surface.
   const cli = await env.deviceLogin();
   const cliRead = await env.bearer("/delegates", "GET", undefined, cli);
   assert.equal(cliRead.status, 403, cliRead.raw);
-  assert.equal(cliRead.body.error, "human_session_required");
+  assert.equal(cliRead.body.code, "forbidden");
   // An agent's Relaycast token and the unexchanged handoff are not Control sessions at all.
   assert.equal((await env.bearer("/delegates", "GET", undefined, recipient.token)).status, 401);
   assert.ok([401, 403].includes((await env.bearer("/delegates", "GET", undefined, env.desktop.handoffToken)).status));
@@ -238,20 +237,20 @@ test("human-only routes refuse agent, CLI and enrollment credentials; off by def
   const memberDesktop = await env.desktopSignIn({ hostName: "member-box", userId: memberId });
   const memberPolicy = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true }, memberDesktop.session);
   assert.equal(memberPolicy.status, 403, memberPolicy.raw);
-  assert.equal(memberPolicy.body.error, "forbidden");
+  assert.equal(memberPolicy.body.code, "forbidden");
 
   // Cookie writes need an allowed origin.
   const crossSite = await request(env.origin, `/cloud${env.base}/delegates/policy`, {
     method: "PUT", cookie: env.desktop.session, body: { delegation_enabled: true }, headers: { origin: "https://evil.example" },
   });
   assert.equal(crossSite.status, 403, crossSite.raw);
-  assert.equal(crossSite.body.error, "csrf_rejected");
+  assert.equal(crossSite.body.code, "csrf_rejected");
 
   // Step-up: a browser session signed in more than 15 minutes ago cannot change delegates.
   await env.database.query("UPDATE token_sessions SET created_at = now() - interval '20 minutes'");
   const stale = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true });
   assert.equal(stale.status, 403, stale.raw);
-  assert.equal(stale.body.error, "reauthentication_required");
+  assert.equal(stale.body.code, "reauthentication_required");
   // The Desktop-verified bearer is not a browser session and needs no step-up.
   const viaDesktop = await env.bearer("/delegates/policy", "PUT", { delegation_enabled: true });
   assert.equal(viaDesktop.status, 200, viaDesktop.raw);
@@ -261,15 +260,15 @@ test("human-only routes refuse agent, CLI and enrollment credentials; off by def
 test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits, audit", async (t) => {
   const env = await setup(t);
   await env.enable({ max_expiry_days: 60 });
-  const bot = await env.claim("kjgrok");
+  const bot = await env.claim("assistant");
   const other = await env.desktopIdentity("not-mine", await env.addMember("bob@acme.test"));
 
   // The delegate must be bound to the caller.
   const foreign = await env.browser("/delegates", "POST", { delegate_agent_id: other.id, scopes: [{ class: "merge", targets: ["a/b"] }] });
-  assert.equal(foreign.status, 409, foreign.raw);
-  assert.equal(foreign.body.error, "delegate_not_bound");
+  assert.equal(foreign.status, 403, foreign.raw);
+  assert.equal(foreign.body.code, "not_delegate");
   const unknown = await env.browser("/delegates", "POST", { delegate_agent_id: "ag_nobody", scopes: [{ class: "merge", targets: ["a/b"] }] });
-  assert.equal(unknown.body.error, "delegate_not_bound");
+  assert.equal(unknown.body.code, "not_delegate");
 
   // Shape: closed classes, whole-segment wildcards, one scope per class, expiry caps.
   for (const scopes of [
@@ -286,11 +285,17 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
     expires_at: new Date(Date.now() + 61 * 86_400_000).toISOString(),
   });
   assert.equal(tooLong.status, 400, tooLong.raw);
+  assert.equal(tooLong.body.code, "invalid_expiry");
 
   const created = await env.grant(bot.id, [{ class: "merge", targets: ["AgentWorkforce/*"] }, { class: "pr_ops", targets: ["AgentWorkforce/relay"] }]);
   assert.match(created.grant_id, /^grt_/);
   assert.equal(created.status, "active");
-  assert.equal(created.delegate_agent_name, "kjgrok");
+  assert.deepEqual(Object.keys(created).sort(), ["created_at", "delegate_agent_id", "expires_at", "grant_id", "owner_id",
+    "require_tier_o", "revoked_at", "revoked_reason", "scopes", "status", "updated_at"]);
+  // One active grant per (owner, delegate): widening is a new grant after revoking.
+  const twice = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "merge", targets: ["a/b"] }] });
+  assert.equal(twice.status, 409, twice.raw);
+  assert.equal(twice.body.code, "grant_exists");
   // Default expiry: 30 days.
   const days = (Date.parse(created.expires_at) - Date.now()) / 86_400_000;
   assert.ok(days > 29.9 && days <= 30, String(days));
@@ -309,11 +314,12 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
   ]) {
     const widened = await env.browser(`/delegates/${created.grant_id}`, "PATCH", patch);
     assert.equal(widened.status, 400, `${JSON.stringify(patch)} ${widened.raw}`);
-    assert.equal(widened.body.error, "widening_refused");
+    assert.equal(widened.body.code, "widening_not_allowed");
   }
 
-  // A second grant, then the owner's panic button.
-  const second = await env.grant(bot.id, [{ class: "external_comms", targets: ["slack:*"] }]);
+  // A second delegate's grant, then the owner's panic button.
+  const bot2 = await env.claim("assistant-2");
+  const second = await env.grant(bot2.id, [{ class: "external_comms", targets: ["slack:*"] }]);
   const list = await env.bearer("/delegates");
   assert.equal(list.body.grants.length, 2);
   const revokedOne = await request(env.origin, `/cloud${env.base}/delegates/${second.grant_id}`, {
@@ -324,7 +330,7 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
   assert.equal(revokedOne.body.revoked_reason, "owner_revoked");
   const all = await env.browser("/delegates/revoke-all", "POST", {});
   assert.equal(all.status, 200, all.raw);
-  assert.deepEqual(all.body.grant_ids, [created.grant_id]);
+  assert.deepEqual(all.body, { revoked: [created.grant_id] });
   // A member cannot revoke the whole workspace.
   const memberId = await env.addMember("carol@acme.test");
   const carol = await env.desktopSignIn({ hostName: "carol-box", userId: memberId });
@@ -338,7 +344,7 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
   // Revocation stays allowed while delegation is off; creation does not.
   await env.enable({ delegation_enabled: false });
   const third = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "merge", targets: ["a/b"] }] });
-  assert.equal(third.body.error, "not_enabled");
+  assert.equal(third.body.code, "not_enabled");
   assert.equal((await env.browser("/delegates/revoke-all", "POST", {})).status, 200);
 
   const audit = await env.bearer("/delegates/audit");
@@ -359,40 +365,47 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
 test("policy change revokes grants that no longer fit", async (t) => {
   const env = await setup(t);
   await env.enable();
-  const bot = await env.claim("kjgrok");
+  const bot = await env.claim("assistant");
+  const bot2 = await env.claim("assistant-2");
   const merge = await env.grant(bot.id, [{ class: "merge", targets: ["a/*"] }]);
-  const comms = await env.grant(bot.id, [{ class: "external_comms", targets: ["slack:*"] }]);
+  const comms = await env.grant(bot2.id, [{ class: "external_comms", targets: ["slack:*"] }]);
   const put = await env.enable({ allowed_classes: ["merge", "pr_ops"] });
-  assert.deepEqual(put.body.revoked_grant_ids, [comms.grant_id]);
+  assert.deepEqual(put.body, { delegation_enabled: true, max_expiry_days: 90, allowed_classes: ["merge", "pr_ops"],
+    require_tier_o: [], code_owner_match: "any_path", revoked_grants: [comms.grant_id] });
   const listed = (await env.bearer("/delegates")).body.grants as Array<{ grant_id: string; status: string; revoked_reason: string }>;
   assert.equal(listed.find(row => row.grant_id === merge.grant_id)!.status, "active");
   assert.equal(listed.find(row => row.grant_id === comms.grant_id)!.revoked_reason, "policy_changed");
+  await env.bearer("/delegates/revoke-all", "POST", {});
   const refused = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "deploy", targets: ["*:staging"] }] });
-  assert.equal(refused.body.error, "class_not_allowed");
+  assert.equal(refused.status, 403, refused.raw);
+  assert.equal(refused.body.code, "out_of_scope");
 });
 
 test("claims: single use, owner-bound, need the agent's own token", async (t) => {
   const env = await setup(t);
   await env.enable();
-  const bot = env.world.addAgent("grok-bot");
+  const bot = env.world.addAgent("chat-assistant");
   const started = await env.browser("/delegates/claims", "POST");
   assert.equal(started.status, 201, started.raw);
-  assert.match(started.body.code, /^[0-9A-Z]{4}(-[0-9A-Z]{4}){3}$/);
+  assert.match(started.body.code, /^dlg_[A-Za-z0-9_-]{32}$/);
+  assert.match(started.body.claim_id, /^clm_[A-Za-z0-9]+$/);
   const complete = (body: Record<string, unknown>) =>
     request(env.origin, `${env.base}/delegates/claims/complete`, { method: "POST", body });
 
   const wrongToken = await complete({ code: started.body.code, agent_id: bot.id, agent_token: "at_not_a_real_token" });
   assert.equal(wrongToken.status, 403, wrongToken.raw);
-  assert.equal(wrongToken.body.error, "agent_not_proven");
+  assert.equal(wrongToken.body.code, "invalid_agent");
+  assert.equal(typeof wrongToken.body.error, "string");
   const otherAgent = env.world.addAgent("impostor");
   const mismatch = await complete({ code: started.body.code, agent_id: bot.id, agent_token: otherAgent.token });
-  assert.equal(mismatch.body.error, "agent_not_proven");
-  const badCode = await complete({ code: "AAAA-BBBB-CCCC-DDDD", agent_id: bot.id, agent_token: bot.token });
+  assert.equal(mismatch.body.code, "invalid_agent");
+  const badCode = await complete({ code: "dlg_AAAABBBBCCCCDDDDEEEEFFFF", agent_id: bot.id, agent_token: bot.token });
   assert.equal(badCode.status, 404, badCode.raw);
+  assert.equal(badCode.body.code, "invalid_code");
 
-  const done = await complete({ code: started.body.code.toLowerCase(), agent_id: bot.id, agent_token: bot.token });
+  const done = await complete({ code: started.body.code, agent_id: bot.id, agent_token: bot.token });
   assert.equal(done.status, 200, done.raw);
-  assert.deepEqual(done.body, { claim_id: started.body.claim_id, owner_id: env.ownerId, agent_id: bot.id, agent_name: "grok-bot" });
+  assert.deepEqual(done.body, { claim_id: started.body.claim_id, agent_id: bot.id, owner_id: env.ownerId });
   const replay = await complete({ code: started.body.code, agent_id: otherAgent.id, agent_token: otherAgent.token });
   assert.equal(replay.status, 404, replay.raw);
 
@@ -400,7 +413,7 @@ test("claims: single use, owner-bound, need the agent's own token", async (t) =>
   const second = await env.browser("/delegates/claims", "POST");
   const again = await complete({ code: second.body.code, agent_id: bot.id, agent_token: bot.token });
   assert.equal(again.status, 409, again.raw);
-  assert.equal(again.body.error, "already_bound");
+  assert.equal(again.body.code, "already_bound");
 
   // Expired codes are refused.
   const third = await env.browser("/delegates/claims", "POST");
@@ -459,7 +472,7 @@ test("attestation: a live delegate's in-scope approval is signed and verifies ag
   const [event] = await env.events("approval.attested");
   assert.equal(event!.jti, claims.jti);
   assert.equal(event!.quote, "yes merge 2250 when green");
-  assert.equal(event!.quote_sha256, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
+  assert.equal(event!.quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
 
   // Positive verdicts are not cached: a second ask issues a fresh jti.
   const again = await env.attest(recipient, messageId);
@@ -497,7 +510,8 @@ test("attestation refusal reasons", async (t) => {
   // out_of_scope: the whole approval is refused when one action is outside the grant.
   assert.equal(await reason(send(env, bot, recipient, env.approval([...merge, { class: "merge", target: "Other/repo#1" }]))), "out_of_scope");
   assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "pr_ops", target: "AgentWorkforce/relay" }]))), "out_of_scope");
-  assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/*" }]))), "out_of_scope");
+  // A wildcard action target is not a concrete action: the approval is malformed (as in Cloud).
+  assert.equal(await reason(send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/*" }]))), "no_approval");
 
   // expired: the approval's own expires_at has passed.
   assert.equal(await reason(send(env, bot, recipient, env.approval(merge, { expires_at: "2020-01-01T00:00:00Z" }))), "expired");
@@ -545,7 +559,7 @@ test("attestation refusal reasons", async (t) => {
   // expired: the grant itself has expired.
   const fresh = await env.grant(bot.id, [{ class: "deploy", targets: ["*:staging"] }]);
   await env.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [fresh.grant_id]);
-  assert.equal(await reason(send(env, bot, recipient, env.approval(deploy))), "revoked");
+  assert.equal(await reason(send(env, bot, recipient, env.approval(deploy))), "expired");
 
   // Every refusal is audited with its reason.
   const refused = new Set((await env.events("approval.refused")).map(row => row.reason));
@@ -573,9 +587,10 @@ test("attestation: expired grant, relay outage, wrong credentials and a released
   assert.equal((await env.attest(recipient, messageId, "own_owner", cli)).status, 403);
   assert.equal((await env.attest(recipient, messageId, "own_owner", recipient.token)).status, 401);
   const bad = await request(env.origin, `${env.base}/messaging/delegation`, {
-    method: "POST", token: env.desktop.accessToken, body: { recipient_agent_id: recipient.id, recipient_token: recipient.token, message_id: messageId },
+    method: "POST", token: env.desktop.accessToken, body: { recipient_agent_id: recipient.id, recipient_token: recipient.token },
   });
   assert.equal(bad.status, 400, bad.raw);
+  assert.deepEqual(bad.body, { error: "Invalid request", code: "invalid_request" });
   const extra = await request(env.origin, `${env.base}/messaging/delegation`, {
     method: "POST", token: env.desktop.accessToken,
     body: { recipient_agent_id: recipient.id, recipient_token: recipient.token, message_id: messageId, accept: "own_owner", owner_approval: {} },
@@ -583,7 +598,7 @@ test("attestation: expired grant, relay outage, wrong credentials and a released
   assert.equal(extra.status, 400, extra.raw);
 
   // A released delegate revokes its grants.
-  env.world.agents.get("kjgrok")!.status = "released";
+  env.world.agents.get("assistant")!.status = "released";
   assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval(merge)))).body.reason, "revoked");
   const grant = (await env.bearer("/delegates")).body.grants[0];
   assert.equal(grant.revoked_reason, "agent_released");
@@ -593,7 +608,7 @@ test("attestation without a signing key is unavailable and the JWKS is empty", a
   const env = await setup(t, { signing: false });
   await env.enable();
   const recipient = await env.desktopIdentity("relay-coder");
-  const bot = await env.claim("kjgrok");
+  const bot = await env.claim("assistant");
   await env.grant(bot.id, [{ class: "merge", targets: ["a/*"] }]);
   const messageId = send(env, bot, recipient, env.approval([{ class: "merge", target: "a/b" }]));
   assert.equal((await env.attest(recipient, messageId)).body.reason, "unavailable");
@@ -617,7 +632,7 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   assert.deepEqual(wrong.body, { ok: false, reason: "out_of_scope" });
   // A recipient that never had it attested.
   const other = await env.desktopIdentity("second-coder");
-  assert.deepEqual((await env.redeem(other, approvalId, prod)).body, { ok: false, reason: "not_pending" });
+  assert.deepEqual((await env.redeem(other, approvalId, prod)).body, { ok: false, reason: "no_approval" });
   // Unknown approval.
   assert.deepEqual((await env.redeem(recipient, "apv_unknown123", prod)).body, { ok: false, reason: "no_approval" });
 
@@ -632,7 +647,7 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   const redeemed = await env.events("approval.redeemed");
   assert.equal(redeemed.length, 1);
   const refused = new Set((await env.events("redeem.refused")).map(row => row.reason));
-  for (const code of ["out_of_scope", "not_pending", "no_approval", "consumed"]) assert.ok(refused.has(code), code);
+  for (const code of ["out_of_scope", "no_approval", "consumed"]) assert.ok(refused.has(code), code);
 });
 
 test("redeem: revocation invalidates unredeemed approvals at once", async (t) => {
@@ -667,6 +682,8 @@ test("redeem: multi-use tier D approvals re-check without consuming; expiry is e
 test("tier O: owner-minted approvals carry the delegate's message and are single-use", async (t) => {
   const { env, recipient, bot } = await ready(t);
   const secret = { class: "secret_change", target: "prod/stripe" };
+  // One active grant per pair: re-grant the delegate with secret_change added.
+  await env.bearer("/delegates/revoke-all", "POST", {});
   const tierD = await env.grant(bot.id, [{ class: "secret_change", targets: ["prod/*"] }]);
   assert.ok(tierD.grant_id);
   // As tier D, a default tier O class is refused.
@@ -674,8 +691,8 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
 
   const minted = await env.browser("/delegates/approvals", "POST", { actions: [secret] });
   assert.equal(minted.status, 201, minted.raw);
+  assert.deepEqual(Object.keys(minted.body), ["approval_id"]);
   assert.match(minted.body.approval_id, /^apv_/);
-  assert.equal(minted.body.single_use, true);
   const ref = minted.body.approval_id as string;
   // Actions must equal the minted object's.
   const mismatch = send(env, bot, recipient, env.approval([{ class: "secret_change", target: "prod/other" }], { approval_ref: ref }));
@@ -703,11 +720,17 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
 test("quote text is redacted to its hash after 90 days", async (t) => {
   const { env, recipient, bot } = await ready(t);
   await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#3" }])));
-  await env.database.query("UPDATE delegation_audit_events SET occurred_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
   const audit = await env.bearer("/delegates/audit");
   const attested = audit.body.events.find((event: { event: string }) => event.event === "approval.attested");
   assert.equal(attested.quote, null);
-  assert.match(attested.quote_sha256, /^[0-9a-f]{64}$/);
+  assert.match(attested.quote_hash, /^[0-9a-f]{64}$/);
+  assert.ok(attested.quote_redacted_at);
+  assert.deepEqual(Object.keys(attested).sort(), ["actor_agent_id", "actor_user_id", "approval_id", "auth_method", "created_at",
+    "data", "event", "grant_id", "id", "message_id", "owner_id", "quote", "quote_hash", "quote_redacted_at", "reason",
+    "recipient_agent_id"]);
+  assert.equal(attested.auth_method, "desktop_bearer");
+  assert.equal(attested.data.jti.length, 36);
 });
 
 // ---------------------------------------------------------------------------
@@ -723,8 +746,8 @@ test("standing: code_owners accepts another person's delegate only through targe
   // Admin-only list; members are refused; bodies are validated.
   const memberRead = await env.bearer("/delegates/target-owners", "GET", undefined, bobDesktop.accessToken);
   assert.equal(memberRead.status, 403, memberRead.raw);
-  for (const bad of [[{ pattern: "*:staging" }], [{ pattern: "*:staging", repo: "a/b", owner_ids: [env.ownerId] }],
-    [{ pattern: "relay-*", owner_ids: [env.ownerId] }], [{ pattern: "*:staging", owner_ids: [randomUUID()] }]]) {
+  for (const bad of [[{ pattern: "*:staging" }], [{ pattern: "*:staging", repo: "not a repo" }],
+    [{ pattern: "relay-*", owner_ids: [env.ownerId] }], [{ pattern: "*:staging", owner_ids: ["not-a-uuid"] }]]) {
     const refused = await env.browser("/delegates/target-owners", "PUT", bad);
     assert.equal(refused.status, 400, `${JSON.stringify(bad)} ${refused.raw}`);
   }
@@ -733,7 +756,8 @@ test("standing: code_owners accepts another person's delegate only through targe
     { pattern: "docs:*", repo: "AgentWorkforce/docs" },
   ]);
   assert.equal(put.status, 200, put.raw);
-  assert.deepEqual((await env.bearer("/delegates/target-owners")).body.target_owners, put.body.target_owners);
+  assert.deepEqual(put.body, [{ pattern: "*:staging", owner_ids: [env.ownerId] }, { pattern: "docs:*", repo: "AgentWorkforce/docs" }]);
+  assert.deepEqual((await env.bearer("/delegates/target-owners")).body, put.body);
 
   // The owner is a target owner of *:staging: Bob's code_owners agent accepts.
   const forBob = send(env, bot, bobsAgent, env.approval([staging]));
@@ -746,8 +770,9 @@ test("standing: code_owners accepts another person's delegate only through targe
   const merge = send(env, bot, bobsAgent, env.approval([{ class: "merge", target: "AgentWorkforce/relay#2250" }]));
   assert.equal((await env.attest(bobsAgent, merge, "code_owners", bobDesktop.accessToken)).body.reason, "recipient_policy");
   // A target-owners entry that points at a repo also needs CODEOWNERS: fail closed.
-  await env.grant(bot.id, [{ class: "deploy", targets: ["docs:*"] }]);
-  const docs = send(env, bot, bobsAgent, env.approval([{ class: "deploy", target: "docs:staging2" }]));
+  const docsBot = await env.claim("docs-bot");
+  await env.grant(docsBot.id, [{ class: "deploy", targets: ["docs:*"] }]);
+  const docs = send(env, docsBot, bobsAgent, env.approval([{ class: "deploy", target: "docs:staging2" }]));
   assert.equal((await env.attest(bobsAgent, docs, "code_owners", bobDesktop.accessToken)).body.reason, "recipient_policy");
   // Standing is per action: one action without it refuses the whole approval.
   const mixed = send(env, bot, bobsAgent, env.approval([staging, { class: "merge", target: "AgentWorkforce/relay#1" }]));
@@ -758,7 +783,7 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
   const env = await setup(t);
   await env.enable();
   const session = await env.desktopIdentity("relay-coder");
-  const bot = await env.claim("kjgrok");
+  const bot = await env.claim("assistant");
   // Grant targets are `*` or `<agent id>:*`.
   for (const targets of [["relay-coder"], ["ag_1:ref"], ["a/b"]]) {
     const bad = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "prompt_approval", targets }] });
@@ -784,8 +809,9 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
   const bobsSession = await env.desktopIdentity("bob-session", bobId);
   const bobDesktop = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
   await env.browser("/delegates/target-owners", "PUT", [{ pattern: "*", owner_ids: [env.ownerId] }]);
-  await env.grant(bot.id, [{ class: "prompt_approval", targets: ["*"] }]);
-  const forBob = send(env, bot, bobsSession, env.approval([{ class: "prompt_approval", target: `${bobsSession.id}:r9` }]));
+  const wideBot = await env.claim("wide-bot");
+  await env.grant(wideBot.id, [{ class: "prompt_approval", targets: ["*"] }]);
+  const forBob = send(env, wideBot, bobsSession, env.approval([{ class: "prompt_approval", target: `${bobsSession.id}:r9` }]));
   assert.equal((await env.attest(bobsSession, forBob, "code_owners", bobDesktop.accessToken)).body.reason, "recipient_policy");
 
   // prompt-delegates: the machine owner's delegates whose grants cover the session.
@@ -794,14 +820,16 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
   });
   const listed = await delegates(env.desktop.accessToken, session);
   assert.equal(listed.status, 200, listed.raw);
-  assert.deepEqual(listed.body, { delegates: [{ agent_id: bot.id, grant_id: created.grant_id }] });
+  assert.deepEqual(listed.body.delegates.map((row: { agent_id: string }) => row.agent_id).sort(), [bot.id, wideBot.id].sort());
+  assert.ok(listed.body.delegates.some((row: { grant_id: string }) => row.grant_id === created.grant_id));
   // Another session of the owner is covered by the `*` grant only.
   const otherList = await delegates(env.desktop.accessToken, other);
-  assert.equal(otherList.body.delegates.length, 1);
-  assert.notEqual(otherList.body.delegates[0].grant_id, created.grant_id);
-  // A session that is not the caller's, or a wrong token, lists nobody.
-  assert.deepEqual((await delegates(env.desktop.accessToken, bobsSession)).body, { delegates: [] });
-  assert.deepEqual((await delegates(env.desktop.accessToken, { ...session, token: "at_wrong_token_value" })).body, { delegates: [] });
+  assert.deepEqual(otherList.body.delegates.map((row: { agent_id: string }) => row.agent_id), [wideBot.id]);
+  // A session that is not the caller's, or a wrong token, is 403.
+  const notMine = await delegates(env.desktop.accessToken, bobsSession);
+  assert.equal(notMine.status, 403, notMine.raw);
+  assert.deepEqual(notMine.body, { error: "The session is not yours", code: "forbidden" });
+  assert.equal((await delegates(env.desktop.accessToken, { ...session, token: "at_wrong_token_value" })).status, 403);
   // Bob's own session: the owner's bot is not Bob's delegate.
   assert.deepEqual((await delegates(bobDesktop.accessToken, bobsSession)).body, { delegates: [] });
   // A plain CLI token is refused.
@@ -853,7 +881,7 @@ test("every delegation route is documented in openapi.yaml", () => {
   const expected: Record<string, string[]> = {
     "/.well-known/relay-delegation-keys.json": ["get"],
     "/api/v1/workspaces/{workspaceId}/delegates": ["get", "post"],
-    "/api/v1/workspaces/{workspaceId}/delegates/{grantId}": ["get", "patch", "delete"],
+    "/api/v1/workspaces/{workspaceId}/delegates/{grantId}": ["patch", "delete"],
     "/api/v1/workspaces/{workspaceId}/delegates/revoke-all": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims/complete": ["post"],
@@ -864,8 +892,89 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/messaging/delegation": ["post"],
     "/api/v1/workspaces/{workspaceId}/messaging/delegation/redeem": ["post"],
     "/api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates": ["post"],
+    "/api/v1/orgs/{organizationId}/delegation-policy": ["get", "put"],
   };
   for (const [path, methods] of Object.entries(expected)) {
     for (const method of methods) assert.ok(spec.paths[path]?.[method], `${method.toUpperCase()} ${path}`);
   }
+});
+
+test("quote_retention_days is an org setting (1–3650, default 90) that every workspace in the org follows", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const orgPath = `/api/v1/orgs/${env.orgId}/delegation-policy`;
+  const orgBrowser = (method: string, body?: unknown, cookie = env.desktop.session) =>
+    request(env.origin, `/cloud${orgPath}`, { method, cookie, ...(method === "GET" ? {} : { body: body ?? {} }),
+      headers: { origin: env.origin } });
+
+  // Default 90 with no row; the Desktop bearer and the browser session both read it.
+  assert.deepEqual((await request(env.origin, orgPath, { token: env.desktop.accessToken })).body, { quote_retention_days: 90 });
+  assert.deepEqual((await orgBrowser("GET")).body, { quote_retention_days: 90 });
+
+  // Validation: an integer from 1 to 3650, required, nothing else.
+  for (const bad of [0, 3651, 1.5, "90", -1, null]) {
+    const refused = await orgBrowser("PUT", { quote_retention_days: bad });
+    assert.equal(refused.status, 400, `${JSON.stringify(bad)} ${refused.raw}`);
+    assert.deepEqual(refused.body, { error: "quote_retention_days must be an integer from 1 to 3650", code: "invalid_request" });
+  }
+  assert.equal((await orgBrowser("PUT", {})).status, 400);
+  assert.equal((await orgBrowser("PUT", { quote_retention_days: 30, extra: 1 })).status, 400);
+  for (const days of [1, 3650, 30]) {
+    const put = await orgBrowser("PUT", { quote_retention_days: days });
+    assert.equal(put.status, 200, put.raw);
+    assert.deepEqual(put.body, { quote_retention_days: days });
+  }
+  assert.deepEqual((await request(env.origin, orgPath, { token: env.desktop.accessToken })).body, { quote_retention_days: 30 });
+
+  // Org owners and admins only; never a plain CLI token or an agent token; an unknown org id is 404.
+  const memberId = await env.addMember("member@acme.test");
+  const member = await env.desktopSignIn({ hostName: "member-box", userId: memberId });
+  const memberPut = await orgBrowser("PUT", { quote_retention_days: 5 }, member.session);
+  assert.equal(memberPut.status, 403, memberPut.raw);
+  assert.equal(memberPut.body.code, "forbidden");
+  assert.equal((await request(env.origin, orgPath, { token: member.accessToken })).status, 403);
+  assert.equal((await request(env.origin, orgPath, { token: await env.deviceLogin() })).status, 403);
+  assert.equal((await request(env.origin, orgPath, { token: recipient.token })).status, 401);
+  assert.equal((await request(env.origin, `/api/v1/orgs/not-a-uuid/delegation-policy`, { token: env.desktop.accessToken })).status, 404);
+  assert.equal((await request(env.origin, `/api/v1/orgs/${randomUUID()}/delegation-policy`, { token: env.desktop.accessToken })).status, 403);
+
+  // A workspace cannot override it: the workspace policy has no such field.
+  const workspaceField = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, quote_retention_days: 5 });
+  assert.equal(workspaceField.status, 400, workspaceField.raw);
+  assert.equal("quote_retention_days" in (await env.enable()).body, false);
+
+  // Audited as org_policy.updated in each of the org's workspaces.
+  const orgEvents = await env.database.query<{ workspace_id: string }>(
+    "SELECT DISTINCT workspace_id::text FROM delegation_audit_events WHERE event = 'org_policy.updated'");
+  assert.deepEqual(orgEvents.rows.map(row => row.workspace_id).sort(), [env.workspaceId, env.otherWorkspaceId].sort());
+
+  // A 30-day window: a 31-day-old quote is redacted, a 29-day-old one is kept.
+  const quoted = async (target: string) => {
+    const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target }])));
+    assert.equal(attested.body.verdict, "delegate", attested.raw);
+    return attested.body.claims.jti as string;
+  };
+  const old = await quoted("AgentWorkforce/relay#31");
+  const recent = await quoted("AgentWorkforce/relay#29");
+  await env.database.query(
+    "UPDATE delegation_audit_events SET created_at = now() - interval '31 days' WHERE data->>'jti' = $1", [old]);
+  await env.database.query(
+    "UPDATE delegation_audit_events SET created_at = now() - interval '29 days' WHERE data->>'jti' = $1", [recent]);
+  type Event = { data: { jti?: string }; quote: string | null; quote_hash: string | null; quote_redacted_at: string | null };
+  const audit = async () => (await env.bearer("/delegates/audit")).body.events as Event[];
+  const byJti = (events: Event[], jti: string) => events.find(event => event.data.jti === jti)!;
+  let events = await audit();
+  assert.equal(byJti(events, old).quote, null);
+  assert.ok(byJti(events, old).quote_redacted_at);
+  assert.equal(byJti(events, old).quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
+  assert.equal(byJti(events, recent).quote, "yes merge 2250 when green");
+  assert.equal(byJti(events, recent).quote_redacted_at, null);
+
+  // Shortening applies to existing quotes at the next sweep; lengthening restores nothing.
+  await orgBrowser("PUT", { quote_retention_days: 5 });
+  events = await audit();
+  assert.equal(byJti(events, recent).quote, null);
+  await orgBrowser("PUT", { quote_retention_days: 3650 });
+  events = await audit();
+  assert.equal(byJti(events, old).quote, null);
+  assert.equal(byJti(events, recent).quote, null);
 });

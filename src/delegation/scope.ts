@@ -52,7 +52,7 @@ export const conditionSchema = z.discriminatedUnion("type", [
 export type Condition = z.infer<typeof conditionSchema>;
 export const GITHUB_CONDITIONS: ReadonlySet<string> = new Set(["ci_green", "head_sha", "reviews_approved", "mergeable"]);
 
-export type Action = { class: ActionClass; target: string; conditions?: Condition[]; note?: string };
+export type Action = { class: ActionClass; target: string; conditions?: Condition[]; note?: string | null };
 export type Scope = { class: ActionClass; targets: string[] };
 
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i;
@@ -63,24 +63,40 @@ export const APPROVAL_REF = /^apv_[A-Za-z0-9]{8,64}$/;
 export const actionClass = z.enum(ACTION_CLASSES);
 const target = z.string().min(1).max(MAX_TARGET_CHARS).refine(value => !/[\u0000-\u001f\u007f]/.test(value));
 
-/** `owner/repo#N`: the only target GitHub conditions may name. */
-export const PR_TARGET = /^[^/:#\s*]+\/[^/:#\s*]+#[0-9]{1,12}$/;
-/** `owner/repo` or `owner/repo#N`: targets whose standing comes from CODEOWNERS. */
-export const REPO_TARGET = /^[^/:#\s]+\/[^/:#\s]+(#[0-9]{1,12})?$/;
+/** `owner/repo#N`: the only target PR conditions apply to (Cloud's PR_TARGET). */
+export const PR_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}$/u;
+/** `owner/repo`: a repository target (Cloud's REPO_TARGET). */
+export const REPO_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
+/** `<session agent id>:<request ref>`: a prompt_approval action target. */
+const PROMPT_TARGET = /^[^\s:*#/]{1,200}:[^\s:*#/]{1,200}$/u;
 
+/** A concrete target: a valid pattern with no wildcard. */
+export function isConcreteTarget(target: string): boolean {
+  return validTargetPattern(target) && !target.includes("*");
+}
+
+/** Whether an action is well formed: concrete target, and conditions valid for that target (§16.1). */
+export function actionIsValid(action: Pick<Action, "class" | "target" | "conditions">): boolean {
+  if (!isConcreteTarget(action.target)) return false;
+  if (action.class === "prompt_approval" && !PROMPT_TARGET.test(action.target)) return false;
+  const conditions = action.conditions ?? [];
+  if (conditions.length > MAX_CONDITIONS) return false;
+  if (new Set(conditions.map(condition => condition.type)).size !== conditions.length) return false;
+  const prTarget = action.class !== "prompt_approval" && PR_TARGET.test(action.target);
+  return conditions.every(condition => condition.type === "not_before" || prTarget);
+}
+
+const uniqueActions = (actions: ReadonlyArray<Pick<Action, "class" | "target">>) =>
+  new Set(actions.map(action => `${action.class}\u0000${action.target}`)).size === actions.length;
+
+/** An action in a tier O mint body: class, target, conditions (no note), as Cloud. */
 export const actionSchema = z.object({
   class: actionClass,
   target,
   conditions: z.array(conditionSchema).max(MAX_CONDITIONS).optional(),
-  note: z.string().max(MAX_NOTE_CHARS).optional(),
-}).strict().superRefine((action, context) => {
-  for (const condition of action.conditions ?? []) {
-    if (action.class === "prompt_approval" ? condition.type !== "not_before"
-      : GITHUB_CONDITIONS.has(condition.type) && !PR_TARGET.test(action.target)) {
-      context.addIssue({ code: "custom", message: `condition ${condition.type} is not valid on this target` });
-    }
-  }
-});
+}).strict().refine(actionIsValid, { message: "invalid target or conditions for this action" });
+export const mintActionsSchema = z.array(actionSchema).min(1).max(MAX_ACTIONS)
+  .refine(uniqueActions, { message: "one entry per class and target" });
 
 /**
  * §16.2: the `owner_approval` object exactly as Relaycast validates it at
@@ -90,7 +106,12 @@ export const actionSchema = z.object({
 export const ownerApprovalSchema = z.object({
   v: z.literal(1),
   owner_id: z.string().min(1).max(MAX_OWNER_ID_CHARS),
-  actions: z.array(actionSchema).min(1).max(MAX_ACTIONS),
+  actions: z.array(z.object({
+    class: actionClass,
+    target,
+    conditions: z.array(conditionSchema).max(MAX_CONDITIONS).nullish().transform(value => value ?? undefined),
+    note: z.string().max(MAX_NOTE_CHARS).nullish(),
+  }).strict().refine(actionIsValid)).min(1).max(MAX_ACTIONS).refine(uniqueActions, { message: "one entry per class and target" }),
   quote: z.string().max(MAX_QUOTE_CHARS).nullable().optional(),
   quoted_at: rfc3339.nullable().optional(),
   quote_source: z.string().max(MAX_QUOTE_SOURCE_CHARS).nullable().optional(),
@@ -258,9 +279,11 @@ export function sameActions(left: readonly Action[], right: readonly Action[]): 
 
 /** §15.2: the owner's display name on one line, at most 80 characters, or "the owner". */
 export function ownerDisplay(name: string | null | undefined): string {
-  const line = (name ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
-  if (!line || line.includes("@")) return "the owner";
-  return [...line].slice(0, 80).join("");
+  // Byte-for-byte Cloud's ownerDisplay: brackets stripped (they delimit the
+  // delegate line), 80 UTF-16 units, trailing space trimmed.
+  const flat = (name ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029[\]]+/gu, " ").replace(/\s+/gu, " ").trim();
+  if (!flat || flat.includes("@")) return "the owner";
+  return flat.length > 80 ? flat.slice(0, 80).trimEnd() : flat;
 }
 
 export function sha256Hex(value: string): string {

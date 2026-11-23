@@ -3,6 +3,7 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
 import {
+  actionIsValid,
   actionsCovered,
   APPROVAL_DEFAULT_MS,
   APPROVAL_MAX_MS,
@@ -10,16 +11,17 @@ import {
   base62,
   canonicalAction,
   classTargetCovered,
+  CLAIM_TTL_MS,
+  DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
   highRisk,
-  promptTarget,
-  REPO_TARGET,
   ownerApprovalSchema,
   ownerDisplay,
+  PR_TARGET,
+  REPO_TARGET,
   sameActions,
   sha256Hex,
   tierDApprovalId,
-  tierORequired,
   type Action,
   type ActionClass,
   type Condition,
@@ -29,7 +31,8 @@ import {
 
 /**
  * Owner-named trusted delegates: grants, claims, attestation and redeem
- * (relay docs/design/owner-trusted-delegates.md §4–§8, §16.3, §16.4).
+ * (relay docs/design/owner-trusted-delegates.md §4–§8, §16.3, §16.4), kept
+ * check-for-check with Cloud's lib/delegation (cloud#6501).
  *
  * The security properties, as in Cloud's native-authority resolver:
  * - The sender id comes from Relaycast's by-message delivery proof for the
@@ -48,13 +51,28 @@ export type DelegationPolicy = {
   allowed_classes: ActionClass[] | null;
   require_tier_o: ActionClass[];
   code_owner_match: "any_path" | "all_paths";
-  updated_at: string | null;
 };
 
-export const DEFAULT_POLICY: DelegationPolicy = {
-  delegation_enabled: false, max_expiry_days: 90, allowed_classes: null, require_tier_o: [],
-  code_owner_match: "any_path", updated_at: null,
+/** Org-wide settings (§16.3 /orgs/{org}/delegation-policy) no workspace policy overrides. */
+export type DelegationOrgPolicy = {
+  /** §15.9 (Khaliq): days audit quotes are kept before redaction to their hash, 1–3650. */
+  quote_retention_days: number;
 };
+
+/** §15.9: the default quote retention window. */
+export const QUOTE_RETENTION_DAYS = 90;
+export const QUOTE_RETENTION_MAX_DAYS = 3650;
+
+export const DEFAULT_POLICY: DelegationPolicy = {
+  delegation_enabled: false, max_expiry_days: 90, allowed_classes: null, require_tier_o: [], code_owner_match: "any_path",
+};
+
+export async function loadOrgPolicy(executor: SqlExecutor, organizationId: string): Promise<DelegationOrgPolicy> {
+  const row = (await executor.query<{ quote_retention_days: number }>(
+    "SELECT quote_retention_days FROM delegation_org_policies WHERE organization_id = $1", [organizationId],
+  )).rows[0];
+  return { quote_retention_days: row?.quote_retention_days ?? QUOTE_RETENTION_DAYS };
+}
 
 export type DelegationWorkspace = {
   id: string;
@@ -78,6 +96,8 @@ type BindingRow = {
   source: string; user_id: string; agent_id: string; agent_name: string; address: string | null; verified: boolean;
 };
 
+export type GrantStatus = "active" | "revoked" | "expired";
+
 export type GrantRow = {
   id: string;
   workspace_id: string;
@@ -87,6 +107,7 @@ export type GrantRow = {
   delegate_agent_name: string;
   scopes: Scope[];
   require_tier_o: ActionClass[];
+  status: GrantStatus;
   expires_at: Date | string;
   created_auth_method: string;
   created_at: Date | string;
@@ -111,62 +132,43 @@ type ApprovalRow = {
 };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const time = (value: Date | string) => (value instanceof Date ? value : new Date(value)).getTime();
+export const time = (value: Date | string) => (value instanceof Date ? value : new Date(value)).getTime();
 const iso = (value: Date | string | null) => value === null ? null : new Date(value).toISOString();
 
-export function grantView(row: GrantRow, now: Date) {
-  const status = row.revoked_at ? "revoked" : time(row.expires_at) <= now.getTime() ? "expired" : "active";
+/** The grant as the API shows it (Cloud's grantJson). Expiry is reported even before the row is marked. */
+export function grantView(row: GrantRow, now = new Date()) {
+  const status: GrantStatus = row.status === "active" && time(row.expires_at) <= now.getTime() ? "expired" : row.status;
   return {
     grant_id: row.id,
     owner_id: row.owner_user_id,
     delegate_agent_id: row.delegate_agent_id,
-    delegate_agent_name: row.delegate_agent_name,
     scopes: row.scopes,
     require_tier_o: row.require_tier_o,
     expires_at: iso(row.expires_at),
+    status,
     created_at: iso(row.created_at),
     updated_at: iso(row.updated_at),
     revoked_at: iso(row.revoked_at),
     revoked_reason: row.revoked_reason,
-    status,
   };
 }
 
-export function newGrantId(): string {
-  return `grt_${base62(randomBytes(16))}`;
+/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`), as Cloud's mintId. */
+export function mintId(prefix: "grt" | "apv" | "clm"): string {
+  return `${prefix}_${base62(randomBytes(16))}`;
 }
 
-export function newApprovalId(): string {
-  return `apv_${base62(randomBytes(16))}`;
-}
-
-export function newClaimId(): string {
-  return `dcl_${base62(randomBytes(16))}`;
-}
-
-/** A one-time claim code: 80 random bits as four groups of Crockford base32. */
+/** A one-time claim code, as Cloud: `dlg_` + 24 random bytes, base64url. Only its SHA-256 is stored. */
 export function newClaimCode(): string {
-  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-  const bytes = randomBytes(16);
-  let out = "";
-  for (let index = 0; index < 16; index += 1) {
-    out += alphabet[bytes[index]! & 31];
-    if (index % 4 === 3 && index < 15) out += "-";
-  }
-  return out;
-}
-
-/** Claim codes are compared by the SHA-256 of their normalized form. */
-export function claimCodeHash(code: string): string {
-  return sha256Hex(code.trim().toUpperCase().replace(/[^0-9A-Z]/g, ""));
+  return `dlg_${randomBytes(24).toString("base64url")}`;
 }
 
 export async function loadPolicy(executor: SqlExecutor, workspaceId: string): Promise<DelegationPolicy> {
   const row = (await executor.query<{
     delegation_enabled: boolean; max_expiry_days: number; allowed_classes: ActionClass[] | null;
-    require_tier_o: ActionClass[]; code_owner_match: "any_path" | "all_paths"; updated_at: Date | string;
+    require_tier_o: ActionClass[]; code_owner_match: "any_path" | "all_paths";
   }>(
-    `SELECT delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match, updated_at
+    `SELECT delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match
        FROM delegation_policies WHERE workspace_id = $1`,
     [workspaceId],
   )).rows[0];
@@ -176,9 +178,14 @@ export async function loadPolicy(executor: SqlExecutor, workspaceId: string): Pr
     max_expiry_days: row.max_expiry_days,
     allowed_classes: row.allowed_classes,
     require_tier_o: row.require_tier_o,
-    code_owner_match: row.code_owner_match,
-    updated_at: iso(row.updated_at),
+    code_owner_match: row.code_owner_match === "all_paths" ? "all_paths" : "any_path",
   };
+}
+
+/** Whether a grant still fits the workspace policy (§4.1: re-checked at every use), as Cloud. */
+export function grantFitsPolicy(grant: Pick<GrantRow, "scopes" | "expires_at" | "created_at">, policy: DelegationPolicy): boolean {
+  if (policy.allowed_classes && grant.scopes.some(scope => !policy.allowed_classes!.includes(scope.class))) return false;
+  return time(grant.expires_at) - time(grant.created_at) <= policy.max_expiry_days * 86_400_000 + 60_000;
 }
 
 /**
@@ -259,43 +266,62 @@ export type AuditInput = {
   messageId?: string | null;
   recipientAgentId?: string | null;
   reason?: string | null;
-  jti?: string | null;
-  details?: Record<string, unknown>;
+  data?: Record<string, unknown>;
   quote?: string | null;
 };
-
-/** §15.9: quote text is redacted to its hash after 90 days. */
-export const QUOTE_RETENTION_DAYS = 90;
 
 export async function recordDelegationAudit(executor: SqlExecutor, input: AuditInput): Promise<void> {
   await executor.query(
     `INSERT INTO delegation_audit_events
-       (id, workspace_id, event, actor_user_id, actor_agent_id, auth_method, owner_user_id, grant_id,
-        approval_id, message_id, recipient_agent_id, reason, jti, details, quote, quote_sha256)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16)`,
+       (workspace_id, event, actor_user_id, actor_agent_id, auth_method, owner_user_id, grant_id,
+        approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14)`,
     [
-      randomUUID(), input.workspaceId, input.event,
+      input.workspaceId, input.event,
       input.actorUserId && UUID.test(input.actorUserId) ? input.actorUserId : null,
       input.actorAgentId ?? null, input.authMethod ?? null,
       input.ownerUserId && UUID.test(input.ownerUserId) ? input.ownerUserId : null,
       input.grantId ?? null, input.approvalId ?? null, input.messageId ?? null, input.recipientAgentId ?? null,
-      input.reason ?? null, input.jti ?? null, JSON.stringify(input.details ?? {}),
+      input.reason ?? null, JSON.stringify(input.data ?? {}),
       input.quote ?? null, input.quote ? sha256Hex(input.quote) : null,
     ],
   );
 }
 
+/** The audit event as the API shows it (Cloud's listAudit row). */
+export function auditView(row: Record<string, unknown>) {
+  const at = (value: unknown) => value === null || value === undefined ? null : new Date(value as string).toISOString();
+  return {
+    id: String(row.id), event: row.event, created_at: at(row.created_at), actor_user_id: row.actor_user_id,
+    actor_agent_id: row.actor_agent_id, auth_method: row.auth_method, owner_id: row.owner_user_id, grant_id: row.grant_id,
+    approval_id: row.approval_id, message_id: row.message_id, recipient_agent_id: row.recipient_agent_id,
+    reason: row.reason, data: row.data, quote: row.quote, quote_hash: row.quote_hash,
+    quote_redacted_at: at(row.quote_redacted_at),
+  };
+}
+
+/**
+ * §15.9 retention, as Cloud's sweep: each quote older than its org's
+ * `quote_retention_days` (90 without an org policy row) is redacted to its hash.
+ * A shorter window applies to existing quotes at the next sweep; a longer one
+ * cannot restore a quote already redacted. Runs on every attestation and
+ * every audit read (relay-control has no cron).
+ */
 export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> {
   await executor.query(
-    `UPDATE delegation_audit_events SET quote = NULL
-      WHERE quote IS NOT NULL AND occurred_at < now() - make_interval(days => $1)`,
+    `UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
+      WHERE e.quote IS NOT NULL
+        AND e.created_at <= now() - make_interval(days => COALESCE(
+          (SELECT p.quote_retention_days FROM delegation_org_policies p
+             JOIN workspaces w ON w.organization_id = p.organization_id
+            WHERE w.id = e.workspace_id), $1))`,
     [QUOTE_RETENTION_DAYS],
   );
 }
 
 /**
  * Revokes grants and invalidates every unredeemed approval under them, in
- * one transaction. Returns the revoked rows (already revoked ones are skipped).
+ * the caller's transaction. Returns the revoked rows (inactive ones are skipped).
  */
 export async function revokeGrants(executor: SqlExecutor, input: {
   workspaceId: string; grantIds: string[]; actorUserId: string | null; reason: string; authMethod: string | null;
@@ -303,8 +329,8 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   if (!input.grantIds.length) return [];
   const revoked = (await executor.query<GrantRow>(
     `UPDATE delegation_grants
-        SET revoked_at = now(), revoked_by = $3, revoked_reason = $4, updated_at = now()
-      WHERE workspace_id = $1 AND id = ANY($2::text[]) AND revoked_at IS NULL
+        SET status = 'revoked', revoked_at = now(), revoked_by = $3, revoked_reason = $4, updated_at = now()
+      WHERE workspace_id = $1 AND id = ANY($2::text[]) AND status = 'active'
       RETURNING *`,
     [input.workspaceId, input.grantIds, input.actorUserId, input.reason],
   )).rows;
@@ -321,10 +347,49 @@ export async function revokeGrants(executor: SqlExecutor, input: {
     await recordDelegationAudit(executor, {
       workspaceId: input.workspaceId, event: "grant.revoked", actorUserId: input.actorUserId,
       authMethod: input.authMethod, ownerUserId: row.owner_user_id, grantId: row.id, reason: input.reason,
-      details: { delegate_agent_id: row.delegate_agent_id },
+      data: { delegate_agent_id: row.delegate_agent_id },
     });
   }
   return revoked;
+}
+
+/**
+ * The panic button (§7): every active grant of one owner (or, with null, the
+ * whole workspace), plus that owner's unredeemed tier O approvals, as Cloud.
+ */
+export async function revokeAllGrants(executor: SqlExecutor, input: {
+  workspaceId: string; ownerUserId: string | null; actorUserId: string | null; reason: string; authMethod: string | null;
+}): Promise<string[]> {
+  const ids = (await executor.query<{ id: string }>(
+    `SELECT id FROM delegation_grants
+      WHERE workspace_id = $1 AND status = 'active' AND ($2::uuid IS NULL OR owner_user_id = $2) FOR UPDATE`,
+    [input.workspaceId, input.ownerUserId],
+  )).rows.map(row => row.id);
+  const revoked = await revokeGrants(executor, { workspaceId: input.workspaceId, grantIds: ids,
+    actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
+  await executor.query(
+    `UPDATE delegation_approvals SET invalidated_at = now()
+      WHERE workspace_id = $1 AND consumed_at IS NULL AND invalidated_at IS NULL
+        AND ($2::uuid IS NULL OR owner_user_id = $2)`,
+    [input.workspaceId, input.ownerUserId],
+  );
+  return revoked.map(row => row.id);
+}
+
+/** Marks a pair's lapsed active grants `expired` and logs `grant.expired` once for each. */
+export async function expireLapsed(executor: SqlExecutor, workspaceId: string, ownerUserId: string,
+  delegateAgentId: string): Promise<void> {
+  const rows = (await executor.query<GrantRow>(
+    `UPDATE delegation_grants SET status = 'expired', updated_at = now()
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
+        AND status = 'active' AND expires_at <= now()
+      RETURNING *`,
+    [workspaceId, ownerUserId, delegateAgentId],
+  )).rows;
+  for (const row of rows) {
+    await recordDelegationAudit(executor, { workspaceId, event: "grant.expired", ownerUserId: row.owner_user_id,
+      grantId: row.id, actorAgentId: row.delegate_agent_id, reason: "expired" });
+  }
 }
 
 class Refusal extends Error {
@@ -333,15 +398,18 @@ class Refusal extends Error {
   }
 }
 
+class ConditionUnmet extends Error {
+  constructor(readonly unmet: Condition[]) {
+    super("condition_unmet");
+  }
+}
+
 const refuse = (reason: ReasonCode): never => {
   throw new Refusal(reason);
 };
 
-/** Relaycast refusing the token is a failed proof; anything else is an outage. */
-function relaycastReason(error: unknown): ReasonCode {
-  if (error instanceof RelaycastCallError && [401, 403, 404].includes(error.status)) return "not_pending";
-  return "unavailable";
-}
+export type Standing = "own_owner" | "code_owner";
+export type AcceptMode = "code_owners" | "own_owner";
 
 export type AttestationClaims = {
   v: 1;
@@ -362,39 +430,49 @@ export type AttestationClaims = {
   jti: string;
 };
 
-export type Standing = "own_owner" | "code_owner";
-export type AcceptMode = "code_owners" | "own_owner";
-
-export type TargetOwnerEntry = { pattern: string; repo: string | null; owner_ids: string[] | null };
+export type TargetOwnerEntry = { pattern: string; repo?: string; owner_ids?: string[] };
 
 export async function loadTargetOwners(executor: SqlExecutor, workspaceId: string): Promise<TargetOwnerEntry[]> {
-  return (await executor.query<TargetOwnerEntry>(
+  const rows = (await executor.query<{ pattern: string; repo: string | null; owner_ids: string[] | null }>(
     "SELECT pattern, repo, owner_ids FROM delegation_target_owners WHERE workspace_id = $1 ORDER BY position",
     [workspaceId],
   )).rows;
+  return rows.map(row => ({ pattern: row.pattern, ...(row.repo ? { repo: row.repo } : {}),
+    ...(row.owner_ids?.length ? { owner_ids: row.owner_ids } : {}) }));
 }
 
 /**
- * §5.4 standing of `ownerUserId` over one action for a recipient owned by
- * `recipientOwnerId`. The recipient's own owner always has standing. Under
- * `code_owners`, another person needs to be a code owner of the target:
+ * §5.4 standing of the approval's owner over every action, for a recipient
+ * owned by `recipientOwnerId` (Cloud's resolveStanding). The recipient's own
+ * owner always has standing. Under `code_owners`, another person must be a
+ * code owner of each target:
  *
- * - Repo targets (`owner/repo`, `owner/repo#N`) are resolved from CODEOWNERS
- *   on GitHub through a verified, linked GitHub account. relay-control has
- *   no verified person-to-GitHub link, so this fails closed (null).
- * - Other targets use the admin target-owners table: an entry naming the
- *   person by id counts; an entry that points at a repo needs CODEOWNERS and
- *   fails closed; no entry means only the recipient's own owner.
+ * - Repo targets (`owner/repo`, `owner/repo#N`) resolve from CODEOWNERS
+ *   through a verified, linked GitHub account. relay-control has no verified
+ *   person-to-GitHub link, so they fail closed.
+ * - Other targets use the admin target-owners table: an entry whose
+ *   `owner_ids` name the person counts; an entry's `repo` needs CODEOWNERS
+ *   and confers nothing here; no entry means only the recipient's own owner.
  * - `prompt_approval` never uses code owners.
  */
-export function standingFor(action: Pick<Action, "class" | "target">, ownerUserId: string, recipientOwnerId: string,
-  accept: AcceptMode, targetOwners: readonly TargetOwnerEntry[]): Standing | null {
-  if (ownerUserId === recipientOwnerId) return "own_owner";
-  if (accept !== "code_owners" || action.class === "prompt_approval") return null;
-  if (REPO_TARGET.test(action.target)) return null;
-  const named = targetOwners.some(entry => entry.owner_ids?.includes(ownerUserId)
-    && classTargetCovered(action.class, entry.pattern, action.target));
-  return named ? "code_owner" : null;
+export function resolveStanding(input: { approvalOwnerId: string; recipientOwnerId: string; accept: AcceptMode;
+  actions: readonly Pick<Action, "class" | "target">[]; targetOwners: readonly TargetOwnerEntry[] }): Standing | null {
+  if (input.approvalOwnerId === input.recipientOwnerId) return "own_owner";
+  if (input.accept !== "code_owners") return null;
+  if (input.actions.some(action => action.class === "prompt_approval")) return null;
+  for (const action of input.actions) {
+    if (PR_TARGET.test(action.target) || REPO_TARGET.test(action.target)) return null;
+    const named = input.targetOwners.some(entry => entry.owner_ids?.includes(input.approvalOwnerId)
+      && classTargetCovered(action.class, entry.pattern, action.target));
+    if (!named) return null;
+  }
+  return "code_owner";
+}
+
+async function standingFor(deps: DelegationDeps, workspaceId: string, input: Omit<Parameters<typeof resolveStanding>[0],
+  "targetOwners">): Promise<Standing | null> {
+  const needsTable = input.approvalOwnerId !== input.recipientOwnerId && input.accept === "code_owners";
+  return resolveStanding({ ...input, targetOwners: needsTable ? await loadTargetOwners(deps.database, workspaceId) : [] });
 }
 
 export type DelegationVerdict =
@@ -408,9 +486,15 @@ type RecipientInput = {
   recipientToken: string;
 };
 
-/** Steps shared by attest and redeem: the recipient is the caller's own agent, proven by its own token. */
+/**
+ * #4987 steps 1–3, shared by attest, redeem and prompt-delegates: the caller
+ * is a member, the recipient is the caller's own agent, and its own token
+ * proves it. A Relaycast refusal of the token is `not_pending`; any other
+ * Relaycast failure throws and becomes `unavailable`.
+ */
 async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Promise<AgentBinding> {
   const { workspace } = input;
+  if (!await memberRole(deps.database, workspace.id, input.callerUserId)) refuse("not_pending");
   // No Relaycast call precedes the owner check, so a foreign recipient cannot
   // probe whether a message or agent exists.
   const recipient = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId,
@@ -420,7 +504,8 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
   try {
     authenticated = await deps.relaycast.authenticatedAgent(input.recipientToken);
   } catch (error) {
-    return refuse(relaycastReason(error));
+    if (error instanceof RelaycastCallError && [401, 403, 404].includes(error.status)) return refuse("not_pending");
+    throw error;
   }
   if (authenticated.id !== recipient!.agentId || authenticated.name !== recipient!.name ||
       (recipient!.address && authenticated.address !== recipient!.address) ||
@@ -431,162 +516,186 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
 }
 
 /**
- * The delegate is still bound to the grant's owner by the same immutable id
- * and still a live agent of that name. When it is not, every live grant of
- * the pair is revoked (§7 automatic revocation).
+ * Re-proves the delegate (Cloud's delegateStillBound): it still has exactly
+ * one Control binding, owned by the grant's owner, Relaycast still names the
+ * same live agent, and the owner is still a member. A binding now owned by
+ * someone else revokes the grant durably (`binding_changed`), as in Cloud.
+ * relay-control has no leave-workspace hook and no release webhook, so an
+ * owner who left (`owner_left`) or a released agent (`agent_released`) also
+ * revokes the grant durably here (§7 automatic revocation); the reason code
+ * returned is `revoked` either way, as in Cloud.
  */
-async function checkDelegateBinding(deps: DelegationDeps, workspace: DelegationWorkspace, ownerUserId: string,
-  delegateAgentId: string, grantIds: string[]): Promise<AgentBinding> {
-  const revokeAll = async (reason: string): Promise<never> => {
+async function delegateStillBound(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow,
+  live: boolean): Promise<ReasonCode | null> {
+  const revoke = async (reason: string): Promise<ReasonCode> => {
     await deps.database.transaction(tx => revokeGrants(tx, {
-      workspaceId: workspace.id, grantIds, actorUserId: null, reason, authMethod: "system",
-    }));
-    return refuse("revoked");
+      workspaceId: workspace.id, grantIds: [grant.id], actorUserId: null, reason, authMethod: "system",
+    })).catch(() => undefined);
+    return "revoked";
   };
-  if (!await memberRole(deps.database, workspace.id, ownerUserId)) return revokeAll("owner_left");
-  const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId, delegateAgentId, true);
-  if (!binding || binding.userId !== ownerUserId) return revokeAll("binding_changed");
-  let live;
-  try {
-    live = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, binding.name);
-  } catch {
-    return refuse("unavailable");
+  const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId,
+    grant.delegate_agent_id, true);
+  if (!binding) return "not_delegate";
+  if (binding.userId !== grant.owner_user_id) return revoke("binding_changed");
+  if (live) {
+    const agent = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, binding.name);
+    if (!agent || agent.id !== binding.agentId || agent.status === "released") return revoke("agent_released");
   }
-  if (!live || live.id !== delegateAgentId || live.status === "released") return revokeAll("agent_released");
-  return binding;
+  if (!await memberRole(deps.database, workspace.id, grant.owner_user_id)) return revoke("owner_left");
+  return null;
 }
 
-async function loadGrants(executor: SqlExecutor, workspaceId: string, ownerUserId: string, delegateAgentId: string) {
-  if (!UUID.test(ownerUserId)) return [];
+/** The one active, unexpired grant for (owner, delegate), or why there is none (Cloud's liveGrant). */
+function liveGrant(grants: GrantRow[], now: Date): GrantRow | ReasonCode {
+  const active = grants.find(grant => grant.status === "active");
+  if (active) return time(active.expires_at) > now.getTime() ? active : "expired";
+  if (!grants.length) return "not_delegate";
+  return grants[0]!.status === "expired" ? "expired" : "revoked";
+}
+
+async function grantsFor(executor: SqlExecutor, workspaceId: string, ownerUserId: string, delegateAgentId: string) {
   return (await executor.query<GrantRow>(
     `SELECT * FROM delegation_grants
       WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
-      ORDER BY created_at`,
+      ORDER BY created_at DESC LIMIT 20`,
     [workspaceId, ownerUserId, delegateAgentId],
   )).rows;
 }
 
-/** No live grant: say why, most specific first. */
-function noLiveGrant(grants: GrantRow[]): never {
-  if (!grants.length) return refuse("not_delegate");
-  return refuse(grants.some(grant => grant.revoked_at) ? "revoked" : "expired");
+function tierOClasses(policy: DelegationPolicy, grant: GrantRow): Set<ActionClass> {
+  return new Set<ActionClass>([...DEFAULT_TIER_O_CLASSES, ...policy.require_tier_o, ...grant.require_tier_o]);
+}
+
+/** Why an action list is outside the grant or the policy, or null (Cloud's scopeRefusal). */
+function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: DelegationPolicy,
+  recipientAgentId: string): ReasonCode | null {
+  if (!grantFitsPolicy(grant, policy)) return "out_of_scope";
+  for (const action of actions) {
+    if (!actionIsValid(action)) return "out_of_scope";
+    if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return "out_of_scope";
+    if (!actionsCovered(grant.scopes, [action])) return "out_of_scope";
+    // A prompt_approval names exactly the session it answers: this recipient.
+    if (action.class === "prompt_approval" && !action.target.startsWith(`${recipientAgentId}:`)) return "out_of_scope";
+  }
+  return null;
 }
 
 /**
- * POST .../messaging/delegation. The caller (route) has already proven a
- * Desktop-verified bearer of a current member of `workspace`.
+ * POST .../messaging/delegation. The route has already proven a
+ * Desktop-verified bearer of a current member of `workspace`;
+ * `stillAuthorized` re-proves it after the network lookups.
  */
 export async function attestDelegation(deps: DelegationDeps, input: RecipientInput & {
   messageId: string;
   accept: AcceptMode;
+  authMethod: string;
+  stillAuthorized?: () => Promise<boolean>;
 }): Promise<DelegationVerdict> {
   const { workspace } = input;
+  const now = deps.now();
   const context: { ownerUserId?: string; grantId?: string; approvalId?: string; senderId?: string } = {};
   try {
-    if (deps.gateOnly || !deps.signer) refuse("unavailable");
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
+    if (deps.gateOnly || !deps.signer) refuse("unavailable");
     const recipient = await proveRecipient(deps, input);
 
+    // Relaycast proves this exact message is still pending for this token, and
+    // is the only source of the sender id and of the stored owner_approval.
     let delivered;
     try {
       delivered = await deps.relaycast.pendingDeliveryForMessage(input.recipientToken, input.messageId);
     } catch (error) {
-      return refuse(relaycastReason(error));
+      if (error instanceof RelaycastCallError && [401, 403, 404].includes(error.status)) return refuse("not_pending");
+      throw error;
     }
-    if (!delivered || delivered.message_id !== input.messageId ||
-        delivered.workspace_id !== workspace.relaycastWorkspaceId) refuse("not_pending");
-    const senderId = delivered!.sender_agent_id;
-    if (!senderId) refuse("not_delegate");
+    const senderId = delivered?.sender_agent_id ?? null;
+    if (!delivered || !senderId || delivered.workspace_id !== workspace.relaycastWorkspaceId ||
+        delivered.message_id !== input.messageId) refuse("not_pending");
     context.senderId = senderId!;
-    if (delivered!.owner_approval === null || delivered!.owner_approval === undefined) refuse("no_approval");
+    if (!delivered!.owner_approval) refuse("no_approval");
     const parsed = ownerApprovalSchema.safeParse(delivered!.owner_approval);
     if (!parsed.success) refuse("no_approval");
     const approval = parsed.data!;
+    if (!UUID.test(approval.owner_id)) refuse("not_delegate");
     context.ownerUserId = approval.owner_id;
 
-    const grants = await loadGrants(deps.database, workspace.id, approval.owner_id, senderId!);
-    const now = deps.now();
-    const live = grants.filter(grant => !grant.revoked_at && time(grant.expires_at) > now.getTime());
-    if (!live.length) noLiveGrant(grants);
-    await checkDelegateBinding(deps, workspace, approval.owner_id, senderId!, live.map(grant => grant.id));
+    const found = liveGrant(await grantsFor(deps.database, workspace.id, approval.owner_id, senderId!), now);
+    if (typeof found === "string") return refuse(found);
+    const grant = found;
+    context.grantId = grant.id;
+    const unbound = await delegateStillBound(deps, workspace, grant, true);
+    if (unbound) refuse(unbound);
 
-    // Tier O takes its actions from the owner-minted approval object.
-    let tier: "D" | "O" = "D";
-    let actions: Action[] = approval.actions.map(canonicalAction);
-    let minted: ApprovalRow | undefined;
+    // Notes are sender-chosen text; they never reach a signed claim.
+    const messageActions = approval.actions.map(action => canonicalAction(action as Action));
+    let tier: "D" | "O";
+    let actions: Action[];
+    let expiresAt: number;
+    let singleUse: boolean;
     if (approval.approval_ref) {
-      minted = (await deps.database.query<ApprovalRow>(
-        "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2 AND tier = 'O'",
+      tier = "O";
+      context.approvalId = approval.approval_ref;
+      const minted = (await deps.database.query<ApprovalRow>(
+        "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
         [approval.approval_ref, workspace.id],
       )).rows[0];
-      if (!minted || minted.owner_user_id !== approval.owner_id) refuse("no_approval");
-      context.approvalId = minted!.id;
+      if (!minted || minted.tier !== "O" || minted.owner_user_id !== approval.owner_id) refuse("no_approval");
       if (minted!.invalidated_at) refuse("revoked");
       if (minted!.consumed_at) refuse("consumed");
       if (time(minted!.expires_at) <= now.getTime()) refuse("expired");
-      if (!sameActions(minted!.actions, approval.actions)) refuse("out_of_scope");
-      tier = "O";
+      if (!sameActions(minted!.actions, messageActions)) refuse("out_of_scope");
       actions = minted!.actions.map(canonicalAction);
-    }
-    // prompt_approval names one request of one session: this recipient's.
-    if (actions.some(action => action.class === "prompt_approval" && promptTarget(action.target)?.agentId !== recipient.agentId)) {
-      refuse("out_of_scope");
-    }
-
-    if (policy.allowed_classes && actions.some(action => !policy.allowed_classes!.includes(action.class))) {
-      refuse("out_of_scope");
-    }
-    const covering = live.filter(grant => actionsCovered(grant.scopes, actions));
-    if (!covering.length) refuse("out_of_scope");
-    const eligible = tier === "O" ? covering
-      : covering.filter(grant => !tierORequired(actions, policy.require_tier_o, grant.require_tier_o));
-    if (!eligible.length) refuse("tier_o_required");
-
-    // §5.4: standing is checked per action; one failure refuses the whole approval.
-    const targetOwners = input.accept === "code_owners" && approval.owner_id !== recipient.userId
-      ? await loadTargetOwners(deps.database, workspace.id) : [];
-    const standings = actions.map(action => standingFor(action, approval.owner_id, recipient.userId, input.accept, targetOwners));
-    if (standings.some(item => item === null)) refuse("recipient_policy");
-    const standing: Standing = standings.every(item => item === "own_owner") ? "own_owner" : "code_owner";
-    const grant = eligible[0]!;
-    context.grantId = grant.id;
-
-    const singleUse = (minted?.single_use ?? false) || actions.some(highRisk);
-    const approvalId = minted?.id ?? tierDApprovalId(workspace.id, input.messageId);
-    context.approvalId = approvalId;
-    let approvalExpiry: number;
-    if (minted) {
-      approvalExpiry = time(minted.expires_at);
+      expiresAt = Math.min(time(minted!.expires_at), time(grant.expires_at));
+      singleUse = minted!.single_use || actions.some(highRisk);
     } else {
-      // The first attestation fixes a tier D approval's expiry: the sender's
-      // expires_at, defaulting to 1 hour and never past 24 hours from when
-      // Control first saw it (or Relaycast's send time, when it reports one).
-      const sentAt = Math.min(now.getTime(), delivered!.created_at ? Date.parse(delivered!.created_at) || now.getTime() : now.getTime());
+      tier = "D";
+      actions = messageActions;
+      context.approvalId = tierDApprovalId(workspace.id, input.messageId);
+      // Cloud's approvalExpiry: the sender's expires_at, default 1 hour after
+      // the send (Relaycast's created_at when reported, else now), at most 24
+      // hours after it, never past the grant. The first attestation stores it.
+      const sentAt = delivered!.created_at && !Number.isNaN(Date.parse(delivered!.created_at))
+        ? Date.parse(delivered!.created_at) : now.getTime();
       const requested = approval.expires_at ? Date.parse(approval.expires_at) : sentAt + APPROVAL_DEFAULT_MS;
-      const expiry = new Date(Math.min(requested, sentAt + APPROVAL_MAX_MS));
+      expiresAt = Math.min(requested, sentAt + APPROVAL_MAX_MS, time(grant.expires_at));
+      singleUse = actions.some(highRisk);
+    }
+    if (expiresAt <= now.getTime()) refuse("expired");
+    const outOfScope = scopeRefusal(actions, grant, policy, recipient.agentId);
+    if (outOfScope) refuse(outOfScope);
+    if (tier === "D") {
+      const required = tierOClasses(policy, grant);
+      if (actions.some(action => required.has(action.class))) refuse("tier_o_required");
+    }
+    // §5.4: the owner needs standing over every action's target.
+    const standing = await standingFor(deps, workspace.id, {
+      approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId, accept: input.accept, actions,
+    });
+    if (!standing) return refuse("recipient_policy");
+    if (tier === "D") {
       await deps.database.query(
         `INSERT INTO delegation_approvals
            (id, workspace_id, owner_user_id, tier, grant_id, message_id, actions, single_use, expires_at)
          VALUES ($1, $2, $3, 'D', $4, $5, $6::jsonb, $7, $8)
          ON CONFLICT (id) DO NOTHING`,
-        [approvalId, workspace.id, approval.owner_id, grant.id, input.messageId,
-          JSON.stringify(actions), singleUse, expiry],
+        [context.approvalId, workspace.id, approval.owner_id, grant.id, input.messageId,
+          JSON.stringify(actions), singleUse, new Date(expiresAt)],
       );
       const stored = (await deps.database.query<ApprovalRow>(
         "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
-        [approvalId, workspace.id],
+        [context.approvalId, workspace.id],
       )).rows[0];
-      if (!stored || stored.tier !== "D" || stored.message_id !== input.messageId) refuse("no_approval");
-      if (stored!.invalidated_at) refuse("revoked");
+      if (!stored) refuse("unavailable");
+      if (stored!.invalidated_at || stored!.grant_id !== grant.id) refuse("revoked");
       if (stored!.consumed_at) refuse("consumed");
-      approvalExpiry = time(stored!.expires_at);
+      expiresAt = Math.min(expiresAt, time(stored!.expires_at));
+      singleUse = stored!.single_use || singleUse;
     }
-    approvalExpiry = Math.min(approvalExpiry, time(grant.expires_at));
-    if (approvalExpiry <= now.getTime()) refuse("expired");
-
-    // Membership may have been revoked during the network calls.
-    if (!await memberRole(deps.database, workspace.id, input.callerUserId)) refuse("not_pending");
+    // Check again after network calls: a membership or bearer revoked during
+    // resolution must not result in a positive verdict.
+    if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
+        (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
 
     const owner = (await deps.database.query<{ name: string | null }>(
       "SELECT name FROM users WHERE id = $1", [approval.owner_id],
@@ -600,41 +709,45 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       delegate_agent_id: senderId!,
       grant_id: grant.id,
       message_id: input.messageId,
-      recipient_agent_id: recipient.agentId,
-      approval_id: approvalId,
+      recipient_agent_id: input.recipientAgentId,
+      approval_id: context.approvalId!,
       tier,
-      actions,
+      actions: actions.map(canonicalAction),
       standing,
       single_use: singleUse,
       iat,
-      exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(approvalExpiry / 1000)),
-      jti: base62(randomBytes(16)),
+      exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
+      jti: randomUUID(),
     };
-    if (claims.exp <= iat) refuse("expired");
     const attestation = deps.signer!.sign(claims);
     await deps.database.transaction(async (tx) => {
       await tx.query(
         `INSERT INTO delegation_attestations
-           (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id, delegate_agent_id, issued_at, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8), to_timestamp($9))`,
-        [claims.jti, workspace.id, approvalId, grant.id, input.messageId, recipient.agentId, senderId, iat, claims.exp],
+           (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id, delegate_agent_id, kid, accept,
+            standing, issued_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11), to_timestamp($12))`,
+        [claims.jti, workspace.id, claims.approval_id, grant.id, input.messageId, input.recipientAgentId, senderId,
+          deps.signer!.kid, input.accept, standing, iat, claims.exp],
       );
       await recordDelegationAudit(tx, {
-        workspaceId: workspace.id, event: "approval.attested", actorAgentId: senderId, ownerUserId: approval.owner_id,
-        grantId: grant.id, approvalId, messageId: input.messageId, recipientAgentId: recipient.agentId,
-        jti: claims.jti, quote: approval.quote ?? null,
-        details: { tier, actions: claims.actions, single_use: singleUse, quote_source: approval.quote_source ?? null,
-          quoted_at: approval.quoted_at ?? null, accept: input.accept, standing },
+        workspaceId: workspace.id, event: "approval.attested", actorUserId: input.callerUserId,
+        authMethod: input.authMethod, ownerUserId: approval.owner_id, grantId: grant.id, approvalId: claims.approval_id,
+        actorAgentId: senderId, messageId: input.messageId, recipientAgentId: input.recipientAgentId,
+        data: { actions: claims.actions, tier, standing, single_use: singleUse, jti: claims.jti, kid: deps.signer!.kid,
+          quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null },
+        quote: approval.quote ?? null,
       });
       await redactExpiredQuotes(tx);
     });
     return { verdict: "delegate", attestation, claims };
   } catch (error) {
+    // No dependency error can promote a peer message or expose a
+    // message-existence oracle.
     const reason: ReasonCode = error instanceof Refusal ? error.reason : "unavailable";
     await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "approval.refused", actorUserId: input.callerUserId,
-      actorAgentId: context.senderId ?? null, ownerUserId: context.ownerUserId ?? null,
-      grantId: context.grantId ?? null, approvalId: context.approvalId ?? null,
+      authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
+      approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
       messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason,
     }).catch(() => undefined);
     return { verdict: "none", reason };
@@ -647,154 +760,150 @@ export type RedeemResult =
 
 /**
  * §5.5 conditions at redeem. `not_before` is checked here. The GitHub
- * conditions need the PR's state through a GitHub App installation that
- * relay-control does not consult for delegation, so they fail closed with
- * `condition_unavailable`.
+ * conditions need the PR's state through a GitHub reader relay-control does
+ * not have for delegation, so they fail closed with `condition_unavailable`.
  */
 export function evaluateConditions(conditions: readonly Condition[], now: Date):
-  { status: "met" } | { status: "unmet"; unmet: Condition[] } | { status: "unavailable" } {
-  if (conditions.some(condition => GITHUB_CONDITIONS.has(condition.type))) return { status: "unavailable" };
-  const unmet = conditions.filter(condition => condition.type === "not_before" && Date.parse(condition.at) > now.getTime());
-  return unmet.length ? { status: "unmet", unmet } : { status: "met" };
-}
-
-class ConditionUnmet extends Error {
-  constructor(readonly unmet: Condition[]) {
-    super("condition_unmet");
-  }
+  { kind: "met" } | { kind: "unmet"; unmet: Condition[] } | { kind: "unavailable" } {
+  if (!conditions.length) return { kind: "met" };
+  if (conditions.some(condition => GITHUB_CONDITIONS.has(condition.type))) return { kind: "unavailable" };
+  const unmet = conditions.filter(condition => condition.type === "not_before" && now.getTime() < Date.parse(condition.at));
+  return unmet.length ? { kind: "unmet", unmet } : { kind: "met" };
 }
 
 /**
- * POST .../messaging/delegation/redeem. Re-checks revocation, binding, scope
- * and expiry, then consumes a single-use approval with one conditional
- * UPDATE: a second redeem, or one racing a revocation, is refused.
+ * POST .../messaging/delegation/redeem (Cloud's redeemApproval). Re-checks
+ * revocation, binding, membership, policy, scope and standing, then the
+ * action's conditions. An unmet condition does not consume; a single-use
+ * approval is consumed with one conditional UPDATE, so a replay or a race with
+ * a revocation is refused.
  */
 export async function redeemApproval(deps: DelegationDeps, input: RecipientInput & {
   approvalId: string;
   action: { class: ActionClass; target: string };
+  authMethod: string;
+  stillAuthorized?: () => Promise<boolean>;
 }): Promise<RedeemResult> {
   const { workspace } = input;
+  const now = deps.now();
   const context: { ownerUserId?: string; grantId?: string } = {};
   try {
-    if (deps.gateOnly) refuse("unavailable");
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
-    const recipient = await proveRecipient(deps, input);
+    if (deps.gateOnly) refuse("unavailable");
+    await proveRecipient(deps, input);
     const approval = (await deps.database.query<ApprovalRow>(
       "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
       [input.approvalId, workspace.id],
     )).rows[0];
     if (!approval) refuse("no_approval");
     context.ownerUserId = approval!.owner_user_id;
-    const attestation = (await deps.database.query<{ grant_id: string; delegate_agent_id: string }>(
-      `SELECT grant_id, delegate_agent_id FROM delegation_attestations
+    // Only a recipient Control attested this approval to may redeem it.
+    const attested = (await deps.database.query<{ grant_id: string; accept: string }>(
+      `SELECT grant_id, accept FROM delegation_attestations
         WHERE workspace_id = $1 AND approval_id = $2 AND recipient_agent_id = $3
         ORDER BY issued_at DESC LIMIT 1`,
-      [workspace.id, input.approvalId, recipient.agentId],
+      [workspace.id, input.approvalId, input.recipientAgentId],
     )).rows[0];
-    if (!attestation) refuse("not_pending");
-    context.grantId = attestation!.grant_id;
+    if (!attested) refuse("no_approval");
+    context.grantId = attested!.grant_id;
+    if (approval!.invalidated_at) refuse("revoked");
     const grant = (await deps.database.query<GrantRow>(
-      "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [attestation!.grant_id, workspace.id],
+      "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [attested!.grant_id, workspace.id],
     )).rows[0];
-    const now = deps.now();
-    if (!grant || grant.revoked_at || approval!.invalidated_at) refuse("revoked");
-    if (time(grant!.expires_at) <= now.getTime()) refuse("expired");
-    await checkDelegateBinding(deps, workspace, grant!.owner_user_id, attestation!.delegate_agent_id, [grant!.id]);
-    const stored = approval!.actions.find(action => action.class === input.action.class && action.target === input.action.target);
-    if (!stored || !actionsCovered(grant!.scopes, [input.action]) ||
-        (policy.allowed_classes && !policy.allowed_classes.includes(input.action.class))) refuse("out_of_scope");
+    if (!grant || grant.status === "revoked") refuse("revoked");
+    if (grant!.status === "expired" || time(grant!.expires_at) <= now.getTime()) refuse("expired");
+    const unbound = await delegateStillBound(deps, workspace, grant!, true);
+    if (unbound) refuse(unbound);
+    if (time(approval!.expires_at) <= now.getTime()) refuse("expired");
+    const action = approval!.actions.find(item => item.class === input.action.class && item.target === input.action.target);
+    if (!action) refuse("out_of_scope");
+    const outOfScope = scopeRefusal([action!], grant!, policy, input.recipientAgentId);
+    if (outOfScope) refuse(outOfScope);
+    if (approval!.tier === "D" && tierOClasses(policy, grant!).has(action!.class)) refuse("tier_o_required");
+    const standing = await standingFor(deps, workspace.id, {
+      approvalOwnerId: approval!.owner_user_id, recipientOwnerId: input.callerUserId,
+      accept: attested!.accept === "own_owner" ? "own_owner" : "code_owners", actions: [action!],
+    });
+    if (!standing) refuse("recipient_policy");
     if (approval!.consumed_at) refuse("consumed");
-    if (Math.min(time(approval!.expires_at), time(grant!.expires_at)) <= now.getTime()) refuse("expired");
-    // Unmet conditions do not consume the approval; the agent may redeem again.
-    const checked = evaluateConditions(stored!.conditions ?? [], now);
-    if (checked.status === "unavailable") refuse("condition_unavailable");
-    if (checked.status === "unmet") throw new ConditionUnmet(checked.unmet);
-    if (approval!.single_use) {
-      const consumed = await deps.database.transaction(async (tx) => {
-        const row = (await tx.query<{ id: string }>(
-          `UPDATE delegation_approvals
-              SET consumed_at = now(), consumed_by_agent_id = $3, consumed_action = $4::jsonb
-            WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NULL AND invalidated_at IS NULL
-              AND expires_at > now()
-              AND EXISTS (SELECT 1 FROM delegation_grants g
-                           WHERE g.id = $5 AND g.revoked_at IS NULL AND g.expires_at > now())
-            RETURNING id`,
-          [input.approvalId, workspace.id, recipient.agentId, JSON.stringify(input.action), grant!.id],
-        )).rows[0];
-        if (!row) return false;
-        await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
-          ownerUserId: grant!.owner_user_id, grantId: grant!.id, approvalId: input.approvalId,
-          recipientAgentId: recipient.agentId, details: { action: input.action, single_use: true },
-        });
-        return true;
-      });
-      if (!consumed) {
-        const current = (await deps.database.query<ApprovalRow>(
-          "SELECT * FROM delegation_approvals WHERE id = $1", [input.approvalId],
-        )).rows[0];
-        refuse(current?.invalidated_at ? "revoked" : current?.consumed_at ? "consumed" : "expired");
-      }
-    } else {
-      await recordDelegationAudit(deps.database, {
-        workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
-        ownerUserId: grant!.owner_user_id, grantId: grant!.id, approvalId: input.approvalId,
-        recipientAgentId: recipient.agentId, details: { action: input.action, single_use: false },
-      });
+    const conditions = evaluateConditions(action!.conditions ?? [], now);
+    if (conditions.kind === "unavailable") refuse("condition_unavailable");
+    if (conditions.kind === "unmet") throw new ConditionUnmet(conditions.unmet);
+    if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
+        (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
+    const singleUse = approval!.single_use || highRisk(action!);
+    if (singleUse) {
+      const consumed = (await deps.database.query<{ id: string }>(
+        `UPDATE delegation_approvals
+            SET consumed_at = now(), consumed_by_agent_id = $3, consumed_action = $4::jsonb
+          WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NULL AND invalidated_at IS NULL
+          RETURNING id`,
+        [input.approvalId, workspace.id, input.recipientAgentId, JSON.stringify(canonicalAction(action!))],
+      )).rows[0];
+      if (!consumed) refuse("consumed");
     }
-    return { ok: true, consumed: approval!.single_use };
+    // The consumption above is the authority; a failed log write must not turn
+    // a spent approval into a refusal the agent would retry.
+    await recordDelegationAudit(deps.database, {
+      workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
+      authMethod: input.authMethod, ownerUserId: approval!.owner_user_id, grantId: grant!.id,
+      approvalId: input.approvalId, recipientAgentId: input.recipientAgentId,
+      data: { action: input.action, consumed: singleUse, conditions: action!.conditions ?? [] },
+    }).catch(() => undefined);
+    return { ok: true, consumed: singleUse };
   } catch (error) {
     const reason: ReasonCode = error instanceof ConditionUnmet ? "condition_unmet"
       : error instanceof Refusal ? error.reason : "unavailable";
+    const unmet = error instanceof ConditionUnmet ? error.unmet : undefined;
     await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
-      ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null, approvalId: input.approvalId,
-      recipientAgentId: input.recipientAgentId, reason,
-      details: { action: input.action, ...(error instanceof ConditionUnmet ? { unmet: error.unmet } : {}) },
+      authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
+      approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,
+      data: { action: input.action, ...(unmet ? { unmet } : {}) },
     }).catch(() => undefined);
-    return error instanceof ConditionUnmet ? { ok: false, reason, unmet: error.unmet } : { ok: false, reason };
+    return unmet ? { ok: false, reason, unmet } : { ok: false, reason };
   }
 }
 
 /**
- * POST .../messaging/delegation/prompt-delegates (§9.3): the machine owner's
- * delegates whose live grants cover `prompt_approval` for this session. The
- * session is the caller's own agent, proven by its own token. Delegation
- * off, or prompt_approval outside the policy, is an empty list.
+ * POST .../messaging/delegation/prompt-delegates (§9.3, Cloud's
+ * promptDelegates): the machine owner's delegates whose live grants cover
+ * `prompt_approval` for this session. Delegation off, or prompt_approval
+ * outside the policy, is an empty list. A session that is not the caller's,
+ * or a failed token proof, is null (the route answers 403).
  */
 export async function promptDelegates(deps: DelegationDeps, input: RecipientInput):
-  Promise<{ delegates: Array<{ agent_id: string; grant_id: string }> }> {
+  Promise<{ delegates: Array<{ agent_id: string; grant_id: string }> } | null> {
   const { workspace } = input;
-  if (deps.gateOnly) return { delegates: [] };
   const policy = await loadPolicy(deps.database, workspace.id);
   if (!policy.delegation_enabled || (policy.allowed_classes && !policy.allowed_classes.includes("prompt_approval"))) {
     return { delegates: [] };
   }
+  if (deps.gateOnly) return { delegates: [] };
   let session: AgentBinding;
   try {
     session = await proveRecipient(deps, input);
   } catch (error) {
-    if (error instanceof Refusal) return { delegates: [] };
+    if (error instanceof Refusal) return null;
     throw error;
   }
   const grants = (await deps.database.query<GrantRow>(
     `SELECT * FROM delegation_grants
-      WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL AND expires_at > now()
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND status = 'active' AND expires_at > now()
       ORDER BY created_at`,
     [workspace.id, session.userId],
-  )).rows;
-  const probe = `${session.agentId}:probe`;
+  )).rows.filter(grant => grant.scopes.some(scope => scope.class === "prompt_approval"));
   const delegates: Array<{ agent_id: string; grant_id: string }> = [];
-  const seen = new Set<string>();
   for (const grant of grants) {
-    if (grant.delegate_agent_id === session.agentId || seen.has(grant.delegate_agent_id)) continue;
-    if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: probe }])) continue;
-    const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId,
-      grant.delegate_agent_id, true);
-    if (!binding || binding.userId !== session.userId) continue;
-    seen.add(grant.delegate_agent_id);
+    if (!grantFitsPolicy(grant, policy)) continue;
+    // Not the session's own agent: a delegate never answers its own prompts.
+    if (grant.delegate_agent_id === session.agentId) continue;
+    if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:any` }])) continue;
+    if (await delegateStillBound(deps, workspace, grant, false)) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });
   }
   return { delegates };
 }
+
+export { CLAIM_TTL_MS };
