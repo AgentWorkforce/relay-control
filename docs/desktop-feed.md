@@ -5,8 +5,10 @@ from the doc and proposed below are both approved). Deviations from the
 contract are listed under "Implementation" and in `openapi.yaml`.
 
 The feed is a relaycontrol-only service: one profile per installation, signed
-with an AWS KMS Ed25519 key and stored in a private S3 bucket under a
-per-profile prefix. It is off (every feed route answers 404) unless both
+with an Ed25519 key held in AWS KMS (`awskms`) or a mounted secret file
+(`file`), and stored in a private Amazon S3 (`s3`) or Google Cloud Storage
+(`gcs`) bucket under a per-profile prefix; the `memory` signer and storage are
+for tests and development. It is off (every feed route answers 404) unless both
 `SELFHOST_DESKTOP_FEED_SIGNER` and `SELFHOST_DESKTOP_FEED_STORAGE` are set.
 This document began as the contract that translates the relay-desktop design
 `docs/enterprise-distribution.md` at `21e61026` (the "source design" below)
@@ -19,7 +21,7 @@ into:
 | Envelope schema (embeds an identical copy of the manifest schema) | `docs/specs/desktop-feed-envelope.schema.json` |
 | Fixtures | `test/fixtures/desktop-feed/` |
 | Contract tests and reference decision functions | `test/desktop-feed-contract.test.ts` |
-| Implementation | `src/desktop-feed/`, `src/aws/sigv4.ts`, `migrations/0013_desktop_feed.sql` |
+| Implementation | `src/desktop-feed/`, `src/aws/sigv4.ts`, `migrations/0027_desktop_feed.sql` |
 | End-to-end and AWS signing tests | `test/desktop-feed.test.ts`, `test/desktop-feed-aws.test.ts` |
 | RFC 8785 canonicaliser | `src/desktop-feed/canonical.ts` (re-exported by `test/support/jcs.ts`) |
 | Strict I-JSON parser (duplicate names, lone surrogates) | `src/desktop-feed/strict-json.ts` (re-exported by `test/support/strict-json.ts`) |
@@ -38,7 +40,7 @@ into:
 | `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `<label>` in `key_id` `fk_<profile>_<label>`. Defaults: `k1` for `awskms`, `f1` for `file`, `dev` for `memory`. A changed key must use a new label |
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to an array of token sha256 hex digests, for CI tokens (`sh_dfp_...`) provisioned outside the admin routes. Only the hash is configured; removing an entry and restarting revokes the token |
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` | `s3`: private bucket name, without dots (TLS on the virtual-hosted host). Its virtual-hosted host `<bucket>.s3.<region>.amazonaws.com` is signed into `download_hosts` |
-| `SELFHOST_DESKTOP_FEED_S3_REGION` | `s3`: bucket region; default `AWS_REGION`, then `SELFHOST_DESKTOP_FEED_KMS_REGION` |
+| `SELFHOST_DESKTOP_FEED_S3_REGION` | `s3`: bucket region; default `AWS_REGION`, then (with `awskms` only) `SELFHOST_DESKTOP_FEED_KMS_REGION`; startup error when none is set |
 | `SELFHOST_DESKTOP_FEED_S3_PREFIX` | `s3`: key prefix, default `desktop-feed` (also when set empty or to `/`). Segments of `[A-Za-z0-9._-]` separated by `/`; `.` and `..` segments and any other character are a startup error |
 | `SELFHOST_DESKTOP_FEED_GCS_BUCKET` | `gcs`: private bucket name (3-63 of `[a-z0-9._-]`). Requests and signed URLs are path-style, so `storage.googleapis.com` is signed into `download_hosts` |
 | `SELFHOST_DESKTOP_FEED_GCS_PREFIX` | `gcs`: object name prefix, same default and rules as `SELFHOST_DESKTOP_FEED_S3_PREFIX` |
@@ -129,18 +131,80 @@ is scoped to an entitled profile.
 the profiles the current workspace may read, so the downloads page can name
 one.
 
+### Sites outside AWS and Google Cloud
+
+A site on another cloud (for example a cluster on Azure AKS) can serve the
+complete feed with one combination only: the `file` signer and `s3` storage
+against Amazon S3. There is no Azure Blob Storage backend and no S3 endpoint
+setting, so S3-compatible stores such as MinIO cannot be used. `gcs` reads
+credentials only from the Google metadata server, so it does not work off
+Google Cloud; `GCE_METADATA_HOST` only moves that server. `awskms` works
+wherever AWS credentials do, but its 4096-byte limit trims the release (see
+above).
+
+With no instance or pod role, give the pod AWS credentials through the chain
+in Configuration:
+
+- Static keys: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and
+  `AWS_SESSION_TOKEN` if they are temporary) from a Kubernetes Secret. When
+  both are set they are used and nothing else is tried.
+- Web identity: `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, when the
+  cluster's service account token issuer is registered with AWS IAM as an
+  OIDC provider. The service calls STS `AssumeRoleWithWebIdentity` on
+  `sts.<region>.amazonaws.com` when `AWS_REGION` or `AWS_DEFAULT_REGION` is
+  set, otherwise on `sts.amazonaws.com`. `AWS_ROLE_SESSION_NAME` is optional.
+
+With `file`, the AWS identity needs only `s3:PutObject`, `s3:GetObject` and
+`s3:DeleteObject` on `<prefix>/profiles/*`; no KMS permission. Set
+`SELFHOST_DESKTOP_FEED_S3_REGION` explicitly unless `AWS_REGION` is set:
+with `file`, nothing else supplies the bucket region (`AWS_DEFAULT_REGION` is
+not read for it), and startup fails without one.
+
+`download-url` returns a five-minute presigned URL on
+`<bucket>.s3.<region>.amazonaws.com`, the host signed into `download_hosts`.
+A client that uses it needs HTTPS egress to that host as well as to the site.
+`GET /assets/{assetId}` also works with `s3`: the service reads the object and
+streams it, so that path needs only the site.
+
+The `file` signer's 65536-byte limit is what lets one release carry the macOS
+headless bundles and their installer; under `awskms` (4096 bytes) the
+publisher trims the release to the asset set listed above.
+
+Operator order:
+
+1. Create one private PKCS8 Ed25519 PEM per profile and mount each as a
+   durable secret file with the permissions in Configuration, the same files
+   on every replica.
+2. Set `SELFHOST_DESKTOP_FEED_SIGNER=file`, `SELFHOST_DESKTOP_FEED_KEY_FILES`
+   (for example `{"x7k2q":"/var/run/secrets/desktop-feed/x7k2q.pem"}`),
+   optionally `SELFHOST_DESKTOP_FEED_KEY_LABEL`,
+   `SELFHOST_DESKTOP_FEED_STORAGE=s3`, `SELFHOST_DESKTOP_FEED_S3_BUCKET`,
+   `SELFHOST_DESKTOP_FEED_S3_REGION`, optionally
+   `SELFHOST_DESKTOP_FEED_S3_PREFIX`, and the AWS credentials above. Block
+   public access on the bucket.
+3. Register the profile with `POST /api/v1/organizations/{org}/desktop-feed/profiles`
+   and take `signing_key.public_key` from the answer for the profile's Desktop
+   build. A profile id with no key file is 409 `signing_key_not_configured`.
+   Bind each workspace that may read the feed (see Profile administration).
+4. Mint a publisher token with `POST .../profiles/{id}/publisher-tokens`, or
+   configure its hash in `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES`.
+5. Publish a release: `POST /releases`, `PUT .../assets/{name}` for each
+   asset, then `POST .../publish` (see Publish binding and `openapi.yaml`).
+6. Mint install tokens for first installs with `POST /install-tokens` from a
+   browser session (see Install token).
+
 ### Source layout
 
 | File | Role |
 |---|---|
 | `src/desktop-feed/routes.ts` | Feed and admin routes, credential resolution, precedence, rate limits, audit |
 | `src/desktop-feed/store.ts` | Postgres access (profiles, bindings, tokens, releases, assets, audit) |
-| `src/desktop-feed/signer.ts` | `AwsKmsDesktopFeedSigner`, `MemoryDesktopFeedSigner` |
+| `src/desktop-feed/signer.ts` | `AwsKmsDesktopFeedSigner`, `FileDesktopFeedSigner`, `MemoryDesktopFeedSigner` |
 | `src/desktop-feed/storage.ts` | `S3DesktopFeedStorage` and `GcsDesktopFeedStorage` (streamed PUT, ranged GET, presigned GET), `MemoryDesktopFeedStorage` |
 | `src/gcp/credentials.ts` | Metadata-server (Workload Identity) access tokens and IAM Credentials `signBlob` for `gcs` |
 | `src/desktop-feed/schemas.ts` | The manifest, envelope and draft-create schemas, kept equal to `docs/specs/` and `openapi.yaml` by `test/desktop-feed.test.ts` |
 | `src/desktop-feed/canonical.ts`, `strict-json.ts` | RFC 8785 and strict I-JSON |
-| `migrations/0013_desktop_feed.sql` | `desktop_feed_*` tables |
+| `migrations/0027_desktop_feed.sql` | `desktop_feed_*` tables |
 
 ### Profile administration
 
@@ -193,7 +257,7 @@ token must pass the existing browser-origin check or it answers 403
     detectable mix is a bearer plus the `/cloud` session cookie.
 12. **All feed responses** carry `Cache-Control: no-store`, not only the
     manifest.
-13. **Not implemented:** `gcpkms`, `gcs` and `postgres-lo` backends, the audit
+13. **Not implemented:** `gcpkms` and `postgres-lo` backends, the audit
     retention prune and the `desktop_feed.denied` burst alert, the mirror
     token (path (b)) and `relayctl desktop-feed` commands.
 
@@ -742,9 +806,13 @@ concrete starting point. The signer below is decided; everything else here is
   is ever in the process, Postgres, logs or audit. `maxCanonicalBytes()` is
   4096, and there is no prehash workaround, so a cloud profile's manifest is
   trimmed to fit (see Configuration).
-- **No file or environment key provider is proposed for any deployed site.**
-  Local development and the contract tests use a throwaway run-time key pair,
-  as `test/desktop-feed-contract.test.ts` does today.
+- **`file`: mounted secret files, never environment variables.** The `file`
+  signer (see Configuration) loads private keys from mounted secret files at
+  startup. No signer reads a key from an environment variable, and the backend
+  never generates a key except in the `memory` signer, which
+  `NODE_ENV=production` refuses. Local development and the contract tests use
+  a throwaway run-time key pair, as `test/desktop-feed-contract.test.ts` does
+  today.
 - **Not accepted, unchanged.** A private key stored in Postgres (see "Signing
   ownership and on-prem paths").
 - **No signer configured.** Import works, publish answers 503
@@ -755,7 +823,7 @@ concrete starting point. The signer below is decided; everything else here is
 - **Feed assets never use the inline Postgres blob table.** `MAX_OBJECT_BYTES`
   in `src/flows/objects.ts` is 8 MiB; installers are hundreds of MiB.
 - **Backend selected by `SELFHOST_DESKTOP_FEED_STORAGE`:** `s3` (SigV4 against
-  an S3-compatible bucket with the instance or pod role; the non-production
+  an Amazon S3 bucket with the AWS credentials in Configuration; the non-production
   default on the AWS box), `gcs` (the XML API with Workload Identity tokens and
   `signBlob` V4 signed URLs; see Configuration), `postgres-lo` (PostgreSQL large objects, streamed in
   chunks; for self-host deployments with no object store, which then answer
