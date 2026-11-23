@@ -3125,6 +3125,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         recordUsage(() => usage.increment(organizationId, "searches"));
         recordPeople(() => people.recordSearch(organizationId, userId));
       },
+      readBody: () => requestObject(request),
+      originAllowed: () => cookieRequestAllowed(request, browserOrigins),
+      hasBearer: () => Boolean(bearer(request)),
     })) {
       return;
     }

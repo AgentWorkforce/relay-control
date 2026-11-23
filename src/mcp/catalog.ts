@@ -67,10 +67,14 @@ const EVENTS_SETTINGS_TOOLS = ["settings.read", "settings.update"] as const;
 const CONNECT_TOOLS = ["create_connect", "host_connect_agent", "join_connect", "connect_send", "connect_inbox", "connect_status",
   "extend_connect", "create_connect_observer", "list_connect_observers", "revoke_connect_observer", "end_connect"] as const;
 export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
+/** Who may read one session, managed in relaygate (session-access.ts). */
+export const SESSION_ACCESS_TOOLS = ["get_session_access", "set_session_access", "reset_session_access",
+  "get_session_access_history"] as const;
 
 export type ToolGroupId =
   | "shared_session_reads" | "team_activity" | "relayfacts" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
-  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
+  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings"
+  | "session_access" | "capability_discovery";
 
 type GroupDefinition = {
   title: string;
@@ -99,13 +103,14 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
+  session_access: { title: "Session access management", tools: SESSION_ACCESS_TOOLS },
   capability_discovery: { title: "Capability discovery", tools: [CAPABILITY_DISCOVERY_TOOL] },
 };
 
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; sessionAccess?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -130,6 +135,9 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.webhookInbox) groups.push("webhook_inbox");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
+  // Session access tools exist only where the read API is relaygate and the
+  // connection is a person's own session (src/sessions/access.ts).
+  if (options.sessionAccess) groups.push("session_access");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -217,6 +225,8 @@ export function describeCapabilities(input: {
   capyPermits?: boolean;
   customerSupport?: boolean;
   grokRoutines?: boolean;
+  /** Whether this connection was given the session access tools (see planToolGroups). */
+  sessionAccess?: boolean;
   /** Whether a managed native call resolves to its synced Desktop identity. */
   nativeAuthorityAvailable?: boolean;
   /** Safe reason and remedy when the managed native identity cannot be used. */
@@ -227,7 +237,7 @@ export function describeCapabilities(input: {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, sessionAccess: input.sessionAccess,
     staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
@@ -303,6 +313,11 @@ export function describeCapabilities(input: {
         reason: "Agent launches are not enabled on this self-hosted installation.",
         how_to_enable: "An operator adds launch to SELFHOST_FEATURES (chart selectedFeatures)." };
     }
+    if (id === "session_access") return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: input.authMode === "oauth"
+        ? "Session access management needs your own Agent Relay sign-in; an OAuth connection cannot use it."
+        : "Session access management needs relaygate's sessions listener as this installation's session read API, and your own exchanged Agent Relay sign-in.",
+      how_to_enable: "An operator points the session read API URL at relaygate's sessions listener, makes read token mints carry the reader kind (SESSION_READ_MINT_INCLUDE_READER_KIND=true, or unset with SELFHOST_RELAYGATE_PUBLIC_URL set) and sets SESSION_READ_API_MCP_READS=true; then connect with your own Agent Relay sign-in. relaygate still decides who is a session access administrator." };
     if (id === "connect") {
       // Connect rooms have no self-host implementation yet. The hosted edition
       // serves them; a public hosted invite is joined from Agent Relay Desktop,

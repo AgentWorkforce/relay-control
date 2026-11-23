@@ -22,7 +22,8 @@ import { relayLaunchCheck } from "./relay-launch-check.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_IDENTITY_TOOLS, MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
-import { historyReader, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
+import { historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
+import { sessionAccessConfigured } from "../sessions/access.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
@@ -473,6 +474,17 @@ export function createMcpHandler(input: {
     }
 
     const site = input.siteBaseUrl(request);
+    const members = async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
+      userId: String(row.userId),
+      email: String(row.email),
+      name: typeof row.name === "string" && row.name.trim() ? row.name : null,
+    }));
+    // Session access management: a person's own exchanged session only (never
+    // OAuth, a Desktop provider credential, a staff grant or an agent
+    // identity), on a relaygate read path.
+    const sessionAccess = !oauth && personOnly && provider === undefined && sessionAccessConfigured(config) &&
+      token.startsWith("sh_at_") && principal.scopes.includes("rth:read") && !principal.pendingHandoff
+      ? sessionAccessDeps(config, principal, workspace, token, members) : undefined;
     const context: McpContext = {
       principal,
       workspace,
@@ -486,11 +498,7 @@ export function createMcpHandler(input: {
       ...(agentIdentity ? { agentIdentity } : {}),
       readHistory: historyReader(config, principal, workspace, token),
       agentTokens: config.sessionSearchAgentTokens,
-      members: async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
-        userId: String(row.userId),
-        email: String(row.email),
-        name: typeof row.name === "string" && row.name.trim() ? row.name : null,
-      })),
+      members,
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
@@ -515,6 +523,7 @@ export function createMcpHandler(input: {
       ...(!oauth && personOnly && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
       ...(input.launch && personOnly ? { launch: true } : {}),
+      ...(sessionAccess ? { sessionAccess } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;

@@ -3,6 +3,7 @@ import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
 import { readerKindOf } from "../session-read.js";
 import { recordedSummary } from "./summary.js";
+import { handleSessionAccessRoutes } from "./access-routes.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
 import {
@@ -45,6 +46,12 @@ export type SessionRouteContext = {
   now?: () => Date;
   /** Usage page: a first-page search by a member of this organization (counts only). */
   onSearch?: (organizationId: string, userId: string) => void;
+  /** Session access writes (./access-routes.ts): the JSON body, size-limited like neighbouring routes. */
+  readBody?: () => Promise<Record<string, unknown>>;
+  /** Session access writes: the same-origin check for a cookie-carried PATCH or POST. */
+  originAllowed?: () => boolean;
+  /** True when the request carries a bearer token rather than the dashboard cookie. */
+  hasBearer?: () => boolean;
 };
 
 const PREFIX = /^\/api\/v1\/workspaces\/([^/]+)\/sessions(?:\/(.*))?$/;
@@ -265,6 +272,7 @@ const LIST_RULES: Record<string, Rule> = {
 };
 
 export async function handleSessionRoutes(ctx: SessionRouteContext): Promise<boolean> {
+  if (await handleSessionAccessRoutes(ctx)) return true;
   try {
     return await routeSessions(ctx);
   } catch (error) {

@@ -8,7 +8,8 @@ import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
-import { readViaSessionRead } from "./session-read-reader.js";
+import { accessViaSessionRead, readViaSessionRead } from "./session-read-reader.js";
+import type { AccessDeps } from "../sessions/access.js";
 import { DESKTOP_MCP_SCOPE, DESKTOP_MCP_TOKEN } from "../auth/desktop-mcp-credentials.js";
 import { mcpReaderMarker } from "../session-read.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
@@ -104,6 +105,12 @@ export type McpContext = {
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
+  /**
+   * Session access management (./session-access.ts), bound to this person.
+   * Present only on a relaygate read path (sessionAccessConfigured) for a
+   * person's own exchanged session with rth:read; see sessionAccessDeps.
+   */
+  sessionAccess?: AccessDeps;
   /** Internal native send resolver; absent until a complete Capy module is mounted. */
   capy?: Pick<CapyBindings, "agentFor">;
   /** Explicit exact-grant reply permits; never the native resolver or a persona pin. */
@@ -222,6 +229,33 @@ export function historyReader(
       throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
     }
   };
+}
+
+/**
+ * Session access calls as this person: the per-person session-read hop
+ * (reader kind `mcp`), never the workspace reader, a service token or the
+ * caller's own token upstream. The MCP route offers this only to an exchanged
+ * user session (`sh_at_`) with rth:read and no pending handoff; an OAuth
+ * connection, a Desktop provider credential, a staff read grant and an agent
+ * identity never get it.
+ */
+export function sessionAccessDeps(
+  config: SelfhostConfig,
+  principal: Principal,
+  workspace: McpWorkspace,
+  callerToken: string,
+  members: () => Promise<McpMember[]>,
+): AccessDeps {
+  const identity = {
+    userId: principal.userId,
+    organizationId: workspace.organizationId,
+    workspaceId: workspace.id,
+    role: workspace.role,
+    callerToken,
+    readerKind: "mcp" as const,
+  };
+  const marker = mcpReaderMarker(config.sessionReadApi.secret);
+  return { send: request => accessViaSessionRead(config, identity, request, marker), members };
 }
 
 export function toolError(error: unknown, options: { correlationId?: string } = {}) {

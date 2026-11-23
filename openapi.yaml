@@ -4072,6 +4072,167 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnsupportedByBackend"
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccess
+      description: |
+        Who may read one session (docs/sessions-read-api.md, "Session
+        access"). Served only when read token mints carry the reader kind
+        (`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+        `SELFHOST_RELAYGATE_PUBLIC_URL` set) and
+        `SESSION_READ_API_MCP_READS=true`, with the session read API URL
+        pointing at relaygate's sessions listener; otherwise 404
+        `session_access_not_configured`. Also served at the same path without
+        the `/cloud` prefix for a bearer. Control forwards relaygate
+        `GET /v1/sessions/{sessionId}/access` with the caller's own read
+        token; relaygate decides who is a session access administrator,
+        before it looks the session up. An administrator may manage a session
+        they cannot read; a non-administrator gets 403 whether or not the
+        session exists. Per-person entries name current members by email and name; a user
+        who is no longer a member is `member: false`.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+    patch:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: setSessionAccess
+      description: |
+        Change who may read one session. `members` and `groups`, when given,
+        REPLACE the current per-person and group lists; they are not merged.
+        Emails resolve to current members of the workspace's organization;
+        any unknown or ambiguous email refuses the whole change (400
+        `unknown_members`) and nothing is sent upstream. Only user ids go
+        upstream. Without `expectedVersion` the current version is read
+        first. A stale version is 409 `conflict` with `currentVersion` and is
+        never retried. A cookie-carried request needs an allowed Origin (403
+        `csrf_rejected`). A 504 `session_access_outcome_unknown` means the
+        change may have applied: read the access again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionAccessChange"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/reset:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: resetSessionAccess
+      description: |
+        Remove the session's access override so the installation's default
+        policy applies again. Versioned and audited like a PATCH; same
+        Origin check, conflict and unknown-outcome rules.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: Audited. Never put session content in it.
+                expectedVersion:
+                  type: integer
+                  minimum: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/history:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccessHistory
+      description: |
+        The audited before/after rows of every access change, oldest first.
+        Follow `nextAfter` (null on the last page). `actor` is the Control
+        person behind a row whose `actorName` is `ctl:<userId>`, else null;
+        `before` is null on a session's first change.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rows, nextAfter]
+                properties:
+                  rows:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SessionAccessHistoryRow"
+                  nextAfter:
+                    type: [integer, "null"]
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
   /api/v1/workspaces/{workspaceId}/relayhistory/origin:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10401,6 +10562,192 @@ components:
                 coverage:
                   type: object
             - type: "null"
+    SessionAccessGrant:
+      type: object
+      required: [userId, perm, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        perm:
+          type: string
+          enum: [r, w, rw]
+        member:
+          type: boolean
+          description: False for a user who is no longer a member; remove the entry with a PATCH.
+    SessionAccessGroup:
+      type: object
+      required: [gid, perm]
+      properties:
+        gid:
+          type: integer
+          minimum: 0
+        perm:
+          type: string
+          enum: [r, w, rw]
+    SessionAccessPolicy:
+      type: object
+      required: [sessionId, runtime, reset, version, mode, gid, groups, members, label, updatedAt]
+      properties:
+        sessionId:
+          type: string
+        runtime:
+          type: boolean
+          description: True when a runtime override is in force.
+        reset:
+          type: boolean
+        version:
+          type: integer
+          minimum: 0
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        updatedAt:
+          type: [string, "null"]
+    SessionAccessAnswer:
+      type: object
+      required: [access]
+      properties:
+        access:
+          $ref: "#/components/schemas/SessionAccessPolicy"
+    SessionAccessChange:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      description: At least one of mode, members, groups or label.
+      properties:
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+          description: Owner, group and other digits. "000" plus r entries restricts reading to those entries.
+        members:
+          type: array
+          maxItems: 64
+          description: Replaces the per-person list.
+          items:
+            type: object
+            required: [email, perm]
+            properties:
+              email:
+                type: string
+                maxLength: 320
+              perm:
+                type: string
+                enum: [r, w, rw]
+        groups:
+          type: array
+          maxItems: 64
+          description: Replaces the group list.
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        label:
+          type: [string, "null"]
+          pattern: "^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$"
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Audited. Never put session content in it.
+        expectedVersion:
+          type: integer
+          minimum: 0
+    SessionAccessSnapshot:
+      type: [object, "null"]
+      properties:
+        mode:
+          type: [string, "null"]
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        reset:
+          type: boolean
+    SessionAccessHistoryRow:
+      type: object
+      required: [seq, at, actorId, actorName, actor, version, reason, before, after]
+      properties:
+        seq:
+          type: integer
+        at:
+          type: string
+        actorId:
+          type: [string, "null"]
+          description: relaygate's internal agent id, as recorded.
+        actorName:
+          type: [string, "null"]
+          description: relaygate's actor name, as recorded; `ctl:<userId>` for a Control person.
+        actor:
+          $ref: "#/components/schemas/SessionAccessActor"
+        version:
+          type: integer
+        reason:
+          type: [string, "null"]
+        before:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+          description: Null on a session's first change.
+        after:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+    SessionAccessActor:
+      type: [object, "null"]
+      description: |
+        The Control person named by `actorName` `ctl:<userId>`, resolved like a
+        per-person entry: email and name for a current member of the
+        organization, `member: false` with the user id only otherwise. Null
+        when `actorName` is not of that form.
+      required: [userId, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        member:
+          type: boolean
+    SessionAccessError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, unknown_members, not_access_admin, csrf_rejected, forbidden, handoff_not_exchanged, not_found, session_access_not_configured, conflict, session_access_unavailable, session_access_outcome_unknown]
+        message:
+          type: string
+        currentVersion:
+          type: [integer, "null"]
+          description: With conflict.
+        emails:
+          type: array
+          items:
+            type: string
+          description: With unknown_members, the emails that name no single current member.
     DashboardSessionCatalog:
       type: object
       required: [catalog, parents, children, commitLinks, truncated]
@@ -11519,6 +11866,19 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    SessionAccessFailure:
+      description: |
+        400 invalid_request or unknown_members; 403 not_access_admin (relaygate
+        refused: not a session access administrator, decided before the
+        session is looked up, so it says nothing about whether the session
+        exists), csrf_rejected, forbidden or handoff_not_exchanged; 404
+        not_found (an administrator naming a session relaygate does not know),
+        session_access_not_configured or a workspace outside the tenant; 409
+        conflict with currentVersion; 503 session_access_unavailable; 504
+        session_access_outcome_unknown (a write whose answer was lost).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SessionAccessError" }
     RelayNodeTokenInvalid:
       description: "token_invalid: no bearer, or not a live (unrevoked, unexpired) relay-node token."
       content:
