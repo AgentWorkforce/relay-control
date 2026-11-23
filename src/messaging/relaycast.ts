@@ -183,6 +183,12 @@ function errorCode(body: string): string | null {
   }
 }
 
+/** A message's reply count: the engine serves its SQL count as a number or a decimal string. Anything else is 0. */
+function replyCountOf(value: unknown): number {
+  const count = typeof value === "string" && /^[0-9]{1,15}$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(count) && (count as number) >= 0 ? count as number : 0;
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -871,13 +877,45 @@ export function createRelaycastClient(input: {
         return [{
           id, sender: text(message.agent_name), text: typeof message.text === "string" ? message.text : "",
           threadId: text(message.thread_id),
-          replyCount: Number.isInteger(message.reply_count) ? message.reply_count as number : 0,
+          replyCount: replyCountOf(message.reply_count),
           createdAt: text(message.created_at),
         }];
       });
       // Snowflake ids: a shorter decimal string is an earlier message.
       messages.sort((left, right) => left.id.length - right.id.length || left.id.localeCompare(right.id));
       return { messages, hasEarlier: data.length >= options.limit };
+    },
+
+    /**
+     * One thread: its parent post and the replies after `after`, oldest first.
+     * Read with the workspace key (or a gated token through relaygate):
+     * callers check the parent's channel and their own membership. Null when
+     * the parent does not exist.
+     */
+    async getChannelThread(credential: string, parentId: string, options: { limit: number; after?: string }):
+      Promise<{ parent: ChannelMessage & { channelId: string | null }; replies: ChannelMessage[] } | null> {
+      const query = new URLSearchParams({ limit: String(options.limit) });
+      if (options.after) query.set("after", options.after);
+      const raw = await labeled("read_thread", () =>
+        call("GET", `/v1/messages/${encodeURIComponent(parentId)}/replies?${query}`, credential, undefined, undefined, true));
+      if (raw === null) return null;
+      const data = record(raw);
+      const parent = record(data?.parent);
+      if (!parent || text(parent.id) !== parentId || !Array.isArray(data?.replies)) throw new RelaycastCallError(200, "", true);
+      const row = (message: Record<string, unknown>, id: string): ChannelMessage => ({
+        id, sender: text(message.agent_name), text: typeof message.text === "string" ? message.text : "",
+        threadId: text(message.thread_id),
+        replyCount: replyCountOf(message.reply_count),
+        createdAt: text(message.created_at),
+      });
+      const replies = (data!.replies as unknown[]).flatMap((item): ChannelMessage[] => {
+        const reply = record(item);
+        const id = text(reply?.id);
+        // Only this parent's replies; anything else in the body is not part of the thread.
+        return reply && id && text(reply.thread_id) === parentId ? [row(reply, id)] : [];
+      });
+      replies.sort((left, right) => left.id.length - right.id.length || left.id.localeCompare(right.id));
+      return { parent: { ...row(parent, parentId), replyCount: replyCountOf(parent.reply_count), channelId: text(parent.channel_id) }, replies };
     },
 
     /**
