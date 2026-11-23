@@ -37,8 +37,10 @@ import {
  *   workspace and actor, which is the person's own launcher participant. The
  *   stored authority is not compared, so a launch stays reachable after the
  *   client restarts with a new Mcp-Session-Id, including rows written while
- *   the authority still carried the session id. New native rows store an
- *   authority of the auth mode alone. An OAuth actor is never a launcher, so a
+ *   the authority still carried the session id. New native rows store one
+ *   fixed authority, the same for every native auth mode, so a key replayed
+ *   from a CLI login and a dashboard session of the same person is one launch.
+ *   An OAuth actor is never a launcher, so a
  *   native connection never reaches an OAuth row, and an OAuth connection
  *   never matches a native row's authority.
  *
@@ -114,6 +116,8 @@ const COLUMNS = `id, workspace_id, user_id, authority_hash, relaycast_workspace_
 const OWNED = `workspace_id = $1 AND user_id = $2 AND authority_hash = $3 AND relaycast_workspace_id = $4 AND actor_id = $5`;
 const ownedParams = (owner: SpawnOwner) =>
   [owner.workspaceId, owner.userId, owner.authorityHash, owner.relaycastWorkspaceId, owner.actorId];
+/** What every native row's authority hashes; never a value an OAuth authority (["oauth", grantId]) can take. */
+const NATIVE_AUTHORITY = ["native"] as const;
 /** A native lookup: the owner without its authority (see the header comment). */
 const NATIVE_OWNED = `workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND actor_id = $4`;
 /**
@@ -357,8 +361,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
     return { workspaceId: context.workspace.id, userId, relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
       authorityHash: ownerHash(JSON.stringify(context.oauth
         ? [context.authMode, context.oauth.access.grantId]
-        // Native: no session id, so a later session of the same person derives the same owner.
-        : [context.authMode])) };
+        // Native: no session id and no auth mode, so a later session of the same person derives the same owner.
+        : NATIVE_AUTHORITY)) };
   }
   /** OAuth compares the grant authority; a native connection is matched by its launcher actor instead. */
   const ownership: SpawnLookup = { compareAuthority: Boolean(context.oauth) };

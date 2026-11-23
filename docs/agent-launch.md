@@ -230,8 +230,9 @@ launch. A node itself enforcing memory at launch is a relay-node follow-up.
 
 Each launch is written to `relay_spawns` before it is sent, bound to the
 workspace, user, MCP authority, Relaycast workspace and launcher. The
-authority is the OAuth grant on an OAuth connection and the auth mode alone on
-a native one (it held the MCP session too before launches survived a restart);
+authority is the OAuth grant on an OAuth connection and one fixed value on a
+native one (it held the auth mode and the MCP session before launches survived
+a restart);
 native lookups do not compare it (see
 [Who can see and stop a launch](#who-can-see-and-stop-a-launch)).
 Repeating the same idempotency key returns the same receipt and never sends a

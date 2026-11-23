@@ -80,7 +80,7 @@ test("an OAuth connection cannot reach a native launch row, even with the same p
   const id = randomUUID();
   // A native row: no grant in its authority. Only the authority tells it apart from this connection's own launches.
   await store.reserve({ workspaceId: f.context.workspace.id, userId: f.context.principal.userId,
-    authorityHash: ownerHash(JSON.stringify(["cli_login"])), relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
+    authorityHash: ownerHash(JSON.stringify(["native"])), relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
     id, idempotencyHash: "c".repeat(64), requestHash: "d".repeat(64), agentName: "worker", cli: "codex", nodeId: "broker",
     state: "failed", invocationId: null, workerId: null, workerAddress: null, releaseInvocationId: null, taskUnconfirmed: false,
     revision: 0, audit: [] });

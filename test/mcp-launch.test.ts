@@ -322,8 +322,8 @@ test("a desktop-linked chat's launch names it as the requester; the launcher sta
   assert.notEqual(invocation.caller_id, chat.id);
 });
 
-/** The authority a native (cli_login) launch row stores: the auth mode alone, no session id. */
-const NATIVE_AUTHORITY = ownerHash(JSON.stringify(["cli_login"]));
+/** The authority every native launch row stores: one fixed value, no session id and no auth mode. */
+const NATIVE_AUTHORITY = ownerHash(JSON.stringify(["native"]));
 const spawnInvocations = (env: Env) => env.world.bodies.filter(body => body.path === "/v1/actions/spawn/invoke").length;
 
 /**
@@ -433,7 +433,10 @@ test("native: a row of the same person whose actor is not its launcher is refuse
     /not started by you in the current workspace/);
   // The launcher itself reaches a row in the same shape.
   const own = await insertSpawn(env, { actorId: env.world.agents.get(launcherName(env.ownerId))!.id, authorityHash: NATIVE_AUTHORITY });
-  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: own } })).status, "failed");
+  // A failed launch is returned as a tool error that still carries the receipt.
+  const reached = await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: own } }) as ToolResult;
+  assert.deepEqual([(reached.structuredContent as Record<string, unknown>).spawn_id, (reached.structuredContent as Record<string, unknown>).status],
+    [own, "failed"]);
   const service = nativeService(env, { userId: env.ownerId, workspaceId: env.workspaceId, relaycastWorkspaceId: "rc-first",
     actorId: "another-actor" });
   await assert.rejects(service.status("not-a-uuid"), /Use a spawn_id returned by spawn_relay_agent\./);
