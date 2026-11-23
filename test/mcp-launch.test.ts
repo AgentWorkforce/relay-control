@@ -8,7 +8,10 @@ import { createApp } from "../src/app.js";
 import { loadSpawnMemoryPolicy, type SelfhostConfig } from "../src/config.js";
 import { NO_FEATURES } from "../src/features.js";
 import { migrate } from "../src/migrations.js";
-import { launcherName } from "../src/mcp/relay-participants.js";
+import type { McpContext } from "../src/mcp/context.js";
+import { launcherName, ownerHash } from "../src/mcp/relay-participants.js";
+import { relaySpawnService, spawnStore } from "../src/mcp/relay-spawn.js";
+import type { RelaycastClient } from "../src/messaging/relaycast.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { copilotDesktopSetup, identitiesPath } from "./support/copilot-desktop.js";
 import { createRelaycastWorld } from "./support/relaycast-world.js";
@@ -103,13 +106,18 @@ async function setup(t: TestContext, options: { launch?: boolean; env?: Record<s
   });
   assert.equal(other.status, 201);
   const ownerId = org.body.owner.id as string;
-  const started = await post("/api/v1/auth/device/start", { client_name: "mcp-test" });
-  const approved = await post("/api/v1/auth/device/approve", {
-    action: "approve", user_code: started.body.user_code, user_id: ownerId, workspace_id: workspace.body.id,
-  });
-  assert.equal(approved.status, 200);
-  const tokens = await post("/api/v1/auth/device/token", { device_code: started.body.device_code });
-  assert.equal(tokens.status, 200);
+  /** A CLI login (authMode cli_login) for one person in one workspace. */
+  const deviceToken = async (userId: string, onWorkspace: string): Promise<string> => {
+    const started = await post("/api/v1/auth/device/start", { client_name: "mcp-test" });
+    const approved = await post("/api/v1/auth/device/approve", {
+      action: "approve", user_code: started.body.user_code, user_id: userId, workspace_id: onWorkspace,
+    });
+    assert.equal(approved.status, 200);
+    const tokens = await post("/api/v1/auth/device/token", { device_code: started.body.device_code });
+    assert.equal(tokens.status, 200);
+    return tokens.body.access_token as string;
+  };
+  const ownerToken = await deviceToken(ownerId, workspace.body.id as string);
   const workspaceId = workspace.body.id as string;
   const orgId = org.body.id as string;
   /** Records a fleet_node_owners claim directly (the claim route is covered by its own tests). */
@@ -120,14 +128,15 @@ async function setup(t: TestContext, options: { launch?: boolean; env?: Record<s
   };
   const setRole = (role: "owner" | "admin" | "member") => database.query(
     "UPDATE organization_memberships SET role = $1 WHERE organization_id = $2 AND user_id = $3", [role, orgId, ownerId]);
-  const connect = async () => {
+  /** Each call is a new MCP session (a new Mcp-Session-Id), as after a client restart. */
+  const connect = async (token = ownerToken) => {
     const client = new Client({ name: "mcp-test", version: "1.0.0" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${origin}${MCP_PATH}`),
-      { requestInit: { headers: { authorization: `Bearer ${tokens.body.access_token as string}` } } }));
+      { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
     t.after(() => client.close());
     return client;
   };
-  return { world, database, workspaceId, otherWorkspaceId: other.body.id as string, orgId, ownerId, claim, setRole, connect };
+  return { world, database, workspaceId, otherWorkspaceId: other.body.id as string, orgId, ownerId, claim, setRole, connect, deviceToken };
 }
 
 type Env = Awaited<ReturnType<typeof setup>>;
@@ -313,16 +322,136 @@ test("a desktop-linked chat's launch names it as the requester; the launcher sta
   assert.notEqual(invocation.caller_id, chat.id);
 });
 
-test("another connection cannot read or release a launch, even for the same user", async (t) => {
+/** The authority a native (cli_login) launch row stores: the auth mode alone, no session id. */
+const NATIVE_AUTHORITY = ownerHash(JSON.stringify(["cli_login"]));
+const spawnInvocations = (env: Env) => env.world.bodies.filter(body => body.path === "/v1/actions/spawn/invoke").length;
+
+/**
+ * A native launch service for one person in one workspace acting as a given
+ * actor, without Relaycast: the rows it is pointed at are refused before any
+ * upstream call, or are failed and answered from the journal alone.
+ */
+function nativeService(env: Env, owner: { userId: string; workspaceId: string; relaycastWorkspaceId: string; actorId: string }) {
+  const context = { authMode: "cli_login", role: "admin", principal: { userId: owner.userId },
+    workspace: { id: owner.workspaceId, organizationId: env.orgId },
+    relay: { sessionId: randomUUID(), database: env.database } } as unknown as McpContext;
+  return relaySpawnService(context, { client: {} as RelaycastClient, workspaceKey: "rk_unused", store: spawnStore(env.database),
+    owners: async () => new Map(), withActor: fn => fn({ id: owner.actorId, name: launcherName(owner.userId), token: "unused",
+      relaycastWorkspaceId: owner.relaycastWorkspaceId }) });
+}
+
+async function insertSpawn(env: Env, row: { userId?: string; workspaceId?: string; relaycastWorkspaceId?: string; actorId: string;
+  authorityHash: string; state?: string }): Promise<string> {
+  const id = randomUUID();
+  await env.database.query(
+    `INSERT INTO relay_spawns (id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash,
+       request_hash, agent_name, cli, node_id, state, audit)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'request', 'earlier-worker', 'codex', 'node-1', $8, '[]'::jsonb)`,
+    [id, row.workspaceId ?? env.workspaceId, row.userId ?? env.ownerId, row.authorityHash, row.relaycastWorkspaceId ?? "rc-first",
+      row.actorId, `inserted-${id}`, row.state ?? "failed"]);
+  return id;
+}
+
+test("native: a launch stays reachable from a later session of the same person, which reads and releases it", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const first = await env.connect();
+  const receipt = data(await first.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  // The stored authority no longer carries the session id.
+  const stored = await env.database.query<{ authority_hash: string }>("SELECT authority_hash FROM relay_spawns WHERE id = $1", [receipt.spawn_id]);
+  assert.equal(stored.rows[0]!.authority_hash, NATIVE_AUTHORITY);
+  // A restarted client: a new MCP session (new Mcp-Session-Id) of the same person in the same workspace.
+  const second = await env.connect();
+  const status = data(await second.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(status.status, "ready");
+  const released = data(await second.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(released.status, "released");
+  assert.equal(env.world.agents.has("reviewer-1"), false);
+});
+
+test("native: a row whose authority carries an old session id is reachable from a new session", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const first = await env.connect();
+  const receipt = data(await first.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  // As written before this change: the authority hashed the auth mode and the session id.
+  await env.database.query("UPDATE relay_spawns SET authority_hash = $2 WHERE id = $1",
+    [receipt.spawn_id, ownerHash(JSON.stringify(["cli_login", "old-session-id"]))]);
+  const second = await env.connect();
+  assert.equal(data(await second.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })).status, "ready");
+  assert.equal(data(await second.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } })).status, "released");
+  // The row kept its stored authority: update matches the row's own columns.
+  const row = await env.database.query<{ authority_hash: string; state: string }>(
+    "SELECT authority_hash, state FROM relay_spawns WHERE id = $1", [receipt.spawn_id]);
+  assert.deepEqual(row.rows[0], { authority_hash: ownerHash(JSON.stringify(["cli_login", "old-session-id"])), state: "released" });
+});
+
+test("native: another admin of the workspace and the same person in another workspace or Relaycast workspace are refused", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const first = await env.connect();
+  const receipt = data(await first.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  const launcher = env.world.agents.get(launcherName(env.ownerId))!;
+
+  const admin = randomUUID();
+  await env.database.query("INSERT INTO users (id, email, name) VALUES ($1, 'admin@example.test', 'Admin')", [admin]);
+  await env.database.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'admin')", [env.orgId, admin]);
+  const other = await env.connect(await env.deviceToken(admin, env.workspaceId));
+  assert.match(errorText(await other.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })),
+    /not started by you in the current workspace/);
+  assert.match(errorText(await other.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } })),
+    /not started by you in the current workspace/);
+  assert.equal(env.world.agents.has("reviewer-1"), true);
+
+  // The same person and even the same launcher id, from another workspace or another Relaycast workspace.
+  const elsewhere = nativeService(env, { userId: env.ownerId, workspaceId: env.otherWorkspaceId, relaycastWorkspaceId: "rc-first",
+    actorId: launcher.id });
+  await assert.rejects(elsewhere.status(receipt.spawn_id), /not started by you in the current workspace/);
+  await assert.rejects(elsewhere.release(receipt.spawn_id), /not started by you in the current workspace/);
+  const otherRelay = nativeService(env, { userId: env.ownerId, workspaceId: env.workspaceId, relaycastWorkspaceId: "rc-other",
+    actorId: launcher.id });
+  await assert.rejects(otherRelay.status(receipt.spawn_id), /not started by you in the current workspace/);
+  // The owner's own later session still reaches it.
+  const same = nativeService(env, { userId: env.ownerId, workspaceId: env.workspaceId, relaycastWorkspaceId: "rc-first", actorId: launcher.id });
+  const failedId = await insertSpawn(env, { actorId: launcher.id, authorityHash: NATIVE_AUTHORITY });
+  assert.equal((await same.status(failedId)).status, "failed");
+  const rows = await env.database.query<{ state: string }>("SELECT state FROM relay_spawns WHERE id = $1", [receipt.spawn_id]);
+  assert.equal(rows.rows[0]!.state, "accepted");
+});
+
+test("native: a row of the same person whose actor is not its launcher is refused", async (t) => {
+  const env = await setup(t);
+  const client = await env.connect();
+  // Same workspace, person, Relaycast workspace and native authority; only the actor differs.
+  const id = await insertSpawn(env, { actorId: "another-actor", authorityHash: NATIVE_AUTHORITY });
+  assert.match(errorText(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: id } })),
+    /not started by you in the current workspace/);
+  assert.match(errorText(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: id } })),
+    /not started by you in the current workspace/);
+  // The launcher itself reaches a row in the same shape.
+  const own = await insertSpawn(env, { actorId: env.world.agents.get(launcherName(env.ownerId))!.id, authorityHash: NATIVE_AUTHORITY });
+  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: own } })).status, "failed");
+  const service = nativeService(env, { userId: env.ownerId, workspaceId: env.workspaceId, relaycastWorkspaceId: "rc-first",
+    actorId: "another-actor" });
+  await assert.rejects(service.status("not-a-uuid"), /Use a spawn_id returned by spawn_relay_agent\./);
+});
+
+test("native: the same idempotency key from a new session returns the earlier receipt; a different request is refused", async (t) => {
   const env = await setup(t);
   env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
   await env.claim("node-1");
   const first = await env.connect();
   const receipt = data(await first.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
   const second = await env.connect();
-  assert.match(errorText(await second.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })), /not owned/);
-  assert.match(errorText(await second.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } })), /not owned/);
-  assert.equal(env.world.agents.has("reviewer-1"), true);
+  assert.equal(data(await second.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") })).spawn_id, receipt.spawn_id);
+  assert.equal(spawnInvocations(env), 1);
+  assert.match(errorText(await second.callTool({ name: "spawn_relay_agent", arguments: launch("node-1", { task: "Other" }) })),
+    /different launch/);
+  assert.equal(spawnInvocations(env), 1);
+  assert.equal((await env.database.query("SELECT 1 FROM relay_spawns")).rows.length, 1);
 });
 
 test("admission refusals: not allowed, offline, harness, unknown target; nothing is journaled or sent", async (t) => {

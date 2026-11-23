@@ -72,6 +72,51 @@ test("OAuth launch journals cannot be recovered through a different grant", asyn
   f.connection.access.grantId = first;
 });
 
+test("an OAuth connection cannot reach a native launch row, even with the same person and actor", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const actor = await f.service.withSpawnActor(async actor => actor);
+  const store = spawnStore(f.database);
+  const id = randomUUID();
+  // A native row: no grant in its authority. Only the authority tells it apart from this connection's own launches.
+  await store.reserve({ workspaceId: f.context.workspace.id, userId: f.context.principal.userId,
+    authorityHash: ownerHash(JSON.stringify(["cli_login"])), relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
+    id, idempotencyHash: "c".repeat(64), requestHash: "d".repeat(64), agentName: "worker", cli: "codex", nodeId: "broker",
+    state: "failed", invocationId: null, workerId: null, workerAddress: null, releaseInvocationId: null, taskUnconfirmed: false,
+    revision: 0, audit: [] });
+  const service = relaySpawnService(f.context, { client: f.context.relay.client, workspaceKey: "rk_fake", store,
+    owners: async () => new Map(), withActor: fn => f.service.withSpawnActor(fn) });
+  await assert.rejects(service.status(id), /This launch is not owned by this connection in the current workspace\./);
+  await assert.rejects(service.release(id), /This launch is not owned by this connection in the current workspace\./);
+});
+
+test("OAuth launch idempotency hash is unchanged: the five owner properties in order, with the grant authority", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const actor = await f.service.withSpawnActor(async actor => actor);
+  const store = spawnStore(f.database);
+  const seen: Array<{ hash: string; compareAuthority: boolean | undefined }> = [];
+  store.findKey = async (_owner, hash, lookup) => {
+    seen.push({ hash, compareAuthority: lookup?.compareAuthority });
+    throw new Error("stop before admission");
+  };
+  const service = relaySpawnService(f.context, { client: f.context.relay.client, workspaceKey: "rk_fake", store,
+    owners: async () => new Map(), withActor: fn => f.service.withSpawnActor(fn) });
+  const key = "fixed-launch-key";
+  await assert.rejects(service.spawn({ name: "worker", cli: "codex", target_node: "broker", task: "test", idempotency_key: key }, 1),
+    /stop before admission/);
+  const workspaceId = f.context.workspace.id;
+  const userId = f.context.principal.userId;
+  const relaycastWorkspaceId = actor.relaycastWorkspaceId;
+  const actorId = actor.id;
+  const grantId = f.connection.access.grantId;
+  const authorityHash = ownerHash(JSON.stringify(["oauth", grantId]));
+  assert.deepEqual(seen, [{
+    hash: ownerHash(JSON.stringify(["selfhost-spawn:v1", { workspaceId, userId, relaycastWorkspaceId, actorId, authorityHash }, key])),
+    compareAuthority: true,
+  }]);
+});
+
 test("OAuth disconnect retains the launcher until its active launch journal is drained", async t => {
   const f = await relayFixture(t);
   await f.service.join({});

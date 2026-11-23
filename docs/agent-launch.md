@@ -167,10 +167,36 @@ machine.
   Matching is only as complete as the page read: an id or name beyond it is
   not seen.
 
-Native clients must retain `Mcp-Session-Id`: their launches belong to that
-session. OAuth launches belong to the exact grant and remain accessible after
-MCP reconnects within that grant. A new consent grant cannot recover them.
-Release workers before disconnecting. Revocation ends tool access immediately;
+## Who can see and stop a launch
+
+`get_relay_spawn_status`, `release_relay_agent` and a replayed
+`idempotency_key` reach only launches you started:
+
+- **Native connections** (CLI login, dashboard session, Desktop provider
+  credential): a launch belongs to the person, the workspace, its Relaycast
+  workspace and the person's launcher. It stays reachable from a later MCP
+  session of the same person in the same workspace, so a client that restarts
+  (and gets a new `Mcp-Session-Id`) can still check and stop the agents it
+  started. Launches journaled before this rule, when ownership included the
+  MCP session, are reachable the same way; no migration is needed. A client
+  must still initialize MCP and keep `Mcp-Session-Id` within a session before
+  it starts agents. Another person, even an owner or admin of the same
+  workspace, another workspace and an OAuth connection get "This launch was
+  not started by you in the current workspace." (native) or "This launch is
+  not owned by this connection in the current workspace." (OAuth).
+- **OAuth connections**: a launch belongs to the exact grant and its approved
+  agent, and remains accessible after MCP reconnects within that grant. A new
+  consent grant cannot recover it, and a native connection of the same person
+  cannot reach it.
+
+An `idempotency_key` reused from a later native session returns the earlier
+receipt instead of sending a second launch, for launches made after this rule.
+The key of a launch made before it is not recognised from a new session:
+recover such a launch by its `spawn_id`, and do not resend it under the old
+key. Without an `idempotency_key` the default key is per session and request,
+so a new session never replays an earlier launch.
+
+Release workers before disconnecting an OAuth grant. Revocation ends tool access immediately;
 cleanup retains the launcher credentials while its journal has active or
 unconfirmed launches. An operator must drain those workers and reconcile their
 journal rows before the deferred cleanup can finish; it never marks a live
@@ -203,7 +229,11 @@ launch. A node itself enforcing memory at launch is a relay-node follow-up.
 ## Journal and failure handling
 
 Each launch is written to `relay_spawns` before it is sent, bound to the
-workspace, user, MCP session authority, Relaycast workspace and launcher.
+workspace, user, MCP authority, Relaycast workspace and launcher. The
+authority is the OAuth grant on an OAuth connection and the auth mode alone on
+a native one (it held the MCP session too before launches survived a restart);
+native lookups do not compare it (see
+[Who can see and stop a launch](#who-can-see-and-stop-a-launch)).
 Repeating the same idempotency key returns the same receipt and never sends a
 second launch; a key reused for a different request is refused. A lost or
 5xx response leaves the row `unknown` rather than guessing. Readiness requires

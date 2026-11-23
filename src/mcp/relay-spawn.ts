@@ -27,9 +27,25 @@ import {
  * a node from another workspace or another installation is never listed or
  * reachable. Every call rechecks the owner's current role and OAuth grant
  * when present. A launch is journaled (relay_spawns) before it
- * is sent and is sent at most once per journal row; status and release only
- * reach rows owned by the same workspace, user, MCP authority, Relaycast
- * workspace and launcher actor.
+ * is sent and is sent at most once per journal row.
+ *
+ * Who reaches a journal row (status, release, idempotent replay):
+ * - An OAuth connection: the same workspace, user, grant authority, Relaycast
+ *   workspace and approved actor. Another grant of the same person never
+ *   reaches it.
+ * - Any other (native) connection: the same workspace, user, Relaycast
+ *   workspace and actor, which is the person's own launcher participant. The
+ *   stored authority is not compared, so a launch stays reachable after the
+ *   client restarts with a new Mcp-Session-Id, including rows written while
+ *   the authority still carried the session id. New native rows store an
+ *   authority of the auth mode alone. An OAuth actor is never a launcher, so a
+ *   native connection never reaches an OAuth row, and an OAuth connection
+ *   never matches a native row's authority.
+ *
+ * The idempotency hash covers the whole owner, authority included, so an
+ * OAuth key never matches another grant's launch; a native key made after the
+ * authority stopped carrying the session id is recognised from a later
+ * session of the same person.
  *
  * On a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL) each new journal row
  * also gets a one-time `sh_lt_` launch credential
@@ -98,6 +114,20 @@ const COLUMNS = `id, workspace_id, user_id, authority_hash, relaycast_workspace_
 const OWNED = `workspace_id = $1 AND user_id = $2 AND authority_hash = $3 AND relaycast_workspace_id = $4 AND actor_id = $5`;
 const ownedParams = (owner: SpawnOwner) =>
   [owner.workspaceId, owner.userId, owner.authorityHash, owner.relaycastWorkspaceId, owner.actorId];
+/** A native lookup: the owner without its authority (see the header comment). */
+const NATIVE_OWNED = `workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND actor_id = $4`;
+/**
+ * How a lookup matches the owner. `compareAuthority: false` is for native
+ * connections only; OAuth lookups always compare the grant authority. It is
+ * kept apart from SpawnOwner so the owner hashed into idempotency keys is
+ * unchanged.
+ */
+export type SpawnLookup = { compareAuthority: boolean };
+const COMPARE_AUTHORITY: SpawnLookup = { compareAuthority: true };
+function ownedClause(owner: SpawnOwner, lookup: SpawnLookup): { clause: string; params: unknown[] } {
+  return lookup.compareAuthority ? { clause: OWNED, params: ownedParams(owner) }
+    : { clause: NATIVE_OWNED, params: [owner.workspaceId, owner.userId, owner.relaycastWorkspaceId, owner.actorId] };
+}
 
 function rowFrom(row: Record<string, unknown>): SpawnRow {
   const nullable = (value: unknown) => typeof value === "string" ? value : null;
@@ -131,15 +161,18 @@ function assertSpawnPatch(row: SpawnRow, patch: SpawnPatch): void {
 
 export function spawnStore(database: { query: SqlExecutor["query"]; transaction<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> },
   options: { beforeReserve?: (tx: SqlExecutor) => Promise<void> } = {}) {
-  async function find(owner: SpawnOwner, id: string): Promise<SpawnRow | null> {
-    const result = await database.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE ${OWNED} AND id = $6`, [...ownedParams(owner), id]);
+  async function find(owner: SpawnOwner, id: string, lookup: SpawnLookup = COMPARE_AUTHORITY): Promise<SpawnRow | null> {
+    const { clause, params } = ownedClause(owner, lookup);
+    const result = await database.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE ${clause} AND id = $${params.length + 1}`,
+      [...params, id]);
     return result.rows[0] ? rowFrom(result.rows[0]) : null;
   }
   return {
     find,
-    async findKey(owner: SpawnOwner, hash: string): Promise<SpawnRow | null> {
-      const result = await database.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE ${OWNED} AND idempotency_hash = $6`,
-        [...ownedParams(owner), hash]);
+    async findKey(owner: SpawnOwner, hash: string, lookup: SpawnLookup = COMPARE_AUTHORITY): Promise<SpawnRow | null> {
+      const { clause, params } = ownedClause(owner, lookup);
+      const result = await database.query(
+        `SELECT ${COLUMNS} FROM relay_spawns WHERE ${clause} AND idempotency_hash = $${params.length + 1}`, [...params, hash]);
       return result.rows[0] ? rowFrom(result.rows[0]) : null;
     },
     /** One transaction per reservation, never held over a network call. */
@@ -320,19 +353,26 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
   }
   function owner(actor: SpawnActor): SpawnOwner {
     if (!context.oauth && !sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
+    // Property order is part of the idempotency hash: keep it.
     return { workspaceId: context.workspace.id, userId, relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
       authorityHash: ownerHash(JSON.stringify(context.oauth
         ? [context.authMode, context.oauth.access.grantId]
-        : [context.authMode, sessionId])) };
+        // Native: no session id, so a later session of the same person derives the same owner.
+        : [context.authMode])) };
   }
+  /** OAuth compares the grant authority; a native connection is matched by its launcher actor instead. */
+  const ownership: SpawnLookup = { compareAuthority: Boolean(context.oauth) };
   const run = <T>(fn: (actor: SpawnActor, owned: SpawnOwner) => Promise<T>): Promise<T> => {
     if (!context.oauth) authorize();
     return deps.withActor(actor => { authorize(); return fn(actor, owner(actor)); });
   };
   async function lookup(owned: SpawnOwner, id: string): Promise<SpawnRow> {
-    if (!z.string().uuid().safeParse(id).success) throw new RelayToolError("Use a spawn_id returned by this connection.");
-    const row = await deps.store.find(owned, id);
-    if (!row) throw new RelayToolError("This launch is not owned by this connection in the current workspace.");
+    if (!z.string().uuid().safeParse(id).success) throw new RelayToolError("Use a spawn_id returned by spawn_relay_agent.");
+    const row = await deps.store.find(owned, id, ownership);
+    if (!row) {
+      throw new RelayToolError(context.oauth ? "This launch is not owned by this connection in the current workspace."
+        : "This launch was not started by you in the current workspace.");
+    }
     return row;
   }
 
@@ -409,7 +449,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           ...(input.worker_cwd ? { worker_cwd: input.worker_cwd } : {}) };
         const idempotencyHash = ownerHash(JSON.stringify(["selfhost-spawn:v1", owned, key]));
         const requestHash = ownerHash(JSON.stringify(launch));
-        const previous = await deps.store.findKey(owned, idempotencyHash);
+        const previous = await deps.store.findKey(owned, idempotencyHash, ownership);
         if (previous) {
           if (previous.requestHash !== requestHash) throw new RelayToolError("This idempotency key already describes a different launch.");
           if (previous.state !== "failed") return result(previous);
@@ -724,11 +764,11 @@ export function registerRelaySpawnTools(server: McpServer, context: McpContext, 
     inputSchema: spawnInput.shape, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   }, (input, extra) => run(service => service.spawn(input, extra.requestId)));
   server.registerTool("get_relay_spawn_status", {
-    description: "Refresh and return a launch owned by this connection, including readiness, structured terminal errors and any unconfirmed initial-task warning. Unknown outcomes remain attached to the original spawn_id.",
+    description: "Refresh and return a launch you started, including readiness, structured terminal errors and any unconfirmed initial-task warning. A launch stays reachable from a later session of the same person in the same workspace; on an OAuth connection it must be the same approved connection. Unknown outcomes remain attached to the original spawn_id.",
     inputSchema: { spawn_id: z.string().uuid() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(service => service.status(input.spawn_id)));
   server.registerTool("release_relay_agent", {
-    description: "Stop and remove only a verified agent launched by this connection. Release uses the immutable worker identity and is repeat-safe. It does not delete or provision machines.",
+    description: "Stop and remove only a verified agent you launched. A launch stays reachable from a later session of the same person in the same workspace; on an OAuth connection it must be the same approved connection. Release uses the immutable worker identity and is repeat-safe. It does not delete or provision machines.",
     inputSchema: { spawn_id: z.string().uuid() }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, input => run(service => service.release(input.spawn_id)));
 }
