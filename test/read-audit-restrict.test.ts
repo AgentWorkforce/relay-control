@@ -199,10 +199,13 @@ test("past the deadline, unanswered ids are withheld and the export still answer
   t.after(() => { for (const release of pending) release(); });
   const hang = () => new Promise<boolean>((resolve) => { pending.push(() => resolve(true)); });
   const started = Date.now();
+  const asked: string[] = [];
   const slowAdmin = await restrictReadAudit([row({ requested_session_id: "sess-a" })], {
-    administrator: hang, readable: async () => true,
+    administrator: hang, readable: async (id) => { asked.push(id); return true; },
   }, { deadlineMs: 30 });
-  // The administrator check used the whole deadline: no probe may start after it.
+  // The administrator check used the whole deadline: no probe may start after
+  // it, even when the timer fires a moment before the clock reads the deadline.
+  assert.deepEqual(asked, []);
   assert.equal(slowAdmin.restricted, true);
   assert.equal((slowAdmin.records[0] as { requested_session_id: string | null }).requested_session_id, null);
 
@@ -214,6 +217,27 @@ test("past the deadline, unanswered ids are withheld and the export still answer
   }, { deadlineMs: 30 });
   assert.deepEqual(slowRead.records.map((record) => record.requested_session_id), ["sess-fast", null]);
   assert.ok(Date.now() - started < 2_000);
+});
+
+test("a deadline timer that fires before the clock reads the deadline still stops every probe", async (t) => {
+  const pending: Array<() => void> = [];
+  t.after(() => { for (const release of pending) release(); });
+  const hang = () => new Promise<boolean>((resolve) => { pending.push(() => resolve(true)); });
+  // The clock never advances, so only the timer can end the administrator check.
+  const frozen = Date.now();
+  t.mock.method(Date, "now", () => frozen);
+  const asked: string[] = [];
+  const shown = await restrictReadAudit([
+    row({ requested_session_id: "sess-a", result_sessions: [session("sess-b")] }),
+  ], {
+    administrator: hang, readable: async (id) => { asked.push(id); return true; },
+  }, { deadlineMs: 20 });
+  assert.deepEqual(asked, []);
+  assert.equal(shown.restricted, true);
+  const record = shown.records[0] as ReadAuditExportRow & { restricted: boolean };
+  assert.equal(record.requested_session_id, null);
+  assert.deepEqual(record.result_sessions, [{ session_id: null, source: "codex", owner_user_ids: null }]);
+  assert.equal(record.restricted, true);
 });
 
 test("an exporter without a person read token sees no session id and nothing is asked", async () => {

@@ -559,12 +559,18 @@ function sessionIdsOf(row: ReadAuditExportRow): string[] {
     .filter((id): id is string => typeof id === "string" && id.length > 0);
 }
 
-function beforeDeadline<T>(read: () => Promise<T>, deadline: number): Promise<T> {
+/**
+ * `spent` is called when the deadline, not the read, ends the wait. A timer
+ * can fire a moment before the clock reads the deadline, so the caller must
+ * stop on that call and not on the clock alone.
+ */
+function beforeDeadline<T>(read: () => Promise<T>, deadline: number, spent: () => void): Promise<T> {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(new Error("deadline passed"));
+  const passed = () => { spent(); return new Error("deadline passed"); };
+  if (remaining <= 0) return Promise.reject(passed());
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("deadline passed")), remaining);
+    timer = setTimeout(() => reject(passed()), remaining);
   });
   return Promise.race([Promise.resolve().then(read), timeout]).finally(() => clearTimeout(timer));
 }
@@ -588,20 +594,23 @@ export async function restrictReadAudit(
   if (!ids.length) return { restricted: false, records: rows };
   const deadline = Date.now() + (limits.deadlineMs ?? RESTRICT_DEADLINE_MS);
   const readable = new Set<string>();
+  // Set once any wait ends on the deadline: no probe starts after that.
+  let spent = false;
+  const within = <T>(read: () => Promise<T>) => beforeDeadline(read, deadline, () => { spent = true; });
   if (probe) {
     // Asked about an id relaygate accepts (it refuses any other before checking
     // administration); with none on the page, the exporter is not confirmed.
     const askable = ids.find((id) => SESSION_ID.test(id));
     const administrator = askable === undefined ? false
-      : await beforeDeadline(() => probe.administrator(askable), deadline).catch(() => false);
+      : await within(() => probe.administrator(askable)).catch(() => false);
     if (administrator === true) return { restricted: false, records: rows };
     const pending = ids.slice(0, RESTRICT_PROBE_MAX);
     let next = 0;
     const worker = async () => {
       while (next < pending.length) {
         const sessionId = pending[next++]!;
-        if (Date.now() >= deadline) return;
-        if (await beforeDeadline(() => probe.readable(sessionId), deadline).catch(() => false) === true) readable.add(sessionId);
+        if (spent || Date.now() >= deadline) return;
+        if (await within(() => probe.readable(sessionId)).catch(() => false) === true) readable.add(sessionId);
       }
     };
     await Promise.all(Array.from({ length: Math.min(RESTRICT_PROBE_CONCURRENCY, pending.length) }, worker));
