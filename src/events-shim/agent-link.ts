@@ -293,8 +293,8 @@ export async function linkInboxToAgent(
       );
       await tx.query(
         `UPDATE events_shims SET wake_url = $2, wake_secret_ciphertext = $3, wake_linked_at = $4,
-           wake_broken_at = NULL, wake_broken_reason = NULL WHERE id = $1`,
-        [shim.id, target.url, encryptSecret(secret, deps.keyring.active), new Date(target.linkedAt)],
+           wake_broken_at = NULL, wake_broken_reason = NULL, wake_agent = $5 WHERE id = $1`,
+        [shim.id, target.url, encryptSecret(secret, deps.keyring.active), new Date(target.linkedAt), agent],
       );
       return current;
     });
@@ -332,7 +332,7 @@ export async function unlinkInboxFromAgent(
       await queueRelease(tx, linkSender(removed));
       await tx.query(
         `UPDATE events_shims SET wake_url = NULL, wake_secret_ciphertext = NULL, wake_linked_at = NULL,
-           wake_broken_at = NULL, wake_broken_reason = NULL WHERE id = $1 AND wake_url LIKE $2`,
+           wake_broken_at = NULL, wake_broken_reason = NULL, wake_agent = NULL WHERE id = $1 AND wake_url LIKE $2`,
         [shim.id, `${AGENT_DM_ORIGIN}/%`],
       );
     }
