@@ -61,6 +61,14 @@ export type McpContext = {
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
+  /**
+   * Set only when session reads follow per-session access (the reader-kind
+   * mint setting): list_team_activity then shows a roster session binding
+   * only once `readHistory` proved the session readable ("probe"), or shows
+   * none ("none") for a caller `readHistory` would refuse. Absent, bindings
+   * are shown as declared.
+   */
+  sessionBindings?: "probe" | "none";
   /** Read `@name` tokens in search text as agent filters. */
   agentTokens?: boolean;
   members: () => Promise<McpMember[]>;
@@ -143,6 +151,32 @@ export const UNAVAILABLE_MESSAGE = "Shared session history is temporarily unavai
 const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
 
+function historyReadGrant(principal: Principal, callerToken: string) {
+  // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
+  // this workspace; RelayHistory introspects it at Control like sh_at_.
+  const staffGrant = callerToken.startsWith("sh_sr_");
+  // A Desktop provider grant (cld_at_, mcp:desktop) was admitted by
+  // DesktopMcpCredentials.resolve, which re-checks its lease, verified
+  // parent and membership on every request. It authenticates nowhere else,
+  // so it reads through the workspace reader, never the session-read hop.
+  const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
+  // An OAuth connection reads only with the opt-in relay:history scope its
+  // person approved as a separate consent line; relay:mcp alone never does.
+  const oauthToken = callerToken.startsWith("mcp_at_");
+  const oauthGrant = oauthToken && principal.scopes.includes(MCP_HISTORY_SCOPE);
+  const nativeGrant = principal.scopes.includes("rth:read") && (callerToken.startsWith("sh_at_") || staffGrant || desktopGrant);
+  return { staffGrant, desktopGrant, oauthToken, oauthGrant, nativeGrant };
+}
+
+/**
+ * True when historyReader would read for this caller at all: every such read
+ * carries a read token for this person (its own, or one minted for it).
+ */
+export function historyReadable(principal: Principal, callerToken: string): boolean {
+  const { oauthGrant, nativeGrant } = historyReadGrant(principal, callerToken);
+  return !principal.pendingHandoff && (nativeGrant || oauthGrant);
+}
+
 /**
  * Reads through the dashboard's workspace-scoped reader: a History
  * `rth:read` session minted for exactly this {user, organization, workspace}
@@ -180,21 +214,9 @@ export function historyReader(
     // MCP admission authenticates the person; content reads additionally need
     // the issue-time read scope. Neither a handoff nor a service credential
     // may be promoted by the reader's Control handoff.
-    // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
-    // this workspace; RelayHistory introspects it at Control like sh_at_.
-    const staffGrant = callerToken.startsWith("sh_sr_");
-    // A Desktop provider grant (cld_at_, mcp:desktop) was admitted by
-    // DesktopMcpCredentials.resolve, which re-checks its lease, verified
-    // parent and membership on every request. It authenticates nowhere else,
-    // so it reads through the workspace reader, never the session-read hop.
-    const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
-    // An OAuth connection reads only with the opt-in relay:history scope its
-    // person approved as a separate consent line; relay:mcp alone never does.
-    const oauthToken = callerToken.startsWith("mcp_at_");
-    const oauthGrant = oauthToken && principal.scopes.includes(MCP_HISTORY_SCOPE);
-    const nativeGrant = principal.scopes.includes("rth:read") && (callerToken.startsWith("sh_at_") || staffGrant || desktopGrant);
+    const { staffGrant, desktopGrant, oauthToken, oauthGrant } = historyReadGrant(principal, callerToken);
     // A pending handoff is refused at OAuth admission too; checked here again.
-    if (principal.pendingHandoff || !(nativeGrant || oauthGrant)) {
+    if (!historyReadable(principal, callerToken)) {
       throw new SharedSessionsToolError(oauthToken && !principal.pendingHandoff
         ? "Session reads need the relay:history scope on this OAuth connection."
         : "Session reads require an exchanged user session with rth:read.");

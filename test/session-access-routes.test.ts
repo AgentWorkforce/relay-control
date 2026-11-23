@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import test, { type TestContext } from "node:test";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { AGENT_IDENTITY_TOOLS, SESSION_ACCESS_TOOLS, STAFF_READ_GRANT_TOOLS } from "../src/mcp/catalog.js";
 import { agentIdentityAllows, staffReadGrantAllows } from "../src/mcp/routes.js";
+import { EXPORT_COLUMNS, insertReadAudit, type ReadAuditRecord } from "../src/mcp/read-audit.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase } from "./support/harness.js";
@@ -41,6 +43,11 @@ function relaygateStub() {
   const actor = { id: "agent-7", name: null as string | null };
   /** Per-path forced answers: status, or "drop" to destroy the connection. */
   const forced = new Map<string, number | "drop">();
+  /** Per-path exact answers (status and raw body), for answers other than the stub's own. */
+  const replies = new Map<string, { status: number; body: string; contentType?: string }>();
+  /** Per-session metadata reads, and the sessions this reader may not read (404). */
+  const metadata: Upstream[] = [];
+  const unreadable = new Set<string>();
   let serial = 0;
   const policyOf = (sessionId: string) => {
     let policy = policies.get(sessionId);
@@ -79,6 +86,16 @@ function relaygateStub() {
       }));
       return;
     }
+    const read = /^\/v1\/sessions\/([^/]+)\/metadata$/.exec(url.pathname);
+    if (read) {
+      metadata.push({ method: req.method ?? "", path: url.pathname, query: url.searchParams, bearer: req.headers.authorization, body });
+      const sessionId = decodeURIComponent(read[1]!);
+      if (!issued.has(req.headers.authorization?.replace(/^Bearer /, "") ?? "")) res.statusCode = 401;
+      else if (unreadable.has(sessionId)) res.statusCode = 404;
+      else res.setHeader("x-relayhistory-workspace-id", url.searchParams.get("workspace") ?? "");
+      res.end(JSON.stringify(res.statusCode === 200 ? { sessionId, source: "codex" } : { error: { code: "not_found" } }));
+      return;
+    }
     const match = /^\/v1\/sessions\/([^/]+)\/access(?:\/(reset|history))?$/.exec(url.pathname);
     assert.ok(match, `unexpected upstream path ${url.pathname}`);
     access.push({ method: req.method ?? "", path: url.pathname, query: url.searchParams, bearer: req.headers.authorization, body });
@@ -88,9 +105,19 @@ function relaygateStub() {
       req.socket.destroy();
       return;
     }
+    const reply = replies.get(`${req.method} ${sessionId}`);
+    if (reply) {
+      res.statusCode = reply.status;
+      if (reply.contentType) res.setHeader("content-type", reply.contentType);
+      res.end(reply.body);
+      return;
+    }
     if (typeof force === "number") {
       res.statusCode = force;
-      res.end(JSON.stringify({ error: { code: "forced", message: "forced" } }));
+      // A forced 404 is relaygate's session-not-found answer.
+      res.end(JSON.stringify(force === 404
+        ? { ok: false, error: { code: "relaygate_not_found", message: "Session not found" } }
+        : { error: { code: "forced", message: "forced" } }));
       return;
     }
     const bearer = req.headers.authorization?.replace(/^Bearer /, "") ?? "";
@@ -132,7 +159,7 @@ function relaygateStub() {
     });
     res.end(JSON.stringify(answer(sessionId, reset)));
   });
-  return { server, mints, access, forced, policies, history, actor };
+  return { server, mints, access, forced, replies, policies, history, actor, metadata, unreadable };
 }
 
 /**
@@ -210,7 +237,7 @@ async function setup(t: TestContext, options: { configured?: boolean; sessionsOn
     return { status: response.status, body: text ? JSON.parse(text) as any : null };
   };
   return {
-    gate, controlUrl, pair, org, workspace, teammate, former, rpc, tool, route, http,
+    gate, controlUrl, pair, org, workspace, teammate, former, rpc, tool, route, http, database,
     ownerId: org.owner.id,
   };
 }
@@ -522,4 +549,138 @@ test("sessions-only install (no relaygate public URL): tools listed, MCP and das
     assert.match(call.bearer!, /^Bearer rth_at_read_/);
     assert.notEqual(call.bearer, `Bearer ${env.pair.accessToken}`);
   }
+});
+
+// ---- capabilities and the read audit export --------------------------------
+
+test("capabilities: session_access follows the session access configuration", async (t) => {
+  const on = await setup(t);
+  const off = await setup(t, { configured: false });
+  for (const [env, expected] of [[on, true], [off, false]] as const) {
+    const read = await env.http("GET", "/api/v1/capabilities");
+    assert.equal(read.status, 200);
+    assert.equal(read.body.capabilities.session_access, expected);
+  }
+  assert.equal(on.gate.access.length + off.gate.access.length, 0, "discovery asks relaygate nothing");
+});
+
+/** Three audit records: one naming two sessions with owners, one naming a single session, one naming none. */
+async function seedAudit(env: Awaited<ReturnType<typeof setup>>) {
+  const base: ReadAuditRecord = {
+    id: "", occurredAt: null, organizationId: env.org.id, workspaceId: env.workspace.id, callerUserId: env.teammate.userId,
+    identityKind: "hosted", authMode: "session", desktopProvider: null, oauthClientId: null, oauthGrantId: null,
+    mcpSessionId: "fake-mcp-session", nativeSessionId: null, nativeSessionProvider: null, nativeSessionVerified: false,
+    toolName: "search_shared_sessions", outcome: "ok", errorMessage: null, queryText: "deploy", agentFilter: null,
+    requestedSessionId: null, requestedSource: null, filters: {}, resultCount: 0, resultSessions: [],
+    resultSessionsTruncated: false, correlationId: null, durationMs: 5,
+  };
+  const records: ReadAuditRecord[] = [
+    {
+      ...base, id: randomUUID(), occurredAt: new Date("2026-01-01T00:00:01Z"), resultCount: 2,
+      resultSessions: [
+        { session_id: "fake-open", source: "codex", owner_user_ids: [env.ownerId] },
+        { session_id: "fake-private", source: "claude", owner_user_ids: [env.former.userId] },
+      ],
+    },
+    { ...base, id: randomUUID(), occurredAt: new Date("2026-01-01T00:00:02Z"), toolName: "get_shared_session", requestedSessionId: "fake-private" },
+    { ...base, id: randomUUID(), occurredAt: new Date("2026-01-01T00:00:03Z"), toolName: "list_session_summaries" },
+  ];
+  for (const record of records) await insertReadAudit(env.database, record);
+  const seeded = records.map((record) => [record.id, record.requestedSessionId, record.resultSessions]);
+  return { path: `/api/v1/workspaces/${env.workspace.id}/shared-session-read-audit`, seeded };
+}
+
+test("read audit export: a session access administrator gets the export unchanged after one access check", async (t) => {
+  const plain = await setup(t, { configured: false });
+  const unflagged = await seedAudit(plain);
+  const expected = await plain.http("GET", unflagged.path);
+  assert.equal(expected.status, 200);
+  assert.equal(JSON.stringify(expected.body).includes("restricted"), false);
+  assert.deepEqual(expected.body.records.map((record: any) => [record.id, record.requested_session_id, record.result_sessions]), unflagged.seeded);
+  assert.equal(plain.gate.access.length + plain.gate.metadata.length + plain.gate.mints.length, 0, "no per-session access: nothing is asked");
+
+  const env = await setup(t);
+  const { path, seeded } = await seedAudit(env);
+  const answer = await env.http("GET", path);
+  assert.equal(answer.status, 200);
+  assert.equal(JSON.stringify(answer.body).includes("restricted"), false);
+  assert.deepEqual(answer.body.records.map((record: any) => [record.id, record.requested_session_id, record.result_sessions]), seeded);
+  assert.deepEqual(env.gate.access.map((call) => [call.method, call.path]), [["GET", "/v1/sessions/fake-open/access"]]);
+  assert.match(env.gate.access[0]!.bearer!, /^Bearer rth_at_read_/);
+  assert.equal(env.gate.metadata.length, 0);
+});
+
+test("read audit export: the administrator check fails closed on any answer but relaygate's own", async (t) => {
+  const json = "application/json";
+  const cases: Array<[string, { status: number; body: string; contentType?: string } | number, boolean]> = [
+    // An administrator asking about a session that does not exist: relaygate's session-not-found 404.
+    ["404 relaygate_not_found", 404, false],
+    ["404 relaygate_not_found, string shape", { status: 404, body: JSON.stringify({ error: "relaygate_not_found" }), contentType: json }, false],
+    ["404 relaygate_route_not_proxied", {
+      status: 404, body: JSON.stringify({ ok: false, error: { code: "relaygate_route_not_proxied", message: "not proxied" } }), contentType: json,
+    }, true],
+    ["404 empty body", { status: 404, body: "" }, true],
+    ["404 non-JSON body", { status: 404, body: "<html>Not Found</html>", contentType: "text/html" }, true],
+    ["200 naming another session", {
+      status: 200, body: JSON.stringify({ runtime: true, access: { sessionId: "fake-other", version: 1 } }), contentType: json,
+    }, true],
+  ];
+  for (const [label, answer, restricted] of cases) {
+    const env = await setup(t);
+    const { path, seeded } = await seedAudit(env);
+    if (typeof answer === "number") env.gate.forced.set("GET fake-open", answer);
+    else env.gate.replies.set("GET fake-open", answer);
+    const read = await env.http("GET", path);
+    assert.equal(read.status, 200, label);
+    assert.deepEqual(env.gate.access.map((call) => call.path), ["/v1/sessions/fake-open/access"], label);
+    if (restricted) {
+      assert.equal(read.body.records.every((record: any) => typeof record.restricted === "boolean"), true, label);
+      assert.equal(read.body.records.some((record: any) => record.restricted), false, `${label}: every session readable here`);
+      assert.equal(env.gate.metadata.length, 2, label);
+    } else {
+      assert.equal(JSON.stringify(read.body).includes("restricted"), false, label);
+      assert.deepEqual(read.body.records.map((record: any) => [record.id, record.requested_session_id, record.result_sessions]), seeded, label);
+      assert.equal(env.gate.metadata.length, 0, label);
+    }
+  }
+});
+
+test("read audit export: a non-administrator sees only the sessions its own read token can read", async (t) => {
+  const env = await setup(t);
+  const { path } = await seedAudit(env);
+  env.gate.forced.set("GET fake-open", 403);
+  env.gate.unreadable.add("fake-private");
+  const answer = await env.http("GET", path);
+  assert.equal(answer.status, 200);
+  const [mixed, single, none] = answer.body.records;
+  assert.deepEqual(mixed.result_sessions, [
+    { session_id: "fake-open", source: "codex", owner_user_ids: [env.ownerId] },
+    { session_id: null, source: "claude", owner_user_ids: null },
+  ]);
+  assert.equal(mixed.result_count, 2);
+  assert.equal(mixed.restricted, true);
+  assert.equal(single.requested_session_id, null);
+  assert.equal(single.restricted, true);
+  assert.equal(none.restricted, false);
+  assert.equal(JSON.stringify(answer.body).includes("fake-private"), false);
+  assert.equal(JSON.stringify(answer.body).includes(env.former.userId), false);
+  assert.equal(answer.body.next_cursor, null);
+
+  assert.equal(env.gate.access.length, 1, "one administrator check");
+  assert.deepEqual(env.gate.metadata.map((call) => call.path).sort(), ["/v1/sessions/fake-open/metadata", "/v1/sessions/fake-private/metadata"]);
+  for (const call of env.gate.metadata) {
+    assert.match(call.bearer!, /^Bearer rth_at_read_/);
+    assert.notEqual(call.bearer, `Bearer ${env.pair.accessToken}`);
+  }
+  for (const mint of env.gate.mints) {
+    assert.equal(mint.userId, env.ownerId);
+    assert.equal(mint.reader_kind, "device");
+  }
+
+  const csv = await fetch(`${env.controlUrl}${path}?format=csv`, { headers: { authorization: `Bearer ${env.pair.accessToken}` } });
+  assert.equal(csv.status, 200);
+  const lines = (await csv.text()).trimEnd().split("\r\n");
+  assert.equal(lines[0], [...EXPORT_COLUMNS, "restricted"].join(","));
+  assert.deepEqual(lines.slice(1).map((line) => line.split(",").at(-1)), ["true", "true", "false"]);
+  assert.equal(lines.join("\n").includes("fake-private"), false);
 });

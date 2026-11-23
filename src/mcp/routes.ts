@@ -22,7 +22,7 @@ import { relayLaunchCheck } from "./relay-launch-check.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_IDENTITY_TOOLS, MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
-import { historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
+import { historyReadable, historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
 import { sessionAccessConfigured } from "../sessions/access.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
@@ -497,6 +497,10 @@ export function createMcpHandler(input: {
       ...(oauth ? { oauth } : {}),
       ...(agentIdentity ? { agentIdentity } : {}),
       readHistory: historyReader(config, principal, workspace, token),
+      // Per-session access mode: roster session bindings follow the caller's
+      // own read access (list_team_activity).
+      ...(config.sessionReadApi?.mintReaderKind
+        ? { sessionBindings: historyReadable(principal, token) ? "probe" as const : "none" as const } : {}),
       agentTokens: config.sessionSearchAgentTokens,
       members,
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"

@@ -46,6 +46,10 @@ async function startHistory(t: TestContext) {
   const handoffs: Array<Record<string, any>> = [];
   const tokens = new Map<string, string>();
   const events: HistoryEvent[] = [];
+  /** Session ids whose metadata answers 404 (not readable by the caller). */
+  const hiddenSessions = new Set<string>();
+  /** Every read after the mint: path and the bearer it carried. */
+  const reads: Array<{ path: string; authorization: string | null }> = [];
   let mints = 0;
   let origin = "";
   let eventsFailure: { status: number; body: unknown } | null = null;
@@ -85,6 +89,7 @@ async function startHistory(t: TestContext) {
       });
       return;
     }
+    reads.push({ path: url.pathname, authorization: request.headers.authorization ?? null });
     const token = /^Bearer (.+)$/.exec(request.headers.authorization ?? "")?.[1];
     const tokenWorkspace = token ? tokens.get(token) : undefined;
     if (!tokenWorkspace) {
@@ -121,6 +126,13 @@ async function startHistory(t: TestContext) {
       });
       return;
     }
+    const metadata = /^\/v1\/sessions\/([^/]+)\/metadata$/.exec(url.pathname);
+    if (metadata) {
+      const sessionId = decodeURIComponent(metadata[1]!);
+      if (hiddenSessions.has(sessionId)) send(404, { error: { code: "not_found" } });
+      else send(200, { sessionId, source: "codex" });
+      return;
+    }
     const detail = /^\/v1\/sessions\/([^/]+)\/events$/.exec(url.pathname);
     if (detail) {
       const sessionId = decodeURIComponent(detail[1]!);
@@ -140,7 +152,7 @@ async function startHistory(t: TestContext) {
   origin = await listen(server);
   t.after(() => close(server));
   return {
-    origin, paths, events, handoffs,
+    origin, paths, events, handoffs, hiddenSessions, reads,
     failEvents(status: number, body: unknown) { eventsFailure = { status, body }; },
   };
 }
@@ -720,6 +732,36 @@ test("list_team_activity merges the Relaycast roster, presence, and History", as
   const degraded = structured(await client.callTool({ name: "list_team_activity", arguments: { status: "all" } }));
   assert.equal(degraded.presence_source, "unavailable");
   assert.equal(degraded.agents[0].presence.liveness, "unknown");
+});
+
+test("list_team_activity with per-session access shows only bindings the caller's own read token can read", async (t) => {
+  const env = await setup(t);
+  env.config.sessionReadApi = { ...env.config.sessionReadApi, mintReaderKind: true };
+  const seen = new Date().toISOString();
+  const declared = (id: string, name: string, session: string) => ({
+    id, name, type: "agent", status: "online", last_seen: seen,
+    metadata: { session_id: session, session_kind: "codex", injectable: "true" },
+  });
+  env.relay.agents = [declared("a1", "builder", "sess-1"), declared("a2", "open", "sess-open"), declared("a3", "private", "sess-private")];
+  env.history.hiddenSessions.add("sess-private");
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const data = structured(await client.callTool({ name: "list_team_activity", arguments: { max_agents_with_activity: 1 } }));
+  assert.deepEqual(data.agents.map((agent: any) => [agent.name, agent.session_id]),
+    [["builder", "sess-1"], ["open", "sess-open"], ["private", null]]);
+  const hidden = data.agents[2];
+  assert.equal(hidden.session_kind, null);
+  assert.equal(hidden.session_attribution, null);
+  assert.equal(hidden.activity_status, "no_session_declared");
+  const probes = env.history.reads.filter((read) => read.path.endsWith("/metadata"));
+  assert.deepEqual(probes.map((read) => read.path).sort(), ["/v1/sessions/sess-open/metadata", "/v1/sessions/sess-private/metadata"]);
+  // The probes carry a read token minted for the caller, never the workspace key or the caller's own token.
+  for (const probe of probes) {
+    assert.match(probe.authorization ?? "", /^Bearer rth_at_read_/);
+    assert.equal(probe.authorization!.includes("rk_live_first"), false);
+    assert.equal(probe.authorization!.includes(env.accessToken), false);
+  }
+  assert.ok(env.history.handoffs.length >= 1);
+  for (const handoff of env.history.handoffs) assert.equal(handoff.userId, env.ownerId);
 });
 
 // relay_messaging -----------------------------------------------------------

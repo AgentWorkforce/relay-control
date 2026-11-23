@@ -118,6 +118,46 @@ search, reads whose `result_sessions[].owner_user_ids` contain someone other
 than the caller (a teammate's session), and the share of calls with
 `native_session_verified = true`.
 
+### Per-session access
+
+When session reads follow per-session access (read token mints carry the
+reader kind; see [sessions-read-api.md](sessions-read-api.md#session-access)),
+an owner or admin is not necessarily allowed to read every session, and the
+export does not reveal sessions the exporter cannot read:
+
+- Each page is read from the database exactly as above (same filters, order,
+  page size and cursor), then checked with the exporter's own read token.
+- One administrator check: `GET /v1/sessions/{id}/access` for the first
+  session id on the page that the read API accepts (`^[A-Za-z0-9._:@-]{1,256}$`;
+  it refuses any other id before checking administration). With no such id on
+  the page, there is no check and the exporter is not an administrator.
+- The exporter is a session access administrator, and the page is exported
+  unchanged, only on a 200 whose body is `{ access: { sessionId } }` naming
+  the asked session, or on a 404 carrying the read API's session-not-found
+  code `relaygate_not_found` (`{ error: { code: "relaygate_not_found" } }` or
+  `{ error: "relaygate_not_found" }`), because it checks administration before
+  existence. Anything else, including any other 404 body, an empty or non-JSON
+  body, another status, a timeout or an error, means it is not: a backend
+  without the access routes answers a 404 for the unknown path, and that must
+  not make every exporter an administrator.
+- Otherwise each distinct session id on the page (`requested_session_id`,
+  `native_session_id`, `result_sessions[].session_id`) is checked with a read
+  of that session: at most 100 per page, 4 at a time, within 15 seconds for
+  the whole page. An id that is not proven readable is withheld: it becomes
+  null wherever it appears, and so does that result session's
+  `owner_user_ids` (its `source` is kept). A record that names several
+  sessions keeps the readable ones.
+- Every record on such a page carries `restricted`: `true` when any of its
+  session ids was withheld, else `false`. The CSV adds a `restricted` column
+  after every other column.
+- An exporter whose credential cannot hold a person's read token (no
+  `rth:read`, or a sign-in handoff not yet exchanged) sees no session ids.
+- A page naming no session, an administrator's export and every export
+  without per-session access are unchanged and carry no `restricted`.
+
+`caller_user_id`, query text, filters, counts and the other columns are not
+redacted. The stored rows are never changed.
+
 ## Retention and purge
 
 Rows are kept indefinitely by default; Control never deletes them. They live
