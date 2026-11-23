@@ -664,18 +664,34 @@ export async function actionConsumed(executor: SqlExecutor, approvalId: string,
 }
 
 /**
- * Consumes one action atomically, in the caller's transaction; false when it
- * was already consumed. Stamps the approval's `consumed_at` once every
- * single-use action of it has been consumed (markSpentIfComplete).
+ * Consumes one action atomically; false when it was already consumed. Stamps
+ * the approval's `consumed_at` once every single-use action of it has been
+ * consumed (markSpentIfComplete). As Cloud's consumeApproval: given a
+ * Database (no caller transaction) it opens its own and locks the approval
+ * FOR NO KEY UPDATE first, so standalone consumers of one approval serialize
+ * (no lock-upgrade deadlock with the stamp, and the stamp is never missed).
+ * Given a caller's transaction, which already holds the approval FOR NO KEY
+ * UPDATE (decideUnderLocks with `consuming`), it takes FOR SHARE.
  */
-export async function consumeAction(executor: SqlExecutor, input: { approvalId: string; workspaceId: string;
+export async function consumeAction(executor: SqlExecutor | Database, input: { approvalId: string; workspaceId: string;
   action: Pick<Action, "class" | "target">; consumedBy: string }): Promise<boolean> {
-  const consumed = (await executor.query(
+  if ("transaction" in executor) return executor.transaction(tx => consumeLocked(tx, input, "FOR NO KEY UPDATE"));
+  return consumeLocked(executor, input, "FOR SHARE");
+}
+
+async function consumeLocked(tx: SqlExecutor, input: { approvalId: string; workspaceId: string;
+  action: Pick<Action, "class" | "target">; consumedBy: string }, lock: "FOR NO KEY UPDATE" | "FOR SHARE"): Promise<boolean> {
+  const live = (await tx.query(
+    `SELECT 1 FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL ${lock}`,
+    [input.workspaceId, input.approvalId],
+  )).rows.length > 0;
+  if (!live) return false;
+  const consumed = (await tx.query(
     `INSERT INTO delegation_action_consumptions (approval_id, workspace_id, class, target, consumed_by)
      VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING approval_id`,
     [input.approvalId, input.workspaceId, input.action.class, input.action.target, input.consumedBy],
   )).rows.length === 1;
-  if (consumed) await markSpentIfComplete(executor, input.approvalId);
+  if (consumed) await markSpentIfComplete(tx, input.approvalId);
   return consumed;
 }
 

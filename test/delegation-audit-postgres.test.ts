@@ -221,3 +221,17 @@ test("the retention sweep skips a row another transaction holds, and never expir
   const grant = (await database.query<{ status: string }>("SELECT status FROM delegation_grants WHERE id = 'grt_lapsedrevoked1'")).rows[0]!;
   assert.equal(grant.status, "revoked");
 });
+
+test("standalone consumers of one approval serialize: 4 over 2 actions, exactly 2 win, consumed_at set", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  const actions = [{ class: "deploy" as const, target: "web:prod" }, { class: "deploy" as const, target: "api:prod" }];
+  const id = `apv_${randomUUID().replaceAll("-", "")}`;
+  await database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+     VALUES ($1, $2, $3, 'O', $4::jsonb, true, now() + interval '1 hour')`, [id, workspaceId, ownerId, JSON.stringify(actions)]);
+  const results = await Promise.all([0, 1, 2, 3].map(index =>
+    consumeAction(database, { approvalId: id, workspaceId, action: actions[index % 2]!, consumedBy: `r-${index}` })));
+  assert.equal(results.filter(Boolean).length, 2);
+  const row = (await database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM delegation_approvals WHERE id = $1", [id])).rows[0]!;
+  assert.ok(row.consumed_at);
+});
