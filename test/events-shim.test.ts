@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -810,6 +811,81 @@ test("an idempotency key outlives feed pruning, then expires with the dedupe win
 
   await s.store.prune({ idleBefore: new Date(0).toISOString(), feedBefore: later });
   assert.equal((await s.database.query("SELECT 1 FROM events_shim_idempotency_keys")).rows.length, 0);
+});
+
+/** Signs like an MCP Events server (Standard Webhooks), independently of the package's code. */
+function standardWebhookHeaders(secret: string, id: string, body: string): Record<string, string> {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const key = Buffer.from(secret.slice("whsec_".length), "base64");
+  const signature = createHmac("sha256", key).update(`${id}.${timestamp}.${body}`).digest("base64");
+  return { "webhook-id": id, "webhook-timestamp": String(timestamp), "webhook-signature": `v1,${signature}` };
+}
+
+test("mcp webhook URL: a signed MCP Events delivery is stored under mode mcp, once per webhook-id", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const set = await request(p.origin, `${SHIM}/shims/current/secrets/mcp`, { method: "PUT", token: shim.manage_token, body: {} });
+  assert.equal(set.status, 200, set.raw);
+  const secret = set.body.secret as string;
+  assert.match(secret, /^whsec_/);
+  assert.equal(set.body.webhook_url, shim.webhook_urls.mcp);
+  const delivery = { name: "issue.opened", data: { n: 1 } };
+  const raw = JSON.stringify(delivery);
+  assert.equal((await p.post(shim.webhook_urls.mcp!, delivery)).status, 401, "unsigned");
+  const headers = standardWebhookHeaders(secret, "msg_0001", raw);
+  assert.equal((await p.post(shim.webhook_urls.mcp!, delivery, headers)).status, 202);
+  assert.equal((await p.post(shim.webhook_urls.mcp!, delivery, headers)).status, 200, "a retry is acknowledged as a duplicate");
+  const rows = (await p.database.query<{ mode: string; event_type: string }>(
+    "SELECT mode, event_type FROM events_shim_events",
+  )).rows;
+  assert.deepEqual(rows, [{ mode: "mcp", event_type: "issue.opened" }], "stored once, under the widened CHECK");
+});
+
+test("well-known MCP webhook receiver document lists the webhook URL prefix", async (t) => {
+  const p = await plane(t);
+  const answer = await request(p.origin, "/.well-known/mcp-webhook-receiver.json");
+  assert.equal(answer.status, 200, answer.raw);
+  assert.deepEqual(answer.body, { receivers: [`${SHIM}/h/`] });
+  const off = await plane(t, NO_FEATURES);
+  assert.equal((await request(off.origin, "/.well-known/mcp-webhook-receiver.json")).status, 404);
+});
+
+test("events/stream frames reach the client while the stream is open", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const rpc = (id: number, method: string, params: Record<string, unknown>, signal?: AbortSignal) => fetch(shim.mcp_url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+    ...(signal ? { signal } : {}),
+  });
+  const polled = await (await rpc(1, "events/poll", { name: "webhook.received" })).json() as { result: { cursor: string } };
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const stream = await rpc(2, "events/stream", { name: "webhook.received", cursor: polled.result.cursor }, controller.signal);
+  assert.equal(stream.status, 200);
+  assert.equal(stream.headers.get("content-type"), "text/event-stream");
+  const reader = stream.body!.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  // A stalled read never returns, so the deadline aborts the request instead of being checked between reads.
+  const deadline = setTimeout(() => controller.abort(), 10_000);
+  t.after(() => clearTimeout(deadline));
+  const until = async (needle: string) => {
+    while (!text.includes(needle)) {
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        throw new Error(`no ${needle} before the deadline: ${text}`, { cause: error });
+      });
+      assert.equal(done, false, `the stream closed before ${needle}: ${text}`);
+      text += decoder.decode(value, { stream: true });
+    }
+  };
+  await until("notifications/events/active");
+  assert.equal((await p.post(shim.webhook_url, { streamed: true })).status, 202);
+  await until("notifications/events/event");
+  // The event's payload can arrive in a later chunk than its method name.
+  await until("streamed");
+  controller.abort();
 });
 
 test("feature off: every events-shim path answers 404 before authentication", async (t) => {
