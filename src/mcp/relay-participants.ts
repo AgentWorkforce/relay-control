@@ -135,6 +135,8 @@ const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 /** Replies per post that read_relay_channel include_replies returns; thread_id reads the rest. */
 export const CHANNEL_REPLIES_PER_POST = 10;
+/** Thread reads include_replies runs at once. */
+const CHANNEL_REPLY_READ_BATCH = 5;
 /** Channels one agent of an MCP OAuth assistant connection may create per clock hour (Cloud's limit). */
 export const CHANNEL_CREATE_LIMIT_PER_HOUR = 5;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
@@ -1442,7 +1444,10 @@ function createRelayService(context: McpContext) {
             RETURNING count`, [workspaceId, agentName])).rows[0];
         return Boolean(row) && Number(row!.count) <= CHANNEL_CREATE_LIMIT_PER_HOUR;
       });
-    } catch {
+    } catch (error) {
+      // Fail closed, but let an operator see a broken counter: no names or content, only the error class.
+      console.warn("[relay-channel]", JSON.stringify({ step: "channel_create_counter_unavailable",
+        error: error instanceof Error ? error.name : "unknown" }));
       return false;
     }
   }
@@ -2016,22 +2021,37 @@ function createRelayService(context: McpContext) {
         }
         const page = await dir.via.listChannelMessages(dir.credential, channel, { before: input.before, limit: input.limit });
         const replies = new Map<string, { replies: ReturnType<typeof view>[]; truncated: boolean }>();
+        const unread = new Set<string>();
         if (input.include_replies) {
-          await Promise.all(page.messages.filter(message => message.replyCount > 0).map(async message => {
-            const thread = await dir.via.getChannelThread(dir.credential, message.id, { limit: CHANNEL_REPLIES_PER_POST });
-            // Never show a thread whose root is not this channel's post.
-            if (!thread || thread.parent.channelId !== member.id) return;
-            replies.set(message.id, { replies: thread.replies.map(view),
-              truncated: thread.parent.replyCount > thread.replies.length || thread.replies.length >= CHANNEL_REPLIES_PER_POST });
-          }));
+          // In batches of CHANNEL_REPLY_READ_BATCH to bound upstream concurrency. A thread that fails to load is
+          // reported on its post (replies_unavailable) instead of failing the whole read.
+          const threaded = page.messages.filter(message => message.replyCount > 0);
+          for (let i = 0; i < threaded.length; i += CHANNEL_REPLY_READ_BATCH) {
+            await Promise.all(threaded.slice(i, i + CHANNEL_REPLY_READ_BATCH).map(async message => {
+              let thread: Awaited<ReturnType<typeof dir.via.getChannelThread>>;
+              try {
+                thread = await dir.via.getChannelThread(dir.credential, message.id, { limit: CHANNEL_REPLIES_PER_POST });
+              } catch (error) {
+                unread.add(message.id);
+                // Ids and the error class only.
+                console.info("[relay-channel]", JSON.stringify({ step: "thread_read_failed", channel, message_id: message.id,
+                  error: error instanceof RelaycastCallError ? `${error.operation ?? "unknown"}:${error.status}` : error instanceof Error ? error.name : "unknown" }));
+                return;
+              }
+              // Never show a thread whose root is not this channel's post.
+              if (!thread || thread.parent.channelId !== member.id) return;
+              replies.set(message.id, { replies: thread.replies.map(view), truncated: thread.parent.replyCount > thread.replies.length });
+            }));
+          }
         }
         return { you: identity.name, channel,
           messages: page.messages.map(message => ({ ...view(message), reply_count: message.replyCount,
             ...(replies.has(message.id) ? { replies: replies.get(message.id)!.replies,
-              ...(replies.get(message.id)!.truncated ? { replies_truncated: true } : {}) } : {}) })),
+              ...(replies.get(message.id)!.truncated ? { replies_truncated: true } : {}) } : {}),
+            ...(unread.has(message.id) ? { replies_unavailable: true } : {}) })),
           earlier: page.hasEarlier ? page.messages[0]?.id ?? null : null,
           reply_guidance: input.include_replies
-            ? `${CHANNEL_REPLY_GUIDANCE} When replies_truncated is true, read the rest with read_relay_channel thread_id=<message_id>.`
+            ? `${CHANNEL_REPLY_GUIDANCE} When replies_truncated or replies_unavailable is true, read that thread with read_relay_channel thread_id=<message_id>.`
             : `${CHANNEL_REPLY_GUIDANCE} Read a post's replies with read_relay_channel thread_id=<message_id>, or include_replies: true.` };
       })) ?? notSubscribed(channel);
     },

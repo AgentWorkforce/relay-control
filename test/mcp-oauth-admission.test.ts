@@ -1482,8 +1482,44 @@ test("an OAuth assistant creates at most 5 channels per agent per clock hour, fa
   await f.database.query("UPDATE relay_channel_creations SET window_start=window_start - interval '3 hours'");
   assert.equal((await f.service.subscribeChannel({channel:"family-6",create:true})).created,true);
   assert.deepEqual((await f.database.query("SELECT count FROM relay_channel_creations")).rows.map(r=>Number(r.count)),[1]);
-  // A counter that cannot be read refuses the creation.
+  // A counter that cannot be read refuses the creation, with a log line an operator can see (no names or content).
   await f.database.query("DROP TABLE relay_channel_creations");
-  await assert.rejects(f.service.subscribeChannel({channel:"family-7",create:true}),/too many channels recently/);
+  const warned:string[]=[];const warn=console.warn;console.warn=(...args:unknown[])=>{warned.push(args.map(String).join(" "));};
+  try { await assert.rejects(f.service.subscribeChannel({channel:"family-7",create:true}),/too many channels recently/); } finally { console.warn=warn; }
+  assert.ok(warned.some(line=>line.includes("channel_create_counter_unavailable")));
+  assert.ok(!warned.some(line=>line.includes("family-7") || line.includes("approved-agent")));
   assert.equal(f.world.channels.has("family-7"),false);
+});
+
+test("include_replies reports a thread that fails to load on its post and still returns the page",async t=>{
+  const f=await relayFixture(t);
+  f.world.addAgent("cousin-grok");
+  await f.service.subscribeChannel({channel:"family",create:true});
+  f.world.channelAs("cousin-grok","family");
+  const token=f.world.agents.get("cousin-grok")!.token;
+  const reply=(parent:string,text:string)=>f.world.handle("POST",`/v1/messages/${parent}/replies`,new URLSearchParams(),token,{text},null);
+  // Seven threaded posts (more than one batch of five): one with exactly 10 replies, one with 11.
+  const posts:string[]=[];
+  for(let i=0;i<7;i++) posts.push((await f.service.postChannel({channel:"family",text:`post ${i}`})).message_id);
+  for(let i=0;i<7;i++) await reply(posts[i]!,`answer ${i}`);
+  for(let n=1;n<10;n++) await reply(posts[5]!,`more ${n}`);
+  for(let n=1;n<11;n++) await reply(posts[6]!,`more ${n}`);
+  f.world.failNext("GET",`/v1/messages/${posts[2]}/replies`,503);
+  const logged:string[]=[];const info=console.info;console.info=(...args:unknown[])=>{logged.push(args.map(String).join(" "));};
+  let read:any;
+  try { read=await f.service.readChannel({channel:"family",limit:20,include_replies:true}); } finally { console.info=info; }
+  assert.equal(read.messages.length,7);
+  const byText=new Map(read.messages.map((m:any)=>[m.text,m]));
+  const failed=byText.get("post 2") as any;
+  assert.deepEqual([failed.replies_unavailable,failed.replies],[true,undefined]);
+  for(const i of [0,1,3,4]) {
+    const m=byText.get(`post ${i}`) as any;
+    assert.deepEqual([m.replies.map((r:any)=>r.text),m.replies_unavailable,m.replies_truncated],[[`answer ${i}`],undefined,undefined]);
+  }
+  assert.equal((byText.get("post 5") as any).replies.length,10);
+  assert.equal((byText.get("post 5") as any).replies_truncated,undefined);
+  assert.deepEqual([(byText.get("post 6") as any).replies.length,(byText.get("post 6") as any).replies_truncated],[10,true]);
+  assert.match(read.reply_guidance,/replies_unavailable/);
+  assert.ok(logged.some(line=>line.includes("thread_read_failed") && line.includes(posts[2]!) && line.includes("read_thread:503")));
+  assert.ok(!logged.some(line=>line.includes("post 2")));
 });

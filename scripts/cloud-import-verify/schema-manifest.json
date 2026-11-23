@@ -88,7 +88,7 @@
     {"name":"0084_mcp_oauth_undelivered_refresh.sql","sha256":"858162f963c0b29539c6ef7c3a4a3a7f3e365b8bcedbb48e40e241f8f434fcd4"},
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
-    {"name":"0087_relay_channel_creations.sql","sha256":"1665198c3ba2d1b1505dbe2b64b67f9b20a8ec30c0ffefa11bd9d9be655fc042"}
+    {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -2228,5 +2228,5 @@
   "optional":{
 
   },
-  "sha256":"5262bce4c2407557088f9766613f782fbe0b8616bcabc65f51ac778249f4d615"
+  "sha256":"548e1a2472c56b89868822838c885186f75ee55cb11dc343cca959be1267fb33"
 }

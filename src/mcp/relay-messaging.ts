@@ -163,7 +163,7 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
     inputSchema: { channel,
       before: messageId.optional().describe("Top-level posts only: return posts older than this message_id (the earlier value of a previous read)."),
       limit: z.number().int().min(1).max(30).default(20).describe("Top-level posts to return, or replies with thread_id."),
-      include_replies: z.boolean().default(false).describe(`Also return each listed post's first ${CHANNEL_REPLIES_PER_POST} replies (replies_truncated marks a longer thread). Cannot be combined with thread_id.`),
+      include_replies: z.boolean().default(false).describe(`Also return each listed post's first ${CHANNEL_REPLIES_PER_POST} replies (replies_truncated marks a longer thread; replies_unavailable marks a thread that could not be read, so read it with thread_id). Cannot be combined with thread_id.`),
       thread_id: messageId.optional().describe("Read one thread instead: this post (or any reply in its thread) and its replies, oldest first. It must be a message in the channel."),
       after: messageId.optional().describe("With thread_id: return replies after this message_id (more_after from a previous thread read)."),
       as, as_person: asPerson, hosted },
