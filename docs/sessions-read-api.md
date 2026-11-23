@@ -398,6 +398,35 @@ Outcomes:
 
 A write is sent once and never retried, including after a 401.
 
+`GET /api/v1/capabilities` reports `session_access: true` when these routes
+are configured (both settings above and a History URL). It grants nothing.
+
+### What other surfaces show under per-session access
+
+When read token mints carry the reader kind, reads follow each session's
+policy, so surfaces that name sessions show only what the caller may read.
+Each check is a read of `GET /v1/sessions/{id}/metadata` with the caller's own
+read token (relaygate needs `r` on the session and its answer names the
+session); relaygate has no route that answers for many ids at once. Answers
+are not kept between requests, and anything not proven readable (a refusal,
+a 404, a timeout, an error, an id past the bound) is treated as unreadable.
+
+- MCP `list_team_activity`: every agent stays listed with its presence. An
+  agent's declared `session_id`, `session_kind` and `session_attribution` are
+  shown only when the caller can read that session; otherwise all three are
+  null and the agent is treated as declaring no session, with nothing saying
+  a claim was hidden. Sessions sampled for activity are proven by that read;
+  at most 40 other ids are checked, 4 at a time, within the tool's existing
+  deadline. A connection that does not read with a person's read token gets
+  no session ids. This applies to owners and admins too: a claim is the
+  agent's own declaration, never verified ownership, so no agent is exempt.
+- Read audit export ([shared-session-read-audit.md](shared-session-read-audit.md#per-session-access)):
+  an exporter that is not a session access administrator gets session ids and
+  owners only for sessions it can read.
+- Session hard delete ([session-erasure.md](session-erasure.md)) is unchanged:
+  its target and receipt carry ids, states and counts, never a session's
+  owner, title or content.
+
 ## Revocation
 
 Control rechecks the token row on every introspection call, and the ingest

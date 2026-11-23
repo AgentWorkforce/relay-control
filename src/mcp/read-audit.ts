@@ -513,8 +513,104 @@ function csvCell(value: unknown): string {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-export function readAuditCsv(rows: ReadAuditExportRow[]): string {
-  const lines = [EXPORT_COLUMNS.join(",")];
-  for (const row of rows) lines.push(EXPORT_COLUMNS.map((column) => csvCell(row[column])).join(","));
+/**
+ * CSV of a page. A page restricted by restrictReadAudit adds the `restricted`
+ * column last; every other column keeps its place.
+ */
+export function readAuditCsv(rows: ReadAuditExportRow[] | RestrictedReadAuditRow[], options: { restricted?: boolean } = {}): string {
+  const columns: readonly string[] = options.restricted ? [...EXPORT_COLUMNS, "restricted"] : EXPORT_COLUMNS;
+  const lines = [columns.join(",")];
+  for (const row of rows) {
+    const cells = row as unknown as Record<string, unknown>;
+    lines.push(columns.map((column) => csvCell(cells[column])).join(","));
+  }
   return `${lines.join("\r\n")}\r\n`;
+}
+
+// ---- Export redaction under per-session access ----------------------------
+
+/** Distinct session ids probed per page, at most this many at a time. */
+export const RESTRICT_PROBE_MAX = 100;
+export const RESTRICT_PROBE_CONCURRENCY = 4;
+/** One deadline for the whole page, the administrator check included. */
+export const RESTRICT_DEADLINE_MS = 15_000;
+
+/**
+ * The exporter's own session access, asked of the read API with its own read
+ * token. `administrator` makes the single session access administrator check;
+ * `readable` answers whether this exporter may read one session. Either may
+ * throw; a throw is the restrictive answer.
+ */
+export type ReadAuditAccessProbe = {
+  administrator: (sessionId: string) => Promise<boolean>;
+  readable: (sessionId: string) => Promise<boolean>;
+};
+
+export type RestrictedReadAuditSession = { session_id: string | null; source: string | null; owner_user_ids: string[] | null };
+export type RestrictedReadAuditRow = Omit<ReadAuditExportRow, "result_sessions"> & {
+  result_sessions: RestrictedReadAuditSession[];
+  restricted: boolean;
+};
+
+/** Every session id a record names: the requested one, the calling chat's, and each result. */
+function sessionIdsOf(row: ReadAuditExportRow): string[] {
+  return [row.requested_session_id, row.native_session_id, ...row.result_sessions.map((session) => session.session_id)]
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+function beforeDeadline<T>(read: () => Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error("deadline passed"));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("deadline passed")), remaining);
+  });
+  return Promise.race([Promise.resolve().then(read), timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Applied to one exported page after the database read, only when session
+ * reads follow per-session access. A page naming no session, or an exporter
+ * the read API confirms as a session access administrator, is returned as
+ * read. Otherwise each distinct session id on the page is probed with the
+ * exporter's own read token (bounded, see RESTRICT_PROBE_MAX), and each id
+ * not proven readable has its session id and owners replaced by null in every
+ * record naming it; such a record gets `restricted: true`, every other record
+ * `restricted: false`. `probe` null (no person read token) proves nothing.
+ */
+export async function restrictReadAudit(
+  rows: ReadAuditExportRow[],
+  probe: ReadAuditAccessProbe | null,
+  limits: { deadlineMs?: number } = {},
+): Promise<{ restricted: false; records: ReadAuditExportRow[] } | { restricted: true; records: RestrictedReadAuditRow[] }> {
+  const ids = [...new Set(rows.flatMap(sessionIdsOf))];
+  if (!ids.length) return { restricted: false, records: rows };
+  const deadline = Date.now() + (limits.deadlineMs ?? RESTRICT_DEADLINE_MS);
+  const readable = new Set<string>();
+  if (probe) {
+    const administrator = await beforeDeadline(() => probe.administrator(ids[0]!), deadline).catch(() => false);
+    if (administrator === true) return { restricted: false, records: rows };
+    const pending = ids.slice(0, RESTRICT_PROBE_MAX);
+    let next = 0;
+    const worker = async () => {
+      while (next < pending.length) {
+        const sessionId = pending[next++]!;
+        if (Date.now() >= deadline) return;
+        if (await beforeDeadline(() => probe.readable(sessionId), deadline).catch(() => false) === true) readable.add(sessionId);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(RESTRICT_PROBE_CONCURRENCY, pending.length) }, worker));
+  }
+  const shown = (id: string | null) => !id || readable.has(id);
+  return {
+    restricted: true,
+    records: rows.map((row): RestrictedReadAuditRow => ({
+      ...row,
+      requested_session_id: shown(row.requested_session_id) ? row.requested_session_id : null,
+      native_session_id: shown(row.native_session_id) ? row.native_session_id : null,
+      result_sessions: row.result_sessions.map((session) => shown(session.session_id)
+        ? session : { session_id: null, source: session.source, owner_user_ids: null }),
+      restricted: !sessionIdsOf(row).every((id) => readable.has(id)),
+    })),
+  };
 }

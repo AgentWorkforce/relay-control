@@ -41,7 +41,11 @@ import {
 } from "./fleet/view.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
-import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
+import {
+  listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError, restrictReadAudit, type ReadAuditAccessProbe,
+} from "./mcp/read-audit.js";
+import { accessViaDashboardReader, readWorkspaceHistory, type HistoryIdentity } from "./sessions/history.js";
+import { sessionAccessConfigured } from "./sessions/access.js";
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
@@ -504,6 +508,8 @@ export function createApp(input: {
   const capabilities = () => ({
     ...features,
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
+    // Session reads follow per-session access (docs/sessions-read-api.md#session-access).
+    session_access: sessionAccessConfigured(config) && Boolean(config.relayhistoryUrl),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
     // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
@@ -1106,6 +1112,38 @@ export function createApp(input: {
       throw new HttpError(403, "forbidden", "Workspace admin role required");
     }
     return { principal: auth.principal, workspace, token: auth.token };
+  }
+
+  // The audit exporter's own session access, asked with its own read token.
+  // A credential that cannot hold a person's read token reads nothing (null).
+  function readAuditAccessProbe(
+    access: Awaited<ReturnType<typeof workspaceAccess>>,
+    request: IncomingMessage,
+  ): ReadAuditAccessProbe | null {
+    if (!access.principal.scopes.includes("rth:read") || access.principal.pendingHandoff || !config.relayhistoryUrl) return null;
+    const identity: HistoryIdentity = {
+      userId: access.principal.userId,
+      organizationId: access.workspace.organizationId,
+      workspaceId: access.workspace.id,
+      role: access.workspace.role,
+      callerToken: access.token,
+      readerKind: readerKindOf(request),
+    };
+    return {
+      // relaygate checks access administration before existence, so 404 also
+      // means an administrator.
+      administrator: async (sessionId) => {
+        const reply = await accessViaDashboardReader(config, identity, {
+          method: "GET", path: `/v1/sessions/${encodeURIComponent(sessionId)}/access`,
+        });
+        return reply.kind === "response" && (reply.status === 200 || reply.status === 404);
+      },
+      readable: async (sessionId) => {
+        const read = await readWorkspaceHistory(config, identity, `/v1/sessions/${encodeURIComponent(sessionId)}/metadata`,
+          new URLSearchParams(), { allowNotFound: true });
+        return read.status === "ok" && read.body.sessionId === sessionId;
+      },
+    };
   }
 
   // Deployment sharing-mode values (docs/capture-policy.md), applied per caller.
@@ -2568,6 +2606,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw error;
       }
       const page = await listReadAudit(store.database, access.workspace.id, query);
+      // With per-session access, a non-administrator exporter sees only the
+      // session ids it may itself read (docs/shared-session-read-audit.md).
+      const shown = config.sessionReadApi?.mintReaderKind
+        ? await restrictReadAudit(page.records, readAuditAccessProbe(access, request))
+        : { restricted: false as const, records: page.records };
       if (query.format === "csv") {
         response.writeHead(200, {
           "content-type": "text/csv; charset=utf-8",
@@ -2575,10 +2618,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           "content-disposition": `attachment; filename="shared-session-read-audit-${access.workspace.id}.csv"`,
           ...(page.nextCursor ? { "x-next-cursor": page.nextCursor } : {}),
         });
-        response.end(readAuditCsv(page.records));
+        response.end(readAuditCsv(shown.records, { restricted: shown.restricted }));
         return;
       }
-      json(response, 200, { workspace_id: access.workspace.id, records: page.records, next_cursor: page.nextCursor }, true);
+      json(response, 200, { workspace_id: access.workspace.id, records: shown.records, next_cursor: page.nextCursor }, true);
       return;
     }
 

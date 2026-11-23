@@ -6656,6 +6656,16 @@ paths:
         `docs/shared-session-read-audit.md`): one record per MCP
         shared-session read tool call, oldest first, keyset-paginated. Never
         contains transcript content. A member is 403; another workspace 404.
+
+        When session reads follow per-session access
+        (SESSION_READ_MINT_INCLUDE_READER_KIND on), an exporter that does
+        not administer session access sees a session id, and its owners,
+        only for a session it may read itself. Other ids and owners are null
+        and the record carries `restricted: true`; on such a page every
+        record carries `restricted`, and the CSV gets a last `restricted`
+        column. Administrators, pages naming no session, and every export
+        without per-session access are unchanged and carry no `restricted`.
+        Filtering, ordering, page size and cursors are the same either way.
       parameters:
         - { name: since, in: query, required: false, schema: { type: string, format: date-time }, description: Inclusive }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: Exclusive }
@@ -6711,12 +6721,15 @@ paths:
                           items:
                             type: object
                             properties:
-                              session_id: { type: string }
+                              session_id: { type: [string, "null"], description: Null only when restricted }
                               source: { type: [string, "null"] }
-                              owner_user_ids: { type: array, maxItems: 10, items: { type: string } }
+                              owner_user_ids: { type: [array, "null"], maxItems: 10, items: { type: string }, description: Null only when restricted }
                         result_sessions_truncated: { type: boolean }
                         correlation_id: { type: [string, "null"] }
                         duration_ms: { type: integer }
+                        restricted:
+                          type: boolean
+                          description: Present only for an exporter that does not administer per-session access. True when a session id in this record was withheld (set to null) because the exporter may not read that session.
             text/csv:
               schema: { type: string }
         "400":
@@ -10068,9 +10081,9 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys, enrollment_self_mint]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, session_access, enrollment_keys, enrollment_self_mint]
       additionalProperties: false
-      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, not SELFHOST_FEATURES.
+      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, and session_access from session-read configuration, not SELFHOST_FEATURES.
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
@@ -10082,6 +10095,9 @@ components:
         session_delete:
           type: boolean
           description: True when the erase API URL and dedicated secret are configured and operator controls permit writes. Configuration availability only, not an upstream health or per-session storage verdict; owner/admin authorization is still required for DELETE.
+        session_access:
+          type: boolean
+          description: True when the session access routes are configured (SESSION_READ_MINT_INCLUDE_READER_KIND and SESSION_READ_API_MCP_READS on, and a History URL configured), so the dashboard may offer per-session access management. Configuration availability only; it grants nothing, and the routes still check rth:read and relaygate still decides who administers each session.
         enrollment_keys:
           type: boolean
           description: Always true. POST /api/v1/auth/enrollment/token exchanges desktop enrollment keys.
