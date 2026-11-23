@@ -10,6 +10,7 @@ import type {
 } from "@agent-relay/events-shim";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
+import { AGENT_NAME_PATTERN } from "../mcp/oauth/agent-name.js";
 
 /** The signed-in person a new inbox is recorded against. */
 export type EventsShimCreator = { workspaceId: string; userId: string };
@@ -220,6 +221,10 @@ export class PostgresEventsShimStore implements EventsShimStore {
     });
   }
 
+  /**
+   * The wake agent's name as kept: a valid Agent Relay agent name (a leading @ dropped), else null.
+   * watch_webhooks repeats it into other sessions' guidance, so free text is never kept.
+   */
   async setWakeTarget(shimId: string, target: WakeTarget | null): Promise<void> {
     await this.database.query(
       `UPDATE events_shims
@@ -228,7 +233,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
         WHERE id = $1`,
       target
         ? [shimId, target.url, this.encrypt(target.secret), target.linkedAt, target.brokenAt ?? null, target.brokenReason ?? null,
-          target.agent ?? null]
+          wakeAgentName(target.agent)]
         : [shimId, null, null, null, null, null, null],
     );
   }
@@ -507,4 +512,10 @@ function eventFrom(row: EventRow): ShimEvent {
   if (row.claim_token) event.claimToken = row.claim_token;
   if (row.wake_error) event.wakeError = row.wake_error;
   return event;
+}
+
+/** `link_relay_wake`'s `agent`, kept only when it is a valid agent name; anything else is stored as null. */
+export function wakeAgentName(agent: string | undefined): string | null {
+  const name = agent?.trim().replace(/^@/u, "") ?? "";
+  return AGENT_NAME_PATTERN.test(name) ? name : null;
 }

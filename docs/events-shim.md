@@ -68,7 +68,10 @@ answers `linked_agent` (and `replaced_agent` when it replaces another link);
 `watch_webhooks` and `GET /shims/current` (`agent.wake_agent`) report it for a
 linked inbox. Control keeps it in `events_shims.wake_agent` (migration 0095):
 the name `link_relay_wake` was given, or the bound agent's name for an agent
-link. A link made without a name, or before 0095, has none, and the agent is
+link. Only a valid agent name is kept (letters, digits, dots, dashes and
+underscores, a leading @ dropped); anything else is stored as null, since
+`watch_webhooks` repeats it to other sessions. A link made without a valid
+name, or before 0095, has none, and the agent is
 told to assume the link belongs to another session unless it linked in this
 conversation.
 The three tokens are shown once; an unknown or expired token answers 404.
