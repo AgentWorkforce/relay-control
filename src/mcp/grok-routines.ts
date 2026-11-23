@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
+import type { SelfhostConfig } from "../config.js";
 import { decryptSecret, encryptSecret, hashSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import { page } from "../identity/pages.js";
-import { RelaycastCallError, type HostedDelivery, type RelaycastClient } from "../messaging/relaycast.js";
+import { createRelaycastClient, RelaycastCallError, type HostedDelivery, type RelaycastClient } from "../messaging/relaycast.js";
 import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../tenancy.js";
 import { admissionConnectorKind, isGrokRoutineKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
@@ -56,6 +57,28 @@ export const isDuplicateRoutine = (error: unknown) => {
 const GATE_TOKEN_REFRESH_AFTER_MS = 12 * 3_600_000;
 /** How long one scan holds a routine while its participant enrols again at relaygate, so another scan does not race it. */
 const GATE_RECOVERY_LEASE_MS = 60_000;
+
+export type GrokRoutinesOptions = GrokRoutines["options"];
+
+/**
+ * The one place GrokRoutines options are built from config, for the server and createApp alike, so a gate-only install
+ * (relaygate public URL set) always gets a gate client and a required cursor run identity is always enforced.
+ * `fetchImpl` is used for the gate client only; `client` is the Relaycast client for non-gated participants.
+ */
+export function grokRoutinesOptions(config: SelfhostConfig,
+  deps: { database: Database; tenancyMode: TenancyMode; client: RelaycastClient; fetchImpl?: typeof fetch; now?: () => Date },
+): GrokRoutinesOptions {
+  return {
+    database: deps.database, keyring: config.encryptionKeyring, client: deps.client,
+    cursorRunIdentityRequired: config.cursorCloud?.enabled !== false && config.cursorCloud?.runIdentity === "required",
+    ...(config.relaygatePublicUrl
+      ? { gate: createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: deps.fetchImpl }) } : {}),
+    publicOrigin: new URL(config.publicBaseUrl).origin, tenancyMode: deps.tenancyMode,
+    ...(deps.now ? { now: deps.now } : {}),
+    // SELFHOST_GROK_ROUTINES_CLOUD_COPY (docs/grok-bot.md); off unless set.
+    cloudCopy: config.mcpOAuth?.grokCloudCopy === true,
+  };
+}
 
 export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;

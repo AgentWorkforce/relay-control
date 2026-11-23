@@ -949,6 +949,130 @@ accepted only by the `/relay-node/v1` broker; every other workspace API token
 gate treats it as no credential and introspection answers `wrong-kind`. See
 [relay-node-credential.md](relay-node-credential.md).
 
+#### Workspace agent identity tokens
+
+A workspace agent identity token lets an unattended agent (a CI job, a
+scheduled worker, a bot) join this workspace's Relay as its own named agent,
+not as a person. It is a workspace API token (`sh_wk_`) of purpose
+`agent-identity`, with scopes fixed to exactly `["relay:agent"]`. An owner or
+admin mints it on the usual route:
+
+```sh
+curl -s -X POST "$CONTROL_URL/api/v1/workspaces/$WORKSPACE_ID/deployment-api-tokens" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"purpose": "agent-identity", "agentName": "release-bot", "expiryDays": 30}'
+```
+
+- `agentName` is required. It is trimmed, at most 64 characters, must pass
+  the Relay agent-name rules (a letter or digit, then letters, digits, `.`,
+  `_` or `-`), and may not be a reserved Relay name in any letter case or
+  start with `launcher-` or `cursor-cloud-`. Otherwise the answer is `400`.
+- `label` is optional and defaults to the name.
+- `expiryDays` is 1 to 365 (default 90). The token always expires:
+  `neverExpires: true` is `400`.
+- A member who is not an owner or admin gets `403`. An enrollment-operator
+  token gets `403 enrollment_operator_scope`, and an agent identity token
+  (like any other workspace API token) gets `401`.
+- The response carries the plaintext `accessToken` once.
+
+The identity is keyed by the workspace and the lower-cased name, and keeps
+the letter case of its first mint. A name that a person's hosted Relay
+participant or a linked Desktop agent of this workspace already uses is
+`409 name_taken`.
+
+Before minting, the route also reads the workspace's Relaycast roster for the
+name (the identity's first-mint letter case when it already exists):
+
+- no roster agent has the name: the token is minted;
+- the roster agent is the one this identity registered at an earlier join:
+  the token is minted (rotation keeps working after the agent joined);
+- any other roster agent has it, released or not: `409 name_taken`;
+- the roster cannot be read (network error, or an error answer other than
+  not found): `503 relay_unavailable` with `Retry-After: 5`. Nothing is
+  written: no identity and no token.
+
+For an owner or admin caller, the route's workspace access check runs first
+and binds a workspace that has no Relaycast binding yet, as every owner/admin
+route does; the roster is then read with that binding. When the installation
+cannot provision the binding, the route answers `503 relaycast_not_ready` with
+`Retry-After: 5` and writes nothing. The roster read runs before, and outside,
+the minting transaction, so check and mint are not atomic: an agent can take
+the name on the roster in between. The identity's join is the backstop: it
+never attaches to a roster agent the identity does not own, and refuses the
+registration instead. Names given by relay nodes are not checked.
+
+In the other direction, a person cannot take an identity's name, in any letter
+case: `join_relay` with that name (or an automatic name equal to it) is
+refused with "That relay name is already taken", in the transaction that
+writes the participant and before any Relaycast call, and on a gate-only
+install also before relaygate enrols anything. MCP OAuth consent reports the
+name as taken. Neither direction takes a lock against the other, so a person's
+join and an identity's first mint for the same name, at the same moment, can
+both pass their checks; the identity's join then refuses the name because the
+person's roster agent holds it. Not covered by the refusal: Agent Relay
+Desktop identity sync (Desktop registers its agents on Relaycast itself;
+Control only records them) and the participants Control registers for
+Replicas, Amp, Capy, chief, Factory, Grok routines and webhook agent links.
+The identity's join refuses any of those names held on the roster.
+
+The agent presents the token as a header bearer on the shared-sessions MCP
+facade only:
+
+```sh
+curl -s -X POST "$CONTROL_URL/api/v1/mcp/shared-sessions" \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+       "params": {"name": "join_relay", "arguments": {}}}'
+```
+
+It can:
+
+- call the Relay messaging tools (`join_relay`, `leave_relay`,
+  `relay_status`, `list_relay_agents`, `get_relay_agent_card`,
+  `set_relay_agent_card`, `send_relay_message`, `get_relay_message_status`,
+  `read_relay_conversation`, `check_relay_inbox`, `list_relay_channels`,
+  `subscribe_relay_channel`, `unsubscribe_relay_channel`,
+  `post_relay_channel`, `read_relay_channel`) and `describe_capabilities`,
+  which reports `auth_mode: "agent_identity"`;
+- act only as its own agent. `join_relay` with no arguments joins as that
+  agent. A `join_relay` `name`, or an `as` on any other tool, must equal the
+  token's name, ignoring letter case (`name` accepts only lowercase letters,
+  digits and `-`, so omit it for other names).
+
+It cannot:
+
+- call any other tool. `tools/list` names only the tools above, and any other
+  `tools/call` is refused with `403` before a tool runs. That covers agent
+  launch and release, Desktop and webhook-inbox linking, shared-session,
+  summary, timing and team-activity reads, customer support, provider
+  bindings (Amp, Factory, Replicas, Capy) and UI tools;
+- join with `desktop_address`, `cursor_identity_token` or another `name`, or
+  act `as` another agent; those are refused with a message naming its agent;
+- authenticate from a cookie, on `/mcp` or any other MCP path, or on any
+  other route: every other workspace API token gate refuses it as before,
+  and introspection reports it inactive;
+- read or act in another workspace: the workspace and organization come only
+  from the token row, and it holds no membership;
+- mint, list or revoke tokens.
+
+Gate-only installs (relaygate) enrol hosted participants for a person only,
+so there the token is admitted but `join_relay` and the acting tools refuse
+with a message saying so.
+
+Rotation and revocation: minting again with the same name (any letter case)
+issues a new token for the same identity, and the agent keeps its Relay
+participant. Older tokens stay live until they expire or are revoked. The
+token list (`GET .../deployment-api-tokens?purpose=agent-identity`) shows
+`purpose` and `agent_name` on each item. `DELETE
+.../deployment-api-tokens/{tokenId}` revokes one token and leaves the others
+live; revoke every token of the name to stop the agent. The identity and its
+participant row (table `agent_identities` and
+`hosted_relay_participants.agent_identity_id`, migration 0086) are kept, so a
+later mint resumes the same agent.
+
 #### Desktop session scopes
 
 Sessions issued to the Desktop (and CLI) through the device flow, and the
@@ -1257,8 +1381,9 @@ before 0014. A change takes effect on the next restart. The domain routes
 answer `409 domains_managed_by_env` to `PUT` and `DELETE` in single mode.
 
 **Multi mode.** The organization a sign-in lands in is chosen in this order:
-1. the invite the person followed, then every other open invite for the
-   email (each is accepted; the session lands in the last one accepted);
+1. the invite the person followed (and any other open invite for the email
+   in that organization); without an invite link, every open invite for
+   the email (each is accepted; the session lands in the last one accepted);
 2. otherwise an existing membership: the remembered organization
    (`users.last_organization_id`) when still a member, else the
    newest;
@@ -1268,11 +1393,204 @@ answer `409 domains_managed_by_env` to `PUT` and `DELETE` in single mode.
    `Default` workspace, when personal organizations are on; else
    `403 no_organization`.
 
+So an invited person joins the inviting organization and never gets a
+personal one, whether they sign in through the invite link or not, by any
+sign-in method. Only an open invite counts: without the link, an expired or
+revoked invite is ignored (a personal organization when those are on); with
+the link, an expired, revoked or replaced invite answers `410` and a rotated
+one `404 invite_invalid`, and nothing is created. An invite created while a
+personal organization's Relaycast workspace is being provisioned still wins:
+the selection runs again before the organization is written and the unused
+workspace is released. Someone who already has a personal organization keeps
+it when invited later and lands in the inviting organization on their next
+sign-in. Invite and sign-in emails are compared lower-cased and trimmed.
+
 The workspace is the remembered one (`last_workspace_id`) when it is in that
 organization, else the organization's oldest. A refused sign-in rolls back
 and leaves no user row. Personal and self-serve organizations need
 `RELAYCAST_INTERNAL_SECRET` to create their Relaycast workspace; without it
 they answer `503 not_ready`.
+
+## Session bridge for organizations moved from Agent Relay Cloud
+
+When an organization moves from Agent Relay Cloud to this deployment, its
+people still sign in to Cloud out of habit. The session bridge lets a browser
+that holds a live Cloud session continue here without signing in again:
+Cloud signs a short-lived, single-use assertion naming the person, and this
+deployment verifies it and issues its own browser session. This deployment
+never validates a Cloud session or a Cloud token; it only trusts the
+assertion's signature, under keys the operator configured.
+
+It is off by default (`SELFHOST_CLOUD_BRIDGE_ENABLED`). While it is off,
+every route below answers 404 like an unknown route.
+
+### Flow
+
+1. `GET /cloud/api/v1/auth/cloud-bridge/start?next=<path>` (also served as
+   `/api/v1/auth/cloud-bridge/start`). This deployment makes a 32-byte random
+   nonce, stores `{nonce, next}` in the encrypted HttpOnly attempt cookie
+   `agent_relay_cloud_bridge` (Path `/cloud/api/v1/auth/cloud-bridge/consume`,
+   5 minutes, `SameSite=None; Secure`) and redirects to
+   `SELFHOST_CLOUD_BRIDGE_HANDOFF_URL?nonce=<nonce>`. Only the nonce goes to
+   Cloud. `next` must be a same-site path; anything else becomes `/`.
+2. Cloud's handoff page, for a person with a live Cloud session, signs an
+   assertion for that nonce and auto-posts a form to
+   `POST /cloud/api/v1/auth/cloud-bridge/consume` with the single field
+   `assertion`. It must post to the `/cloud` form of the path: the attempt
+   cookie is only sent there.
+3. This deployment checks the request and the assertion, spends it, signs the
+   person in, sets the usual session cookie (Path `/cloud`), clears the attempt
+   cookie and answers `303` to `next` (checked again as a same-site path).
+
+The consume request is a cross-site form post by design, so it is exempt from
+this deployment's same-origin rule for its own forms. Instead its `Origin`
+header must equal the origin of `SELFHOST_CLOUD_BRIDGE_HANDOFF_URL` exactly; a
+missing header, `null` or any other value is refused before the assertion is
+read. A handoff page served with `Referrer-Policy: no-referrer` makes
+browsers send `Origin: null` on its form post, and the bridge then refuses
+every sign-in: Cloud's handoff page must use a policy that keeps the origin
+(for example `strict-origin-when-cross-origin`). The attempt cookie is
+`SameSite=None` because a `Lax` cookie is not sent on a cross-site POST.
+
+### The assertion
+
+A compact JWS signed with Ed25519, verified with Node's own crypto.
+
+| Part | Rule |
+| --- | --- |
+| `alg` (header) | Exactly `EdDSA` |
+| `typ` (header) | Exactly `cloud-bridge+jwt` |
+| `kid` (header) | Required; one of the configured keys (Cloud uses the RFC 7638 thumbprint; it is compared as opaque text) |
+| `crit` (header) | Refused when present |
+| `iss` | Exactly `SELFHOST_CLOUD_BRIDGE_ISSUER` |
+| `aud` | A string exactly equal to `SELFHOST_CLOUD_BRIDGE_AUDIENCE` (an array is refused) |
+| `sub` | Required. The Cloud user id, which the import keeps as the user's id here. The only identity key: the account is never matched by email |
+| `org_id` | Required. The organization being bridged into |
+| `workspace_id` | Optional. Used when it names a workspace of that organization; otherwise ignored |
+| `auth_time` | Required. When the person signed in to Cloud (seconds) |
+| `auth_method` | Optional. Recorded in the audit row only |
+| `use` | Exactly `browser` |
+| `nonce` | Required. Must equal the nonce in this browser's attempt cookie |
+| `jti` | Required, opaque, at most 128 characters. Single use |
+| `iat`, `exp` | Required. `exp - iat` at most 120 seconds; `iat` not more than 30 seconds in the future; `exp` not more than 30 seconds in the past |
+| `nbf` | Optional. Refused when more than 30 seconds in the future |
+| `email` | Ignored |
+
+The whole assertion is capped at 4 KiB. The signature is verified before any
+claim is judged.
+
+### What it never does
+
+- It creates nothing: no user, organization, membership, workspace or
+  invitation. The person, the organization's bridge window and the membership
+  must already exist. An invite or an auto-join domain that matches the
+  person's email does not help, and neither do the admin-email rules.
+- It accepts no Cloud token or Cloud session cookie.
+- It exchanges no Desktop credential, MCP OAuth grant or API token. Desktop
+  completes its normal browser sign-in on the bridged browser session.
+
+### Checks and refusals
+
+In order, after the assertion verified: the user exists (by `sub`), the
+organization has an open bridge window, the user is a member, `auth_time` is
+not older than `SELFHOST_CLOUD_BRIDGE_MAX_AUTH_AGE_SECONDS` (nor in the
+future beyond the skew), and the person has not signed out here since. Then
+the workspace is chosen: the `workspace_id` claim when it is the
+organization's, else the person's last used workspace there, else the oldest.
+The session is labelled "Browser sign-in (moved from Cloud)" and audited as
+`auth.cloud_bridge.accepted` (target: `jti` and `authMethod`). The assertion's
+`jti` is spent before these checks, so a refused assertion cannot be retried.
+
+**Signed out since.** Cloud cannot end its own session server-side, so a kept
+copy of it could otherwise bridge again. Signing out of this deployment (or a
+password reset or operator session removal) ends bridging for every Cloud
+sign-in made before it; a new Cloud sign-in can still bridge while the
+organization's window is open. Precisely: any session of the person ended at
+or after `auth_time` refuses the assertion, except a session ended by a
+workspace switch or by removing one Desktop MCP provider, which are not
+sign-outs.
+
+Refusals are HTML pages with a link to `/login`. They are never cached and
+always clear the attempt cookie. The page's `x-error-code` header carries the
+code:
+
+| Code | Status | When |
+| --- | --- | --- |
+| `cloud_bridge_invalid` | 400 | Anything wrong with the request or the assertion: Origin, missing or expired attempt cookie, nonce mismatch, header, signature, claims, lifetime, replay |
+| `cloud_bridge_user_unknown` | 403 | No user here has the `sub` id |
+| `cloud_bridge_org_not_moved` | 403 | The organization has no open bridge window |
+| `cloud_bridge_not_member` | 403 | The user is not a member of the organization |
+| `cloud_bridge_auth_too_old` | 403 | The Cloud sign-in is older than the maximum age |
+| `cloud_bridge_signed_out` | 403 | The person signed out here after that Cloud sign-in |
+
+A `503 not_ready` page means the installation or the organization's workspace
+is not set up yet.
+
+Every refusal writes one log line, `cloud bridge refused`, with an internal
+`reason`: `origin`, `attempt_missing`, `malformed`, `wrong_type`, `wrong_alg`,
+`unknown_kid`, `bad_signature`, `wrong_issuer`, `wrong_audience`, `expired`,
+`not_yet_valid`, `lifetime_too_long`, `wrong_use`, `nonce_mismatch`,
+`replayed`, `user_unknown`, `org_not_moved`, `not_member`, `auth_too_old` or
+`signed_out`. The line names the `kid` when it is plain base64url text, and
+`sub`, `orgId` and `jti` only once the signature verified. It never holds the
+assertion, any part of it, the nonce or the cookie. When the signature
+verified and the organization exists here, the refusal is also audited in it
+as `auth.cloud_bridge.refused` with the reason.
+
+**Rate limits.** Per source address: 30 starts and 30 consumes per 5
+minutes. Once the signature verified: 10 per person (`sub`) and 1,200 per
+organization per 10 minutes. Over a limit, the browser gets the usual
+"Too many attempts" page (429).
+
+### Configuration
+
+| Variable | |
+| --- | --- |
+| `SELFHOST_CLOUD_BRIDGE_ENABLED` | `true` or `false` (default); anything else fails start-up |
+| `SELFHOST_CLOUD_BRIDGE_ISSUER` | Required when enabled. The exact `iss` |
+| `SELFHOST_CLOUD_BRIDGE_AUDIENCE` | Required when enabled. The exact `aud` |
+| `SELFHOST_CLOUD_BRIDGE_HANDOFF_URL` | Required when enabled. https (http only on localhost), no query or fragment |
+| `SELFHOST_CLOUD_BRIDGE_PUBLIC_KEYS[_FILE]` | Required when enabled. JWKS with 1-4 Ed25519 public keys (`kty` `OKP`, `crv` `Ed25519`), unique `kid`s, no `d` member |
+| `SELFHOST_CLOUD_BRIDGE_MAX_AUTH_AGE_SECONDS` | Optional, default `2592000` (30 days), at most `7776000` (90 days) |
+
+**Key rotation.** Change `SELFHOST_CLOUD_BRIDGE_PUBLIC_KEYS` and restart. It
+holds up to 4 keys, so the old and new key can be listed together while
+Cloud switches over; remove the old one afterwards.
+
+### Operator routes
+
+Bootstrap bearer only, like the
+[installation settings](#installation-settings-kill-switches); 404 while the
+bridge is off.
+
+- `GET /api/v1/installation/cloud-bridge/organizations` lists
+  `{organizations: [{organizationId, opensAt, closesAt, setBy, updatedAt}]}`.
+- `PUT /api/v1/installation/cloud-bridge/organizations/{organizationId}` with
+  `{"closesAt": "<time>", "opensAt": "<time>", "setBy": "<who>"}` opens or
+  changes the window. `opensAt` defaults to now; `closesAt` must be in the
+  future and at most 90 days after `opensAt`; `setBy` (1-120 characters) names
+  who made the change, since the bootstrap bearer names no person. An unknown
+  organization is 404; one with no members is `409 organization_empty`.
+  Audited as `installation.cloud_bridge.organization_set`.
+- `DELETE` on the same path removes the window (`204`; 404 when there is
+  none). Audited as `installation.cloud_bridge.organization_removed`.
+
+List an organization only after its import has been applied and verified, as
+part of the same operator step.
+
+### Operations
+
+- Cloud must end the Cloud session it vouches for when it signs the
+  assertion, so the person is not signed in to both.
+- A reverse proxy in front of a separate dashboard host must route
+  `/cloud/api/v1/auth/cloud-bridge/start` and
+  `/cloud/api/v1/auth/cloud-bridge/consume` to this service and pass
+  `Set-Cookie` on the consume response.
+
+**Removal.** The bridge is a migration tool. Once the last organization's
+window has closed, set `SELFHOST_CLOUD_BRIDGE_ENABLED=false`. Its routes,
+tables (`cloud_bridge_organizations`, `cloud_bridge_assertions`) and settings
+can be deleted in a later release.
 
 ## Invites
 
@@ -1677,6 +1995,7 @@ adds one.
 | Enrollment key session | `POST /api/v1/auth/enrollment/token` (one exchange of an `sh_ek_` key) | `cli:auth rth:read rth:sync rth:acquire` |
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
 | Staff read grant (`sh_sr_`) | `POST /api/v1/workspaces/{id}/staff-read-grants`, staff only ([staff-read-grants.md](staff-read-grants.md)) | `rth:read`, on the shared-sessions MCP facade only; never refreshed |
+| Workspace agent identity token (`sh_wk_`) | `POST /api/v1/workspaces/{id}/deployment-api-tokens` with `purpose: "agent-identity"`, owner or admin ([Workspace agent identity tokens](#workspace-agent-identity-tokens)) | `relay:agent`, on the shared-sessions MCP facade's Relay messaging tools only; expires within 365 days |
 | Launch-check token (gate-only installs) | Control itself, for one relaygate `POST /v1/check` per launch; 60 seconds, revoked after the check | None |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 

@@ -74,19 +74,29 @@ workspaceId, audience, scopes: ["rth:read"], label? }`, with `refreshToken`
 instead of `label` on refresh. The caller's own token never reaches the read
 API.
 
-On gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the body also
-carries `reader_kind`, taken from how the caller authenticated and never from
+When `SELFHOST_RELAYGATE_PUBLIC_URL` is set, or `SESSION_READ_MINT_INCLUDE_READER_KIND=true`,
+the body also carries `reader_kind`, taken from how the caller authenticated and never from
 the request body: `browser` for a cookie session with no bearer, `device` for
 an `sh_at_` bearer (a request with both a cookie and a bearer is `device`),
 and `mcp` for every MCP read made on the person's behalf. Relaygate records it
 and strips it before proxying, because the read API's internal schema is
-strict; on other installs the body is exactly as above. MCP reads that hop
+strict; otherwise the body is exactly as above. MCP reads that hop
 over Control's public session-read route prove themselves with the
 `x-relaycontrol-session-reader` header, an HMAC of a fixed string keyed by
 `SESSION_READ_API_SECRET`; a cookie request ignores the header, and a bearer
 without a matching header is `device`. Control validates the reply's identity, audience, read-only scope, token
 format (`rth_at_read_`/`rth_rt_read_`) and expiry, and sets `baseUrl` from
 configuration. Keep the internal routes off public ingress.
+
+`SESSION_READ_MINT_INCLUDE_READER_KIND` (`true` or `false`; any other value
+is a startup error) decides whether `reader_kind` is sent. Unset or empty, it
+is sent exactly when `SELFHOST_RELAYGATE_PUBLIC_URL` is set; an explicit value
+wins in both directions. A site that routes only the internal session read API
+through relaygate, without a public relaygate URL, sets this to `true` so that
+relaygate policy rules using `readerKinds` can match. With `false` (or unset
+without a relaygate public URL) such rules match nothing. Set it to `true` only
+when the service receiving the mint accepts or strips the field, as relaygate
+does; a read API that receives it directly refuses the body.
 
 `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) adds `role` to both
 bodies: `"owner"`, `"admin"` or `"member"`, the caller's organization role
@@ -301,6 +311,121 @@ non-200 read as their usual "unavailable" tool error.
 pair through Control (see the README); without it MCP reads use the same
 dashboard path above. Both paths use the read API, so cursors stay valid
 whichever one is selected.
+
+## Session access
+
+When the read API is relaygate, a session access administrator can see and
+change who may read one session. relaygate holds the policy and decides who
+is an administrator; Control stores nothing for it (no migration). It is on
+only when both hold: read token mints carry the reader kind
+(`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+`SELFHOST_RELAYGATE_PUBLIC_URL` set), and `SESSION_READ_API_MCP_READS=true`.
+The session read API URL must be relaygate's sessions listener; a
+sessions-only install without a public relaygate URL qualifies. Otherwise the
+MCP tools are not listed and the routes answer
+`404 session_access_not_configured`.
+
+relaygate checks that the caller is a session access administrator before it
+looks the session up. An administrator can manage a session they cannot
+themselves read, and a non-administrator gets the 403 answer
+(`not_access_admin`) whether or not the session exists. An administrator gets
+404 (`not_found`, "Session not found.") only for a session id relaygate does
+not know.
+
+Surfaces:
+
+| MCP tool (group `session_access`) | Dashboard route (`/cloud` cookie or bearer) | relaygate |
+| --- | --- | --- |
+| `get_session_access` | `GET /api/v1/workspaces/{ws}/sessions/{id}/access` | `GET /v1/sessions/{id}/access` |
+| `set_session_access` | `PATCH .../access` | `PATCH /v1/sessions/{id}/access` |
+| `reset_session_access` | `POST .../access/reset` | `POST /v1/sessions/{id}/access/reset` |
+| `get_session_access_history` | `GET .../access/history?after=&limit=` | `GET /v1/sessions/{id}/access/history` |
+
+Every upstream call carries the acting person's own read token, minted for
+that person with reader kind `mcp` (tools), `browser` (cookie) or `device`
+(bearer); never a workspace credential, the Control token or the issuer
+secret. The tools are offered only on a person's own session: not on an OAuth
+connection, a Desktop provider credential, a staff read grant or a workspace
+agent identity token. A cookie-carried PATCH or POST needs an allowed Origin
+(`403 csrf_rejected`).
+
+Changing access:
+
+- `mode` is three digits (owner, group, other), each 0, 2, 4 or 6. `"000"`
+  with `r` entries restricts reading to those entries.
+- `members` (emails) and `groups` (`{gid, perm}`), when given, **replace** the
+  current per-person and group lists. They are not merged: send every entry
+  that should remain. At most 64 each; `perm` is `r`, `w` or `rw`.
+- Emails resolve to current members of the workspace's organization, case
+  insensitively. An email that names no member, a member of another
+  organization, or more than one user refuses the whole change
+  (`unknown_members`, listing the emails) and nothing is sent. Only user ids
+  go upstream, never an email or a name.
+- `label` is null or 1 to 24 letters, digits, spaces, dots, underscores or
+  hyphens.
+- `reason` (1 to 200 characters, no control characters) is required on every
+  change and reset, and is kept in relaygate's audit history. Never put
+  session content in it.
+- Without an expected version Control reads the current version first and
+  sends it; relaygate always receives `expectedVersion` and `reason`.
+
+Reads show per-person entries with email and name for current members; a user
+who is no longer a member is shown as `member: false` (with the user id only)
+so the entry can be removed. History rows are oldest first, `limit` 1 to 200
+(default 50), with `next_after` / `nextAfter` for the next page.
+
+Each history row keeps relaygate's `actor_id` (its internal agent id) and
+`actor_name` as recorded, and adds `actor`. relaygate records a Control person
+as `actor_name` `ctl:<userId>`; that user id resolves like a grant, to
+`{user_id, email, name, member: true}` (`userId` on the route) for a current
+member of the organization or `{user_id, member: false}` otherwise. Any other
+`actor_name` gives `actor: null`. The user ids in `before` and `after` resolve
+the same way as per-person entries. `before` is null on a session's first
+change.
+
+Outcomes:
+
+| relaygate or transport | Tool `outcome` | Route |
+| --- | --- | --- |
+| 2xx | `ok` | 200 |
+| refused before sending | `invalid_request` / `unknown_members` | 400 |
+| 400 | `invalid_request` | 400 |
+| 403 | `not_access_admin` | 403 |
+| 404 (an administrator naming an unknown session; 403 is decided first) | `not_found` ("Session not found.") | 404 |
+| 409 | `conflict` with the current version, never retried | 409 `currentVersion` |
+| a read lost, 401 after one retry, 5xx, unreadable body | `unavailable` | 503 `session_access_unavailable` |
+| a PATCH or reset whose answer was lost, or an unreadable 2xx | `outcome_unknown` (may have applied: read again) | 504 `session_access_outcome_unknown` |
+
+A write is sent once and never retried, including after a 401.
+
+`GET /api/v1/capabilities` reports `session_access: true` when these routes
+are configured (both settings above and a History URL). It grants nothing.
+
+### What other surfaces show under per-session access
+
+When read token mints carry the reader kind, reads follow each session's
+policy, so surfaces that name sessions show only what the caller may read.
+Each check is a read of `GET /v1/sessions/{id}/metadata` with the caller's own
+read token (relaygate needs `r` on the session and its answer names the
+session); relaygate has no route that answers for many ids at once. Answers
+are not kept between requests, and anything not proven readable (a refusal,
+a 404, a timeout, an error, an id past the bound) is treated as unreadable.
+
+- MCP `list_team_activity`: every agent stays listed with its presence. An
+  agent's declared `session_id`, `session_kind` and `session_attribution` are
+  shown only when the caller can read that session; otherwise all three are
+  null and the agent is treated as declaring no session, with nothing saying
+  a claim was hidden. Sessions sampled for activity are proven by that read;
+  at most 40 other ids are checked, 4 at a time, within the tool's existing
+  deadline. A connection that does not read with a person's read token gets
+  no session ids. This applies to owners and admins too: a claim is the
+  agent's own declaration, never verified ownership, so no agent is exempt.
+- Read audit export ([shared-session-read-audit.md](shared-session-read-audit.md#per-session-access)):
+  an exporter that is not a session access administrator gets session ids and
+  owners only for sessions it can read.
+- Session hard delete ([session-erasure.md](session-erasure.md)) is unchanged:
+  its target and receipt carry ids, states and counts, never a session's
+  owner, title or content.
 
 ## Revocation
 

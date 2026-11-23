@@ -1,0 +1,28 @@
+{
+  "description": "Throwaway Ed25519 key generated once for contract tests; the private half was discarded. Assertion is expired by design. NOT a production key.",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "JUQ6GP3ifr-p-PgHPhLG7OswY1LR6xFboorZyd2Zfgc",
+        "x": "g7GUHMZ7mEYEVmr04pw3ns2_S1lBX2b9DMFWW9peKDo"
+      }
+    ]
+  },
+  "claims": {
+    "iss": "agentrelay-cloud",
+    "aud": "https://agentrelay.com/cloud",
+    "sub": "fixture-user-0001",
+    "org_id": "fixture-org-0001",
+    "workspace_id": "fixture-workspace-0001",
+    "email": "fixture@example.invalid",
+    "auth_time": 1790000000,
+    "use": "browser",
+    "nonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+    "iat": 1790000100,
+    "exp": 1790000160,
+    "jti": "0b6c2f0e-6f4a-4d2b-9b1e-3c5d7a9e1f20"
+  },
+  "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6ImNsb3VkLWJyaWRnZStqd3QiLCJraWQiOiJKVVE2R1AzaWZyLXAtUGdIUGhMRzdPc3dZMUxSNnhGYm9vclp5ZDJaZmdjIn0.eyJpc3MiOiJhZ2VudHJlbGF5LWNsb3VkIiwiYXVkIjoiaHR0cHM6Ly9hZ2VudHJlbGF5LmNvbS9jbG91ZCIsInN1YiI6ImZpeHR1cmUtdXNlci0wMDAxIiwib3JnX2lkIjoiZml4dHVyZS1vcmctMDAwMSIsIndvcmtzcGFjZV9pZCI6ImZpeHR1cmUtd29ya3NwYWNlLTAwMDEiLCJlbWFpbCI6ImZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkIiwiYXV0aF90aW1lIjoxNzkwMDAwMDAwLCJ1c2UiOiJicm93c2VyIiwibm9uY2UiOiJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFIiwiaWF0IjoxNzkwMDAwMTAwLCJleHAiOjE3OTAwMDAxNjAsImp0aSI6IjBiNmMyZjBlLTZmNGEtNGQyYi05YjFlLTNjNWQ3YTllMWYyMCJ9.jNVN_YYN4VX3-RejwvrofjX3nYITKc75pOSv2gQjSZmIo1zAgpdrEOg5QUbUtlT7IjroqVFrW2PD_ixlP3ZLBA"
+}
