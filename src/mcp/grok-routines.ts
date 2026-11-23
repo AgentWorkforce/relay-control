@@ -15,7 +15,7 @@ import {
 } from "./grok-routine.js";
 import { REPLY_MODES, type ReplyMode } from "./grok-events-policy.js";
 import {
-  GROK_EVENT_RETENTION_MS, eventFromDelivery, getEvent, insertEvent, ownedSenders, pendingWakes, recentEvents, wakeBody,
+  GROK_EVENT_RETENTION_MS, eventFromDelivery, getEvent, insertEvent, ownedSenders, pendingWakes, recentEvents, wakeBody, wakesRoutine,
 } from "./grok-events.js";
 import { ownerHash, HOSTED_SOURCE } from "./relay-participants.js";
 
@@ -166,10 +166,19 @@ export class GrokRoutines {
     return this.options.database.transaction(async tx => {
       await this.grant(tx, grantId, owner);
       // Cloud's disconnect_grok_bot_routine: mode or webhook_url narrows it; neither stops both.
-      const urlHash = input.webhookUrl === undefined ? null : hashSecret(parseGrokRoutineUrl(input.webhookUrl));
-      const mode = urlHash ? "webhook" : input.mode ?? null;
+      if (input.webhookUrl !== undefined) {
+        // Match the saved URL itself, so a routine saved before URL hashes were stored is found too.
+        const url = parseGrokRoutineUrl(input.webhookUrl);
+        const row = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1 AND delivery_mode='webhook' FOR UPDATE", [grantId])).rows[0];
+        let saved: string | null = null;
+        try { saved = row?.credentials_ciphertext ? parseGrokRoutineUrl(JSON.parse(decryptSecret(row.credentials_ciphertext, this.options.keyring)).url) : null; }
+        catch { saved = null; }
+        if (saved !== url) return { removed: 0 };
+        await tx.query("DELETE FROM grok_bot_routines WHERE grant_id=$1", [grantId]);
+        return { removed: 1 };
+      }
       const result = await tx.query(`DELETE FROM grok_bot_routines WHERE grant_id=$1 AND ($2::text IS NULL OR delivery_mode=$2)
-        AND ($3::text IS NULL OR routine_url_hash=$3) RETURNING grant_id`, [grantId, mode, urlHash]);
+        RETURNING grant_id`, [grantId, input.mode ?? null]);
       return { removed: result.rows.length };
     });
   }
@@ -194,7 +203,11 @@ export class GrokRoutines {
     return this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner);
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
-      return getEvent(tx, this.options.keyring, grant, routine?.reply_mode ?? "notes-only", eventId, this.retainedSince());
+      const workspace = (await tx.query<{ relaycast_workspace_id: string }>("SELECT relaycast_workspace_id FROM workspaces WHERE id=$1",
+        [owner.workspaceId])).rows[0];
+      if (!workspace) return null;
+      return getEvent(tx, this.options.keyring, grant, routine?.reply_mode ?? "notes-only", eventId, this.retainedSince(),
+        { userId: owner.userId, workspaceId: owner.workspaceId, relaycastWorkspaceId: workspace.relaycast_workspace_id });
     });
   }
 
@@ -308,6 +321,8 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         const routine = (await tx.query<Routine>(`SELECT * FROM grok_bot_routines WHERE grant_id=$1 AND next_attempt_at<=$2
           AND ($3::boolean OR NOT cloud_copy) FOR UPDATE`, [grant.id, this.now(), this.cloudCopy])).rows[0];
         if (!routine) return null;
+        // A failing statement must not abort the scan's transaction: roll back to here, record the failure, go on.
+        await tx.query("SAVEPOINT grok_routine_scan");
         try {
           // One budget bounds all remote reads, response bodies and the wake
           // while the revocation fence is held. stop() aborts the same requests.
@@ -383,6 +398,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
             next_attempt_at=$3,updated_at=$4,last_delivered_at=CASE WHEN $5 THEN $4 ELSE last_delivered_at END WHERE grant_id=$1`,
           [grant.id, ids, new Date(this.now().getTime() + 5_000), this.now(), fresh.length > 0]);
         } catch {
+          await tx.query("ROLLBACK TO SAVEPOINT grok_routine_scan");
           await this.failed(tx, grant.id, routine.failures);
         }
         return null;
@@ -413,7 +429,8 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
     const page: HostedDelivery[] = (await input.via.readHostedInbox(input.token, input.signal)).slice(0, 100);
     const inbox = page.filter(message => message.sender_id !== remote.id);
     if (inbox.length) {
-      // Trust and sender kind come from rows this service owns, never from agent metadata a sender could set.
+      // Sender kind comes from rows this service owns, never from agent metadata a sender could set. Trust is not
+      // stored: get_event decides it from current rows.
       const senders = await ownedSenders(tx, { ...input.owner, relaycastWorkspaceId: input.relaycastWorkspaceId },
         inbox.flatMap(message => message.sender_id ? [message.sender_id] : []));
       const channels = new Map(remote.channels.map(row => [row.id, row.name]));
@@ -421,8 +438,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         const event = eventFromDelivery({ grantId: grant.id, agent: remote.name, message, now,
           channel: message.channel_id ? channels.get(message.channel_id) ?? null : null,
           senderKind: message.sender_id && senders.people.has(message.sender_id) ? "person" : "agent" });
-        await insertEvent(tx, this.options.keyring, grant.id, event,
-          message.sender_id && senders.owned.has(message.sender_id) ? { trusted: true, reason: "your agent" } : { trusted: false, reason: null });
+        await insertEvent(tx, this.options.keyring, grant.id, event, wakesRoutine(event), now);
       }
     }
     let woke = false;

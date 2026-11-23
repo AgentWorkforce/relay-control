@@ -89,7 +89,7 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0088_grok_routines_cloud_copy.sql","sha256":"044f5dec50906156fbabf361099dcae5bb6a50a3fd9e4be17974e2c26e274ce2"}
+    {"name":"0088_grok_routines_cloud_copy.sql","sha256":"bb64036356dadda116e0e91a14c43ab4790715bb2e0342b9a8560d265e231b0c"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -605,19 +605,19 @@
     {"kind":"column","name":"public.flows_workspace_deletions.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.github_app_installations.installation_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
     {"kind":"column","name":"public.github_app_installations.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
-    {"kind":"column","name":"public.grok_bot_events.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.grok_bot_events.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":9,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.grok_bot_events.event_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
     {"kind":"column","name":"public.grok_bot_events.grant_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.grok_bot_events.grant_seq","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"bigint"}},
     {"kind":"column","name":"public.grok_bot_events.name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
-    {"kind":"column","name":"public.grok_bot_events.notified_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.grok_bot_events.notified_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.grok_bot_events.occurred_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"timestamp with time zone"}},
-    {"kind":"column","name":"public.grok_bot_events.payload_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
+    {"kind":"column","name":"public.grok_bot_events.payload_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":7,"type":"text"}},
     {"kind":"column","name":"public.grok_bot_events.sender","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":5,"type":"text"}},
-    {"kind":"column","name":"public.grok_bot_events.trusted_reason","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"text"}},
     {"kind":"column","name":"public.grok_bot_routines.cloud_copy","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":9,"type":"boolean"}},
     {"kind":"column","name":"public.grok_bot_routines.credentials_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":2,"type":"text"}},
     {"kind":"column","name":"public.grok_bot_routines.delivery_mode","definition":{"collation":"pg_catalog.default","default":"'webhook'::text","generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
+    {"kind":"column","name":"public.grok_bot_routines.event_seq","definition":{"collation":null,"default":"0","generated":"","identity":"","not_null":true,"position":15,"type":"bigint"}},
     {"kind":"column","name":"public.grok_bot_routines.failures","definition":{"collation":null,"default":"0","generated":"","identity":"","not_null":true,"position":5,"type":"integer"}},
     {"kind":"column","name":"public.grok_bot_routines.from_filter","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":12,"type":"text"}},
     {"kind":"column","name":"public.grok_bot_routines.grant_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
@@ -1540,7 +1540,6 @@
     {"kind":"constraint","name":"public.grok_bot_events.grok_bot_events_grant_seq_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((grant_seq >= 1))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.grok_bot_events.grok_bot_events_name_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((name = ANY (ARRAY['relay.message'::text, 'relay.channel_message'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.grok_bot_events.grok_bot_events_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (grant_id, event_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
-    {"kind":"constraint","name":"public.grok_bot_events.grok_bot_events_trusted_reason_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((trusted_reason IS NULL) OR (trusted_reason = 'your agent'::text)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.grok_bot_routines.grok_bot_routines_credentials","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((delivery_mode = 'polling'::text) OR (credentials_ciphertext IS NOT NULL)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.grok_bot_routines.grok_bot_routines_delivery_mode_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((delivery_mode = ANY (ARRAY['webhook'::text, 'polling'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.grok_bot_routines.grok_bot_routines_from_filter_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((from_filter IS NULL) OR ((length(from_filter) >= 1) AND (length(from_filter) <= 512))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
@@ -2262,5 +2261,5 @@
   "optional":{
 
   },
-  "sha256":"3768be9a3c8453a83d78376ba49b0d6c78294f4ab569b91756a494e2b35eb596"
+  "sha256":"9820478d55c3a2643295785ce024de58d7468e9ad4d67211ef1e94a744df3333"
 }

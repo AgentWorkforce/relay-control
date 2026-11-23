@@ -13,6 +13,8 @@ ALTER TABLE grok_bot_routines
   ADD COLUMN polling_since timestamptz,
   -- sha256 of the routine URL, so one Grok routine is saved under at most one grant.
   ADD COLUMN routine_url_hash text,
+  -- The last event sequence handed out for this routine. Never reused, so a cursor stays valid after retention deletes rows.
+  ADD COLUMN event_seq bigint NOT NULL DEFAULT 0,
   ADD CONSTRAINT grok_bot_routines_polling_copy CHECK (delivery_mode <> 'polling' OR cloud_copy),
   ADD CONSTRAINT grok_bot_routines_credentials CHECK (delivery_mode = 'polling' OR credentials_ciphertext IS NOT NULL);
 CREATE UNIQUE INDEX grok_bot_routines_routine_url ON grok_bot_routines(routine_url_hash) WHERE routine_url_hash IS NOT NULL;
@@ -21,7 +23,9 @@ CREATE UNIQUE INDEX grok_bot_routines_routine_url ON grok_bot_routines(routine_u
 -- and never acknowledges Relaycast deliveries itself. The worker ingests each
 -- delivery here (message text encrypted with the Control keyring), then
 -- acknowledges it. Events belong to the routine row and go with it; the worker
--- also deletes any older than seven days. grant_seq is the grant's own cursor.
+-- also deletes any older than seven days. grant_seq is the grant's own cursor,
+-- taken from grok_bot_routines.event_seq. Sender trust is not stored: get_event
+-- decides it from current rows each time.
 CREATE TABLE grok_bot_events (
   grant_id uuid NOT NULL REFERENCES grok_bot_routines(grant_id) ON DELETE CASCADE,
   event_id text NOT NULL CHECK (event_id ~ '^evt_[a-f0-9]{32}$'),
@@ -29,7 +33,6 @@ CREATE TABLE grok_bot_events (
   name text NOT NULL CHECK (name IN ('relay.message', 'relay.channel_message')),
   sender text,
   occurred_at timestamptz NOT NULL,
-  trusted_reason text CHECK (trusted_reason IS NULL OR trusted_reason IN ('your agent')),
   payload_ciphertext text NOT NULL,
   notified_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),

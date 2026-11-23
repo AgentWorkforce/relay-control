@@ -34,8 +34,8 @@ export function grokEventId(grantId: string, deliveryId: string): string {
 
 type Payload = { data: Record<string, unknown>; detail: Record<string, unknown> };
 type EventRow = { event_id: string; grant_seq: string | number; name: string; sender: string | null; occurred_at: Date | string;
-  trusted_reason: string | null; payload_ciphertext: string };
-const COLUMNS = "event_id,grant_seq,name,sender,occurred_at,trusted_reason,payload_ciphertext";
+  payload_ciphertext: string };
+const COLUMNS = "event_id,grant_seq,name,sender,occurred_at,payload_ciphertext";
 
 const iso = (value: Date | string) => new Date(value).toISOString();
 
@@ -70,7 +70,9 @@ export function eventFromDelivery(input: { grantId: string; agent: string; messa
     ? {
       data: { messageId: message.message_id, channel: input.channel, channelId: message.channel_id, threadId: message.thread_id,
         replyThreadId: message.thread_id ?? message.message_id, from: message.sender, senderKind: input.senderKind,
-        addressed: message.reason === "mention" || message.reason === "thread-reply", agent, summary: summarize(message.text) },
+        // Cloud's shape ("mention" | "bot-thread" | "post"). Relaycast gives thread-reply to every member for every
+        // thread, so only a mention counts as addressed here; the bot-thread rule needs channel-event tracking.
+        addressed: message.reason === "mention" ? "mention" : "post", agent, summary: summarize(message.text) },
       detail: { text: message.text, sender: message.sender, senderAgentId: message.sender_id ?? null, senderKind: input.senderKind,
         channel: input.channel, channelId: message.channel_id, threadId: message.thread_id, reason: message.reason ?? null,
         createdAt: message.created_at, deliveryId: message.delivery_id },
@@ -85,14 +87,27 @@ export function eventFromDelivery(input: { grantId: string; agent: string; messa
     occurredAt, payload };
 }
 
+/**
+ * Stores one event if it is new. Its sequence comes from the routine row's counter (locked FOR UPDATE by the scan),
+ * so a value is never reused, even after retention deletes older rows. `wake` false stores it as already notified:
+ * readable through get_recent_events but never a webhook wake.
+ */
 export async function insertEvent(tx: SqlExecutor, keyring: EncryptionKeyring, grantId: string,
-  event: ReturnType<typeof eventFromDelivery>, trust: SenderTrust): Promise<void> {
-  // grant_seq is this grant's own cursor (the routine row is locked FOR UPDATE by the scan, so it cannot race).
-  await tx.query(`INSERT INTO grok_bot_events(grant_id,event_id,grant_seq,name,sender,occurred_at,trusted_reason,payload_ciphertext)
-    SELECT $1,$2,COALESCE((SELECT MAX(grant_seq) FROM grok_bot_events WHERE grant_id=$1),0)+1,$3,$4,$5,$6,$7
-    ON CONFLICT (grant_id,event_id) DO NOTHING`,
-  [grantId, event.eventId, event.name, typeof event.payload.data.from === "string" ? event.payload.data.from : null,
-    event.occurredAt, trust.trusted ? trust.reason : null, encryptSecret(JSON.stringify(event.payload), keyring.active)]);
+  event: ReturnType<typeof eventFromDelivery>, wake: boolean, now: Date): Promise<void> {
+  if ((await tx.query("SELECT 1 FROM grok_bot_events WHERE grant_id=$1 AND event_id=$2", [grantId, event.eventId])).rows.length) return;
+  const seq = (await tx.query<{ event_seq: string | number }>(
+    "UPDATE grok_bot_routines SET event_seq=event_seq+1 WHERE grant_id=$1 RETURNING event_seq", [grantId])).rows[0];
+  if (!seq) throw new Error("routine_unavailable");
+  // created_at uses the same clock as the retention sweep and the read filter.
+  await tx.query(`INSERT INTO grok_bot_events(grant_id,event_id,grant_seq,name,sender,occurred_at,payload_ciphertext,notified_at,created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+  [grantId, event.eventId, seq.event_seq, event.name, typeof event.payload.data.from === "string" ? event.payload.data.from : null,
+    event.occurredAt, encryptSecret(JSON.stringify(event.payload), keyring.active), wake ? null : now, now]);
+}
+
+/** Until a channel-wake policy exists here, a routine wakes for direct messages and channel mentions only. */
+export function wakesRoutine(event: ReturnType<typeof eventFromDelivery>): boolean {
+  return event.name === RELAY_MESSAGE_EVENT || event.payload.data.addressed === "mention";
 }
 
 /** Null when the payload cannot be decrypted (a retired key): such an event is skipped, never fatal. */
@@ -123,13 +138,17 @@ export function assertOwnIdentity(approved: string, declared: string | undefined
 
 /** Cloud's getEvent for a relay.message / relay.channel_message, from this grant's retained log. */
 export async function getEvent(tx: SqlExecutor, keyring: EncryptionKeyring, grant: { id: string; agent_name: string },
-  replyMode: ReplyMode, eventId: string, retainedSince: Date) {
+  replyMode: ReplyMode, eventId: string, retainedSince: Date,
+  owner: { userId: string; workspaceId: string; relaycastWorkspaceId: string }) {
   const row = (await tx.query<EventRow>(`SELECT ${COLUMNS} FROM grok_bot_events WHERE grant_id=$1 AND event_id=$2 AND created_at>=$3`,
     [grant.id, eventId, retainedSince])).rows[0];
   const event = row ? view(row, keyring, grant.agent_name) : null;
   if (!row || !event) return null;
   const settings = grantEventsSettings(replyMode);
-  const trust: SenderTrust = row.trusted_reason === "your agent" ? { trusted: true, reason: "your agent" } : UNTRUSTED;
+  // Trust is decided now, from current rows: a retired binding or a removed participant is no longer "your agent".
+  const senderAgentId = typeof event.detail.senderAgentId === "string" ? event.detail.senderAgentId : null;
+  const trust: SenderTrust = senderAgentId && (await ownedSenders(tx, owner, [senderAgentId])).owned.has(senderAgentId)
+    ? { trusted: true, reason: "your agent" } : UNTRUSTED;
   // Earlier messages of the same DM conversation (Cloud keeps five, 500 characters each).
   const conversationId = typeof event.data.conversationId === "string" ? event.data.conversationId : null;
   const earlier = conversationId ? (await tx.query<EventRow>(`SELECT ${COLUMNS} FROM grok_bot_events

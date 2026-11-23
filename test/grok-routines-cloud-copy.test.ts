@@ -10,7 +10,8 @@ import { encryptSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastClient } from "../src/messaging/relaycast.js";
-import { GrokRoutines, GROK_SETUP_PATH, isDuplicateRoutine } from "../src/mcp/grok-routines.js";
+import { GrokRoutines, GROK_SETUP_PATH, grokRoutinesOptions, isDuplicateRoutine } from "../src/mcp/grok-routines.js";
+import { loadConfig } from "../src/config.js";
 import { grokRoutinePrompt, parseGrokRoutineDetails } from "../src/mcp/grok-routine.js";
 import { eventSteps, grantEventsSettings } from "../src/mcp/grok-events-policy.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
@@ -355,4 +356,109 @@ test("Cloud copy, gate-only: ingest and acknowledgement go through relaygate wit
   assert.ok(gatePaths.some(path => /^POST \/v1\/deliveries\/[^/]+\/ack$/.test(path)), "acknowledged through relaygate");
   assert.equal(f.world.pending("fake-grok").length, 0);
   assert.deepEqual(f.relayPaths.filter(path => /deliveries|\/v1\/agent$/.test(path)), [], "no direct Relaycast read or ack");
+});
+
+test("Cloud copy: trust is decided at read time from this person's own rows in this workspace", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  const other = randomUUID();
+  await f.database.query("INSERT INTO users(id,email,name) VALUES ($1,'teammate@example.test','Teammate')", [other]);
+  await f.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')", [f.owner.organizationId, other]);
+  const insertDesktop = async (name: string, userId: string, workspaceId: string) => {
+    const agent = f.sender(name);
+    await f.database.query(`INSERT INTO desktop_relay_identities(id,workspace_id,organization_id,user_id,relaycast_workspace_id,source_id,agent_name,
+      agent_remote_id,address,token_ciphertext) VALUES ($1,$2,$3,$4,'fake-workspace',$5,$6,$7,$8,$9)`,
+    [randomUUID(), workspaceId, f.owner.organizationId, userId, randomUUID(), name, agent.id, `${name}@laptop`, encryptSecret(agent.token, KEYRING.active)]);
+  };
+  // A teammate's own agent in the same workspace is not this person's agent.
+  await insertDesktop("teammate-agent", other, f.owner.workspaceId);
+  // The person's agent in another workspace of the organization does not count here.
+  const elsewhere = randomUUID();
+  await f.database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+    VALUES ($1,$2,'Other Workspace','other-relay',$3)`, [elsewhere, f.owner.organizationId, encryptSecret("rk_other", KEYRING.active)]);
+  await insertDesktop("elsewhere-agent", f.owner.userId, elsewhere);
+  await f.ownAgent("mine-for-now");
+  for (const from of ["teammate-agent", "elsewhere-agent", "mine-for-now"]) await f.message(from, `from ${from}`);
+  await f.routines.tick();
+  const event = (from: string) => f.calls.find(call => call.body.data.from === from)!.body.eventId;
+  assert.match(text(await f.tool("get_event", { eventId: event("teammate-agent") })), /trustedSender false/);
+  assert.match(text(await f.tool("get_event", { eventId: event("elsewhere-agent") })), /trustedSender false/);
+  assert.match(text(await f.tool("get_event", { eventId: event("mine-for-now") })), /trustedSender true/);
+  // The identity is removed after the message was stored: the next read no longer trusts it.
+  await f.database.query("DELETE FROM desktop_relay_identities WHERE agent_name='mine-for-now'");
+  assert.match(text(await f.tool("get_event", { eventId: event("mine-for-now") })), /trustedSender false/);
+  // A retired Capy binding never counts; a bound one does.
+  const capy = f.sender("capy-agent");
+  await f.database.query(`INSERT INTO capy_bindings(id,workspace_id,organization_id,user_id,thread_id,state,connection_digest,relaycast_workspace_id,agent_name,agent_remote_id)
+    VALUES ($1,$2,$3,$4,'thread-1','retired','digest','fake-workspace','capy-agent',$5)`, [randomUUID(), f.owner.workspaceId, f.owner.organizationId, f.owner.userId, capy.id]);
+  await f.message("capy-agent", "from capy"); f.advance(); await f.routines.tick();
+  assert.match(text(await f.tool("get_event", { eventId: event("capy-agent") })), /trustedSender false/);
+});
+
+test("Cloud copy: the cursor never restarts after retention deletes events", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine", { mode: "polling" });
+  await f.message("sender", "one"); await f.message("sender", "two"); await f.routines.tick();
+  const first = (await f.tool("get_recent_events", { scheduled: true, since: "0" })).structuredContent as any;
+  assert.deepEqual(first.events.map((event: any) => event.cursor), ["1", "2"]);
+  f.advance(8 * 24 * 3_600_000); await f.routines.tick();
+  assert.equal((await f.database.query("SELECT * FROM grok_bot_events")).rows.length, 0);
+  await f.message("sender", "three"); f.advance(); await f.routines.tick();
+  const later = (await f.tool("get_recent_events", { scheduled: true, since: first.cursor })).structuredContent as any;
+  assert.deepEqual(later.events.map((event: any) => [event.cursor, event.text]), [["3", "three"]]);
+});
+
+test("Cloud copy: a channel post wakes the routine only when it mentions the bot; addressed has Cloud's shape", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  f.sender("peer");
+  f.world.channelAs("fake-grok", "ops");
+  f.world.channelAs("peer", "ops", "general chatter");
+  f.world.channelAs("peer", "ops", "@fake-grok please look", { mention: "fake-grok" });
+  await f.routines.tick();
+  assert.equal(f.calls.length, 1, "only the mention woke the routine");
+  assert.equal(f.calls[0]!.body.name, "relay.channel_message");
+  assert.equal(f.calls[0]!.body.data.addressed, "mention");
+  const all = (await f.tool("get_recent_events", {})).structuredContent as any;
+  assert.deepEqual(all.events.map((event: any) => [event.data.addressed, event.text]),
+    [["post", "general chatter"], ["mention", "@fake-grok please look"]]);
+  assert.equal(f.world.pending("fake-grok").length, 0, "both were ingested and acknowledged");
+});
+
+test("Cloud copy: a racing duplicate save is refused through the route's unique-index catch; a save before join_relay is refused", async t => {
+  const f = await fixture(t);
+  // Before the bot joins Relay there is no pinned identity to wake.
+  const early = await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  assert.equal(early.status, 400);
+  assert.match((await early.json() as any).error_description, /join_relay/);
+  await f.tool("connect_grok_bot_routine");
+  // Another grant holds the URL, and the pre-check is made to miss it, as when two saves race.
+  const other = randomUUID();
+  await f.addGrant(other, "other-grok", randomUUID());
+  const hash = (await import("../src/crypto.js")).hashSecret(URL);
+  await f.database.query("INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,routine_url_hash) VALUES ($1,'x',$2)", [other, hash]);
+  const database = f.routines.options.database;
+  const racing = { ...database, transaction: (fn: (tx: any) => Promise<unknown>) => database.transaction(tx => fn({
+    query: (sql: string, params?: unknown[]) => sql.startsWith("SELECT 1 FROM grok_bot_routines WHERE routine_url_hash")
+      ? Promise.resolve({ rows: [] }) : tx.query(sql, params) })) } as typeof database;
+  const routines = new GrokRoutines({ ...f.routines.options, database: racing });
+  const response = await routines.handle(new Request(`https://relay.example.test${GROK_SETUP_PATH}?grant=${f.owner.grantId}`, {
+    method: "POST", headers: { origin: "https://relay.example.test", "content-type": "application/json" },
+    body: JSON.stringify({ webhook_url: URL, authorization: KEY }) }), f.owner);
+  assert.equal(response.status, 400);
+  assert.match((await response.json() as any).error_description, /already connected to another Agent Relay connection/);
+});
+
+test("Cloud copy: the server's wiring reads SELFHOST_GROK_ROUTINES_CLOUD_COPY from config", () => {
+  const env = { DATABASE_URL: "postgres://unused", SELFHOST_BOOTSTRAP_TOKEN: "fake-bootstrap-token-at-least-32-bytes",
+    SELFHOST_PUBLIC_URL: "https://relay.example.test", RELAYCAST_URL: "http://relaycast.test",
+    RELAYCAST_PUBLIC_URL: "https://relaycast.selfhosted.company", SESSION_READ_API_URL: "http://history.test",
+    SESSION_READ_API_SECRET: "fake-read-api-secret-at-least-32-bytes", RELAYCONTROL_INTROSPECT_SECRET: "fake-introspect-secret-at-least-32-bytes",
+    SESSION_READ_API_PUBLIC_URL: "https://history.selfhosted.company", SELFHOST_ENCRYPTION_KEY_ID: "fake-key",
+    SELFHOST_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64") };
+  const deps = { database: undefined as never, tenancyMode: "single" as const, client: undefined as never };
+  assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig(env), deps)).cloudCopy, false);
+  assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig({ ...env, SELFHOST_GROK_ROUTINES_CLOUD_COPY: "on" }), deps)).cloudCopy, true);
 });
