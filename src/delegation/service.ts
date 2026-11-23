@@ -402,9 +402,16 @@ export async function redactExpiredQuotes(executor: SqlExecutor, limit?: number)
           JOIN delegation_audit_events e ON e.workspace_id = q.workspace_id AND e.message_id = q.message_id
          WHERE e.quote IS NOT NULL
          LIMIT $2)),
+     -- Rows another transaction holds (an owner's redaction of the same
+     -- message, say) are skipped, never waited on: one conflict never aborts
+     -- or stalls the batch, and the skipped row is due again next sweep.
+     locked AS (
+       SELECT e.id FROM delegation_audit_events e
+        WHERE e.id IN (SELECT id FROM due) AND e.quote IS NOT NULL
+        FOR UPDATE SKIP LOCKED),
      redacted AS (
        UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
-        WHERE e.id IN (SELECT id FROM due) AND e.quote IS NOT NULL
+        WHERE e.id IN (SELECT id FROM locked) AND e.quote IS NOT NULL
         RETURNING e.workspace_id, e.message_id),
      queued AS (
        INSERT INTO delegation_quote_redactions (workspace_id, message_id)
