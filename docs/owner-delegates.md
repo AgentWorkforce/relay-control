@@ -127,8 +127,8 @@ Control then:
    (with conditions) must equal the message's;
 6. checks expiry, then that the grant still fits the policy, policy classes
    and grant scope for every action (the whole approval or nothing). Next it
-   checks tier O requirements (defaults `secret_change`, `destructive`,
-   `spend`, plus the policy's and the grant's). Last, standing (§5.4) for
+   checks tier O requirements: the policy's and the grant's
+   `require_tier_o` (no class needs tier O by default, §15). Last, standing (§5.4) for
    every action under `accept` (default `code_owners`);
 7. fixes a tier D approval's expiry at its first attestation, as Cloud's
    `approvalExpiry` does. The base time is Relaycast's `created_at` when it
@@ -175,6 +175,23 @@ stripped. The cut is at 80 characters on a code point boundary, so an emoji is n
 The attestation's `standing` is `own_owner` when every action held by own
 owner, otherwise `code_owner`.
 
+### config_change (§5.1, §5.3)
+
+A session's own permissions, sandbox and configuration are delegable (§15,
+Khaliq's decision).
+
+- **Approval target:** `<agent id>:<setting>=<value>`. It names exactly one
+  setting and its new value, has no `*`, and is at most 256 characters. The
+  agent id must be the recipient itself.
+- **Grant target:** an agent id, or `*` for any of the owner's agents.
+- **Limits:**
+  - Always single-use.
+  - Only `not_before` conditions.
+  - Only the recipient's own owner has standing; code owners never apply.
+- **Never delegable:** a `config_change` of `delegated_approvals_from` or
+  `spawn_delegate_approvals` (the recipient's own delegation settings) is
+  `out_of_scope`, including in a tier O mint.
+
 ### prompt_approval (§9.3)
 
 A grant target is `*` or `<agent id>:*`. An approval target is
@@ -188,8 +205,9 @@ proof, is `403 forbidden`.
 ## Redeem
 
 Redeem is required right before acting when the approval is single-use (any
-high-risk action: `release`, `secret_change`, `destructive`, `spend`, or
-`deploy` to `:prod`/`:production`) or when the action has conditions.
+high-risk action: `release`, `secret_change`, `destructive`, `spend`,
+`config_change`, or `deploy` to `:prod`/`:production`) or when the action has
+conditions.
 Control:
 
 - requires an earlier attestation of that approval to this recipient

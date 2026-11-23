@@ -11,6 +11,8 @@ import {
   base62,
   canonicalAction,
   classTargetCovered,
+  configTarget,
+  NEVER_DELEGABLE_SETTINGS,
   CLAIM_TTL_MS,
   DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
@@ -459,7 +461,8 @@ export function resolveStanding(input: { approvalOwnerId: string; recipientOwner
   actions: readonly Pick<Action, "class" | "target">[]; targetOwners: readonly TargetOwnerEntry[] }): Standing | null {
   if (input.approvalOwnerId === input.recipientOwnerId) return "own_owner";
   if (input.accept !== "code_owners") return null;
-  if (input.actions.some(action => action.class === "prompt_approval")) return null;
+  // prompt_approval and config_change belong to the machine owner alone.
+  if (input.actions.some(action => action.class === "prompt_approval" || action.class === "config_change")) return null;
   for (const action of input.actions) {
     if (PR_TARGET.test(action.target) || REPO_TARGET.test(action.target)) return null;
     const named = input.targetOwners.some(entry => entry.owner_ids?.includes(input.approvalOwnerId)
@@ -574,8 +577,14 @@ function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: Deleg
     if (!actionIsValid(action)) return "out_of_scope";
     if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return "out_of_scope";
     if (!actionsCovered(grant.scopes, [action])) return "out_of_scope";
-    // A prompt_approval names exactly the session it answers: this recipient.
-    if (action.class === "prompt_approval" && !action.target.startsWith(`${recipientAgentId}:`)) return "out_of_scope";
+    // A prompt_approval or config_change names exactly the session it
+    // applies to: this recipient.
+    if ((action.class === "prompt_approval" || action.class === "config_change") &&
+        !action.target.startsWith(`${recipientAgentId}:`)) return "out_of_scope";
+    // The recipient's own delegation settings are never delegable (§5.3).
+    if (action.class === "config_change" && NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? "")) {
+      return "out_of_scope";
+    }
   }
   return null;
 }

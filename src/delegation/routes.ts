@@ -15,11 +15,14 @@ import {
   APPROVAL_MAX_MS,
   canonicalAction,
   classTargetCovered,
+  configTarget,
+  NEVER_DELEGABLE_SETTINGS,
   GRANT_DEFAULT_DAYS,
   GRANT_MAX_DAYS,
   highRisk,
   mintActionsSchema,
   sha256Hex,
+  validConfigPattern,
   validPromptPattern,
   validTargetPattern,
   type ActionClass,
@@ -136,8 +139,9 @@ const scopeSchema = z.object({
   class: actionClass,
   targets: z.array(z.string().max(256)).min(1).max(50),
 }).strict().refine(scope => scope.targets.every(target =>
-  scope.class === "prompt_approval" ? validPromptPattern(target) : validTargetPattern(target)),
-"`*` may only stand for a whole segment; prompt_approval targets are `<agent id>:*` or `*`");
+  scope.class === "prompt_approval" ? validPromptPattern(target)
+    : scope.class === "config_change" ? validConfigPattern(target) : validTargetPattern(target)),
+"`*` may only stand for a whole segment; prompt_approval targets are `<agent id>:*` or `*`; config_change targets are agent ids or `*`");
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
@@ -615,6 +619,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const policy = await requireEnabled(workspace.id);
       const actions = body.actions.map(canonicalAction);
       policyRefusal(actions.map(action => action.class), policy);
+      // The recipient's own delegation settings are never delegable (§5.3).
+      if (actions.some(action => action.class === "config_change" &&
+          NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? ""))) {
+        fail("out_of_scope", "Delegation settings are never delegable", 403);
+      }
       const from = now().getTime();
       const expiresAt = body.expires_at ? Date.parse(body.expires_at) : from + APPROVAL_DEFAULT_MS;
       if (expiresAt <= from) fail("invalid_expiry", "expires_at must be in the future", 400);

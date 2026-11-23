@@ -10,11 +10,21 @@ import { z } from "zod";
 /** §16.1: the closed, protocol-versioned action classes. */
 export const ACTION_CLASSES = [
   "merge", "pr_ops", "deploy", "release", "secret_change", "destructive", "spend", "external_comms", "prompt_approval",
+  "config_change",
 ] as const;
 export type ActionClass = typeof ACTION_CLASSES[number];
 
-/** §16.1: classes that need an owner-minted (tier O) approval by default. */
-export const DEFAULT_TIER_O_CLASSES: readonly ActionClass[] = ["secret_change", "destructive", "spend"];
+/**
+ * §16.1, §15 (Khaliq, 7:43): no class needs an owner-minted (tier O) approval
+ * by default. An org can still require it with `require_tier_o`.
+ */
+export const DEFAULT_TIER_O_CLASSES: readonly ActionClass[] = [];
+
+/**
+ * §5.3: the recipient's own delegation settings are never delegable, so a
+ * delegate cannot widen its own reach through `config_change`.
+ */
+export const NEVER_DELEGABLE_SETTINGS: readonly string[] = ["delegated_approvals_from", "spawn_delegate_approvals"];
 
 export const MAX_TARGET_CHARS = 256;
 export const MAX_NOTE_CHARS = 280;
@@ -69,6 +79,15 @@ export const PR_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100
 export const REPO_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
 /** `<session agent id>:<request ref>`: a prompt_approval action target. */
 const PROMPT_TARGET = /^[^\s:*#/]{1,200}:[^\s:*#/]{1,200}$/u;
+/** `<agent id>:<setting>=<value>`: a config_change action target, exact, no `*` (§16.1). */
+const CONFIG_TARGET = /^([^\s:*#/=]{1,200}):([A-Za-z0-9_.-]{1,64})=([^\s*]{1,200})$/u;
+
+/** A config_change target's parts, or null when it is not one. */
+export function configTarget(target: string): { agentId: string; setting: string; value: string } | null {
+  if (target.length > MAX_TARGET_CHARS) return null;
+  const match = CONFIG_TARGET.exec(target);
+  return match ? { agentId: match[1]!, setting: match[2]!, value: match[3]! } : null;
+}
 
 /** A concrete target: a valid pattern with no wildcard. */
 export function isConcreteTarget(target: string): boolean {
@@ -79,10 +98,12 @@ export function isConcreteTarget(target: string): boolean {
 export function actionIsValid(action: Pick<Action, "class" | "target" | "conditions">): boolean {
   if (!isConcreteTarget(action.target)) return false;
   if (action.class === "prompt_approval" && !PROMPT_TARGET.test(action.target)) return false;
+  if (action.class === "config_change" && !configTarget(action.target)) return false;
   const conditions = action.conditions ?? [];
   if (conditions.length > MAX_CONDITIONS) return false;
   if (new Set(conditions.map(condition => condition.type)).size !== conditions.length) return false;
-  const prTarget = action.class !== "prompt_approval" && PR_TARGET.test(action.target);
+  // prompt_approval and config_change take `not_before` only.
+  const prTarget = action.class !== "prompt_approval" && action.class !== "config_change" && PR_TARGET.test(action.target);
   return conditions.every(condition => condition.type === "not_before" || prTarget);
 }
 
@@ -213,8 +234,19 @@ export function validPromptPattern(pattern: string): boolean {
     && !pattern.slice(0, -2).includes("*") && !/[\u0000-\u001f\u007f\s]/.test(pattern);
 }
 
+/** A config_change grant target: an agent id, or `*` for any agent (§16.1). */
+export function validConfigPattern(pattern: string): boolean {
+  return pattern === "*" || /^[^\s:*#/=]{1,200}$/u.test(pattern);
+}
+
 /** Whether a grant pattern of `cls` covers `target` (or, with `subsumes`, another pattern). */
 export function classTargetCovered(cls: ActionClass, pattern: string, target: string, subsumes = false): boolean {
+  if (cls === "config_change") {
+    if (!validConfigPattern(pattern)) return false;
+    if (subsumes) return pattern === "*" ? validConfigPattern(target) : target === pattern;
+    const parsed = configTarget(target);
+    return parsed !== null && (pattern === "*" || parsed.agentId === pattern);
+  }
   if (cls !== "prompt_approval") return targetCovered(pattern, target, subsumes);
   if (!validPromptPattern(pattern)) return false;
   if (pattern === "*") return subsumes ? validPromptPattern(target) : promptTarget(target) !== null;
@@ -231,7 +263,7 @@ export function actionsCovered(scopes: readonly Scope[], actions: readonly Pick<
 
 /** §16.1: high-risk actions are always single-use. */
 export function highRisk(action: Pick<Action, "class" | "target">): boolean {
-  if (["release", "secret_change", "destructive", "spend"].includes(action.class)) return true;
+  if (["release", "secret_change", "destructive", "spend", "config_change"].includes(action.class)) return true;
   return action.class === "deploy" && /:(prod|production)$/.test(action.target);
 }
 

@@ -165,7 +165,9 @@ test("scope matching follows §16.1", () => {
 });
 
 test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
-  for (const cls of ["release", "secret_change", "destructive", "spend"] as const) assert.ok(highRisk({ class: cls, target: "x" }));
+  for (const cls of ["release", "secret_change", "destructive", "spend", "config_change"] as const) {
+    assert.ok(highRisk({ class: cls, target: "x" }));
+  }
   assert.ok(highRisk({ class: "deploy", target: "web:prod" }));
   assert.ok(highRisk({ class: "deploy", target: "web:production" }));
   assert.ok(!highRisk({ class: "deploy", target: "web:staging" }));
@@ -538,7 +540,7 @@ test("attestation refusal reasons", async (t) => {
   const bobsAgent = await env.desktopIdentity("bob-coder", bobId);
   assert.equal(await reason(send(env, bot, bobsAgent, env.approval(merge)), "own_owner", bobsAgent), "not_pending");
 
-  // tier_o_required: a default tier O class, granted, but sent as tier D.
+  // tier_o_required: a class the grant requires tier O for, sent as tier D.
   await env.browser(`/delegates/${grantId}`, "PATCH", { require_tier_o: ["merge"] });
   assert.equal(await reason(send(env, bot, recipient, env.approval(merge))), "tier_o_required");
 
@@ -694,7 +696,12 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
   await env.bearer("/delegates/revoke-all", "POST", {});
   const tierD = await env.grant(bot.id, [{ class: "secret_change", targets: ["prod/*"] }]);
   assert.ok(tierD.grant_id);
-  // As tier D, a default tier O class is refused.
+  // No class needs tier O by default (§15, Khaliq 7:43): a tier D secret_change is single-use.
+  const plain = await env.attest(recipient, send(env, bot, recipient, env.approval([secret])));
+  assert.equal(plain.body.verdict, "delegate", plain.raw);
+  assert.equal(plain.body.claims.single_use, true);
+  // An org that requires tier O for the class refuses it as tier D.
+  await env.enable({ require_tier_o: ["secret_change"] });
   assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval([secret])))).body.reason, "tier_o_required");
 
   const minted = await env.browser("/delegates/approvals", "POST", { actions: [secret] });
@@ -985,4 +992,60 @@ test("quote_retention_days is an org setting (1–3650, default 90) that every w
   events = await audit();
   assert.equal(byJti(events, old).quote, null);
   assert.equal(byJti(events, recent).quote, null);
+});
+
+test("config_change: one exact setting of the recipient's own session, single-use, own owner only", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const session = await env.desktopIdentity("relay-coder");
+  const other = await env.desktopIdentity("other-session");
+  const bot = await env.claim("assistant");
+  // Grant targets are agent ids or `*`, never a setting pattern.
+  for (const targets of [[`${session.id}:sandbox=*`], [`${session.id}:*`], ["a/b"], [`${session.id}:sandbox=off`]]) {
+    const bad = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "config_change", targets }] });
+    assert.equal(bad.status, 400, `${targets} ${bad.raw}`);
+  }
+  await env.grant(bot.id, [{ class: "config_change", targets: [session.id] }]);
+  const change = (target: string, extra: Record<string, unknown> = {}) =>
+    send(env, bot, session, env.approval([{ class: "config_change", target, ...extra }]));
+
+  const ok = await env.attest(session, change(`${session.id}:sandbox=workspace-write`));
+  assert.equal(ok.body.verdict, "delegate", ok.raw);
+  assert.equal(ok.body.claims.single_use, true);
+  assert.equal(ok.body.claims.standing, "own_owner");
+  const action = { class: "config_change", target: `${session.id}:sandbox=workspace-write` };
+  assert.deepEqual((await env.redeem(session, ok.body.claims.approval_id, action)).body, { ok: true, consumed: true });
+  assert.deepEqual((await env.redeem(session, ok.body.claims.approval_id, action)).body, { ok: false, reason: "consumed" });
+
+  // The recipient's own delegation settings are never delegable.
+  for (const setting of ["delegated_approvals_from=org", "spawn_delegate_approvals=true"]) {
+    assert.equal((await env.attest(session, change(`${session.id}:${setting}`))).body.reason, "out_of_scope", setting);
+  }
+  // Another session's setting, or one the grant does not name.
+  assert.equal((await env.attest(session, change(`${other.id}:sandbox=off`))).body.reason, "out_of_scope");
+  // Exact only: a wildcard or a malformed target is not an approval; only not_before conditions.
+  assert.equal((await env.attest(session, change(`${session.id}:sandbox=*`))).body.reason, "no_approval");
+  assert.equal((await env.attest(session, change(`${session.id}:sandbox`))).body.reason, "no_approval");
+  assert.equal((await env.attest(session, change(`${session.id}:sandbox=off`, { conditions: [{ type: "mergeable" }] }))).body.reason,
+    "no_approval");
+  const later = new Date(Date.now() + 3_600_000).toISOString();
+  const timed = await env.attest(session, change(`${session.id}:approval_profile=strict`, {
+    conditions: [{ type: "not_before", at: later }] }));
+  assert.equal(timed.body.verdict, "delegate", timed.raw);
+
+  // Own owner only: never through code owners, even with a target-owners entry.
+  const bobId = await env.addMember("bob@acme.test");
+  const bobsSession = await env.desktopIdentity("bob-session", bobId);
+  const bobDesktop = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
+  await env.browser("/delegates/target-owners", "PUT", [{ pattern: "*", owner_ids: [env.ownerId] }]);
+  const wide = await env.claim("wide-assistant");
+  await env.grant(wide.id, [{ class: "config_change", targets: ["*"] }]);
+  const forBob = send(env, wide, bobsSession, env.approval([{ class: "config_change", target: `${bobsSession.id}:sandbox=off` }]));
+  assert.equal((await env.attest(bobsSession, forBob, "code_owners", bobDesktop.accessToken)).body.reason, "recipient_policy");
+
+  // Tier O mint refuses the never-delegable settings too.
+  const minted = await env.browser("/delegates/approvals", "POST", {
+    actions: [{ class: "config_change", target: `${session.id}:spawn_delegate_approvals=true` }] });
+  assert.equal(minted.status, 403, minted.raw);
+  assert.equal(minted.body.code, "out_of_scope");
 });

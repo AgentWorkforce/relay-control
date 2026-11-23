@@ -9927,7 +9927,7 @@ components:
   schemas:
     DelegationActionClass:
       type: string
-      enum: [merge, pr_ops, deploy, release, secret_change, destructive, spend, external_comms, prompt_approval]
+      enum: [merge, pr_ops, deploy, release, secret_change, destructive, spend, external_comms, prompt_approval, config_change]
     DelegationReason:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
