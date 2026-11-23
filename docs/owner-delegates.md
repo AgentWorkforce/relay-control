@@ -181,9 +181,10 @@ A session's own permissions, sandbox and configuration are delegable (§15,
 Khaliq's decision).
 
 - **Approval target:** `<agent id>:<setting>=<value>`. It names exactly one
-  setting and its new value, has no `*`, and is at most 256 characters. The
+  setting (at most 100 characters) and its new value (which may be empty), has
+  no `*`, and is at most 256 characters. The
   agent id must be the recipient itself.
-- **Grant target:** an agent id, or `*` for any of the owner's agents.
+- **Grant target:** `<agent id>:*` for one agent, or `*` for any of the owner's agents (as Cloud).
 - **Limits:**
   - Always single-use.
   - Only `not_before` conditions.

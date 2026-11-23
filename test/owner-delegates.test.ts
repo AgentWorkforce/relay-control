@@ -1000,12 +1000,12 @@ test("config_change: one exact setting of the recipient's own session, single-us
   const session = await env.desktopIdentity("relay-coder");
   const other = await env.desktopIdentity("other-session");
   const bot = await env.claim("assistant");
-  // Grant targets are agent ids or `*`, never a setting pattern.
-  for (const targets of [[`${session.id}:sandbox=*`], [`${session.id}:*`], ["a/b"], [`${session.id}:sandbox=off`]]) {
+  // Grant targets name agents, as `<agent id>:*` or `*`, never a setting pattern (as Cloud).
+  for (const targets of [[`${session.id}:sandbox=*`], [session.id], ["a/b"], [`${session.id}:sandbox=off`]]) {
     const bad = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "config_change", targets }] });
     assert.equal(bad.status, 400, `${targets} ${bad.raw}`);
   }
-  await env.grant(bot.id, [{ class: "config_change", targets: [session.id] }]);
+  await env.grant(bot.id, [{ class: "config_change", targets: [`${session.id}:*`] }]);
   const change = (target: string, extra: Record<string, unknown> = {}) =>
     send(env, bot, session, env.approval([{ class: "config_change", target, ...extra }]));
 

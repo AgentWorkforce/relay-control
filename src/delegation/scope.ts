@@ -79,8 +79,8 @@ export const PR_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100
 export const REPO_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
 /** `<session agent id>:<request ref>`: a prompt_approval action target. */
 const PROMPT_TARGET = /^[^\s:*#/]{1,200}:[^\s:*#/]{1,200}$/u;
-/** `<agent id>:<setting>=<value>`: a config_change action target, exact, no `*` (§16.1). */
-const CONFIG_TARGET = /^([^\s:*#/=]{1,200}):([A-Za-z0-9_.-]{1,64})=([^\s*]{1,200})$/u;
+/** `<agent id>:<setting>=<value>`: a config_change action target, exact, no `*` (§16.1), as Cloud's CONFIG_TARGET. */
+const CONFIG_TARGET = /^([^\s:*#/=]{1,200}):([A-Za-z0-9_.-]{1,100})=([^\s*]{0,200})$/u;
 
 /** A config_change target's parts, or null when it is not one. */
 export function configTarget(target: string): { agentId: string; setting: string; value: string } | null {
@@ -234,9 +234,9 @@ export function validPromptPattern(pattern: string): boolean {
     && !pattern.slice(0, -2).includes("*") && !/[\u0000-\u001f\u007f\s]/.test(pattern);
 }
 
-/** A config_change grant target: an agent id, or `*` for any agent (§16.1). */
+/** A config_change grant target names which agents, as Cloud: `<agent id>:*` or `*` (§16.1). */
 export function validConfigPattern(pattern: string): boolean {
-  return pattern === "*" || /^[^\s:*#/=]{1,200}$/u.test(pattern);
+  return pattern === "*" || /^[^\s:*#/=]{1,200}:\*$/u.test(pattern);
 }
 
 /** Whether a grant pattern of `cls` covers `target` (or, with `subsumes`, another pattern). */
@@ -245,7 +245,7 @@ export function classTargetCovered(cls: ActionClass, pattern: string, target: st
     if (!validConfigPattern(pattern)) return false;
     if (subsumes) return pattern === "*" ? validConfigPattern(target) : target === pattern;
     const parsed = configTarget(target);
-    return parsed !== null && (pattern === "*" || parsed.agentId === pattern);
+    return parsed !== null && (pattern === "*" || `${parsed.agentId}:*` === pattern);
   }
   if (cls !== "prompt_approval") return targetCovered(pattern, target, subsumes);
   if (!validPromptPattern(pattern)) return false;

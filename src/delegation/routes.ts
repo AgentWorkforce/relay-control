@@ -141,7 +141,7 @@ const scopeSchema = z.object({
 }).strict().refine(scope => scope.targets.every(target =>
   scope.class === "prompt_approval" ? validPromptPattern(target)
     : scope.class === "config_change" ? validConfigPattern(target) : validTargetPattern(target)),
-"`*` may only stand for a whole segment; prompt_approval targets are `<agent id>:*` or `*`; config_change targets are agent ids or `*`");
+"`*` may only stand for a whole segment; prompt_approval and config_change targets are `<agent id>:*` or `*`");
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
@@ -618,12 +618,12 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const body = parse(mintBody, await readJson(request), "Invalid approval");
       const policy = await requireEnabled(workspace.id);
       const actions = body.actions.map(canonicalAction);
-      policyRefusal(actions.map(action => action.class), policy);
-      // The recipient's own delegation settings are never delegable (§5.3).
+      // The recipient's own delegation settings are never delegable (§5.3); checked first, as Cloud.
       if (actions.some(action => action.class === "config_change" &&
           NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? ""))) {
-        fail("out_of_scope", "Delegation settings are never delegable", 403);
+        fail("out_of_scope", "Delegation settings themselves are never delegable", 403);
       }
+      policyRefusal(actions.map(action => action.class), policy);
       const from = now().getTime();
       const expiresAt = body.expires_at ? Date.parse(body.expires_at) : from + APPROVAL_DEFAULT_MS;
       if (expiresAt <= from) fail("invalid_expiry", "expires_at must be in the future", 400);
