@@ -112,7 +112,7 @@ export type DelegationRoutesInput = {
   /** GitHub's REST API (gate repository resolution at registration). */
   githubFetch?: typeof fetch;
   /** The workspace's GitHub connection token for this person, or null when it has none. */
-  githubToken?: (workspaceId: string, userId: string) => Promise<string | null>;
+  githubToken?: (workspaceId: string, userId: string | null) => Promise<string | null>;
   /* null: the workspace has no GitHub connection (the public API may be asked); throws GithubUnavailable on an outage. */
   /** The issuers that verifier accepts (GitHub Actions first); a gate names one of them. */
   oidcIssuers: readonly string[];
@@ -302,6 +302,14 @@ const gateBody = z.object({
     const job = JOB_WORKFLOW_FILE.exec(gate.job_workflow_ref);
     if (!job || (job[1]!.endsWith("*") && job[1] !== gate.ref_pattern)) {
       context.addIssue({ code: "custom", message: "job_workflow_ref must be <owner>/<repo>/.github/workflows/<file>@<ref or commit SHA>" });
+    } else {
+      // A reusable workflow in ANOTHER repository is matched by name only (no
+      // repository id), and a branch or tag there can be moved by that repo's
+      // writers: it must be pinned to a commit SHA (as Cloud).
+      const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
+      if (jobRepo.toLowerCase() !== gate.repo.toLowerCase() && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
+        context.addIssue({ code: "custom", message: "a job_workflow_ref in another repository must be pinned to a 40-hex commit SHA" });
+      }
     }
   }
   // A prefix not anchored to this repository would let one gate redeem another repo's releases.
@@ -617,6 +625,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const result = await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
         workspace, verifyOidc: input.workflowOidc, oidcToken: token, approvalId: body.approval_id, action: body.action,
         dryRun: body.dry_run === true,
+        liveDefaultBranch: async (repo) => (await resolveGateRepository({ repo, fetchImpl: input.githubFetch ?? globalThis.fetch,
+          token: input.githubToken ? await input.githubToken(row.id, null) : null }))?.defaultBranch ?? null,
       });
       json(gateRedeemStatus(result), result);
       return true;

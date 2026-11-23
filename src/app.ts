@@ -608,7 +608,8 @@ export function createApp(input: {
     githubToken: async (workspaceId, userId) => {
       if (!admin) return null;
       try {
-        return (await admin.connections.runtimeToken({ workspaceId, provider: "github", actor: { kind: "user", userId } })).accessToken;
+        return (await admin.connections.runtimeToken({ workspaceId, provider: "github",
+          actor: userId ? { kind: "user", userId } : { kind: "service", subject: "delegation-gate-redeem" } })).accessToken;
       } catch (error) {
         if (error instanceof ConnectionError && error.status === 404) return null;
         throw new GithubUnavailable();

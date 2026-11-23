@@ -128,8 +128,7 @@ type ClaimMatchFields = Pick<WorkflowClaims, "issuer" | "repository" | "workflow
  * gate without ids (none are created any more) never serves.
  */
 function sameRepositoryIds(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
-  return Boolean(gate.repository_id && gate.repository_owner_id && gate.repository_id === claims.repository_id &&
-    gate.repository_owner_id === claims.repository_owner_id);
+  return gate.repository_id === claims.repository_id && gate.repository_owner_id === claims.repository_owner_id;
 }
 
 /** Every signed field except the repository ids. */
@@ -168,6 +167,13 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
   approvalId: string;
   action: { class: ActionClass; target: string };
   dryRun?: boolean;
+  /**
+   * The repository's default branch read live from GitHub (the workspace's
+   * connection, else the public API): null when GitHub no longer resolves
+   * it; throws GithubUnavailable on an outage. Only asked for an off-commit
+   * candidate redeem through an opt-out gate.
+   */
+  liveDefaultBranch?: (repo: string) => Promise<string | null>;
 }): Promise<GateRedeemResult> {
   const { workspace } = input;
   const dryRun = input.dryRun === true;
@@ -234,8 +240,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // gate's owner sees it, also on a dry run. As Cloud.
     const exact = byName.filter(item => sameRepositoryIds(item, claims!));
     if (!exact.length) {
-      const squatted = byName.find(item => item.repository_id);
-      if (!squatted) return await refuse("gate_mismatch");
+      // Every gate holds its ids (NOT NULL): audited for the first name-matched gate.
+      const squatted = byName[0]!;
       gate = squatted;
       ownerUserId = squatted.owner_user_id;
       audited = true;
@@ -273,6 +279,15 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (!named) return await refuse("out_of_scope");
     if (named.sha.toLowerCase() !== claims.sha) {
       candidates = named.form === "candidate" ? candidates.filter(mayOptOutOfSourceSha) : [];
+      // The stored default branch is only what registration saw: read it live
+      // now (as Cloud). If the repository's default branch moved (or GitHub no
+      // longer resolves it), the gate's branch is not the reviewed one any more
+      // and the opt-out does not apply; an outage answers unavailable. A gate
+      // on a self-host issuer keeps the branch its owner named at registration.
+      if (candidates.length && claims.issuer === GITHUB_ACTIONS_OIDC_ISSUER && input.liveDefaultBranch) {
+        const live = await input.liveDefaultBranch(claims.repository);
+        candidates = live === null ? [] : candidates.filter(item => item.ref === `refs/heads/${live}`);
+      }
       if (!candidates.length) return await refuse("sha_mismatch");
       gate = candidates[0]!;
     }

@@ -90,7 +90,7 @@
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
     {"name":"0088_owner_delegates.sql","sha256":"5e882f3949a5a8348b5c018b145569a8b05839374bc67474bc661175938230df"},
-    {"name":"0089_delegation_release_gates.sql","sha256":"fc5f957be07598c5093a9f852028280e69754180c489f26f9d8325e37195292d"},
+    {"name":"0089_delegation_release_gates.sql","sha256":"3cf6c6eb8632a583802e9a8daf412041cb6cc78a721e9ada0712e7c0cf71fa01"},
     {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
@@ -378,8 +378,8 @@
     {"kind":"column","name":"public.delegation_gates.ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.ref_pattern","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.repo","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.repository_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":12,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.repository_owner_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":13,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.repository_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":12,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.repository_owner_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":13,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.target_prefix","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
@@ -2465,5 +2465,5 @@
   "optional":{
 
   },
-  "sha256":"59d178594b4fd5c2b064463cfa4f6ab729acb11d037db56ca51bd5e349647571"
+  "sha256":"4c040937a0e76479f06b7bccc90a977937abd344e989ed38d5047d8238825595"
 }

@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   -- GitHub's stable repository and owner ids, resolved and pinned at
   -- registration: a repository that later reuses the name (after a rename,
   -- transfer or delete) never matches, and a gate without them never serves.
-  repository_id text,
-  repository_owner_id text,
+  repository_id text NOT NULL,
+  repository_owner_id text NOT NULL,
   -- Candidate-run release targets name the candidate's source commit, which a
   -- promote workflow may not be running on: only a gate that opts out lets
   -- such a target differ from the run's sha claim. Land and iOS never may.

@@ -397,6 +397,9 @@ may be in another repo), and the token's `job_workflow_ref` must match it
 exactly too. A gate without `job_workflow_ref` covers only the jobs defined
 in its own file: the token's `job_workflow_ref` must be absent or equal its
 `workflow_ref` (a job inside a reusable workflow must be named on the gate).
+A `job_workflow_ref` in another repository must be pinned to a 40-hex commit
+SHA (400 otherwise): it is matched by name only, and a branch or tag there can
+be moved by that repository's writers.
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
@@ -488,9 +491,14 @@ dry_run?}`. Control checks, in order:
    Right after the action is found, a `release` is bound to the run's commit,
    as Cloud: the target's sha (the last segment for land and iOS, the source
    sha for a candidate) must equal the token's `sha` (a 64-hex sha never equals
-   a 40-hex target). On a mismatch only exact-branch gates with
+   a 40-hex target). On a mismatch only gates on the default branch with
    `allow_source_sha_mismatch` keep serving a candidate target, land and
    iOS targets keep none, and with none left the answer is `sha_mismatch`.
+   For a GitHub Actions gate the default branch is then read live from
+   GitHub (the workspace's connection, else the public API; never on an
+   on-commit redeem): if it moved, or GitHub no longer resolves the
+   repository, the opt-out does not apply; a GitHub outage is `unavailable`.
+   A self-host issuer gate keeps the default branch its owner named.
    Other classes are not sha-bound. Every gate event carries the run's `sha`.
 
    A `release` action must name exactly one release (§11a.2), or the

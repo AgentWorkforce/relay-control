@@ -426,7 +426,7 @@ test("every gate route is documented in openapi.yaml", () => {
 
 test("gate redeem: a gate for a reusable workflow also requires job_workflow_ref", async (t) => {
   const env = await setup(t);
-  const reusable = "AgentWorkforce/release-workflows/.github/workflows/publish.yml@refs/heads/main";
+  const reusable = `AgentWorkforce/release-workflows/.github/workflows/publish.yml@${SHA}`;
   await env.gate({ job_workflow_ref: reusable });
   const approvalId = await env.approval([STABLE]);
   const dry = { dry_run: true };
@@ -522,7 +522,7 @@ test("gates: allowed events, one live gate per workflow identity, pinned reposit
   const again = await env.browser("/delegates/gates", "POST", body);
   assert.equal(again.status, 409, again.raw);
   assert.deepEqual(again.body, { error: "You already registered this gate", code: "gate_exists" });
-  const reusable = `AgentWorkforce/workflows/.github/workflows/publish.yml@refs/heads/main`;
+  const reusable = `AgentWorkforce/workflows/.github/workflows/publish.yml@${SHA}`;
   await env.gate({ job_workflow_ref: reusable });
   assert.equal((await env.browser("/delegates/gates", "POST", { ...body, job_workflow_ref: reusable })).status, 409);
   // Deleting it frees the identity.
@@ -872,4 +872,38 @@ test("gate repository resolution: a connection's 404 or redirect is unresolved w
     fetchImpl: answer(200, { id: 5, owner: { id: 6 }, full_name: REPO, default_branch: "trunk" }) }),
   { repositoryId: "5", repositoryOwnerId: "6", fullName: REPO, defaultBranch: "trunk" });
   await assert.rejects(resolveGateRepository({ repo: REPO, token: null, fetchImpl: answer(502, {}) }), GithubUnavailable);
+});
+
+test("gate redeem: the opt-out re-reads the default branch live; a cross-repo reusable workflow must be SHA-pinned", async (t) => {
+  const env = await setup(t);
+  // A reusable workflow in another repository pinned to a branch: 400.
+  const crossBranch = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main",
+    event: "workflow_dispatch", target_prefix: `${REPO}:`,
+    job_workflow_ref: "AgentWorkforce/workflows/.github/workflows/publish.yml@refs/heads/main" });
+  assert.equal(crossBranch.status, 400, crossBranch.raw);
+  // An opt-out gate on the default branch (main) serves a candidate target from another commit.
+  await env.gate({ allow_source_sha_mismatch: true });
+  const other = "c".repeat(40);
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId, sha: other }));
+  const dry = { dry_run: true };
+  const approvalId = await env.approval([STABLE]);
+  const before = env.githubApi.calls.length;
+  assert.deepEqual((await env.redeem(token("960"), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
+  assert.equal(env.githubApi.calls.length, before + 1, "the default branch is read live");
+  // On-commit redeems never ask GitHub.
+  const onCommit = env.githubApi.calls.length;
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ run_id: "961" })), approvalId, STABLE, dry)).body,
+    { ok: true, consumed: false, dry_run: true });
+  assert.equal(env.githubApi.calls.length, onCommit);
+  // The default branch moved: the gate's branch is no longer the reviewed one.
+  env.githubApi.repos.set(REPO.toLowerCase(), { id: 70151234, owner: 90122, full_name: REPO, default_branch: "trunk" });
+  assert.deepEqual((await env.redeem(token("962"), approvalId, STABLE, dry)).body, { ok: false, reason: "sha_mismatch", dry_run: true });
+  // GitHub no longer resolves the repository: no opt-out either.
+  env.githubApi.repos.delete(REPO.toLowerCase());
+  assert.deepEqual((await env.redeem(token("963"), approvalId, STABLE, dry)).body, { ok: false, reason: "sha_mismatch", dry_run: true });
+  // An outage: unavailable (503).
+  env.githubApi.repos.set(REPO.toLowerCase(), "down");
+  const outage = await env.redeem(token("964"), approvalId);
+  assert.equal(outage.status, 503, outage.raw);
+  assert.deepEqual(outage.body, { ok: false, reason: "unavailable" });
 });
