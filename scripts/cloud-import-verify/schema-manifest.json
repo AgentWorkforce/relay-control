@@ -89,7 +89,8 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"}
+    {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
+    {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -484,6 +485,7 @@
     {"kind":"column","name":"public.events_shims.relay_workspace_key_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":19,"type":"text"}},
     {"kind":"column","name":"public.events_shims.secrets_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"text"}},
     {"kind":"column","name":"public.events_shims.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":17,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shims.wake_agent","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":21,"type":"text"}},
     {"kind":"column","name":"public.events_shims.wake_broken_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shims.wake_broken_reason","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":11,"type":"text"}},
     {"kind":"column","name":"public.events_shims.wake_linked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"timestamp with time zone"}},
@@ -2229,5 +2231,5 @@
   "optional":{
 
   },
-  "sha256":"d3698af82264dbb46e12e52f634ee48d889d76ce1ca19e1fa5156d5bd221df70"
+  "sha256":"f57e508ae6945eb7352f52d541cdf664f2f41e40368ecf0bc8e3945fab30a938"
 }
