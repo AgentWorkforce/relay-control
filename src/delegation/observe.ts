@@ -15,9 +15,14 @@
  *   delegation.dependency_failed  a JWKS (or other dependency) read failed (fails closed)
  *   delegation.refused            one refusal, by `op` and `reason` (info level)
  *   delegation.redaction_backlog  the Relaycast redaction queue after a sweep (warn when it needs an operator)
+ *   delegation.audit_fenced       a paged audit read held events back behind a running transaction (info)
+ *
+ * relay-control writes each line synchronously to the console, so a line is
+ * never lost when the request ends (Cloud registers its async delivery with
+ * the Worker's waitUntil for the same reason).
  */
 export type DelegationOp = "attest" | "redeem" | "gate_redeem" | "prompt_delegates" | "conditions" | "standing" |
-  "github_oidc_jwks" | "retention";
+  "github_oidc_jwks" | "retention" | "audit";
 
 export type SafeContext = {
   workspaceId?: string | null;
@@ -90,4 +95,8 @@ export function logRefused(op: DelegationOp, ctx: SafeContext): void {
 
 export function logRedactionBacklog(level: "info" | "warn", ctx: SafeContext): void {
   emit(level, "delegation.redaction_backlog", fields("retention", ctx));
+}
+
+export function logAuditFenced(ctx: SafeContext): void {
+  emit("info", "delegation.audit_fenced", fields("audit", ctx));
 }

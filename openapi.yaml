@@ -3614,18 +3614,31 @@ paths:
         - name: after_id
           in: query
           required: false
-          description: Resume after this event `id` (as Cloud); `0` starts from the beginning. Paging is commit-safe; events come in (writing transaction, id) order and only events of transactions older than every one still in flight are returned, so resuming never skips an event committed out of id order. An id that names no event of this workspace is 400 `invalid_request`.
+          description: Page from the previous response's `next_after_id` (as Cloud); `0` or none is the first page, which lists every committed event. A cursor page lists events after that event in (writing transaction, id) order, only those of transactions older than every one still running, so paging never skips an event committed out of id order. An id that names no event of this workspace is 400 `invalid_request`.
           schema: { type: string, pattern: "^(0|[1-9][0-9]{0,15})$" }
       responses:
         "200":
           description: Events
+          headers:
+            X-Audit-Next-After-Id:
+              description: JSONL only. The safe cursor to page from (`next_after_id`); absent when there is none yet.
+              schema: { type: string }
+            X-Audit-Complete:
+              description: JSONL only. `true` or `false`, as `complete`.
+              schema: { type: string, enum: ["true", "false"] }
           content:
             application/json:
               schema:
                 type: object
-                required: [events]
+                required: [events, next_after_id, complete]
                 properties:
                   events: { type: array, items: { $ref: "#/components/schemas/DelegationAuditEvent" } }
+                  next_after_id:
+                    type: [string, "null"]
+                    description: The cursor to page from (`after_id`); every event at or before it is final. Not necessarily the last event's id; events after it may be listed again.
+                  complete:
+                    type: boolean
+                    description: False while the page is full or an event was held back behind a running transaction; page again from `next_after_id`.
             application/x-ndjson:
               schema: { type: string }
         "400": { description: "`invalid_request`" }

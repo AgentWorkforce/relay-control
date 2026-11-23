@@ -31,6 +31,7 @@ import {
   type ActionClass,
   type Scope,
 } from "./scope.js";
+import { logAuditFenced } from "./observe.js";
 import {
   anyBinding,
   attestDelegation,
@@ -898,10 +899,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
-      // Resume after an event id, as Cloud: `?after_id=<last event id>` (0:
-      // from the start). Pages are commit-safe (listAuditPage), so resuming
-      // never skips an event committed out of id order. An id that names no
-      // event of this workspace is invalid_request.
+      // As Cloud: the first page (no after_id, or 0) lists every committed
+      // event. To page, pass after_id=<next_after_id> (JSONL:
+      // X-Audit-Next-After-Id), not the last event's id. A paged read lists
+      // only events whose transaction is older than every one still running,
+      // so paging never skips a late commit; events after the cursor may
+      // repeat. `complete` (X-Audit-Complete) is false while the page is full
+      // or an event was held back. An unknown after_id is invalid_request.
       const after = params.get("after_id");
       if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
@@ -909,19 +913,22 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const limit = Math.min(MAX_AUDIT_EVENTS,
         Math.max(1, Number.parseInt(params.get("limit") ?? `${MAX_AUDIT_EVENTS}`, 10) || MAX_AUDIT_EVENTS));
       await redactExpiredQuotes(input.database);
-      const events = (await listAuditPage(input.database, {
+      const page = await listAuditPage(input.database, {
         workspaceId: workspace.id, all: caller.admin, viewerUserId: principal.userId, since: since || null,
         grantId: grantId || null, limit, afterId: after,
       }).catch((error: unknown) => {
         if (error instanceof AuditCursorError) return fail("invalid_request", "after_id must be an event id", 400);
         throw error;
-      })).map(auditView);
+      });
+      if (page.heldBack > 0) logAuditFenced({ workspaceId: workspace.id, held_back: page.heldBack });
+      const events = page.events.map(auditView);
       if (format === "jsonl") {
-        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });
+        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store",
+          "x-audit-complete": String(page.complete), ...(page.nextAfterId ? { "x-audit-next-after-id": page.nextAfterId } : {}) });
         response.end(events.map(event => JSON.stringify(event)).join("\n") + (events.length ? "\n" : ""));
         return true;
       }
-      json(200, { events });
+      json(200, { events, next_after_id: page.nextAfterId, complete: page.complete });
       return true;
     }
 
@@ -1081,6 +1088,12 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     if (!workspace) return fail("not_found", "Approval not found", 404);
     // As Cloud: with delegation off there is nothing to withdraw.
     if (!(await loadPolicy(input.database, workspace.id)).delegation_enabled) return fail("not_found", "Approval not found", 404);
+    // As Cloud: the approval must exist before anything is asked of Relaycast,
+    // so an unauthenticated body cannot drive Relaycast calls for made-up ids.
+    const exists = (await input.database.query(
+      "SELECT 1 FROM delegation_approvals WHERE id = $1 AND workspace_id = $2", [approvalId, workspace.id],
+    )).rows.length > 0;
+    if (!exists) return fail("not_found", "Approval not found", 404);
     const binding = await input.relaycastBinding(workspace.id);
     if (input.gateOnly || !binding) return UNAVAILABLE();
     let agent;

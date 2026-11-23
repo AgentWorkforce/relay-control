@@ -91,6 +91,8 @@ would otherwise swallow, as one JSON line each with a fixed message
 - `delegation.dependency_failed` (error): a JWKS read failed, with
   `stale_cache_served`, `refresh` and `status`.
 - `delegation.refused` (info): one refusal, by `op` and `reason`.
+- `delegation.audit_fenced` (info): a paged audit read held `held_back`
+  events back behind a running transaction.
 
 These lines carry only `op`, `workspaceId`, approval, grant and gate ids,
 `reason`, the error class and the Postgres SQLSTATE. They never carry tokens,

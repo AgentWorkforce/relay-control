@@ -437,41 +437,75 @@ export class AuditCursorError extends Error {
   }
 }
 
+/** One page of the audit log (Cloud's AuditPage). */
+export type AuditPage = {
+  events: Record<string, unknown>[];
+  /** The cursor to page from (`after_id`): every event at or before it is final. Null when there is none yet. */
+  nextAfterId: string | null;
+  /** True when nothing more is listable right now: the page is not full and no committed event was held back. */
+  complete: boolean;
+  /** Events held back by the commit fence on a cursor page (a lower bound). */
+  heldBack: number;
+};
+
 /**
- * One page of a workspace's audit log, commit-safe, as Cloud's listAudit. A
- * bigserial id is drawn before its transaction commits, so ids do not arrive
- * in commit order. Each event records the id of the transaction that wrote it
- * (`xact_id`); events are ordered by (xact_id, id), and only those written by
- * transactions older than the oldest one still in flight (this statement's
- * snapshot xmin) are returned. That set is final, so a later page never needs
- * a row behind its cursor. `after_id` resolves to its event's (xact_id, id);
- * an unknown id is AuditCursorError; 0 (or none) starts from the beginning.
+ * One page of a workspace's audit log, in commit-safe order (xact_id, then
+ * id), as Cloud's listAuditPage.
+ *
+ * A bigserial id is drawn before its transaction commits, so ids do not
+ * arrive in commit order. Each event records the id of the transaction that
+ * wrote it (`xact_id`). The fence is W, the statement's snapshot xmin
+ * (`pg_snapshot_xmin(pg_current_snapshot())`), read in the same statement as
+ * the rows: every transaction below W has ended, so the events below W are
+ * final, and any event not yet visible has xact_id >= W and sorts after them.
+ *
+ * - Without `afterId` (the first page) nothing is hidden: every visible event
+ *   is listed. `nextAfterId` is the last listed event below W, the cursor that
+ *   is safe to page from; events after it may be listed again on the next page.
+ * - With `afterId` (an unknown one is AuditCursorError; `0` is the first page)
+ *   the page continues after that event's (xact_id, id) and is fenced to
+ *   events below W, so paging never skips an event whose transaction committed
+ *   late. Events held back by the fence are counted in `heldBack` and make
+ *   `complete` false; they appear once older transactions end.
  */
 export async function listAuditPage(executor: SqlExecutor, input: {
   workspaceId: string; all: boolean; viewerUserId: string; since: string | null; grantId: string | null;
   limit: number; afterId: string | null;
-}): Promise<Record<string, unknown>[]> {
+}): Promise<AuditPage> {
+  const paged = Boolean(input.afterId && input.afterId !== "0");
   let cursor: { xact_id: string; id: string } | null = null;
-  if (input.afterId && input.afterId !== "0") {
+  if (paged) {
     const row = (await executor.query<{ xact_id: string }>(
       "SELECT xact_id::text FROM delegation_audit_events WHERE workspace_id = $1 AND id = $2::bigint",
       [input.workspaceId, input.afterId],
     )).rows[0];
     if (!row) throw new AuditCursorError();
-    cursor = { xact_id: row.xact_id, id: input.afterId };
+    cursor = { xact_id: row.xact_id, id: input.afterId! };
   }
-  return (await executor.query<Record<string, unknown>>(
-    `SELECT * FROM delegation_audit_events
+  // One statement, so the rows and the fence come from the same snapshot.
+  const rows = (await executor.query<Record<string, unknown> & { xact_text: string; fence: string }>(
+    `SELECT *, xact_id::text AS xact_text, pg_snapshot_xmin(pg_current_snapshot())::text AS fence
+       FROM delegation_audit_events
       WHERE workspace_id = $1
         AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
         AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
         AND ($5::text IS NULL OR grant_id = $5)
         AND ($7::bigint IS NULL OR (xact_id, id) > ($7::bigint, $8::bigint))
-        AND xact_id < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
       ORDER BY xact_id, id LIMIT $6`,
     [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit,
       cursor?.xact_id ?? null, cursor?.id ?? null],
   )).rows;
+  const fence = rows.length ? BigInt(rows[0]!.fence) : null;
+  // Ordered by xact_id, so the final (below-fence) events are a prefix.
+  const final = fence === null ? rows : rows.filter(row => BigInt(row.xact_text) < fence);
+  const listed = paged ? final : rows;
+  const lastFinal = final.at(-1);
+  return {
+    events: listed.map(({ fence: _fence, xact_text: _text, xact_id: _xact, ...row }) => row),
+    nextAfterId: lastFinal ? String(lastFinal.id) : paged ? input.afterId : null,
+    complete: rows.length < input.limit && final.length === rows.length,
+    heldBack: paged ? rows.length - final.length : 0,
+  };
 }
 
 /**
@@ -907,7 +941,9 @@ export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: 
 /**
  * The final re-check's transaction, as Cloud's decideUnderLocks: it share-
  * locks, in this order, the membership rows of `memberUserIds` (sorted), the
- * workspace policy row, the grant row and the approval row, reads them, and
+ * workspace policy row, the grant row and the approval row (FOR NO KEY
+ * UPDATE instead when `consuming`, so consumers of one approval run one at a
+ * time), reads them, and
  * runs `decide` on that state in the same transaction. The caller then
  * re-proves its bearer (share-locking the session row) and commits what it
  * decided (the attestation, a consumption) in that transaction. Policy PUT
@@ -915,7 +951,8 @@ export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: 
  * rows in the same order, so a change committing meanwhile decides the answer.
  */
 export async function decideUnderLocks<T>(database: Database, input: { workspaceId: string; memberUserIds: string[];
-  grantId: string | null; approvalId: string }, decide: (state: DecisionState, tx: SqlExecutor) => Promise<T>): Promise<T> {
+  grantId: string | null; approvalId: string; consuming?: boolean },
+  decide: (state: DecisionState, tx: SqlExecutor) => Promise<T>): Promise<T> {
   return database.transaction(async (tx) => {
     let member = true;
     for (const userId of [...new Set(input.memberUserIds)].sort()) {
@@ -926,8 +963,14 @@ export async function decideUnderLocks<T>(database: Database, input: { workspace
     const grant = input.grantId ? (await tx.query<GrantRow>(
       "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.grantId],
     )).rows[0] ?? null : null;
+    // A consuming call (redeem, gate redeem) takes FOR NO KEY UPDATE, so
+    // consumers of one approval serialize: two share holders that each insert
+    // a consumption and then stamp consumed_at would deadlock, and each could
+    // miss the other's consumption when deciding the approval is spent.
+    // Revocation (an UPDATE) conflicts with either mode. As Cloud.
     const approval = (await tx.query<ApprovalRow>(
-      "SELECT * FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.approvalId],
+      `SELECT * FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 ${input.consuming ? "FOR NO KEY UPDATE" : "FOR SHARE"}`,
+      [input.workspaceId, input.approvalId],
     )).rows[0] ?? null;
     return decide({ member, policy, grant, approval }, tx);
   });
@@ -983,12 +1026,13 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
 }): Promise<DelegationVerdict> {
   const { workspace } = input;
   const now = deps.now();
-  const context: { ownerUserId?: string; grantId?: string; approvalId?: string; senderId?: string } = {};
+  const context: { ownerUserId?: string; grantId?: string; approvalId?: string; senderId?: string; proven?: boolean } = {};
   try {
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
     if (deps.gateOnly || !deps.signer) refuse("unavailable");
     const recipient = await proveRecipient(deps, input);
+    context.proven = true;
 
     // Relaycast proves this exact message is still pending for this token, and
     // is the only source of the sender id and of the stored owner_approval.
@@ -1164,7 +1208,10 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       logUnavailable("attest", error, { workspaceId: workspace.id, approvalId: context.approvalId ?? null,
         grantId: context.grantId ?? null });
     }
-    await recordDelegationAudit(deps.database, {
+    // A refusal before the caller's recipient is proven (delegation off, no
+    // key, a bad token) is logged and counted only: unproven callers never
+    // write audit rows. As Cloud.
+    if (context.proven) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "approval.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
@@ -1209,12 +1256,13 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
 }): Promise<RedeemResult> {
   const { workspace } = input;
   const now = deps.now();
-  const context: { ownerUserId?: string; grantId?: string } = {};
+  const context: { ownerUserId?: string; grantId?: string; proven?: boolean } = {};
   try {
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
     if (deps.gateOnly) refuse("unavailable");
     await proveRecipient(deps, input);
+    context.proven = true;
     const approval = (await deps.database.query<ApprovalRow>(
       "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
       [input.approvalId, workspace.id],
@@ -1260,7 +1308,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     // are re-checked under locks, and a single-use action is consumed in the
     // same transaction.
     await decideUnderLocks(deps.database, { workspaceId: workspace.id, memberUserIds: [input.callerUserId],
-      grantId: grant!.id, approvalId: input.approvalId }, async (state, tx) => {
+      grantId: grant!.id, approvalId: input.approvalId, consuming: true }, async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
       if (stale) refuse(stale);
@@ -1288,7 +1336,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       logUnavailable("redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId,
         grantId: context.grantId ?? null });
     }
-    await recordDelegationAudit(deps.database, {
+    // As at attest: only a proven recipient's refusals are written to the audit log.
+    if (context.proven) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,
