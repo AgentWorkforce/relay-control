@@ -3411,6 +3411,152 @@ paths:
                   approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
         "400": { description: "`invalid_request` or `invalid_expiry`" }
         "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationGates
+      tags: [Owner delegates]
+      description: |
+        Release gates (relay design §11a.3). Human-only (browser session or
+        verified Desktop bearer). The caller's gates; workspace owner/admin may
+        pass `all=1`. Allowed while delegation is off.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: all, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Gates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gates]
+                properties:
+                  gates: { type: array, items: { $ref: "#/components/schemas/DelegationGate" } }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`" }
+    post:
+      operationId: registerDelegationGate
+      tags: [Owner delegates]
+      description: |
+        Register exactly which workflow may redeem an approval of the caller's:
+        `repo`, `job_workflow_ref`, `event`, and either an exact `ref` or a
+        `ref_pattern` of the form `refs/tags/<literal prefix>*` (one trailing
+        `*`). `target_prefix` must start with `<repo>:`. Human-only, delegation
+        on. Audited `gate.registered`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationGateInput" }
+      responses:
+        "201":
+          description: Registered gate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationGate" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+        "409": { description: "`gate_exists`: the caller already has a gate for this exact workflow identity" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates/{gateId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: gateId, in: path, required: true, schema: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" } }
+    delete:
+      operationId: deleteDelegationGate
+      tags: [Owner delegates]
+      description: Human-only. The gate's owner, or a workspace owner/admin. Allowed while delegation is off. Audited `gate.deleted`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The deleted gate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationGate" }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates/redeem:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redeemThroughDelegationGate
+      tags: [Owner delegates]
+      description: |
+        The publishing job redeems the approval itself (§11a.3), with
+        `Authorization: Bearer <workflow OIDC token>`. The token is verified
+        against its issuer's JWKS (GitHub Actions, plus
+        SELFHOST_DELEGATION_OIDC_ISSUERS), its issuer, its audience (this
+        deployment's origin) and its validity window. `repository`,
+        `job_workflow_ref`, `ref` (or the gate's `ref_pattern`) and
+        `event_name` must match one of the approval owner's gates exactly.
+        Then the normal redeem checks run (approval, grant, delegate binding,
+        scope, policy, tier O, expiry, revocation, conditions), the action's
+        target must start with the gate's `target_prefix`, and a `release`
+        target must name exactly one release (§11a.2).
+
+        The first redeem consumes the approval and binds it to the token's
+        `run_id`. Any later redeem in the same run (another job, or a later
+        attempt) answers `{ok:true, consumed:true, same_run:true}`; any other
+        run gets `consumed`. `dry_run: true` runs every check, never consumes,
+        and answers `{ok, reason?, dry_run:true}`. Audited `gate.redeemed`,
+        `gate.refused` or `gate.dry_run`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [approval_id, action]
+              properties:
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                action:
+                  type: object
+                  additionalProperties: false
+                  required: [class, target]
+                  properties:
+                    class: { $ref: "#/components/schemas/DelegationActionClass" }
+                    target: { type: string, maxLength: 256 }
+                dry_run: { type: boolean }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, consumed]
+                    properties:
+                      ok: { const: true }
+                      consumed: { type: boolean }
+                      same_run: { const: true }
+                  - type: object
+                    required: [ok, dry_run]
+                    properties:
+                      ok: { const: true }
+                      dry_run: { const: true }
+                  - type: object
+                    required: [ok, reason]
+                    properties:
+                      ok: { const: false }
+                      reason: { $ref: "#/components/schemas/DelegationReason" }
+                      unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
+                      dry_run: { const: true }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`: no bearer" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`" }
   /api/v1/workspaces/{workspaceId}/delegates/audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10071,7 +10217,8 @@ components:
     DelegationReason:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
-        consumed, not_pending, unavailable, condition_unmet, condition_unavailable]
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, gate_unknown, oidc_invalid,
+        gate_mismatch, target_prefix]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
@@ -10095,6 +10242,31 @@ components:
       properties:
         error: { type: string, description: Human-readable message }
         code: { type: string, description: Stable machine-readable code }
+    DelegationGate:
+      type: object
+      required: [gate_id, repo, job_workflow_ref, ref, ref_pattern, event, target_prefix, owner_id, created_at]
+      properties:
+        gate_id: { type: string }
+        repo: { type: string }
+        job_workflow_ref: { type: string }
+        ref: { type: [string, "null"] }
+        ref_pattern: { type: [string, "null"] }
+        event: { type: string }
+        target_prefix: { type: string }
+        owner_id: { type: string }
+        created_at: { type: string, format: date-time }
+    DelegationGateInput:
+      type: object
+      additionalProperties: false
+      required: [repo, job_workflow_ref, event, target_prefix]
+      description: Exactly one of `ref` and `ref_pattern`.
+      properties:
+        repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
+        job_workflow_ref: { type: string, maxLength: 512, example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
+        ref: { type: string, example: "refs/heads/main" }
+        ref_pattern: { type: string, pattern: "^refs/tags/[A-Za-z0-9_./-]{1,200}\\*$", example: "refs/tags/v2026.*" }
+        event: { type: string, pattern: "^[a-z_]{1,64}$", example: workflow_dispatch }
+        target_prefix: { type: string, maxLength: 256, example: "AgentWorkforce/relay-app:" }
     DelegationAction:
       type: object
       description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.

@@ -122,7 +122,7 @@ export type GrantRow = {
   revoked_reason: string | null;
 };
 
-type ApprovalRow = {
+export type ApprovalRow = {
   id: string;
   workspace_id: string;
   owner_user_id: string;
@@ -157,8 +157,8 @@ export function grantView(row: GrantRow, now = new Date()) {
   };
 }
 
-/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`), as Cloud's mintId. */
-export function mintId(prefix: "grt" | "apv" | "clm"): string {
+/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`, `gate_`), as Cloud's mintId. */
+export function mintId(prefix: "grt" | "apv" | "clm" | "gate"): string {
   return `${prefix}_${base62(randomBytes(16))}`;
 }
 
@@ -616,19 +616,19 @@ export async function expireLapsed(executor: SqlExecutor, workspaceId: string, o
   }
 }
 
-class Refusal extends Error {
+export class Refusal extends Error {
   constructor(readonly reason: ReasonCode) {
     super(reason);
   }
 }
 
-class ConditionUnmet extends Error {
+export class ConditionUnmet extends Error {
   constructor(readonly unmet: Condition[]) {
     super("condition_unmet");
   }
 }
 
-const refuse = (reason: ReasonCode): never => {
+export const refuse = (reason: ReasonCode): never => {
   throw new Refusal(reason);
 };
 
@@ -753,7 +753,7 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
  * revokes the grant durably here (§7 automatic revocation); the reason code
  * returned is `revoked` either way, as in Cloud.
  */
-async function delegateStillBound(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow,
+export async function delegateStillBound(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow,
   live: boolean): Promise<ReasonCode | null> {
   const revoke = async (reason: string): Promise<ReasonCode> => {
     await deps.database.transaction(tx => revokeGrants(tx, {
@@ -790,12 +790,12 @@ async function grantsFor(executor: SqlExecutor, workspaceId: string, ownerUserId
   )).rows;
 }
 
-function tierOClasses(policy: DelegationPolicy, grant: GrantRow): Set<ActionClass> {
+export function tierOClasses(policy: DelegationPolicy, grant: GrantRow): Set<ActionClass> {
   return new Set<ActionClass>([...DEFAULT_TIER_O_CLASSES, ...policy.require_tier_o, ...grant.require_tier_o]);
 }
 
 /** Why an action list is outside the grant or the policy, or null (Cloud's scopeRefusal). */
-function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: DelegationPolicy,
+export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: DelegationPolicy,
   recipientAgentId: string): ReasonCode | null {
   if (!grantFitsPolicy(grant, policy)) return "out_of_scope";
   for (const action of actions) {

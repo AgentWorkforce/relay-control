@@ -8,6 +8,8 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
+import { gateView, redeemThroughGate, type GateRow } from "./gates.js";
+import { OidcInvalid, type WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
   actionClass,
@@ -101,7 +103,9 @@ export type DelegationRoutesInput = {
     id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; role: Principal["role"];
   } | null>;
   json: JsonWriter;
-  /** A workspace's Relaycast binding, without a person (claims/complete, withdraw). */
+  /** Release gates (§11a.3): the workflow OIDC verifier for gate redeem. */
+  workflowOidc: WorkflowOidcVerifier;
+  /** A workspace's organization and Relaycast binding, without a person. */
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
   /** Redacts a quote in Relaycast's stored owner_approval; null: redactions stay queued. */
   relaycastRedact?: RelaycastQuoteRedactor;
@@ -221,6 +225,28 @@ const withdrawBody = z.object({
 }).strict();
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
 const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
+const GATE_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
+/** `POST /delegates/gates` (§11a.3): exactly which workflow may redeem. */
+const gateBody = z.object({
+  repo: z.string().regex(GATE_REPO),
+  // `<owner>/<repo>/.github/workflows/<file>@<ref>`; a reusable workflow may live in another repo.
+  job_workflow_ref: z.string().max(512)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[A-Za-z0-9_./-]{1,200}\.ya?ml@refs\/[A-Za-z0-9_./-]{1,255}$/u),
+  ref: z.string().max(300).regex(/^refs\/[A-Za-z0-9_./-]{1,255}$/u).optional(),
+  // `refs/tags/<literal prefix>*`: one trailing `*`, nothing else wild.
+  ref_pattern: z.string().max(300).regex(/^refs\/tags\/[A-Za-z0-9_./-]{1,200}\*$/u).optional(),
+  event: z.string().regex(/^[a-z_]{1,64}$/u),
+  target_prefix: z.string().min(1).max(256),
+}).strict().refine(gate => gate.target_prefix.startsWith(`${gate.repo}:`),
+  "target_prefix must start with `<repo>:`")
+  .refine(gate => (gate.ref === undefined) !== (gate.ref_pattern === undefined), "a gate sets exactly one of ref and ref_pattern");
+const gateRedeemBody = z.object({
+  approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
+  action: z.object({ class: actionClass, target: z.string().min(1).max(256) }).strict(),
+  dry_run: z.boolean().optional(),
+}).strict();
+const GATE_ID = /^gate_[A-Za-z0-9]{8,64}$/u;
+const GATE_REDEEM_RATE = { limit: 60, windowMs: 60_000 };
 const promptDelegatesBody = z.object({
   session_agent_id: z.string().min(1).max(200),
   session_token: z.string().min(12).max(512),
@@ -497,6 +523,37 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return true;
     }
 
+    if (sub === "gates/redeem") {
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      input.rateLimit(response, `delegation-gate:${input.clientKey(request)}`, GATE_REDEEM_RATE);
+      const token = bearer(request);
+      if (!token) return fail("unauthorized", "Unauthorized", 401);
+      const body = parse(gateRedeemBody, await readJson(request), "Invalid request");
+      const row = (await input.database.query<{ id: string; organization_id: string }>(
+        "SELECT id, organization_id FROM workspaces WHERE id::text = $1", [workspaceId],
+      )).rows[0];
+      if (!row) return NOT_ENABLED();
+      const binding = await input.relaycastBinding(row.id);
+      if (input.gateOnly || !binding) return UNAVAILABLE();
+      const workspace: DelegationWorkspace = { id: row.id, organizationId: row.organization_id,
+        relaycastWorkspaceId: binding.relaycastWorkspaceId, relaycastApiKey: binding.relaycastApiKey };
+      let claims;
+      try {
+        claims = await input.workflowOidc(token);
+      } catch (error) {
+        // An unverified token's claims are never trusted, so none are logged.
+        await recordDelegationAudit(input.database, { workspaceId: workspace.id,
+          event: body.dry_run ? "gate.dry_run" : "gate.refused", authMethod: "workflow_oidc", approvalId: body.approval_id,
+          reason: "oidc_invalid", data: { action: body.action, detail: error instanceof OidcInvalid ? error.detail : "error",
+            ...(body.dry_run ? { dry_run: true } : {}) } }).catch(() => undefined);
+        json(200, { ok: false, reason: "oidc_invalid", ...(body.dry_run ? { dry_run: true } : {}) });
+        return true;
+      }
+      json(200, await redeemThroughGate(deps, { workspace, claims, approvalId: body.approval_id, action: body.action,
+        dryRun: body.dry_run === true }));
+      return true;
+    }
+
     if (sub === "claims/complete") {
       if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       input.rateLimit(response, `delegation-claim:${input.clientKey(request)}`, CLAIM_COMPLETE_RATE);
@@ -641,6 +698,63 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       json(201, grantView(row, now()));
       return true;
+    }
+
+    if (sub === "gates" || (sub?.startsWith("gates/") && !sub.slice(6).includes("/"))) {
+      if (sub === "gates" && method === "GET") {
+        const all = new URL(request.url ?? "/", "http://localhost").searchParams.get("all") === "1";
+        if (all && !caller.admin) fail("forbidden", "Only org owners and admins can list every gate", 403);
+        const rows = (await input.database.query<GateRow>(
+          `SELECT * FROM delegation_gates WHERE workspace_id = $1 AND deleted_at IS NULL
+             AND ($2::boolean OR owner_user_id = $3) ORDER BY created_at DESC`,
+          [workspace.id, all, principal.userId],
+        )).rows;
+        json(200, { gates: rows.map(gateView) });
+        return true;
+      }
+      if (sub === "gates" && method === "POST") {
+        const body = parse(gateBody, await readJson(request), "Invalid gate");
+        await requireEnabled(workspace.id);
+        let row: GateRow;
+        try {
+          row = await input.database.transaction(async (tx) => {
+            const created = (await tx.query<GateRow>(
+              `INSERT INTO delegation_gates
+                 (id, workspace_id, owner_user_id, repo, job_workflow_ref, ref, ref_pattern, event, target_prefix,
+                  created_auth_method)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+              [mintId("gate"), workspace.id, principal.userId, body.repo, body.job_workflow_ref, body.ref ?? null,
+                body.ref_pattern ?? null, body.event, body.target_prefix, caller.authMethod],
+            )).rows[0]!;
+            await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
+              ownerUserId: principal.userId, data: { ...gateView(created) } });
+            return created;
+          });
+        } catch (error) {
+          if ((error as { code?: string })?.code === "23505") {
+            return fail("gate_exists", "This workflow already has a gate", 409);
+          }
+          throw error;
+        }
+        json(201, gateView(row));
+        return true;
+      }
+      if (sub !== "gates" && method === "DELETE") {
+        const gateId = sub!.slice(6);
+        if (!GATE_ID.test(gateId)) fail("not_found", "Gate not found", 404);
+        const gate = (await input.database.query<GateRow>(
+          "SELECT * FROM delegation_gates WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL", [gateId, workspace.id],
+        )).rows[0];
+        if (!gate || (gate.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Gate not found", 404);
+        await input.database.transaction(async (tx) => {
+          await tx.query("UPDATE delegation_gates SET deleted_at = now() WHERE id = $1", [gateId]);
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.deleted", ...actor,
+            ownerUserId: gate!.owner_user_id, data: { ...gateView(gate!) } });
+        });
+        json(200, gateView(gate!));
+        return true;
+      }
+      return fail("method_not_allowed", "Method not allowed", 405);
     }
 
     if (sub === "revoke-all") {

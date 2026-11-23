@@ -296,6 +296,82 @@ refusal at the commit point signs nothing.
 
 After either, the next attest or redeem of that approval is `revoked`.
 
+## Release gates (§11a)
+
+The job that publishes redeems the approval itself, under its own short-lived
+workflow OIDC token, right before its first publish step. Whatever starts the
+job therefore cannot skip the check. No stored secret is involved.
+
+**Registering a gate.** `GET`/`POST /delegates/gates` and
+`DELETE /delegates/gates/{gate_id}` are for the owner, by browser session or
+verified Desktop bearer. A gate is `{gate_id, repo, job_workflow_ref, ref,
+ref_pattern, event, target_prefix}`. For example:
+
+- `repo`: `AgentWorkforce/relay-app`
+- `job_workflow_ref`: `AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main`
+- `ref`: `refs/heads/main`
+- `event`: `workflow_dispatch`
+- `target_prefix`: `AgentWorkforce/relay-app:`
+
+A gate sets exactly one of `ref` (exact) and `ref_pattern`. A `ref_pattern` is
+`refs/tags/<literal prefix>*`, with one trailing `*` and nothing else wild,
+and it is matched against the token's `ref`. `target_prefix` must start with
+`<repo>:`. Registering needs delegation on. Each change is audited
+(`gate.registered`, `gate.deleted`).
+
+**Redeeming.** The job calls `POST /delegates/gates/redeem` with
+`Authorization: Bearer <workflow OIDC token>` and `{approval_id, action,
+dry_run?}`. Control checks, in order:
+
+1. **The token.**
+   - Its signature verifies against the issuer's JWKS, found by OpenID
+     discovery, cached for 10 minutes and refetched for an unknown `kid`.
+   - The issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
+     or one listed in `SELFHOST_DELEGATION_OIDC_ISSUERS` (comma-separated https
+     URLs, at most 8; for example a GitHub Enterprise Server issuer).
+   - The audience is this deployment's origin (`SELFHOST_PUBLIC_URL`).
+   - The token is within its validity window, with 60 seconds of clock skew.
+   - Failing any of these is `oidc_invalid`, and an unverified token's claims
+     are never logged.
+2. **The gate.**
+   - No gate for the token's `repository` is `gate_unknown`.
+   - The gate must belong to the approval's owner, otherwise `gate_unknown`.
+   - Its `job_workflow_ref`, `ref` (or `ref_pattern`) and `event` must match
+     the token's `job_workflow_ref`, `ref` and `event_name` exactly, otherwise
+     `gate_mismatch`. Matching the repository alone is not enough.
+3. **The approval.** The normal redeem checks run:
+   - revocation and the owner's membership;
+   - the action must be in the approval;
+   - policy classes;
+   - for a delegate's (tier D) approval: its grant, the delegate's binding,
+     scope and tier O requirements;
+   - expiry;
+   - conditions (`not_before`; GitHub conditions are `condition_unavailable`).
+
+   An owner-minted (tier O) approval goes through the gate the same way.
+4. **The target.**
+   - The action's target must start with the gate's `target_prefix`,
+     otherwise `target_prefix`.
+   - A `release` target must name exactly one release (§11a.2), otherwise
+     `out_of_scope`:
+     - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
+     - `<repo>:land:<branch>:<head sha>`
+     - `<repo>:ios:<distribution>:<build number>:<sha>`
+5. **Single use per run.**
+   - The first redeem consumes the approval and binds it to the token's
+     `run_id` (and repository and issuer).
+   - Any later redeem in the same run, by another job or a later attempt,
+     answers `{ok:true, consumed:true, same_run:true}`.
+   - Any other run gets `consumed`.
+
+`dry_run: true` runs every check and never consumes. It answers
+`{ok:true, dry_run:true}` or `{ok:false, reason, dry_run:true}` and is
+audited as `gate.dry_run`. Real redeems are audited as `gate.redeemed` or
+`gate.refused`, with the run, workflow and action.
+
+Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
+`delegation_gate_redemptions`.
+
 ## Revocation
 
 Revocation happens in these cases:

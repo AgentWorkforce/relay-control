@@ -106,6 +106,7 @@ import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.j
 import { createDelegationHandler } from "./delegation/routes.js";
 import { relaycastQuoteRedactor } from "./delegation/service.js";
 import { DelegationSigner } from "./delegation/jws.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER, workflowOidcVerifier } from "./delegation/oidc.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
@@ -460,6 +461,8 @@ export function createApp(input: {
   };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
+  /** Test hook: fetch for release-gate OIDC discovery and JWKS (docs/owner-delegates.md). */
+  delegationOidcFetch?: typeof fetch;
   /** RELAYCAST_INTERNAL_SECRET: lets webhook inboxes issue temporary Agent Relay workspaces. */
   relaycastInternalSecret?: string | null;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -587,6 +590,12 @@ export function createApp(input: {
     authenticateAccessToken: (token) => store.authenticateAccessToken(token),
     workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
     json,
+    workflowOidc: workflowOidcVerifier({
+      issuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+      audience: new URL(config.publicBaseUrl).origin,
+      fetchImpl: input.delegationOidcFetch,
+      now: input.now,
+    }),
     // Never provisions: these lookups can run before any caller is proven.
     relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
