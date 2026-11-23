@@ -27,7 +27,11 @@ type Subscription = {
 
 export type RelaycastWorld = ReturnType<typeof createRelaycastWorld>;
 
-export function createRelaycastWorld(roster: unknown[]) {
+/**
+ * `mentions`: a channel post or thread reply naming `@member` is delivered to that member with reason `mention`, as
+ * Relaycast does (off by default, so existing tests keep plain reasons). `now`: message timestamps follow this clock.
+ */
+export function createRelaycastWorld(roster: unknown[], options: { mentions?: boolean; now?: () => Date } = {}) {
   let sequence = 1000;
   const next = () => String(++sequence);
   const agents = new Map<string, Agent>();
@@ -85,14 +89,17 @@ export function createRelaycastWorld(roster: unknown[]) {
   const byToken = (token: string) => [...agents.values()].find(agent => agent.token === token) ?? null;
   function message(sender: Agent, text: string, place: { conversation_id?: string; channel_id?: string; thread_id?: string }): Message {
     const created = {
-      id: next(), agent_name: sender.name, agent_id: sender.id, text, created_at: new Date(Date.UTC(2026, 10, 7, 0, 0, sequence)).toISOString(),
+      id: next(), agent_name: sender.name, agent_id: sender.id, text,
+      created_at: (options.now?.() ?? new Date(Date.UTC(2026, 10, 7, 0, 0, sequence))).toISOString(),
       conversation_id: place.conversation_id ?? null, channel_id: place.channel_id ?? null, thread_id: place.thread_id ?? null,
     };
     messages.set(created.id, created);
     return created;
   }
   function deliver(to: string, created: Message, reason: string): void {
-    if (agents.has(to)) deliveries.push({ id: `dl_${next()}`, agent: to, message: created, reason, acked: false });
+    // Relaycast's channelReasonSql: a channel delivery to a member the text @mentions is reason `mention`.
+    const mentioned = options.mentions && reason !== "dm" && new RegExp(`(?:^|\\s)@${to.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(created.text);
+    if (agents.has(to)) deliveries.push({ id: `dl_${next()}`, agent: to, message: created, reason: mentioned ? "mention" : reason, acked: false });
   }
   function directMessage(sender: Agent, to: string, text: string) {
     let conversation = conversations.find(item => item.participants.includes(sender.name) && item.participants.includes(to));

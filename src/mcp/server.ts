@@ -80,7 +80,7 @@ export function buildMcpServer(context: McpContext): McpServer {
   const webhookInbox = context.webhookInbox;
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokRoutines?.cloudCopy),
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokEvents),
     staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),

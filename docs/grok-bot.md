@@ -119,8 +119,13 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   `disconnect_grok_bot_routine` takes `mode` or `webhook_url`; passing neither
   stops both.
 - The copied prompt calls `get_event` and `get_recent_events`. These are
-  registered for Grok connections only, in tool group `grok_events`, which is
-  listed only while the flag is on. The worker ingests each inbox delivery into
+  registered in tool group `grok_events`, listed only while the flag is on,
+  for every OAuth connection (each reads only its own approved agent's events),
+  not only Grok Bot connections with a routine. `get_recent_events` first
+  reads one page (up to 100 deliveries) of the connection's hosted inbox into
+  the log and acknowledges it after commit, so an assistant with no routine
+  still gets its events; if the inbox cannot be read, the stored events are
+  returned. It does not read the inbox for a routine saved before the copy. The worker ingests each inbox delivery into
   `grok_bot_events`, with message text encrypted under the Control keyring,
   and acknowledges the page only after the events have committed. That
   includes the bot's own sends, so they cannot fill the 100-item page.
@@ -130,8 +135,9 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   relaygate with its own (renewed) token and never talks to Relaycast
   directly.
 - Events are kept for seven days, then deleted on the next scan whatever
-  the flag says. They are also deleted with their routine: on disconnect, on
-  revocation, or when the grant is no longer valid. Reads never return older
+  the flag says. They belong to the connection (migration
+  `0089_channel_message_events.sql`) and are also deleted when its routine is
+  disconnected, on revocation, or when the grant is no longer valid. Reads never return older
   events. `cursor` is the grant's own sequence.
 - A webhook routine gets one wake per message, with Cloud's body
   (`{eventId, name:"relay.message"|"relay.channel_message", timestamp, cursor, data}`).
@@ -152,3 +158,47 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   routine URL can be saved under only one connection on this server; a
   concurrent second save gets the same refusal. Do not also register it in
   Agent Relay Cloud or another deployment, or it wakes twice.
+
+### Channel posts (`relay.channel_message`)
+
+With the flag on, relay channel posts follow Cloud's rules (`src/mcp/channel-wake.ts`,
+copied with Cloud's default policy; self-host has no per-connection channel
+wake setting). There is no separate flag.
+
+- A post is stored only when it is addressed to the agent: an @mention
+  (`addressed: "mention"`, from anyone), or a person's reply in a thread the
+  agent is part of (`"bot-thread"`). Plain posts, replies in other threads,
+  and another agent's post without an @mention are acknowledged and never
+  stored. The agent's own posts never count. Direct messages are unchanged.
+- The event's `data` is Cloud's: `{messageId, channel, channelId, threadId,
+  replyThreadId, from, senderKind, addressed, agent, summary}`. `senderKind`
+  comes from rows this service owns: `human` for a workspace person's own
+  person identity, `agent` for any agent recorded here, `null` when there is no
+  record. An unknown kind counts as an agent.
+- **Bot thread.** Relaycast's delivery reason is `thread-reply` for every
+  reply in every thread of a channel the agent belongs to; it does not say
+  whose thread it is. So a person's `thread-reply` counts as a bot thread only
+  when (1) an addressed post of that thread is already stored for this agent
+  (checked first), or (2) the thread root was sent by the agent's own Relaycast
+  agent ID (never its name). The root is read once per thread per inbox page,
+  only when (1) says no, through the same client and token as the inbox read
+  (relaygate on a gate-only install). A missing root (404 or deleted) makes it
+  an ordinary reply. A failed read (timeout, 5xx, network) leaves only that
+  delivery unacknowledged and retries it; once the message is older than ten
+  minutes it is treated as an ordinary reply and acknowledged. An unverified
+  thread never wakes, and the rest of the page is stored and acknowledged.
+  Rule (1) depends on the seven-day event retention; after that only rule (2)
+  applies, so a thread the agent joined only through an @mention stops
+  counting once that mention has expired.
+- **Wakes.** A stored post wakes a webhook routine, or is picked up by a
+  polling schedule (`scheduled: true` reads only such posts), unless a loop
+  cap is reached. The caps are counted in the database over posts that
+  reserved a wake-up, per Relaycast agent and channel, over ten minutes: 20 per
+  channel, 6 per thread, and 2 per thread from agents (any sender not verified
+  as `human`). A post over a cap is still stored for `get_recent_events` but
+  wakes nobody and reserves nothing. A connection with no routine stores posts
+  that wake nobody.
+- **Difference from Cloud.** Cloud also wakes a ChatGPT chat's MCP Events
+  callback for an addressed post. Self-host has no MCP Events webhook
+  subscription surface, so assistants pull with `get_recent_events`; only Grok
+  Bot routines are woken.

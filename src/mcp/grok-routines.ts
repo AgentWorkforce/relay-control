@@ -12,17 +12,22 @@ import {
   GrokRoutineError, grokInboxPrompt, grokRoutineHeaders, grokRoutinePrompt, parseGrokRoutineCredentials, parseGrokRoutineDetails,
   parseGrokRoutineUrl,
 } from "./grok-routine.js";
-import { REPLY_MODES, type ReplyMode } from "./grok-events-policy.js";
+import { REPLY_MODES, UNTRUSTED, type ReplyMode, type SenderTrust } from "./grok-events-policy.js";
 import {
-  GROK_EVENT_RETENTION_MS, eventFromDelivery, getEvent, insertEvent, ownedSenders, pendingWakes, recentEvents, wakeBody,
+  GROK_EVENT_RETENTION_MS, addressedInThread, channelWakeCounts, eventFromDelivery, eventStored, getEvent, insertEvent,
+  lockChannelWakes, ownedSenders, pendingWakes, recentEvents, senderKinds, wakeBody,
 } from "./grok-events.js";
-import { ownerHash, HOSTED_SOURCE } from "./relay-participants.js";
+import { ownerHash, HOSTED_SOURCE, isChannelDelivery } from "./relay-participants.js";
+import { channelRetryExpired, channelWakeAllows, channelWakeCap, type ChannelAddress, type ChannelSenderKind } from "./channel-wake.js";
 
 // Shared dashboard ingresses route /cloud/api to Control, and /cloud to the UI.
 export const GROK_SETUP_PATH = "/cloud/api/v1/grok-bot/routine";
 type Owner = Pick<McpConsentPrincipal, "userId" | "organizationId" | "workspaceId">;
-/** `kind`: the kind the grant is admitted as (grok-bot, or cursor-cloud for a Grok Bot running as a Cursor cloud agent). */
-type Grant = { id: string; agent_name: string; agent_remote_id: string | null; kind: RoutineKind };
+/**
+ * `kind`: the kind the grant is admitted as (grok-bot, or cursor-cloud for a Grok Bot running as a Cursor cloud agent;
+ * any connector kind for an event read, which every hosted participant connection may make).
+ */
+type Grant = { id: string; agent_name: string; agent_remote_id: string | null; kind: string };
 type RoutineKind = "grok-bot" | "cursor-cloud";
 /**
  * `cloud_copy`: saved under SELFHOST_GROK_ROUTINES_CLOUD_COPY (Cloud's prompt, event log, one wake per
@@ -36,6 +41,11 @@ type Routine = { credentials_ciphertext: string | null; notified_delivery_ids: s
 type Recovery = { participantId: string; tokenCiphertext: string; relaygateAgentId: string; agentName: string; admittedClients: string[]; kind: RoutineKind };
 /** Deliveries to acknowledge after the scan's transaction commits, through the client and token the scan used. */
 type Acknowledgement = { via: RelaycastClient; token: string; ids: string[] };
+type Participant = { id: string; token_ciphertext: string; relaycast_workspace_id: string; relaygate_agent_id: string | null;
+  agent_name: string; admitted_clients: string[]; stale: boolean };
+type Remote = Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
+/** The approved agent's hosted inbox, verified: the client (Relaycast, or relaygate when gated) and its current token. */
+type Inbox = { via: RelaycastClient; token: string; remote: Remote; relaycastWorkspaceId: string };
 
 const DUPLICATE_ROUTINE = "This Grok routine is already connected to another Agent Relay connection. Disconnect it there first, or use a different routine.";
 const ROUTINE_URL_INDEX = "grok_bot_routines_routine_url";
@@ -73,7 +83,8 @@ export class GrokRoutines {
 
   private now() { return this.options.now?.() ?? new Date(); }
 
-  async grant(tx: SqlExecutor, id: string, owner: Owner): Promise<Grant> {
+  /** `events`: an event read (get_event, get_recent_events), open to every connector kind, not only Grok Bot routines. */
+  async grant(tx: SqlExecutor, id: string, owner: Owner, options: { events?: boolean } = {}): Promise<Grant> {
     await lockUser(tx, owner.userId);
     await lockOrganization(tx, owner.organizationId);
     const row = (await tx.query<Grant & { client_name: string | null; redirect_uris: string[]; used: string[] }>(`SELECT g.id,g.agent_name,g.agent_remote_id,c.client_name,c.redirect_uris,
@@ -91,10 +102,10 @@ export class GrokRoutines {
       [this.options.publicOrigin + "/mcp", this.options.publicOrigin + "/cloud/api/v1/mcp/shared-sessions"],
       this.options.tenancyMode, this.now()])).rows[0];
     const kind = row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }, row.used ?? []) : "mcp";
-    if (!row || !isGrokRoutineKind(kind)) {
+    if (!row || (!options.events && !isGrokRoutineKind(kind))) {
       throw new GrokRoutineError("This Grok Bot connection is no longer available. Reconnect it in this workspace.");
     }
-    return { ...row, kind: kind as RoutineKind };
+    return { ...row, kind };
   }
 
   setupUrl(grantId: string, from?: string): string {
@@ -138,7 +149,7 @@ export class GrokRoutines {
     });
   }
 
-  /** Deleting the routine row also deletes its events (grok_bot_events references it ON DELETE CASCADE). */
+  /** Removing a routine also deletes the connection's events. */
   async disconnect(grantId: string, owner: Owner, input: { mode?: "webhook" | "polling"; webhookUrl?: string } = {}) {
     return this.options.database.transaction(async tx => {
       await this.grant(tx, grantId, owner);
@@ -147,6 +158,7 @@ export class GrokRoutines {
       const mode = urlHash ? "webhook" : input.mode ?? null;
       const result = await tx.query(`DELETE FROM grok_bot_routines WHERE grant_id=$1 AND ($2::text IS NULL OR delivery_mode=$2)
         AND ($3::text IS NULL OR routine_url_hash=$3) RETURNING grant_id`, [grantId, mode, urlHash]);
+      if (result.rows.length) await tx.query("DELETE FROM grok_bot_events WHERE grant_id=$1", [grantId]);
       return { removed: result.rows.length };
     });
   }
@@ -169,18 +181,58 @@ export class GrokRoutines {
 
   async event(grantId: string, owner: Owner, eventId: string) {
     return this.options.database.transaction(async tx => {
-      const grant = await this.grant(tx, grantId, owner);
+      const grant = await this.grant(tx, grantId, owner, { events: true });
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
       return getEvent(tx, this.options.keyring, grant, routine?.reply_mode ?? "notes-only", eventId, this.retainedSince());
     });
   }
 
+  /**
+   * Cloud's get_recent_events, after one bounded refresh of the connection's hosted inbox, so a connection with no
+   * routine (a pull-only assistant) still gets its events. The refreshed deliveries are acknowledged after commit.
+   */
   async recent(grantId: string, owner: Owner, input: { since?: string; limit: number; scheduled?: boolean }) {
-    return this.options.database.transaction(async tx => {
-      const grant = await this.grant(tx, grantId, owner);
-      const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0] ?? null;
+    let acknowledgement: Acknowledgement | null = null;
+    const result = await this.options.database.transaction(async tx => {
+      const grant = await this.grant(tx, grantId, owner, { events: true });
+      const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1 FOR UPDATE", [grantId])).rows[0] ?? null;
+      acknowledgement = await this.refresh(tx, grant, routine, owner);
       return recentEvents(tx, this.options.keyring, grant, routine, input, this.retainedSince());
     });
+    if (acknowledgement) await this.acknowledge([acknowledgement]);
+    return result;
+  }
+
+  /**
+   * One inbox page for an event read. Skipped (null) when the copy is off, before the connection has joined, for a
+   * routine saved before the copy (its pasted prompt drains the inbox itself), or when the inbox cannot be read now;
+   * stored events are still returned. A gated participant whose relaygate enrolment lapsed is left to the scan.
+   */
+  private async refresh(tx: SqlExecutor, grant: Grant, routine: Routine | null, owner: Owner): Promise<Acknowledgement | null> {
+    if (!this.cloudCopy || !grant.agent_remote_id || (routine && !routine.cloud_copy)) return null;
+    const signal = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
+    let inbox: Inbox | null;
+    let page: HostedDelivery[];
+    try {
+      inbox = (await this.openInbox(tx, grant, owner, signal)).inbox;
+      if (!inbox) return null;
+      page = (await inbox.via.readHostedInbox(inbox.token, signal)).slice(0, 100);
+    } catch (error) {
+      if (error instanceof RelaycastCallError || (error instanceof Error && error.message === "identity_unavailable")) return null;
+      throw error;
+    }
+    const ids = await this.ingestPage(tx, grant, routine, inbox, owner, page, signal);
+    return ids.length ? { via: inbox.via, token: inbox.token, ids } : null;
+  }
+
+  /** Acknowledges committed deliveries; a failure stops that inbox's run and is retried on the next read. */
+  private async acknowledge(acknowledgements: Acknowledgement[], signal?: AbortSignal): Promise<void> {
+    for (const { via, token, ids } of acknowledgements) {
+      for (const id of ids) {
+        if (signal?.aborted) return;
+        try { await via.acknowledgeDelivery(token, id); } catch { break; }
+      }
+    }
   }
 
   private retainedSince(): Date { return new Date(this.now().getTime() - GROK_EVENT_RETENTION_MS); }
@@ -278,8 +330,8 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         let grant: Grant;
         try { grant = await this.grant(tx, candidate.grant_id, owner); } catch (error) {
           if (!(error instanceof GrokRoutineError)) throw error;
-          // Its events go with it (ON DELETE CASCADE).
           await tx.query("DELETE FROM grok_bot_routines WHERE grant_id=$1", [candidate.grant_id]);
+          await tx.query("DELETE FROM grok_bot_events WHERE grant_id=$1", [candidate.grant_id]);
           return null;
         }
         const routine = (await tx.query<Routine>(`SELECT * FROM grok_bot_routines WHERE grant_id=$1 AND next_attempt_at<=$2
@@ -290,53 +342,23 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
           // while the revocation fence is held. stop() aborts the same requests.
           const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
           const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-          const participant = (await tx.query<{ id: string; token_ciphertext: string; relaycast_workspace_id: string;
-            relaygate_agent_id: string | null; agent_name: string; admitted_clients: string[]; stale: boolean }>(
-            `SELECT p.id,p.token_ciphertext,p.relaycast_workspace_id,p.relaygate_agent_id,p.agent_name,p.admitted_clients,
-              p.updated_at < $5 AS stale
-            FROM hosted_relay_participants p JOIN workspaces w ON w.id=p.workspace_id AND w.organization_id=$4
-            WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3
-              AND p.relaycast_workspace_id=w.relaycast_workspace_id`,
-          [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id,
-            new Date(this.now().getTime() - GATE_TOKEN_REFRESH_AFTER_MS)])).rows[0];
-          if (!participant) throw new Error("identity_unavailable");
-          // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
-          const gated = participant.relaygate_agent_id !== null;
-          if (gated && !this.options.gate) throw new Error("identity_unavailable");
-          const via = gated ? this.options.gate! : this.options.client;
-          let token = decryptSecret(participant.token_ciphertext, this.options.keyring);
-          // relaygate enrolled this participant for other hosted clients only, or rejects its token (it lapsed
-          // while the routine was idle): enrol it again as Grok Bot once this transaction ends (recover).
-          const recover = async (rejected: boolean): Promise<Recovery> => {
+          const opened = await this.openInbox(tx, grant, owner, requestSignal);
+          if (!opened.inbox) {
+            // relaygate enrolled this participant for other hosted clients only, or rejects its token (it lapsed
+            // while the routine was idle): enrol it again as Grok Bot once this transaction ends (recover).
+            const participant = opened.participant;
             await tx.query("UPDATE grok_bot_routines SET next_attempt_at=$2,updated_at=$3 WHERE grant_id=$1",
               [grant.id, new Date(this.now().getTime() + GATE_RECOVERY_LEASE_MS), this.now()]);
+            const kind = grant.kind as RoutineKind;
             return { participantId: participant.id, tokenCiphertext: participant.token_ciphertext, relaygateAgentId: participant.relaygate_agent_id!,
               agentName: participant.agent_name,
-              admittedClients: rejected ? [grant.kind] : [...new Set([...(participant.admitted_clients ?? []), grant.kind])], kind: grant.kind };
-          };
-          if (gated && !(participant.admitted_clients ?? []).includes(grant.kind)) return await recover(false);
-          let remote: Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
-          try {
-            if (gated && participant.stale) {
-              // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
-              token = await via.refreshGateToken(token, requestSignal);
-              await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
-                [participant.id, encryptSecret(token, this.options.keyring.active)]);
-            }
-            remote = await via.authenticatedAgent(token, requestSignal);
-          } catch (error) {
-            if (gated && error instanceof RelaycastCallError && error.status === 401) return await recover(true);
-            throw error;
+              admittedClients: opened.rejected ? [kind] : [...new Set([...(participant.admitted_clients ?? []), kind])], kind };
           }
-          if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
-              isBindingOwnedIdentity(remote.metadata) ||
-              remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(candidate.user_id) ||
-              remote.metadata.cloud_workspace_id !== candidate.workspace_id) throw new Error("identity_unavailable");
+          const { via, token, remote } = opened.inbox;
           if (routine.cloud_copy) {
             // The same client and (possibly renewed) token as every read above: a gated participant never talks
             // to Relaycast directly.
-            const ingested = await this.copyScan(tx, { grant, routine, remote, via, token, owner,
-              relaycastWorkspaceId: participant.relaycast_workspace_id, signal: requestSignal });
+            const ingested = await this.copyScan(tx, { grant, routine, inbox: opened.inbox, owner, signal: requestSignal });
             if (ingested.length) acknowledgements.push({ via, token, ids: ingested });
             return null;
           }
@@ -368,12 +390,50 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
     }
     // Cloud copy: acknowledge only deliveries whose events have committed. A failed acknowledgement is retried on the
     // next scan; the event id is stable per delivery, so the re-read inserts nothing new.
-    for (const { via, token, ids } of acknowledgements) {
-      for (const id of ids) {
-        if (signal?.aborted) return;
-        try { await via.acknowledgeDelivery(token, id); } catch { break; }
+    await this.acknowledge(acknowledgements, signal);
+  }
+
+  /**
+   * The grant's approved hosted participant, verified as this person's in this workspace, with the client it reads
+   * through (relaygate for a gated participant; its rg_ token is renewed at half-life). `inbox` is null when a gated
+   * participant must enrol again at relaygate first (`rejected`: relaygate refused its token). Throws
+   * identity_unavailable for any mismatch.
+   */
+  private async openInbox(tx: SqlExecutor, grant: Grant, owner: Owner, signal: AbortSignal):
+    Promise<{ participant: Participant; inbox: Inbox | null; rejected: boolean }> {
+    const participant = (await tx.query<Participant>(
+      `SELECT p.id,p.token_ciphertext,p.relaycast_workspace_id,p.relaygate_agent_id,p.agent_name,p.admitted_clients,
+        p.updated_at < $5 AS stale
+      FROM hosted_relay_participants p JOIN workspaces w ON w.id=p.workspace_id AND w.organization_id=$4
+      WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3
+        AND p.relaycast_workspace_id=w.relaycast_workspace_id`,
+    [owner.workspaceId, owner.userId, grant.agent_remote_id, owner.organizationId,
+      new Date(this.now().getTime() - GATE_TOKEN_REFRESH_AFTER_MS)])).rows[0];
+    if (!participant) throw new Error("identity_unavailable");
+    // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
+    const gated = participant.relaygate_agent_id !== null;
+    if (gated && !this.options.gate) throw new Error("identity_unavailable");
+    const via = gated ? this.options.gate! : this.options.client;
+    let token = decryptSecret(participant.token_ciphertext, this.options.keyring);
+    if (gated && !(participant.admitted_clients ?? []).includes(grant.kind)) return { participant, inbox: null, rejected: false };
+    let remote: Remote;
+    try {
+      if (gated && participant.stale) {
+        // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
+        token = await via.refreshGateToken(token, signal);
+        await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
+          [participant.id, encryptSecret(token, this.options.keyring.active)]);
       }
+      remote = await via.authenticatedAgent(token, signal);
+    } catch (error) {
+      if (gated && error instanceof RelaycastCallError && error.status === 401) return { participant, inbox: null, rejected: true };
+      throw error;
     }
+    if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
+        isBindingOwnedIdentity(remote.metadata) ||
+        remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(owner.userId) ||
+        remote.metadata.cloud_workspace_id !== owner.workspaceId) throw new Error("identity_unavailable");
+    return { participant, inbox: { via, token, remote, relaycastWorkspaceId: participant.relaycast_workspace_id }, rejected: false };
   }
 
   /**
@@ -382,26 +442,13 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
    * id on the page to acknowledge after commit, the bot's own sends included, so they cannot fill the page. Throws to
    * record a retry with backoff.
    */
-  private async copyScan(tx: SqlExecutor, input: { grant: Grant; routine: Routine; via: RelaycastClient; token: string;
-    remote: { id: string; name: string; channels: Array<{ id: string; name: string }> }; owner: Owner; relaycastWorkspaceId: string;
+  private async copyScan(tx: SqlExecutor, input: { grant: Grant; routine: Routine; inbox: Inbox; owner: Owner;
     signal: AbortSignal }): Promise<string[]> {
-    const { grant, routine, remote } = input;
+    const { grant, routine, inbox } = input;
+    const { remote } = inbox;
     const now = this.now();
-    const page: HostedDelivery[] = (await input.via.readHostedInbox(input.token, input.signal)).slice(0, 100);
-    const inbox = page.filter(message => message.sender_id !== remote.id);
-    if (inbox.length) {
-      // Trust and sender kind come from rows this service owns, never from agent metadata a sender could set.
-      const senders = await ownedSenders(tx, { ...input.owner, relaycastWorkspaceId: input.relaycastWorkspaceId },
-        inbox.flatMap(message => message.sender_id ? [message.sender_id] : []));
-      const channels = new Map(remote.channels.map(row => [row.id, row.name]));
-      for (const message of inbox) {
-        const event = eventFromDelivery({ grantId: grant.id, agent: remote.name, message, now,
-          channel: message.channel_id ? channels.get(message.channel_id) ?? null : null,
-          senderKind: message.sender_id && senders.people.has(message.sender_id) ? "person" : "agent" });
-        await insertEvent(tx, this.options.keyring, grant.id, event,
-          message.sender_id && senders.owned.has(message.sender_id) ? { trusted: true, reason: "your agent" } : { trusted: false, reason: null });
-      }
-    }
+    const page: HostedDelivery[] = (await inbox.via.readHostedInbox(inbox.token, input.signal)).slice(0, 100);
+    const acknowledge = await this.ingestPage(tx, grant, routine, inbox, input.owner, page, input.signal);
     let woke = false;
     let failure = false;
     if (routine.delivery_mode === "webhook" && routine.credentials_ciphertext) {
@@ -434,7 +481,93 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         last_delivered_at=CASE WHEN $4 THEN $3 ELSE last_delivered_at END WHERE grant_id=$1`,
       [grant.id, new Date(now.getTime() + 5_000), now, woke]);
     }
-    return page.map(message => message.delivery_id);
+    return acknowledge;
+  }
+
+  /**
+   * Stores one inbox page as events and returns the delivery ids to acknowledge after commit: every delivery on the
+   * page, the bot's own sends included so they cannot fill it, except a channel post whose thread could not be
+   * checked yet (retried within CHANNEL_RETRY_WINDOW_MS). Direct messages are stored as before. A channel post is
+   * stored as relay.channel_message only when it is addressed to the bot (channel-wake.ts); with a routine it
+   * reserves a wake-up unless a wake cap is reached, and an unreserved post wakes nobody.
+   */
+  private async ingestPage(tx: SqlExecutor, grant: Grant, routine: Routine | null, inbox: Inbox, owner: Owner,
+    page: HostedDelivery[], signal: AbortSignal): Promise<string[]> {
+    const { remote } = inbox;
+    const now = this.now();
+    const deferred = new Set<string>();
+    const incoming = page.filter(message => message.sender_id !== remote.id);
+    if (incoming.length) {
+      // Trust and sender kind come from rows this service owns, never from agent metadata a sender could set.
+      const senderIds = incoming.flatMap(message => message.sender_id ? [message.sender_id] : []);
+      const senders = await ownedSenders(tx, { ...owner, relaycastWorkspaceId: inbox.relaycastWorkspaceId }, senderIds);
+      const kinds = await senderKinds(tx, { workspaceId: owner.workspaceId, relaycastWorkspaceId: inbox.relaycastWorkspaceId }, senderIds);
+      const channels = new Map(remote.channels.map(row => [row.id, row.name]));
+      // A routine that can wake: a Cloud-copy webhook with its credential, or a polling schedule. Anything else (no
+      // routine) stores events that wake nobody.
+      const waking = routine?.cloud_copy && (routine.delivery_mode === "polling" || routine.credentials_ciphertext) ? routine : null;
+      const agent = { workspaceId: owner.workspaceId, agentRemoteId: remote.id };
+      const roots = new Map<string, Promise<"bot-thread" | "other" | "unverified">>();
+      for (const message of incoming) {
+        const trust: SenderTrust = message.sender_id && senders.owned.has(message.sender_id) ? { trusted: true, reason: "your agent" } : UNTRUSTED;
+        if (!isChannelDelivery(message)) {
+          const event = eventFromDelivery({ grantId: grant.id, agent: remote.name, message, now, channel: null,
+            senderKind: message.sender_id && senders.people.has(message.sender_id) ? "person" : "agent" });
+          await insertEvent(tx, this.options.keyring, grant.id, event, trust,
+            { notifiedAt: waking?.delivery_mode === "webhook" ? null : now });
+          continue;
+        }
+        const senderKind: ChannelSenderKind = message.sender_id ? kinds.get(message.sender_id) ?? null : null;
+        let addressed: ChannelAddress = message.reason === "mention" ? "mention" : "post";
+        // Only a person's reply can wake through a thread (channelWakeAllows), so only theirs is checked.
+        if (message.reason === "thread-reply" && message.thread_id && senderKind === "human") {
+          const thread = await this.botThread(tx, agent, inbox, message.thread_id, roots, signal);
+          if (thread === "bot-thread") addressed = "bot-thread";
+          else if (thread === "unverified" && !channelRetryExpired(message, now)) { deferred.add(message.delivery_id); continue; }
+        }
+        // Not addressed to the bot: acknowledged, never stored.
+        if (!channelWakeAllows(addressed, senderKind) || !message.channel_id) continue;
+        const channel = channels.get(message.channel_id) ?? null;
+        // A reply needs the channel's name; a membership list that does not show it yet is retried like a failed read.
+        if (!channel) { if (!channelRetryExpired(message, now)) deferred.add(message.delivery_id); continue; }
+        const event = eventFromDelivery({ grantId: grant.id, agent: remote.name, message, now, channel, senderKind, addressed });
+        // A page read again after a failed acknowledgement must not count its posts twice.
+        if (await eventStored(tx, grant.id, event.eventId)) continue;
+        const replyThreadId = message.thread_id ?? message.message_id;
+        let wakeReservedAt: Date | null = null;
+        if (waking && (!waking.from_filter || message.sender === waking.from_filter)) {
+          await lockChannelWakes(tx, remote.id);
+          const cap = channelWakeCap(await channelWakeCounts(tx, agent, message.channel_id, replyThreadId, now), senderKind);
+          // Over a cap the post is still stored for get_recent_events, but wakes nobody and reserves nothing.
+          if (cap) console.info("[grok-events]", JSON.stringify({ step: "channel_wake_capped", grant: grant.id, messageId: message.message_id, cap }));
+          else wakeReservedAt = now;
+        }
+        await insertEvent(tx, this.options.keyring, grant.id, event, trust, {
+          notifiedAt: wakeReservedAt && waking?.delivery_mode === "webhook" ? null : now,
+          channel: { channelId: message.channel_id, replyThreadId, senderKind, addressed, wakeReservedAt } });
+      }
+    }
+    return page.map(message => message.delivery_id).filter(id => !deferred.has(id));
+  }
+
+  /**
+   * Whether a thread reply is in a thread the bot is part of. Rule (1), checked first: an addressed post of this
+   * thread is already stored for the bot. Rule (2), only when (1) says no: the thread root was sent by the bot's own
+   * Relaycast agent id (never its name), read once per thread per page through the inbox's own client and token (so
+   * relaygate on a gate-only install). A missing root (404, deleted) is not the bot's; a failed read is "unverified".
+   */
+  private async botThread(tx: SqlExecutor, agent: { workspaceId: string; agentRemoteId: string }, inbox: Inbox, threadId: string,
+    roots: Map<string, Promise<"bot-thread" | "other" | "unverified">>, signal: AbortSignal) {
+    if (await addressedInThread(tx, agent, threadId, this.retainedSince())) return "bot-thread" as const;
+    let root = roots.get(threadId);
+    if (!root) {
+      root = inbox.via.getMessage(inbox.token, threadId, signal).then(
+        found => found?.agentId === inbox.remote.id ? "bot-thread" as const : "other" as const,
+        (error: unknown) => error instanceof RelaycastCallError && error.status >= 400 && error.status < 500 && error.status !== 429
+          ? "other" as const : "unverified" as const);
+      roots.set(threadId, root);
+    }
+    return root;
   }
 
   /** Neither provider error bodies nor URLs/keys are ever stored or logged. */

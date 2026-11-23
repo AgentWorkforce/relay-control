@@ -55,6 +55,11 @@ export type McpContext = {
    */
   agentIdentity?: { id: string; name: string };
   grokRoutines?: GrokRoutines;
+  /**
+   * SELFHOST_GROK_ROUTINES_CLOUD_COPY: get_event and get_recent_events for this OAuth connection's approved agent.
+   * Set for every hosted participant (OAuth) connection while the copy is on, routine or not.
+   */
+  grokEvents?: GrokRoutines;
   /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
   cursorCloud?: CursorCloudDeps;
   customerSupport?: CustomerSupportConnection;

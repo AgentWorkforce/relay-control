@@ -770,14 +770,18 @@ export function createRelaycastClient(input: {
       };
     },
 
-    /** A message's author, thread and channel, read with an agent's token; null when unknown. */
-    async getMessage(token: string, messageId: string):
-      Promise<{ id: string; agentName: string | null; threadId: string | null; channelId: string | null } | null> {
+    /**
+     * A message's author (name and Relaycast agent id), thread and channel, read with an agent's token; null when
+     * Relaycast answers 404 (absent, deleted or not visible to that agent).
+     */
+    async getMessage(token: string, messageId: string, signal?: AbortSignal):
+      Promise<{ id: string; agentName: string | null; agentId: string | null; threadId: string | null; channelId: string | null } | null> {
       const data = record(await labeled("get_message", () =>
-        call("GET", `/v1/messages/${encodeURIComponent(messageId)}`, token, undefined, undefined, true)));
+        call("GET", `/v1/messages/${encodeURIComponent(messageId)}`, token, undefined, undefined, true, signal)));
       if (!data) return null;
       if (text(data.id) !== messageId) throw new RelaycastCallError(200, "", true);
-      return { id: messageId, agentName: text(data.agent_name), threadId: text(data.thread_id), channelId: text(data.channel_id) };
+      return { id: messageId, agentName: text(data.agent_name), agentId: text(data.agent_id), threadId: text(data.thread_id),
+        channelId: text(data.channel_id) };
     },
 
     /** Agent token only: Relaycast authorizes the immutable message sender. */

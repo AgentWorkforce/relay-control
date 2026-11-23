@@ -133,11 +133,14 @@ function registerCloudCopyTools(server: McpServer, context: McpContext, run: Run
 
 }
 
-/** get_event / get_recent_events for the Cloud copy's routine prompt (tool group grok_events). */
+/**
+ * get_event / get_recent_events (tool group grok_events): the Cloud copy's routine prompt calls them, and every
+ * hosted participant connection reads its own approved agent's events with them, routine or not.
+ */
 export function registerGrokEventTools(server: McpServer, context: McpContext): void {
   const run = runner(context);
   const oauth = context.oauth!;
-  const routines = context.grokRoutines!;
+  const routines = context.grokEvents!;
   const owner = oauth.access.principal;
   const grantId = oauth.access.grantId;
   const respond = (data: unknown) => ({

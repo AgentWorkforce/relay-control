@@ -96,8 +96,8 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   connect: { title: "Relay Connect rooms", tools: CONNECT_TOOLS },
   events: { title: "Agent Relay events", tools: EVENT_TOOLS, relayEventsOnly: true },
   grok_routines: { title: "Self-hosted Grok Bot webhook wake-ups", tools: GROK_ROUTINE_TOOLS },
-  // SELFHOST_GROK_ROUTINES_CLOUD_COPY: the event reads Cloud's copied routine prompt calls.
-  grok_events: { title: "Grok Bot routine events (Cloud copy)", tools: GROK_EVENT_TOOLS },
+  // SELFHOST_GROK_ROUTINES_CLOUD_COPY: the event reads Cloud's copied routine prompt calls, for every OAuth connection.
+  grok_events: { title: "Agent Relay events (Cloud copy)", tools: GROK_EVENT_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
@@ -132,7 +132,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.webhookInbox) groups.push("webhook_inbox");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
-  if (options.grokRoutines && options.grokEvents) groups.push("grok_events");
+  if (options.grokEvents) groups.push("grok_events");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -294,8 +294,8 @@ export function describeCapabilities(input: {
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "grok_events" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
-      reason: "Grok Bot routine events serve Grok Bot connections only, on a server with SELFHOST_GROK_ROUTINES_CLOUD_COPY on.",
-      how_to_enable: "Ask your operator to set SELFHOST_GROK_ROUTINES_CLOUD_COPY=on, then connect from Grok Bot." };
+      reason: "Agent Relay events serve OAuth connections (each reads its own approved agent's events), on a server with SELFHOST_GROK_ROUTINES_CLOUD_COPY on.",
+      how_to_enable: "Ask your operator to set SELFHOST_GROK_ROUTINES_CLOUD_COPY=on, then connect with OAuth." };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "Webhook wake-ups require a Grok Bot OAuth connection on this self-hosted server.",
       how_to_enable: "Connect Grok Bot to this server's /cloud/api/v1/mcp/shared-sessions endpoint, then call connect_grok_bot_routine." };
