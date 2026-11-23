@@ -949,6 +949,130 @@ accepted only by the `/relay-node/v1` broker; every other workspace API token
 gate treats it as no credential and introspection answers `wrong-kind`. See
 [relay-node-credential.md](relay-node-credential.md).
 
+#### Workspace agent identity tokens
+
+A workspace agent identity token lets an unattended agent (a CI job, a
+scheduled worker, a bot) join this workspace's Relay as its own named agent,
+not as a person. It is a workspace API token (`sh_wk_`) of purpose
+`agent-identity`, with scopes fixed to exactly `["relay:agent"]`. An owner or
+admin mints it on the usual route:
+
+```sh
+curl -s -X POST "$CONTROL_URL/api/v1/workspaces/$WORKSPACE_ID/deployment-api-tokens" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"purpose": "agent-identity", "agentName": "release-bot", "expiryDays": 30}'
+```
+
+- `agentName` is required. It is trimmed, at most 64 characters, must pass
+  the Relay agent-name rules (a letter or digit, then letters, digits, `.`,
+  `_` or `-`), and may not be a reserved Relay name in any letter case or
+  start with `launcher-` or `cursor-cloud-`. Otherwise the answer is `400`.
+- `label` is optional and defaults to the name.
+- `expiryDays` is 1 to 365 (default 90). The token always expires:
+  `neverExpires: true` is `400`.
+- A member who is not an owner or admin gets `403`. An enrollment-operator
+  token gets `403 enrollment_operator_scope`, and an agent identity token
+  (like any other workspace API token) gets `401`.
+- The response carries the plaintext `accessToken` once.
+
+The identity is keyed by the workspace and the lower-cased name, and keeps
+the letter case of its first mint. A name that a person's hosted Relay
+participant or a linked Desktop agent of this workspace already uses is
+`409 name_taken`.
+
+Before minting, the route also reads the workspace's Relaycast roster for the
+name (the identity's first-mint letter case when it already exists):
+
+- no roster agent has the name: the token is minted;
+- the roster agent is the one this identity registered at an earlier join:
+  the token is minted (rotation keeps working after the agent joined);
+- any other roster agent has it, released or not: `409 name_taken`;
+- the roster cannot be read (network error, or an error answer other than
+  not found): `503 relay_unavailable` with `Retry-After: 5`. Nothing is
+  written: no identity and no token.
+
+For an owner or admin caller, the route's workspace access check runs first
+and binds a workspace that has no Relaycast binding yet, as every owner/admin
+route does; the roster is then read with that binding. When the installation
+cannot provision the binding, the route answers `503 relaycast_not_ready` with
+`Retry-After: 5` and writes nothing. The roster read runs before, and outside,
+the minting transaction, so check and mint are not atomic: an agent can take
+the name on the roster in between. The identity's join is the backstop: it
+never attaches to a roster agent the identity does not own, and refuses the
+registration instead. Names given by relay nodes are not checked.
+
+In the other direction, a person cannot take an identity's name, in any letter
+case: `join_relay` with that name (or an automatic name equal to it) is
+refused with "That relay name is already taken", in the transaction that
+writes the participant and before any Relaycast call, and on a gate-only
+install also before relaygate enrols anything. MCP OAuth consent reports the
+name as taken. Neither direction takes a lock against the other, so a person's
+join and an identity's first mint for the same name, at the same moment, can
+both pass their checks; the identity's join then refuses the name because the
+person's roster agent holds it. Not covered by the refusal: Agent Relay
+Desktop identity sync (Desktop registers its agents on Relaycast itself;
+Control only records them) and the participants Control registers for
+Replicas, Amp, Capy, chief, Factory, Grok routines and webhook agent links.
+The identity's join refuses any of those names held on the roster.
+
+The agent presents the token as a header bearer on the shared-sessions MCP
+facade only:
+
+```sh
+curl -s -X POST "$CONTROL_URL/api/v1/mcp/shared-sessions" \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+       "params": {"name": "join_relay", "arguments": {}}}'
+```
+
+It can:
+
+- call the Relay messaging tools (`join_relay`, `leave_relay`,
+  `relay_status`, `list_relay_agents`, `get_relay_agent_card`,
+  `set_relay_agent_card`, `send_relay_message`, `get_relay_message_status`,
+  `read_relay_conversation`, `check_relay_inbox`, `list_relay_channels`,
+  `subscribe_relay_channel`, `unsubscribe_relay_channel`,
+  `post_relay_channel`, `read_relay_channel`) and `describe_capabilities`,
+  which reports `auth_mode: "agent_identity"`;
+- act only as its own agent. `join_relay` with no arguments joins as that
+  agent. A `join_relay` `name`, or an `as` on any other tool, must equal the
+  token's name, ignoring letter case (`name` accepts only lowercase letters,
+  digits and `-`, so omit it for other names).
+
+It cannot:
+
+- call any other tool. `tools/list` names only the tools above, and any other
+  `tools/call` is refused with `403` before a tool runs. That covers agent
+  launch and release, Desktop and webhook-inbox linking, shared-session,
+  summary, timing and team-activity reads, customer support, provider
+  bindings (Amp, Factory, Replicas, Capy) and UI tools;
+- join with `desktop_address`, `cursor_identity_token` or another `name`, or
+  act `as` another agent; those are refused with a message naming its agent;
+- authenticate from a cookie, on `/mcp` or any other MCP path, or on any
+  other route: every other workspace API token gate refuses it as before,
+  and introspection reports it inactive;
+- read or act in another workspace: the workspace and organization come only
+  from the token row, and it holds no membership;
+- mint, list or revoke tokens.
+
+Gate-only installs (relaygate) enrol hosted participants for a person only,
+so there the token is admitted but `join_relay` and the acting tools refuse
+with a message saying so.
+
+Rotation and revocation: minting again with the same name (any letter case)
+issues a new token for the same identity, and the agent keeps its Relay
+participant. Older tokens stay live until they expire or are revoked. The
+token list (`GET .../deployment-api-tokens?purpose=agent-identity`) shows
+`purpose` and `agent_name` on each item. `DELETE
+.../deployment-api-tokens/{tokenId}` revokes one token and leaves the others
+live; revoke every token of the name to stop the agent. The identity and its
+participant row (table `agent_identities` and
+`hosted_relay_participants.agent_identity_id`, migration 0086) are kept, so a
+later mint resumes the same agent.
+
 #### Desktop session scopes
 
 Sessions issued to the Desktop (and CLI) through the device flow, and the
@@ -1858,6 +1982,7 @@ adds one.
 | Enrollment key session | `POST /api/v1/auth/enrollment/token` (one exchange of an `sh_ek_` key) | `cli:auth rth:read rth:sync rth:acquire` |
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
 | Staff read grant (`sh_sr_`) | `POST /api/v1/workspaces/{id}/staff-read-grants`, staff only ([staff-read-grants.md](staff-read-grants.md)) | `rth:read`, on the shared-sessions MCP facade only; never refreshed |
+| Workspace agent identity token (`sh_wk_`) | `POST /api/v1/workspaces/{id}/deployment-api-tokens` with `purpose: "agent-identity"`, owner or admin ([Workspace agent identity tokens](#workspace-agent-identity-tokens)) | `relay:agent`, on the shared-sessions MCP facade's Relay messaging tools only; expires within 365 days |
 | Launch-check token (gate-only installs) | Control itself, for one relaygate `POST /v1/check` per launch; 60 seconds, revoked after the check | None |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 

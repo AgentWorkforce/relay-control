@@ -10,10 +10,12 @@ import type { Database } from "../database.js";
 import type { Principal } from "../store.js";
 import {
   API_TOKEN_PREFIX,
+  AGENT_IDENTITY_PURPOSE,
   API_TOKEN_PURPOSE_SCOPES,
   ApiTokenError,
   ApiTokenStore,
   DESKTOP_ENROLLMENT_PURPOSE,
+  type AgentIdentityRosterCheck,
   type ApiTokenPurpose,
   type MintActor,
 } from "./api-tokens.js";
@@ -56,6 +58,8 @@ export type AdminRouteHelpers = {
   bearer(request: IncomingMessage): string | null;
   /** app.ts's shared limiter: throws 429 (with retry-after) once `key` passes `rule`. */
   rateLimit(response: ServerResponse, key: string, rule: { limit: number; windowMs: number }): void;
+  /** The workspace Relaycast roster check an agent-identity mint runs before its transaction. */
+  agentRoster: AgentIdentityRosterCheck;
 };
 
 /**
@@ -823,7 +827,8 @@ export function createAdminModule(input: {
           purpose: body.purpose,
           expiryDays: body.expiryDays,
           neverExpires: body.neverExpires,
-          agentName: body.agent_name,
+          // agent-identity tokens name their agent as `agentName`; relayfile-agent keeps `agent_name`.
+          agentName: body.purpose === AGENT_IDENTITY_PURPOSE && body.agent_name === undefined ? body.agentName : body.agent_name,
           nodeName: body.nodeName,
           aud: body.aud,
           scope: body.scope,
@@ -834,7 +839,7 @@ export function createAdminModule(input: {
           policyConsent: body.policyConsent,
           ...(caller.operatorTokenId !== null ? { mintedByTokenId: caller.operatorTokenId } : {}),
           actor: caller.actor,
-        });
+        }, { agentRoster: helpers.agentRoster });
         json(response, 201, token);
         return true;
       }
@@ -936,12 +941,18 @@ export function createAdminModule(input: {
 /** Maps admin-module errors to HTTP. Returns null for foreign errors. */
 export function adminErrorResponse(
   error: unknown,
-): { status: number; body: { error: string; message: string } } | null {
+): { status: number; body: { error: string; message: string }; retryAfterSeconds?: number } | null {
+  if (error instanceof ApiTokenError) {
+    return {
+      status: error.status,
+      body: { error: error.code, message: error.message },
+      ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+    };
+  }
   if (
     error instanceof AdminHttpError ||
     error instanceof ConnectionError ||
-    error instanceof CodingAgentError ||
-    error instanceof ApiTokenError
+    error instanceof CodingAgentError
   ) {
     return { status: error.status, body: { error: error.code, message: error.message } };
   }
