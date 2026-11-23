@@ -184,6 +184,18 @@ test("session search @name parsing is default off and strictly boolean", () => {
   assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
 });
 
+test("SESSION_READ_MINT_INCLUDE_READER_KIND overrides the relaygate default and is strictly boolean", () => {
+  const relaygate = { SELFHOST_RELAYGATE_PUBLIC_URL: "https://cast.selfhosted.company" };
+  assert.equal(loadConfig(completeEnv).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "  " }).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate, SESSION_READ_MINT_INCLUDE_READER_KIND: "" }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "true" }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate, SESSION_READ_MINT_INCLUDE_READER_KIND: "false" }).sessionReadApi.mintReaderKind, false);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "yes" }),
+    /SESSION_READ_MINT_INCLUDE_READER_KIND must be true or false/);
+});
+
 test("the read API mint role is default off and strictly boolean", () => {
   assert.equal(loadConfig(completeEnv).sessionReadMintIncludeRole, false);
   assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "false" }).sessionReadMintIncludeRole, false);
