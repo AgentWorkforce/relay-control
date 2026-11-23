@@ -991,6 +991,13 @@ test("a stream write that fills the socket waits for drain, and stops if the cli
 
   const gone = Object.assign(new EventEmitter(), { destroyed: true }) as unknown as ServerResponse;
   assert.equal(await drained(gone), false);
+
+  // A client that stops reading but keeps the connection open: the wait ends, unanswered.
+  const stuck = Object.assign(new EventEmitter(), { destroyed: false }) as unknown as ServerResponse;
+  const started = Date.now();
+  assert.equal(await drained(stuck, 50), false);
+  assert.ok(Date.now() - started >= 45, "waited for the timeout");
+  assert.equal(stuck.listenerCount("drain") + stuck.listenerCount("close"), 0, "no listener left behind");
 });
 
 test("feature off: every events-shim path answers 404 before authentication", async (t) => {

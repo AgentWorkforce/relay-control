@@ -214,16 +214,14 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
 
 const NO_STORE = { "content-type": "application/json", "cache-control": "no-store" };
 
-/** Whether a JSON-RPC body (one request, or a batch) asks for `events/stream`. */
+/** Whether a JSON-RPC body is an `events/stream` request (the package never streams a batch). */
 function isEventsStreamRequest(body: string): boolean {
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(body);
+    const parsed = JSON.parse(body) as { method?: unknown } | null;
+    return !Array.isArray(parsed) && parsed?.method === "events/stream";
   } catch {
     return false;
   }
-  const messages = Array.isArray(parsed) ? parsed : [parsed];
-  return messages.some((message) => (message as { method?: unknown } | null)?.method === "events/stream");
 }
 
 /** The refusal for one stream too many: MCP Events' resource-exhausted error, as JSON-RPC. */
@@ -245,17 +243,25 @@ function tooManyStreams(body: string): Response {
   }), { status: 429, headers: { ...NO_STORE, "retry-after": "30" } });
 }
 
-/** Resolves true once the response can take more, false if it closed first. */
-export function drained(response: ServerResponse): Promise<boolean> {
+/** How long a stream waits for a full socket to drain before cutting the client off. */
+export const EVENTS_SHIM_STREAM_DRAIN_TIMEOUT_MS = 30_000;
+
+/**
+ * Resolves true once the response can take more; false if it closed first or did not drain
+ * within `timeoutMs` (the caller then destroys the connection).
+ */
+export function drained(response: ServerResponse, timeoutMs = EVENTS_SHIM_STREAM_DRAIN_TIMEOUT_MS): Promise<boolean> {
   if (response.destroyed) return Promise.resolve(false);
   return new Promise((resolve) => {
     const done = (ok: boolean) => {
+      clearTimeout(timer);
       response.off("drain", onDrain);
       response.off("close", onClose);
       resolve(ok);
     };
     const onDrain = () => done(true);
     const onClose = () => done(false);
+    const timer = setTimeout(() => done(false), timeoutMs);
     response.once("drain", onDrain);
     response.once("close", onClose);
   });
@@ -331,16 +337,22 @@ async function send(response: ServerResponse, answer: Response): Promise<void> {
     response.writeHead(answer.status, { ...headers, "x-accel-buffering": "no" });
     response.flushHeaders();
     const reader = answer.body.getReader();
+    let stalled = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done || response.destroyed) break;
-        // A slow client: wait for the socket to drain instead of buffering without bound.
-        if (!response.write(value) && !(await drained(response))) break;
+        // A full socket: wait (bounded) for it to drain. A client that stops reading but keeps
+        // the connection open is cut off, so it cannot hold the handler and a stream slot.
+        if (!response.write(value) && !(await drained(response))) {
+          stalled = true;
+          break;
+        }
       }
     } finally {
       await reader.cancel().catch(() => undefined);
-      if (!response.writableEnded) response.end();
+      if (stalled) response.destroy();
+      else if (!response.writableEnded) response.end();
     }
     return;
   }
