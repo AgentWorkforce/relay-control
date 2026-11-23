@@ -5,7 +5,7 @@ import {
   actionConsumed,
   consumeAction,
   delegateStillBound,
-  recheckGrant,
+  recheckAtCommit,
   Refusal,
   evaluateConditions,
   loadPolicy,
@@ -45,6 +45,8 @@ export type GateRow = {
   ref_pattern: string | null;
   event: string;
   target_prefix: string;
+  repository_id: string | null;
+  repository_owner_id: string | null;
   created_auth_method: string;
   created_at: Date | string;
   deleted_at: Date | string | null;
@@ -64,31 +66,53 @@ export function gateView(row: GateRow) {
     ...(row.ref_pattern ? { ref_pattern: row.ref_pattern } : {}),
     event: row.event,
     target_prefix: row.target_prefix,
+    ...(row.repository_id ? { repository_id: row.repository_id } : {}),
+    ...(row.repository_owner_id ? { repository_owner_id: row.repository_owner_id } : {}),
     created_at: new Date(row.created_at).toISOString(),
   };
 }
 
 export type GateRedeemResult =
   | { ok: true; consumed: true; same_run?: true }
-  | { ok: true; dry_run: true }
+  | { ok: true; consumed: false; dry_run: true }
   | { ok: false; reason: ReasonCode; unmet?: Condition[]; dry_run?: true };
 
 /**
- * Every one of repository, workflow_ref, ref and event_name must match
- * exactly, plus job_workflow_ref when the gate names a reusable workflow
- * (§11a.3). A gate with `ref_pattern` (`refs/tags/<prefix>*`) matches a tag
- * ref that starts with that prefix (and is longer than it) instead of one
- * exact ref.
+ * The workflow refs match as Cloud's workflowMatches: `owner/repo/` is
+ * case-insensitive on GitHub, the file path and ref are not.
  */
-export function gateMatches(gate: Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" | "ref_pattern" | "event">,
-  claims: Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name">): boolean {
+function workflowRefMatches(want: string, have: string): boolean {
+  const split = (value: string) => {
+    const at = value.indexOf("/.github/workflows/");
+    return at < 0 ? [value, ""] : [value.slice(0, at).toLowerCase(), value.slice(at)];
+  };
+  const [wantRepo, wantRest] = split(want), [haveRepo, haveRest] = split(have);
+  return wantRepo === haveRepo && wantRest === haveRest;
+}
+
+/**
+ * Every one of repository, workflow_ref, ref and event_name must match, plus
+ * job_workflow_ref when the gate names a reusable workflow (§11a.3). A gate
+ * with `ref_pattern` (`refs/tags/<prefix>*`) matches a tag ref that starts
+ * with that prefix (and is longer than it) instead of one exact ref. A gate
+ * pinned to GitHub's repository ids also needs them to match, so a
+ * repository that later reuses the name never does. Repository names compare
+ * case-insensitively, as on GitHub.
+ */
+export function gateMatches(gate: Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" |
+  "ref_pattern" | "event" | "repository_id" | "repository_owner_id">,
+  claims: Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name" |
+    "repository_id" | "repository_owner_id">): boolean {
+  if (gate.repository_id && gate.repository_id !== claims.repository_id) return false;
+  if (gate.repository_owner_id && gate.repository_owner_id !== claims.repository_owner_id) return false;
   const refMatches = gate.ref !== null ? gate.ref === claims.ref :
     gate.ref_pattern !== null && /^refs\/tags\/[^\s*]+\*$/u.test(gate.ref_pattern) &&
       claims.ref.startsWith(gate.ref_pattern.slice(0, -1)) && claims.ref.length > gate.ref_pattern.length - 1;
   // The issuer is part of the identity: a same-named repository on another
   // trusted issuer (a GitHub Enterprise Server, say) is a different repository.
-  return gate.issuer === claims.issuer && gate.repo === claims.repository && gate.workflow_ref === claims.workflow_ref &&
-    (gate.job_workflow_ref === null || gate.job_workflow_ref === claims.job_workflow_ref) && refMatches &&
+  return gate.issuer === claims.issuer && gate.repo.toLowerCase() === claims.repository.toLowerCase() &&
+    workflowRefMatches(gate.workflow_ref, claims.workflow_ref) &&
+    (gate.job_workflow_ref === null || workflowRefMatches(gate.job_workflow_ref, claims.job_workflow_ref)) && refMatches &&
     gate.event === claims.event_name;
 }
 
@@ -138,7 +162,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       return await refuse("oidc_invalid", undefined, error instanceof OidcInvalid ? error.detail : "error");
     }
     const registered = (await deps.database.query<GateRow>(
-      "SELECT * FROM delegation_gates WHERE workspace_id = $1 AND repo = $2 AND deleted_at IS NULL",
+      "SELECT * FROM delegation_gates WHERE workspace_id = $1 AND lower(repo) = lower($2) AND deleted_at IS NULL",
       [workspace.id, claims.repository],
     )).rows;
     if (!registered.length) return await refuse("gate_unknown");
@@ -146,6 +170,16 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // another branch also gets a token for the same repository.
     const exact = registered.filter(item => gateMatches(item, claims!));
     if (!exact.length) return await refuse("gate_mismatch");
+    // The first verified match pins the gate to GitHub's repository ids.
+    if (claims.repository_id && claims.repository_owner_id) {
+      for (const item of exact.filter(candidate => !candidate.repository_id)) {
+        await deps.database.query(
+          `UPDATE delegation_gates SET repository_id = $2, repository_owner_id = $3
+            WHERE id = $1 AND repository_id IS NULL`,
+          [item.id, claims.repository_id, claims.repository_owner_id],
+        ).catch(() => undefined);
+      }
+    }
     const candidates = exact.filter(item => input.action.target.startsWith(item.target_prefix));
     if (!candidates.length) return await refuse("target_prefix");
     gate = candidates[0]!;
@@ -198,10 +232,14 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       if (time(approval.expires_at) <= now.getTime()) return await refuse("expired");
       // The gate's owner stands where a recipient's owner would (§5.4); any
       // matching gate whose owner gives the approval owner standing will do.
-      const targetOwners = candidates.some(item => item.owner_user_id === approval.owner_user_id) ? []
+      // A gate serves only while its owner is still a member.
+      const served: GateRow[] = [];
+      for (const item of candidates) if (await memberRole(deps.database, workspace.id, item.owner_user_id)) served.push(item);
+      const targetOwners = served.some(item => item.owner_user_id === approval.owner_user_id) ? []
         : await loadTargetOwners(deps.database, workspace.id);
-      const standingGate = candidates.find(item => resolveStanding({ approvalOwnerId: approval.owner_user_id,
-        recipientOwnerId: item.owner_user_id, accept: "code_owners", actions: [action], targetOwners }));
+      const standingGate = served.find(item => item.owner_user_id === approval.owner_user_id) ??
+        served.find(item => resolveStanding({ approvalOwnerId: approval.owner_user_id,
+          recipientOwnerId: item.owner_user_id, accept: "code_owners", actions: [action], targetOwners }));
       if (!standingGate) return await refuse("recipient_policy");
       gate = standingGate;
       const conditions = evaluateConditions(action.conditions ?? [], now);
@@ -210,8 +248,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     }
 
     if (dryRun) {
-      await audit("gate.redeemed", null).catch(() => undefined);
-      return { ok: true, dry_run: true };
+      // As Cloud: a passing dry run is `gate.checked`, so `gate.redeemed` counts real uses only.
+      await audit("gate.checked", null).catch(() => undefined);
+      return { ok: true, consumed: false, dry_run: true };
     }
     // Single use per run, atomically: the first redeem wins and records the
     // run; any later redeem in that run is same_run; any other run is consumed.
@@ -219,6 +258,22 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       // While the checks above waited, the approval may have been revoked,
       // withdrawn or expired, the gate deleted, or the grant revoked or
       // narrowed: decide on the current rows, under their locks.
+      // Locks in the order the policy writer and revocation take them:
+      // policy, grant, membership, approval.
+      const commitNow = deps.now().getTime();
+      if (approval.tier === "D" && approval.grant_id) {
+        // The current policy and grant decide (not_enabled, revoked, expired,
+        // out_of_scope, tier_o_required), as at attest and redeem.
+        await recheckAtCommit(tx, { workspaceId: workspace.id, grantId: approval.grant_id, tier: "D", actions: [action],
+          recipientAgentId: "", nowMs: commitNow });
+      } else {
+        const current = await loadPolicy(tx, workspace.id, true);
+        if (!current.delegation_enabled) return "not_enabled" as const;
+        if (current.allowed_classes && !current.allowed_classes.includes(action.class)) return "out_of_scope" as const;
+      }
+      // The gate's owner (and, for tier O, the approval's owner) still a member.
+      if (!await memberRole(tx, workspace.id, gate!.owner_user_id, true)) return "recipient_policy" as const;
+      if (approval.tier === "O" && !await memberRole(tx, workspace.id, approval.owner_user_id, true)) return "revoked" as const;
       const live = (await tx.query<{ expires_at: Date | string }>(
         "SELECT expires_at FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE", [approval.id],
       )).rows[0];
@@ -226,12 +281,14 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       const gateLive = (await tx.query("SELECT 1 FROM delegation_gates WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
         [gate!.id])).rows.length > 0;
       if (!gateLive) return "gate_unknown" as const;
-      const commitNow = deps.now().getTime();
-      if (approval.tier === "D" && approval.grant_id) {
-        await recheckGrant(tx, workspace.id, approval.grant_id, [action], policy, commitNow);
-      }
       const alreadyUsed = await actionConsumed(tx, approval.id, action);
       if (!alreadyUsed && time(live.expires_at) <= commitNow) return "expired" as const;
+      // Standing against the target owners as committed now.
+      if (!alreadyUsed && !resolveStanding({ approvalOwnerId: approval.owner_user_id, recipientOwnerId: gate!.owner_user_id,
+        accept: "code_owners", actions: [action],
+        targetOwners: gate!.owner_user_id === approval.owner_user_id ? [] : await loadTargetOwners(tx, workspace.id) })) {
+        return "recipient_policy" as const;
+      }
       if (await consumeAction(tx, { approvalId: approval.id, workspaceId: workspace.id, action,
         consumedBy: `github-run:${claims!.run_id}` })) {
         await tx.query(
@@ -245,8 +302,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       }
       return await boundRun(tx) ? "same_run" as const : "taken" as const;
     });
-    if (outcome === "revoked" || outcome === "gate_unknown" || outcome === "expired") return await refuse(outcome);
     if (outcome === "taken") return await refuse("consumed");
+    if (outcome !== "consumed" && outcome !== "same_run") return await refuse(outcome);
     const sameRun = outcome === "same_run";
     await audit("gate.redeemed", null, { same_run: sameRun }).catch(() => undefined);
     return sameRun ? { ok: true, consumed: true, same_run: true } : { ok: true, consumed: true };

@@ -244,7 +244,9 @@ const gateBody = z.object({
   ref: z.string().regex(/^refs\/(?:heads|tags)\/[^\s*]{1,250}$/u).optional(),
   /** Tag-triggered workflows: `refs/tags/<literal prefix>*`, a single trailing `*` and nothing else. */
   ref_pattern: z.string().regex(/^refs\/tags\/[^\s*]{1,200}\*$/u).optional(),
-  event: z.string().regex(/^[a-z][a-z_]{0,63}$/u),
+  // As Cloud: only events that run the gated ref's own, trusted workflow code
+  // (never pull_request* or workflow_run).
+  event: z.enum(["push", "workflow_dispatch", "release", "schedule"]),
   target_prefix: z.string().min(1).max(256),
 }).strict().superRefine((gate, context) => {
   if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
@@ -729,6 +731,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
         await requireEnabled(workspace.id);
         const row = await input.database.transaction(async (tx) => {
+          // Held until commit, as Cloud: a departure cannot finish between the
+          // caller's membership check and this insert and leave a live gate.
+          if (!await memberRole(tx, workspace.id, principal.userId, true)) fail("forbidden", "Forbidden", 403);
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
                (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
@@ -740,6 +745,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
             ownerUserId: principal.userId, data: gateView(created) });
           return created;
+        }).catch((error: unknown) => {
+          if ((error as { code?: string })?.code === "23505") fail("gate_exists", "You already registered this gate", 409);
+          throw error;
         });
         json(201, gateView(row));
         return true;

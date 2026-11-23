@@ -3449,8 +3449,11 @@ paths:
         and either an exact `ref` (`refs/heads/...` or `refs/tags/...`) or a
         `ref_pattern` of the form `refs/tags/<literal prefix>*` (one trailing
         `*`). `target_prefix` must start with `<repo>:` and contain no
-        whitespace or `*`. Human-only (browser session or verified Desktop
-        bearer), delegation on. Audited `gate.registered`.
+        whitespace or `*`. `event` is one of push, workflow_dispatch, release
+        and schedule. Human-only (browser session or verified Desktop
+        bearer, of a current member), delegation on. The same live gate
+        (owner, repo, workflow_ref, job_workflow_ref, event, target_prefix)
+        cannot be registered twice. Audited `gate.registered`.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -3468,6 +3471,7 @@ paths:
         "400": { description: "`invalid_request`" }
         "401": { description: "`unauthorized`" }
         "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+        "409": { description: "`gate_exists`: you already registered this gate" }
     delete:
       operationId: deleteDelegationGate
       tags: [Owner delegates]
@@ -3526,9 +3530,13 @@ paths:
         `run_id`. Any later redeem in the same run (another job, or a later
         attempt) answers `{ok:true, consumed:true, same_run:true}`; any other
         run gets `consumed`. `dry_run: true` runs every check, never consumes,
-        and answers `{ok, reason?, dry_run:true}`. Audited `gate.redeemed` or
-        `gate.refused` (with `dry_run: true` in the event data for a dry run),
-        auth method `github_oidc`.
+        and answers `{ok:true, consumed:false, dry_run:true}` or
+        `{ok:false, reason, dry_run:true}`. Audited `gate.redeemed`,
+        `gate.checked` (a passing dry run) or `gate.refused` (with
+        `dry_run: true` in the event data for a dry run), auth method
+        `github_oidc`. A gate serves only while its owner is a member; the
+        first verified match pins it to the token's `repository_id` and
+        `repository_owner_id`. Repository names match case-insensitively.
       security:
         - bearerAuth: []
       requestBody:
@@ -3563,9 +3571,10 @@ paths:
                       consumed: { type: boolean }
                       same_run: { const: true }
                   - type: object
-                    required: [ok, dry_run]
+                    required: [ok, consumed, dry_run]
                     properties:
                       ok: { const: true }
+                      consumed: { const: false }
                       dry_run: { const: true }
                   - type: object
                     required: [ok, reason]
@@ -10277,6 +10286,8 @@ components:
         ref_pattern: { type: string }
         event: { type: string }
         target_prefix: { type: string }
+        repository_id: { type: string, description: "GitHub's repository id, pinned from the first verified match" }
+        repository_owner_id: { type: string, description: "GitHub's repository owner id, pinned with repository_id" }
         owner_id: { type: string }
         created_at: { type: string, format: date-time }
     DelegationGateInput:
@@ -10291,7 +10302,7 @@ components:
         job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@refs/heads/main" }
         ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
         ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
-        event: { type: string, pattern: "^[a-z][a-z_]{0,63}$", example: workflow_dispatch }
+        event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
         target_prefix: { type: string, maxLength: 256, example: "AgentWorkforce/relay-app:" }
     DelegationAction:
       type: object

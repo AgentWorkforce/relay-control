@@ -328,7 +328,13 @@ narrowed) are re-read under their locks.
 the publishing job runs inside a reusable workflow, the gate also sets
 `job_workflow_ref` (that workflow's file and ref, which may be in another
 repo), and the token's `job_workflow_ref` must match it too.
-`target_prefix` must start with `<repo>:` and contain no `*`. Registering needs delegation on. Each change is audited
+`target_prefix` must start with `<repo>:` and contain no `*`. `event` is one
+of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
+the gated ref's own workflow code (never `pull_request*` or `workflow_run`).
+Registering needs delegation on and a current member (the membership is
+held until the insert commits). The same live gate (owner, repo,
+`workflow_ref`, `job_workflow_ref`, event, `target_prefix`) cannot be
+registered twice: 409 `gate_exists`. Each change is audited
 (`gate.registered`, `gate.deleted`).
 
 **Redeeming.** The job calls `POST /delegates/gates/redeem` with
@@ -351,6 +357,11 @@ dry_run?}`. Control checks, in order:
    - A gate's `workflow_ref`, `ref` (or `ref_pattern`) and `event` must
      match the token's `workflow_ref`, `ref` and `event_name` exactly, and
      its `job_workflow_ref` too when set; otherwise `gate_mismatch`. Matching the repository alone is not enough.
+     Repository names (also the `owner/repo/` part of a workflow ref) match
+     case-insensitively, as on GitHub; the workflow file and ref exactly.
+   - The first verified match pins the gate to the token's `repository_id`
+     and `repository_owner_id` (shown on the gate); a pinned gate needs them
+     to match, so a repository that later reuses the name never does.
    - The action's target must start with the matching gate's
      `target_prefix`, otherwise `target_prefix`.
 4. **The approval.** The normal redeem checks run:
@@ -379,10 +390,16 @@ dry_run?}`. Control checks, in order:
    - Any other run gets `consumed`.
 
 `dry_run: true` runs every check and never consumes. It answers
-`{ok:true, dry_run:true}` or `{ok:false, reason, dry_run:true}`. Redeems are
-audited as `gate.redeemed` or `gate.refused`, with the run, workflow and
-action and auth method `github_oidc`. A dry run carries `dry_run: true` in the
-event data, as in Cloud.
+`{ok:true, consumed:false, dry_run:true}` or `{ok:false, reason, dry_run:true}`.
+Redeems are audited as `gate.redeemed` or `gate.refused`, with the run,
+workflow and action and auth method `github_oidc`; a passing dry run is
+`gate.checked`, so `gate.redeemed` counts real uses only. A dry run carries
+`dry_run: true` in the event data, as in Cloud.
+
+A gate serves only while its owner is still a member. At the commit, the
+current policy and grant decide as at attest and redeem (`not_enabled`,
+`out_of_scope`, `tier_o_required`), and the gate owner's membership is
+re-read under a share lock.
 
 Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
 `delegation_gate_redemptions`.

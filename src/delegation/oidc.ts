@@ -27,6 +27,9 @@ export type WorkflowClaims = {
   event_name: string;
   run_id: string;
   run_attempt: number;
+  /** GitHub's stable repository and owner ids, when the issuer sends them (a gate pins them on first match). */
+  repository_id: string | null;
+  repository_owner_id: string | null;
 };
 
 export class OidcInvalid extends Error {
@@ -139,6 +142,10 @@ export function workflowOidcVerifier(input: {
       return value;
     };
     text("sub");
+    const optionalId = (name: string) => {
+      const value = claims[name];
+      return typeof value === "string" && /^[0-9]{1,20}$/.test(value) ? value : null;
+    };
     const runAttempt = Number(text("run_attempt"));
     const runId = text("run_id");
     if (!/^[1-9][0-9]{0,19}$/.test(runId) || !Number.isSafeInteger(runAttempt) || runAttempt < 1) {
@@ -153,6 +160,8 @@ export function workflowOidcVerifier(input: {
       event_name: text("event_name"),
       run_id: runId,
       run_attempt: runAttempt,
+      repository_id: optionalId("repository_id"),
+      repository_owner_id: optionalId("repository_owner_id"),
     };
   };
 }

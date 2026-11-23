@@ -290,8 +290,8 @@ test("gate redeem: dry_run runs every check, never consumes, and is audited as d
   const token = (runId = "500") => mint(env.github, env.workflowClaims({ run_id: runId }));
   const approvalId = await env.approval([STABLE]);
   const dry = { dry_run: true };
-  assert.deepEqual((await env.redeem(token(), approvalId, STABLE, dry)).body, { ok: true, dry_run: true });
-  assert.deepEqual((await env.redeem(token(), approvalId, STABLE, dry)).body, { ok: true, dry_run: true });
+  assert.deepEqual((await env.redeem(token(), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
+  assert.deepEqual((await env.redeem(token(), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
   // Nothing was consumed: a real redeem by any run still succeeds.
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
     [approvalId])).rows.length, 0);
@@ -303,13 +303,17 @@ test("gate redeem: dry_run runs every check, never consumes, and is audited as d
     { ok: false, reason: "gate_mismatch", dry_run: true });
   // After the real redeem, a dry run from the same run is ok and from another run is consumed.
   assert.deepEqual((await env.redeem(token("600"), approvalId)).body, { ok: true, consumed: true });
-  assert.deepEqual((await env.redeem(token("600"), approvalId, STABLE, dry)).body, { ok: true, dry_run: true });
+  assert.deepEqual((await env.redeem(token("600"), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
   assert.deepEqual((await env.redeem(token("601"), approvalId, STABLE, dry)).body, { ok: false, reason: "consumed", dry_run: true });
-  // Dry runs are audited with `dry_run: true` in the event data, as Cloud.
+  // Dry runs are audited with `dry_run: true` in the event data; a passing one
+  // is `gate.checked`, so `gate.redeemed` counts real uses only, as Cloud.
   const all = (await env.database.query<{ event: string; reason: string | null; data: Record<string, unknown> }>(
-    "SELECT event, reason, data FROM delegation_audit_events WHERE event IN ('gate.redeemed', 'gate.refused') ORDER BY id")).rows;
+    `SELECT event, reason, data FROM delegation_audit_events
+      WHERE event IN ('gate.redeemed', 'gate.refused', 'gate.checked') ORDER BY id`)).rows;
   const dryEvents = all.filter(event => event.data.dry_run === true);
-  assert.deepEqual(dryEvents.map(event => event.reason), [null, null, "target_prefix", "oidc_invalid", "gate_mismatch", null, "consumed"]);
+  assert.deepEqual(dryEvents.map(event => [event.event, event.reason]), [["gate.checked", null], ["gate.checked", null],
+    ["gate.refused", "target_prefix"], ["gate.refused", "oidc_invalid"], ["gate.refused", "gate_mismatch"],
+    ["gate.checked", null], ["gate.refused", "consumed"]]);
   assert.deepEqual(all.filter(event => event.data.dry_run !== true).map(event => event.event), ["gate.redeemed"]);
 });
 
@@ -339,7 +343,7 @@ test("gate ref_pattern: refs/tags/<literal prefix>* only, matched against the to
     workflow_ref: body.workflow_ref, job_workflow_ref: body.workflow_ref, ref, event_name: "push", run_id: `${Math.floor(Math.random() * 1e9) + 1}`, ...extra }));
   const approvalId = await env.approval([STABLE]);
   const dry = { dry_run: true };
-  assert.deepEqual((await env.redeem(tag("refs/tags/v2026.11.7"), approvalId, STABLE, dry)).body, { ok: true, dry_run: true });
+  assert.deepEqual((await env.redeem(tag("refs/tags/v2026.11.7"), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
   // Another prefix, a branch with the same name, or another event: gate_mismatch.
   for (const [ref, extra] of [["refs/tags/v2025.1.0", {}], ["refs/heads/v2026.11.7", {}], ["refs/tags/x/v2026.1", {}],
     ["refs/tags/v2026.11.7", { event_name: "workflow_dispatch" }]] as Array<[string, Record<string, unknown>]>) {
@@ -483,6 +487,84 @@ test("gate redeem: a gate deleted, an approval revoked or a grant narrowed durin
   };
   assert.deepEqual((await env.redeem(token("3"), second, BETA)).body, { ok: false, reason: "out_of_scope" });
   // Nothing was consumed by any of these.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  env.world.handle = handle;
+});
+
+test("gates: allowed events, one live gate per workflow identity, pinned repository ids, case-insensitive repo", async (t) => {
+  const env = await setup(t);
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  // Only events that run the gated ref's own workflow code.
+  for (const event of ["pull_request", "pull_request_target", "workflow_run", "issue_comment"]) {
+    assert.equal((await env.browser("/delegates/gates", "POST", { ...body, event })).status, 400, event);
+  }
+  const gate = await env.gate();
+  // The same live gate twice is 409 gate_exists; another reusable workflow behind it is a distinct gate.
+  const again = await env.browser("/delegates/gates", "POST", body);
+  assert.equal(again.status, 409, again.raw);
+  assert.deepEqual(again.body, { error: "You already registered this gate", code: "gate_exists" });
+  const reusable = `AgentWorkforce/workflows/.github/workflows/publish.yml@refs/heads/main`;
+  await env.gate({ job_workflow_ref: reusable });
+  assert.equal((await env.browser("/delegates/gates", "POST", { ...body, job_workflow_ref: reusable })).status, 409);
+  // Deleting it frees the identity.
+  assert.equal((await env.bearer(`/delegates/gates?gate_id=${gate.gate_id}`, "DELETE")).status, 200);
+  const pinned = await env.gate();
+
+  // The repository name matches case-insensitively, the workflow file exactly.
+  const approvalId = await env.approval([STABLE]);
+  const lower = REPO.toLowerCase();
+  const dry = { dry_run: true };
+  const ids = { repository_id: "70151234", repository_owner_id: "90122" };
+  const caseToken = mint(env.github, env.workflowClaims({ repository: lower,
+    workflow_ref: WORKFLOW.replace(REPO, lower), job_workflow_ref: WORKFLOW.replace(REPO, lower), ...ids }));
+  assert.deepEqual((await env.redeem(caseToken, approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
+  const fileCase = mint(env.github, env.workflowClaims({ workflow_ref: WORKFLOW.replace("desktop-promote", "Desktop-Promote"),
+    job_workflow_ref: WORKFLOW.replace("desktop-promote", "Desktop-Promote"), ...ids }));
+  assert.deepEqual((await env.redeem(fileCase, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  // The first verified match pinned GitHub's repository ids: a repository that reuses the name never matches.
+  const listed = (await env.bearer("/delegates/gates")).body.gates as Array<Record<string, unknown>>;
+  const view = listed.find(item => item.gate_id === pinned.gate_id)!;
+  assert.equal(view.repository_id, ids.repository_id);
+  assert.equal(view.repository_owner_id, ids.repository_owner_id);
+  const reused = mint(env.github, env.workflowClaims({ repository_id: "99999999", repository_owner_id: "90122" }));
+  assert.deepEqual((await env.redeem(reused, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims(ids)), approvalId)).body, { ok: true, consumed: true });
+});
+
+test("gates: a gate serves only while its owner is a member; policy at the commit decides", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId }));
+  // Delegation turned off while the checks waited.
+  const first = await env.approval([STABLE]);
+  during = async () => {
+    await env.database.query("UPDATE delegation_policies SET delegation_enabled = false WHERE workspace_id = $1", [env.workspaceId]);
+  };
+  assert.deepEqual((await env.redeem(token("11"), first)).body, { ok: false, reason: "not_enabled" });
+  await env.database.query("UPDATE delegation_policies SET delegation_enabled = true WHERE workspace_id = $1", [env.workspaceId]);
+  // A tier O requirement added meanwhile.
+  during = async () => {
+    await env.database.query("UPDATE delegation_policies SET require_tier_o = ARRAY['release'] WHERE workspace_id = $1",
+      [env.workspaceId]);
+  };
+  assert.deepEqual((await env.redeem(token("12"), first)).body, { ok: false, reason: "tier_o_required" });
+  await env.database.query("UPDATE delegation_policies SET require_tier_o = '{}' WHERE workspace_id = $1", [env.workspaceId]);
+  // The gate's owner leaves meanwhile: the gate no longer serves.
+  during = async () => {
+    await env.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [env.ownerId]);
+  };
+  const left = await env.redeem(token("13"), first);
+  assert.equal(left.body.ok, false, left.raw);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
   env.world.handle = handle;
 });

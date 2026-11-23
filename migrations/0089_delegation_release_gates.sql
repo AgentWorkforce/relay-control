@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   ref_pattern text,
   event text NOT NULL,
   target_prefix text NOT NULL,
+  -- GitHub's stable repository and owner ids, pinned from the first verified
+  -- token that matches: a repository that later reuses the name (after a
+  -- rename, transfer or delete) never matches.
+  repository_id text,
+  repository_owner_id text,
   created_auth_method text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz,
@@ -29,7 +34,15 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
 );
 
 CREATE INDEX IF NOT EXISTS delegation_gates_repo_idx
-  ON delegation_gates (workspace_id, repo) WHERE deleted_at IS NULL;
+  ON delegation_gates (workspace_id, lower(repo)) WHERE deleted_at IS NULL;
+
+-- One live gate per owner and workflow identity (as Cloud, plus the issuer):
+-- registering the same one twice is 409 gate_exists. Two reusable workflows
+-- behind one caller are distinct gates.
+CREATE UNIQUE INDEX IF NOT EXISTS delegation_gates_live_unique
+  ON delegation_gates (workspace_id, owner_user_id, issuer, repo, workflow_ref, COALESCE(job_workflow_ref, ''), event,
+    target_prefix)
+  WHERE deleted_at IS NULL;
 
 -- The run a gate redeem consumed an action for (single use is per action,
 -- §5.1). Any later redeem of that action in the same run (another job of it,
