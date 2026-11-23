@@ -91,7 +91,9 @@ test("expired, long-lived and future proofs are refused", async () => {
   const now = Math.floor(Date.now() / 1000);
   await refused(claudeAttestationFor(await call({ iat: now - 120, exp: now - 60 }), desktopHeaders, auth, store), "expired");
   await refused(claudeAttestationFor(await call({ iat: now, exp: now + 61 }), desktopHeaders, auth, store), "lifetime out of range");
-  await refused(claudeAttestationFor(await call({ iat: now + 31, exp: now + 60 }), desktopHeaders, auth, store), "issued in the future");
+  // Well past the 30 s allowance: the verifier reads the clock again, and a
+  // proof only one second over would pass when a second boundary falls between.
+  await refused(claudeAttestationFor(await call({ iat: now + 40, exp: now + 70 }), desktopHeaders, auth, store), "issued in the future");
 });
 
 test("a replayed tool use is refused", async () => {
