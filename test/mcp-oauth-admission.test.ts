@@ -1466,3 +1466,24 @@ test("a pinned OAuth assistant creates a channel as its approved agent and reads
   const thread=await f.service.readChannel({channel:"thanksgiving",limit:20,thread_id:post.message_id}) as any;
   assert.deepEqual(thread.replies.map((m:any)=>[m.sender,m.text]),[["cousin-grok","I will bring pie"]]);
 });
+
+test("an OAuth assistant creates at most 5 channels per agent per clock hour, failing closed; joining is never limited",async t=>{
+  const f=await relayFixture(t);
+  for(let i=1;i<=5;i++) assert.equal((await f.service.subscribeChannel({channel:`family-${i}`,create:true})).created,true);
+  const before=f.world.channels.size;
+  await assert.rejects(f.service.subscribeChannel({channel:"family-6",create:true}),
+    /approved-agent has created too many channels recently, so #family-6 was not created\. Join an existing channel/);
+  assert.equal(f.world.channels.size,before);
+  assert.equal(f.world.channels.has("family-6"),false);
+  // Joining an existing channel, even with create: true, does not count.
+  f.world.addAgent("peer");f.world.channelAs("peer","existing");
+  assert.equal((await f.service.subscribeChannel({channel:"existing",create:true})).created,false);
+  // The next clock hour has a fresh budget; old windows are pruned.
+  await f.database.query("UPDATE relay_channel_creations SET window_start=window_start - interval '3 hours'");
+  assert.equal((await f.service.subscribeChannel({channel:"family-6",create:true})).created,true);
+  assert.deepEqual((await f.database.query("SELECT count FROM relay_channel_creations")).rows.map(r=>Number(r.count)),[1]);
+  // A counter that cannot be read refuses the creation.
+  await f.database.query("DROP TABLE relay_channel_creations");
+  await assert.rejects(f.service.subscribeChannel({channel:"family-7",create:true}),/too many channels recently/);
+  assert.equal(f.world.channels.has("family-7"),false);
+});

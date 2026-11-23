@@ -125,6 +125,8 @@ const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 /** Replies per post that read_relay_channel include_replies returns; thread_id reads the rest. */
 export const CHANNEL_REPLIES_PER_POST = 10;
+/** Channels one agent of an MCP OAuth assistant connection may create per clock hour (Cloud's limit). */
+export const CHANNEL_CREATE_LIMIT_PER_HOUR = 5;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const CHANNEL_DELIVERY_REASONS: ReadonlySet<string> = new Set(["message", "mention", "thread-reply"]);
@@ -1340,6 +1342,27 @@ function createRelayService(context: McpContext) {
     return fn(hosted);
   }
 
+  /**
+   * Counts one channel creation for this workspace's agent in the current clock hour; true while within
+   * CHANNEL_CREATE_LIMIT_PER_HOUR. A failed count refuses (fails closed). The count is taken before the
+   * create, so a refused or failed create still uses one.
+   */
+  async function admitChannelCreate(agentName: string): Promise<boolean> {
+    try {
+      return await database.transaction(async tx => {
+        await tx.query("DELETE FROM relay_channel_creations WHERE workspace_id=$1 AND window_start < date_trunc('hour', now()) - interval '1 hour'",
+          [workspaceId]);
+        const row = (await tx.query<{ count: number }>(`INSERT INTO relay_channel_creations(workspace_id,agent_name,window_start,count)
+            VALUES ($1,$2,date_trunc('hour', now()),1)
+            ON CONFLICT (workspace_id,agent_name,window_start) DO UPDATE SET count=relay_channel_creations.count+1
+            RETURNING count`, [workspaceId, agentName])).rows[0];
+        return Boolean(row) && Number(row!.count) <= CHANNEL_CREATE_LIMIT_PER_HOUR;
+      });
+    } catch {
+      return false;
+    }
+  }
+
   async function membership(identity: Identity, channel: string) {
     return (await clientFor(identity).authenticatedAgent(identity.token)).channels.find(row => row.name === channel) ?? null;
   }
@@ -1808,6 +1831,13 @@ function createRelayService(context: McpContext) {
         } catch (error) {
           if (!(error instanceof RelaycastCallError) || error.status !== 404) throw error;
           if (!input.create) throw new RelayToolError(`No channel #${channel} exists. Use list_relay_channels, or pass create: true to start it.`);
+          // An OAuth assistant (ChatGPT, Grok Bot, Muse...) acting as its approved agent can be talked into
+          // creating channels by the posts it reads, so its creations are rate limited per agent, failing closed.
+          // A linked Desktop identity is the person's own session and is not limited.
+          if (oauth && !identity.desktop && !await admitChannelCreate(identity.name)) {
+            console.info("[relay-channel]", JSON.stringify({ step: "channel_create_limited", channel }));
+            throw new RelayToolError(`${identity.name} has created too many channels recently, so #${channel} was not created. Join an existing channel (list_relay_channels), or try again later.`);
+          }
           try {
             // The creator becomes the channel's owner, which is membership.
             await clientFor(identity).createChannel(identity.token, channel);

@@ -1380,6 +1380,15 @@ test("channels: list, subscribe, post, thread, read, inbox, and unsubscribe", as
     /Channel names are lowercase/);
 });
 
+test("a person's own MCP session is not held to the OAuth assistant channel-creation limit", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  for (let i = 1; i <= 6; i++) {
+    assert.equal(structured(await client.callTool({ name: "subscribe_relay_channel",
+      arguments: { channel: `team-${i}`, create: true, hosted: true } })).created, true);
+  }
+});
+
 test("leave_relay releases the remote agent and deletes the participant", async (t) => {
   const env = await setup(t);
   const client = await relayClient(t, env);

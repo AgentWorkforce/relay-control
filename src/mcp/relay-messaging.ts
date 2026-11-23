@@ -136,8 +136,8 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   }, input => run(service => service.listChannels(input)));
 
   server.registerTool("subscribe_relay_channel", {
-    description: `Subscribe the acting identity to a channel; create starts the channel when it is missing. The operation is idempotent. New posts are retained in the hosted participant's inbox. ${CHANNEL_IDENTITY}`,
-    inputSchema: { channel, create: z.boolean().default(false).describe("Create the channel if it does not exist."), as, as_person: asPerson, hosted },
+    description: `Subscribe the acting identity to a channel; create starts the channel when it is missing, with the acting identity as its owner and first member. The operation is idempotent. On an OAuth assistant connection, channel creation is rate limited per agent. New posts are retained in the hosted participant's inbox. ${CHANNEL_IDENTITY}`,
+    inputSchema: { channel, create: z.boolean().default(false).describe("Create the channel if it does not exist. Only when the person asked for a new channel."), as, as_person: asPerson, hosted },
     annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
   }, input => run(service => service.subscribeChannel(input)));
 
