@@ -5,7 +5,9 @@
 // changed quickly, so a browser GET/HEAD here is sent to the matching
 // relay-webapp route on SELFHOST_DASHBOARD_URL.
 //
-// Only that configured origin is ever named, never a host from the request.
+// Only a configured dashboard origin is ever named (the primary one, or the
+// dashboard of the SELFHOST_EXTRA_SITES site the request arrived on), never a
+// host from the request.
 // When the dashboard shares this service's origin (single-host), or the request
 // already arrived on the dashboard host, nothing is redirected.
 

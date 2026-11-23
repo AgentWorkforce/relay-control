@@ -931,6 +931,35 @@ test("just-in-time connect: operator OAuth app from config, admin message, retur
   assert(offsitePage.includes(`href="${ctx.origin}/dashboard/"`));
 });
 
+test("connect-session returnTo accepts an extra site's dashboard origin, and only dashboard origins", async (t) => {
+  const extraDashboard = "https://app.public.example.com";
+  const ctx = await setup(t, {
+    operatorOAuthApps: { mockhub: { clientId: "mock-client", clientSecret: "mock-secret-value-123", scopes: null } },
+    extraSites: [{ dashboardOrigin: extraDashboard, apiOrigin: "https://api.public.example.com" }],
+  });
+  const ws = `/api/v1/workspaces/${ctx.workspaceId}`;
+  async function callbackPage(returnTo: string): Promise<string> {
+    const session = await request(ctx.origin, `${ws}/integrations/connect-session`, {
+      method: "POST",
+      token: ctx.member,
+      body: { allowedIntegrations: ["mockhub"], returnTo },
+    });
+    assert.equal(session.status, 200);
+    const authorize = await fetch(new URL(session.body.connectLink), { redirect: "manual" });
+    return (await fetch(authorize.headers.get("location")!)).text();
+  }
+  const extra = `${extraDashboard}/dashboard/#/flows/f1`;
+  assert((await callbackPage(extra)).includes(`href="${extra}"`), "an extra site's dashboard");
+  const primary = `${ctx.origin}/dashboard/#/flows/f1`;
+  assert((await callbackPage(primary)).includes(`href="${primary}"`), "the primary dashboard");
+  // An extra site's API origin is not a dashboard; neither is an unconfigured origin.
+  for (const refused of ["https://api.public.example.com/dashboard/", "https://evil.example.com/phish"]) {
+    const page = await callbackPage(refused);
+    assert(!page.includes(new URL(refused).host), refused);
+    assert(page.includes(`href="${ctx.origin}/dashboard/"`), refused);
+  }
+});
+
 test("operator OAuth apps load from env and mounted Secret files", async () => {
   const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
