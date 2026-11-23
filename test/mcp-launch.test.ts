@@ -764,28 +764,66 @@ test("target_node: among names sharing a key, an exact case-sensitive stored nam
   assert.deepEqual(sentTargets(env), ["studio", "Studio"]);
 });
 
-test("target_node: a full every-state page is treated like a failed read", async (t) => {
+test("target_node: an every-state read with another page is permanent: a name match or a miss says pass the id", async (t) => {
   const env = await setup(t);
-  const filler = Array.from({ length: 99 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }));
+  // One more node than Relaycast's maximum history page (500), so it reports a next_cursor.
+  const filler = Array.from({ length: 500 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }));
   env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler]);
   await env.claim("mine");
   const client = await env.connect();
-  // A live id never depends on the every-state page.
+  // A live id never depends on the every-state read.
   assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine") })).status, "accepted");
+  const read = env.world.bodies.filter(body => body.path === "/v1/nodes").length;
   const lone = await refusalOf(client, launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-2" }));
-  assert.equal(lone.retryable, true);
-  assert.match(lone.message, /matches a live node's name, but not every node could be read \(the node list filled its one-page limit\)/);
+  assert.equal(lone.retryable, false);
+  assert.match(lone.message, /matches a live node's name, but this workspace has more nodes than one read returns.*Pass the node's id\.$/);
+  assert.doesNotMatch(lone.message, /Try again/);
   const missing = await refusalOf(client, launch("nowhere", { idempotency_key: "target-key-3" }));
-  assert.equal(missing.retryable, true);
-  assert.match(missing.message, /not every node could be read/);
+  assert.equal(missing.retryable, false);
+  assert.match(missing.message, /among the nodes read; this workspace has more nodes than one read returns\. Pass the node's id/);
+  assert.doesNotMatch(missing.message, /Try again/);
   assert.deepEqual(missing.valid_targets, [{ id: "mine", name: "studio-desktop" }]);
-  // One node short of a full page: the same name launches.
+  assert.equal(env.world.bodies.filter(body => body.path === "/v1/nodes").length, read + 4);
+  // Exactly one page (no next_cursor): the same name launches.
   env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler.slice(1)]);
   assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
     arguments: launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-2" }) })).target_node, "mine");
 });
 
-test("target_node: a lone offline name match with a padded stored name gets the padded-name refusal", async (t) => {
+test("target_node: a legacy bare-array every-state answer is the whole roster, however long", async (t) => {
+  const env = await setup(t);
+  env.world.nodesHistory.unsupported = true;
+  const filler = Array.from({ length: 600 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }));
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler]);
+  await env.claim("mine");
+  const client = await env.connect();
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") })).target_node, "mine");
+});
+
+test("target_node: with an incomplete read, a live exact-name tiebreak gets the could-not-read refusal, retryable by cause", async (t) => {
+  const env = await setup(t);
+  const twins = [node("studio-a", "Studio"), node("studio-b", "studio")];
+  env.world.nodes.set(FIRST_KEY, twins);
+  await env.claim("studio-a");
+  await env.claim("studio-b");
+  const client = await env.connect();
+  env.world.everyStateNodesFailures.remaining = 1;
+  const failed = await refusalOf(client, launch("Studio"));
+  assert.equal(failed.code, "spawn_target_unavailable");
+  assert.equal(failed.retryable, true);
+  assert.match(failed.message, /matches a live node's name, but offline nodes could not be read.*Try again/);
+  assert.doesNotMatch(failed.message, /names of 2 nodes/);
+  // A next page: the same refusal, permanent.
+  env.world.nodes.set(FIRST_KEY, [...twins, ...Array.from({ length: 500 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }))]);
+  const partial = await refusalOf(client, launch("Studio", { idempotency_key: "target-key-2" }));
+  assert.equal(partial.retryable, false);
+  assert.match(partial.message, /more nodes than one read returns.*Pass the node's id/);
+  // Without an exact live match, several matches stay ambiguous either way.
+  assert.match((await refusalOf(client, launch("STUDIO", { idempotency_key: "target-key-3" }))).message, /names of 2 nodes/);
+  assert.equal(sentTargets(env).length, 0);
+});
+
+test("target_node: an offline node with a padded stored name gets the padded-name refusal by name and by id", async (t) => {
   const env = await setup(t);
   env.world.nodes.set(FIRST_KEY, [node("pad", " lab ", { live: false }), node("alt", "alt-desktop")]);
   await env.claim("pad");
@@ -796,7 +834,10 @@ test("target_node: a lone offline name match with a padded stored name gets the 
   assert.equal(refused.retryable, false);
   assert.match(refused.message, /Node " lab " \(pad\) has whitespace around its name/);
   assert.deepEqual(targetIds(refused.alternatives), ["alt"]);
-  // By id, an offline node keeps its offline refusal.
-  assert.equal((await refusalOf(client, launch("pad", { idempotency_key: "target-key-2" }))).code, "spawn_target_offline");
+  // By id too, even offline: renaming, not waiting, is what helps.
+  const byId = await refusalOf(client, launch("pad", { idempotency_key: "target-key-2" }));
+  assert.equal(byId.code, "spawn_target_unavailable");
+  assert.equal(byId.retryable, false);
+  assert.match(byId.message, /has whitespace around its name/);
   assert.equal(sentTargets(env).length, 0);
 });

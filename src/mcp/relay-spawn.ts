@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { SqlExecutor } from "../database.js";
 import {
-  RELAY_HARNESS_ID_PATTERN, RELAY_NODE_PAGE_LIMIT, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
+  RELAY_HARNESS_ID_PATTERN, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
 } from "../messaging/relaycast.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import type { McpContext } from "./context.js";
@@ -60,10 +60,12 @@ export const spawnInput = z.object({
   target_node: z.string().trim().min(1).max(128)
     .refine(value => !INVISIBLE.test(value), "target_node must not contain control, format or line separator characters.")
     .describe("Required: the target_node id of an allowed live launch target in the current workspace fleet (from list_relay_spawn_targets). " +
-      "A value matching no node id is accepted as the name of exactly one live target, compared case-insensitively with curly and " +
-      "straight apostrophes treated alike; leading and trailing spaces are trimmed. When several nodes share that name, the one whose " +
-      "stored name matches exactly (case-sensitive) is used if it is live; otherwise the name, like a value matching nothing, is " +
-      "refused and lists the valid ids and names. An idempotency key covers the exact target_node given, so " +
+      "A value matching no node id is accepted as a node name: leading and trailing spaces are trimmed and names of nodes in every state " +
+      "are compared case-insensitively, with curly and straight apostrophes treated alike. It resolves only when exactly one node has " +
+      "that name and it is live; when several do, the one whose stored name matches exactly (case-sensitive) is used if it is live. " +
+      "Otherwise it is refused: an offline match as offline, several matches as ambiguous, and a value matching nothing with the " +
+      "valid ids and names. A node whose stored name has surrounding spaces is refused by id or by name. When not every node could " +
+      "be read, a name match is refused; pass the node's id. An idempotency key covers the exact target_node given, so " +
       "switching between a node's name and its id is a different launch."),
   task: z.string().min(1).max(8192).refine(value => value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 8192 && !value.includes("\0"),
     "Task must be nonempty and at most 8192 UTF-8 bytes."),
@@ -414,17 +416,18 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         }
         const online = await deps.client.listSpawnTargets(deps.workspaceKey);
         // Ids first. Only an id miss on the live page reads nodes of every state, so offline nodes never displace
-        // live ones and a launch by a live id never depends on that read; if it fails there is no offline
-        // information. Each read is one page of at most RELAY_NODE_PAGE_LIMIT nodes; anything beyond it is not seen,
-        // so a full every-state page is treated like a failed read: it cannot rule out an id or name past the page.
+        // live ones and a launch by a live id never depends on that read. Each read is one page; anything beyond it
+        // is not seen. The every-state read is incomplete when it fails (a retry may help) or when Relaycast reports
+        // another page (permanent for this roster: pass an id instead). Either way it cannot rule out an unseen node.
         const byId = online.find(item => item.id === input.target_node);
-        const everyState = byId ? null : await deps.client.listSpawnTargets(deps.workspaceKey, { includeOffline: true }).catch(() => {
+        const allStates = byId ? null : await deps.client.listAllSpawnTargets(deps.workspaceKey).catch(() => {
           // Counts only, no names or ids: how often launches run without offline information.
           console.warn("[selfhost-mcp] spawn_every_state_roster_failed");
           return null;
         });
-        const offlineUnread = !byId && (everyState === null || everyState.length >= RELAY_NODE_PAGE_LIMIT);
-        const unreadReason = everyState === null ? "offline nodes could not be read" : "not every node could be read (the node list filled its one-page limit)";
+        const everyState = allStates?.targets ?? null;
+        const unread: "failed" | "partial" | null = byId ? null : !allStates ? "failed" : allStates.complete ? null : "partial";
+        const offlineUnread = unread !== null;
         const idHolder = everyState?.find(item => item.id === input.target_node);
         // Names, on an id miss only: an id held by a node in any state seen is never reread as a name. Relaycast's
         // selector matches stored names of every state, so names are compared over every state: the value resolves
@@ -447,7 +450,6 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const unconfirmed = offlineUnread && liveLone !== undefined;
         const target = byId ?? liveLone;
         const offline = idHolder ?? (lone && !liveLone ? lone : undefined);
-        const offlineByName = !idHolder && offline ? offline : undefined;
         const owners = await deps.owners([...online.filter(eligible), ...(target ? [target] : []), ...(offline ? [offline] : [])]
           .map(item => item.id));
         const options = await placementOptions(input.cli);
@@ -489,9 +491,12 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
               `pass one of their ids as target_node: ${listTargets(named)}` });
         }
         if (unconfirmed) {
-          throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: true,
-            message: `target_node "${requested}" matches a live node's name, but ${unreadReason} to confirm ` +
-              "that no node has it as an id. Try again, or pass the node's id." });
+          throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: unread === "failed",
+            message: unread === "failed"
+              ? `target_node "${requested}" matches a live node's name, but offline nodes could not be read to confirm ` +
+                "that no node has it as an id. Try again, or pass the node's id."
+              : `target_node "${requested}" matches a live node's name, but this workspace has more nodes than one read ` +
+                "returns, so it cannot be confirmed that no node has it as an id. Pass the node's id." });
         }
         // Permission first, even for an offline node: a node you may not use is never retryable.
         const known = target ?? offline ?? undefined;
@@ -499,17 +504,20 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           // Neither an id nor a live name: say what the caller could pass instead. Retrying the same value will not
           // help, unless offline nodes could not be read: then it may be an offline node's id, and a retry can tell.
           const valid = listTargets(listable(online));
-          throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: offlineUnread,
-            valid_targets: validTargets(online), message: offlineUnread
-              ? `target_node "${requested}" matches no live node id or name, and ${unreadReason} to check whether ` +
+          throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: unread === "failed",
+            valid_targets: validTargets(online), message: unread === "failed"
+              ? `target_node "${requested}" matches no live node id or name, and offline nodes could not be read to check whether ` +
                 `it is an offline node's id. Try again, or pass one of these live ids and names: ${valid}`
-              : `target_node "${requested}" matches no live node id or name; valid ids and names: ${valid}` });
+              : unread === "partial"
+                ? `target_node "${requested}" matches no live node id or name among the nodes read; this workspace has more nodes ` +
+                  `than one read returns. Pass the node's id; live ids and names: ${valid}`
+                : `target_node "${requested}" matches no live node id or name; valid ids and names: ${valid}` });
         }
         const placed = ranking.targets.find(item => item.target_node === known.id) ?? rankTargets([known], owners, userId, options).targets[0]!;
         if (!placed.allowed) throw refuse("spawn_target_not_allowed", known, placed);
         // The launch goes out by name and Relaycast trims it, so a padded name cannot select its own node.
-        // A lone offline name match with a padded name gets this refusal too: renaming, not waiting, is what helps.
-        const paddedNode = [target, offlineByName].find(item => item && padded(item));
+        // Offline too, by id or by name: renaming, not waiting, is what helps.
+        const paddedNode = padded(known) ? known : undefined;
         if (paddedNode) {
           throw refuse("spawn_target_unavailable", paddedNode, placed, undefined, { retryable: false,
             message: `Node "${displayName(paddedNode.name)}" (${paddedNode.id}) has whitespace around its name. Relaycast trims the name a ` +
@@ -690,11 +698,11 @@ export function registerRelaySpawnTools(server: McpServer, context: McpContext, 
     }
   };
   server.registerTool("list_relay_spawn_targets", {
-    description: "List the live machines in the current workspace's fleet that can launch agents, ranked best first. Each target reports target_node (its id; pass it to spawn_relay_agent, which also accepts a unique live node name), name, kind, machine, owner, allowed status, repositories, harnesses and versions, available slots, load, memory and ranking reason. Pass harness (the one you intend to launch) so memory is judged for it. A target with allowed false cannot accept this connection's launch; one with admissible false would refuse that launch now. Requires current workspace owner or admin access. Does not provision machines.",
+    description: "List the live machines in the current workspace's fleet that can launch agents, ranked best first. Each target reports target_node (its id; pass it to spawn_relay_agent, which also accepts a node name that only one node has, live), name, kind, machine, owner, allowed status, repositories, harnesses and versions, available slots, load, memory and ranking reason. Pass harness (the one you intend to launch) so memory is judged for it. A target with allowed false cannot accept this connection's launch; one with admissible false would refuse that launch now. Requires current workspace owner or admin access. Does not provision machines.",
     inputSchema: targetsInput.shape, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(service => service.targets(input)));
   server.registerTool("spawn_relay_agent", {
-    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or the name of exactly one live node) with a harness that target advertises. A name matching several live nodes, or a value matching nothing, is refused with the valid ids and names; the receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
+    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or a name that only one node has, live) with a harness that target advertises. Among nodes sharing a name case-insensitively, the exact (case-sensitive) stored name wins when that node is live; otherwise the name is refused, and a value matching nothing is refused with the valid ids and names. The receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
     inputSchema: spawnInput.shape, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   }, (input, extra) => run(service => service.spawn(input, extra.requestId)));
   server.registerTool("get_relay_spawn_status", {

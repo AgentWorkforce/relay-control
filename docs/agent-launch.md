@@ -94,12 +94,14 @@ machine.
 - **Id first.** A value equal to a live node's id selects it; that launch never
   reads offline nodes. On a miss, nodes of every state are read: an offline
   node's id keeps its offline (or not-allowed) refusal and is never reread as
-  another node's name. If that read fails (logged as the counter-only
-  `spawn_every_state_roster_failed`), or returns a full page of 100 nodes so
-  more may exist, it is treated as incomplete: a live name match is then
-  refused as retryable, since it might be an unseen node's id, and a value
-  matching nothing is refused as retryable, still listing the live ids and
-  names.
+  another node's name. If that read is incomplete, a live name match is
+  refused, since it might be an unseen node's id, and so is a value matching
+  nothing (both still list the live ids and names):
+  - the read failed (logged as the counter-only
+    `spawn_every_state_roster_failed`): `retryable: true`, try again or pass
+    the node's id;
+  - Relaycast reported another page (`next_cursor`): `retryable: false`, since
+    the same roster gives the same answer; pass the node's id.
 - **Name fallback.** Otherwise the value is compared with node names of every
   state (Relaycast's selector matches stored names of every state) after
   trimming, NFC normalization, curly apostrophes (U+2018, U+2019, U+02BC) as a
@@ -108,7 +110,7 @@ machine.
   memory) then runs on that node as it would for its id, and the receipt and
   journal record its id. A lone offline match keeps its offline (or
   not-allowed) refusal, so an offline node's own name never launches on a live
-  look-alike; a lone offline match whose stored name is padded gets the
+  look-alike; an offline node whose stored name is padded gets the
   padded-name refusal below instead.
 - **Exact-name tiebreak.** When several nodes of any state share the key, the
   one whose stored name equals the trimmed value exactly (case-sensitive, byte
@@ -118,7 +120,9 @@ machine.
   caller who types one variant's exact spelling gets that machine without
   being told a look-alike exists, in exchange for not refusing a value that
   names exactly one node to Relaycast. An exact match that is offline is never
-  swapped for a live variant.
+  swapped for a live variant. If the every-state read is incomplete, a live
+  exact match gets the could-not-read refusal above (retryable by its cause),
+  not the ambiguity refusal.
 - **Ambiguous names.** Otherwise several nodes of any state on that key are
   refused with `spawn_target_unavailable`, `retryable: false`, listing their
   `id (name)` pairs; pass one of those ids. Case or apostrophe variants are distinct
@@ -126,8 +130,8 @@ machine.
   alternatives.
 - **Padded names.** A node whose stored name has surrounding whitespace
   (`" lab "`) can never be reached by its own name, because the selector trims
-  it. It is refused by id or by name, `retryable: false`, asking the owner to
-  rename it, and is never offered as an alternative.
+  it. It is refused by id or by name, live or offline, `retryable: false`,
+  asking the owner to rename it, and is never offered as an alternative.
 - **No match.** Refused with `spawn_target_unavailable`, `retryable: false`,
   listing live ids and names in the message and in `valid_targets` (at most
   20, with an "(and N more; call list_relay_spawn_targets)" suffix; ambiguous
@@ -141,9 +145,15 @@ machine.
 - **Idempotency.** An `idempotency_key` covers the trimmed `target_node` as
   given, so reusing a key after switching from a node's name to its id (or to
   another spelling of its name) is refused as a different launch.
-- **Limits.** Each roster read is one page of at most 100 nodes. Matching is
-  only as complete as the page read: an id or name beyond that page is not
-  seen, which is why a full every-state page is treated as incomplete.
+- **Limits.** Each roster read is one page of Relaycast's `GET /v1/nodes`.
+  The live read (`status=online&limit=100`) sees at most 100 live nodes. The
+  every-state read uses the paginated `history=true` contract (`{ nodes,
+  next_cursor }`) at Relaycast's maximum `limit` of 500
+  (`NODE_LIST_HISTORY_MAX_LIMIT`); a `next_cursor` means more nodes exist and
+  the read is incomplete, as above. An older Relaycast without that contract
+  answers the bare array, which lists every node and counts as complete.
+  Matching is only as complete as the page read: an id or name beyond it is
+  not seen.
 
 Native clients must retain `Mcp-Session-Id`: their launches belong to that
 session. OAuth launches belong to the exact grant and remain accessible after

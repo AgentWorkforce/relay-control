@@ -49,6 +49,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   const nodes = new Map<string, Array<Record<string, any>>>();
   /** While positive, the every-state roster read (GET /v1/nodes without status=online) fails with 503 and decrements. */
   const everyStateNodesFailures = { remaining: 0 };
+  /** When true, GET /v1/nodes ignores history=true and answers the legacy bare array (an older Relaycast). */
+  const nodesHistory = { unsupported: false };
   /** Native spawn/release invocations. `spawnOutcome` decides how the next spawn completes. */
   const invocations = new Map<string, Record<string, any>>();
   const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
@@ -158,8 +160,15 @@ export function createRelaycastWorld(roster: unknown[]) {
         everyStateNodesFailures.remaining -= 1;
         return fail(503, "unavailable");
       }
+      // As Relaycast serves it: status=online honors limit; history=true is the paginated every-state read
+      // ({ nodes, next_cursor }, limit default 100, max 500); otherwise the bare array is every node.
       const listed = (nodes.get(bearer) ?? []).filter(node => query.get("status") !== "online" || node.live === true);
-      return ok(listed);
+      if (query.get("history") === "true" && !nodesHistory.unsupported) {
+        const limit = Math.min(Math.max(1, Number(query.get("limit") ?? 100)), 500);
+        const page = listed.slice(0, limit);
+        return ok({ nodes: page, next_cursor: listed.length > limit ? page.at(-1)!.id : null });
+      }
+      return ok(query.get("status") === "online" && query.get("limit") ? listed.slice(0, Number(query.get("limit"))) : listed);
     }
     if (method === "POST" && path === "/v1/actions/spawn/invoke" && caller) {
       const input = body!.input as Record<string, any>;
@@ -364,7 +373,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, everyStateNodesFailures, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
+    nodes, everyStateNodesFailures, nodesHistory, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);
