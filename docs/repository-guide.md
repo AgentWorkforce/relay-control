@@ -319,6 +319,14 @@ secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
 carries `role: "owner" | "admin" | "member"`, the caller's live organization
 role ([docs/sessions-read-api.md](sessions-read-api.md#read-credentials)).
+`reader_kind: "browser" | "device" | "mcp"` is added when
+`SESSION_READ_MINT_INCLUDE_READER_KIND=true`; unset, it is sent exactly when
+`SELFHOST_RELAYGATE_PUBLIC_URL` is set, and `false` omits it. A site that
+routes only the internal session read API through relaygate, without a public
+relaygate URL, sets it to `true` so that relaygate policy rules using
+`readerKinds` can match; with `false` (or unset without a relaygate URL) such
+rules match nothing
+([docs/sessions-read-api.md](sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
