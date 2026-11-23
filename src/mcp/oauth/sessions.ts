@@ -28,6 +28,8 @@ export type McpOAuthSessionRecord = McpOAuthSessionOwner & {
   sessionId: string; scopes: string[]; grantScopes: string[]; resource: string; clientId: string;
   revokedAt: Date | null; grantRevokedAt: Date | null;
   accessTokenExpiresAt: Date; refreshTokenExpiresAt: Date;
+  /** Root session of a stable-refresh child; null for a root session. */
+  parentSessionId: string | null;
 };
 export type McpOAuthAccess = {
   principal: Principal;
@@ -38,7 +40,7 @@ type SessionRow = {
   id: string; grant_id: string; token_family_id: string; user_id: string; organization_id: string; workspace_id: string;
   scopes: string[]; grant_scopes: string[]; resource: string; client_id: string;
   revoked_at: Date | string | null; grant_revoked_at: Date | string | null;
-  access_token_expires_at: Date | string; refresh_token_expires_at: Date | string;
+  access_token_expires_at: Date | string; refresh_token_expires_at: Date | string; parent_session_id: string | null;
 };
 
 function record(row: SessionRow): McpOAuthSessionRecord {
@@ -46,7 +48,8 @@ function record(row: SessionRow): McpOAuthSessionRecord {
     organizationId: row.organization_id, workspaceId: row.workspace_id, scopes: row.scopes, grantScopes: row.grant_scopes,
     resource: row.resource, clientId: row.client_id, revokedAt: row.revoked_at ? new Date(row.revoked_at) : null,
     grantRevokedAt: row.grant_revoked_at ? new Date(row.grant_revoked_at) : null,
-    accessTokenExpiresAt: new Date(row.access_token_expires_at), refreshTokenExpiresAt: new Date(row.refresh_token_expires_at) };
+    accessTokenExpiresAt: new Date(row.access_token_expires_at), refreshTokenExpiresAt: new Date(row.refresh_token_expires_at),
+    parentSessionId: row.parent_session_id ?? null };
 }
 
 export class McpOAuthSessions {
@@ -70,16 +73,22 @@ export class McpOAuthSessions {
       throw new Error("OAuth session does not match an active consented grant");
     }
     const createdAt = this.now();
+    return this.insert(tx, input, scopes, createdAt, new Date(createdAt.getTime()+REFRESH_TTL_MS), null);
+  }
+
+  /** The only session INSERT. A child row (parentSessionId set) is a stable-refresh access sibling of a root session. */
+  private async insert(tx: SqlExecutor, owner: McpOAuthSessionOwner, scopes: string[], createdAt: Date, refreshExpires: Date,
+    parentSessionId: string | null): Promise<McpOAuthIssuedPair> {
     const sessionId = randomUUID();
     const accessToken = opaqueToken(MCP_OAUTH_ACCESS_PREFIX), refreshToken = opaqueToken(MCP_OAUTH_REFRESH_PREFIX);
-    const accessExpires = new Date(createdAt.getTime()+ACCESS_TTL_MS), refreshExpires = new Date(createdAt.getTime()+REFRESH_TTL_MS);
+    const accessExpires = new Date(createdAt.getTime()+ACCESS_TTL_MS);
     await tx.query(`INSERT INTO mcp_oauth_sessions
       (id,grant_id,token_family_id,user_id,organization_id,workspace_id,scopes,access_token_hash,refresh_token_hash,
-       access_token_expires_at,refresh_token_expires_at,created_at,updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`,
-    [sessionId,input.grantId,input.tokenFamilyId,input.userId,input.organizationId,input.workspaceId,scopes,
-      hashSecret(accessToken),hashSecret(refreshToken),accessExpires,refreshExpires,createdAt]);
-    return { sessionId,tokenFamilyId:input.tokenFamilyId,accessToken,refreshToken,
+       access_token_expires_at,refresh_token_expires_at,created_at,updated_at,parent_session_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13)`,
+    [sessionId,owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,scopes,
+      hashSecret(accessToken),hashSecret(refreshToken),accessExpires,refreshExpires,createdAt,parentSessionId]);
+    return { sessionId,tokenFamilyId:owner.tokenFamilyId,accessToken,refreshToken,
       accessTokenExpiresAt:accessExpires.toISOString(),refreshTokenExpiresAt:refreshExpires.toISOString(),scopes };
   }
 
@@ -93,41 +102,106 @@ export class McpOAuthSessions {
     return result.rows[0] ? record(result.rows[0]) : null;
   }
 
-  /** Source refresh CAS; the retired hash is committed atomically with rotation. */
+  /**
+   * Source refresh CAS; the retired hash, its successor and its own expiry are committed atomically with rotation.
+   * `prior` reads the expiry from the statement snapshot; a concurrent rotation changes the hash, so the CAS then misses.
+   */
   async rotate(tx: SqlExecutor, refreshToken: string, expected: McpOAuthSessionOwner): Promise<McpOAuthIssuedPair | null> {
     if (!REFRESH_PATTERN.test(refreshToken)) return null;
-    const now = this.now();
+    const now = this.now(), refreshTokenHash = hashSecret(refreshToken);
     const accessToken = opaqueToken(MCP_OAUTH_ACCESS_PREFIX), nextRefresh = opaqueToken(MCP_OAUTH_REFRESH_PREFIX);
     const accessExpires = new Date(now.getTime()+ACCESS_TTL_MS), refreshExpires = new Date(now.getTime()+REFRESH_TTL_MS);
-    const result = await tx.query<{ id: string; scopes: string[] }>(`UPDATE mcp_oauth_sessions s
+    const result = await tx.query<{ id: string; scopes: string[]; retired_expires_at: Date | string }>(`UPDATE mcp_oauth_sessions s
       SET access_token_hash=$2,refresh_token_hash=$3,access_token_expires_at=$4,refresh_token_expires_at=$5,
-          last_refreshed_at=$6,updated_at=$6
-      FROM mcp_oauth_grants g,organization_memberships m,workspaces w
-      WHERE s.refresh_token_hash=$1 AND s.revoked_at IS NULL AND s.refresh_token_expires_at>$6
+          last_refreshed_at=$6,updated_at=$6,current_pair_used_at=NULL
+      FROM mcp_oauth_grants g,organization_memberships m,workspaces w,
+        (SELECT id,refresh_token_expires_at FROM mcp_oauth_sessions WHERE refresh_token_hash=$1) prior
+      WHERE s.refresh_token_hash=$1 AND prior.id=s.id AND s.parent_session_id IS NULL AND s.revoked_at IS NULL AND s.refresh_token_expires_at>$6
         AND s.grant_id=$7 AND s.token_family_id=$8 AND s.user_id=$9 AND s.organization_id=$10 AND s.workspace_id=$11
         AND g.id=s.grant_id AND g.revoked_at IS NULL
         AND m.organization_id=s.organization_id AND m.user_id=s.user_id
         AND w.id=s.workspace_id AND w.organization_id=s.organization_id
         AND ($12::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))
-      RETURNING s.id,s.scopes`,[hashSecret(refreshToken),hashSecret(accessToken),hashSecret(nextRefresh),accessExpires,refreshExpires,now,
+      RETURNING s.id,s.scopes,prior.refresh_token_expires_at AS retired_expires_at`,[refreshTokenHash,hashSecret(accessToken),
+      hashSecret(nextRefresh),accessExpires,refreshExpires,now,
       expected.grantId,expected.tokenFamilyId,expected.userId,expected.organizationId,expected.workspaceId,this.options.tenancyMode]);
     const row = result.rows[0];
     if (!row) return null;
     await tx.query(`INSERT INTO mcp_oauth_retired_refresh_tokens
-      (token_hash,grant_id,user_id,organization_id,workspace_id,retired_at) VALUES ($1,$2,$3,$4,$5,$6)
-      ON CONFLICT (token_hash) DO NOTHING`,[hashSecret(refreshToken),expected.grantId,expected.userId,
-      expected.organizationId,expected.workspaceId,now]);
+      (token_hash,grant_id,user_id,organization_id,workspace_id,retired_at,successor_token_hash,refresh_token_expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (token_hash) DO NOTHING`,[refreshTokenHash,expected.grantId,expected.userId,
+      expected.organizationId,expected.workspaceId,now,hashSecret(nextRefresh),new Date(row.retired_expires_at)]);
     return { sessionId:row.id,tokenFamilyId:expected.tokenFamilyId,accessToken,refreshToken:nextRefresh,
       accessTokenExpiresAt:accessExpires.toISOString(),refreshTokenExpiresAt:refreshExpires.toISOString(),scopes:row.scopes };
+  }
+
+  /**
+   * Re-issue a pair whose refresh response never arrived: keyed by the exact successor hash, only while that
+   * pair is unused. Keeps the refresh expiry and caps the access expiry by it; the caller writes retired rows.
+   */
+  async reissueUndelivered(tx: SqlExecutor, successorHash: string, expected: McpOAuthSessionOwner, now: Date): Promise<McpOAuthIssuedPair | null> {
+    const accessToken = opaqueToken(MCP_OAUTH_ACCESS_PREFIX), nextRefresh = opaqueToken(MCP_OAUTH_REFRESH_PREFIX);
+    const result = await tx.query<{ id: string; scopes: string[]; access_token_expires_at: Date | string; refresh_token_expires_at: Date | string }>(
+      `UPDATE mcp_oauth_sessions s
+      SET access_token_hash=$2,refresh_token_hash=$3,access_token_expires_at=LEAST($4::timestamptz,s.refresh_token_expires_at),
+          last_refreshed_at=$5,updated_at=$5,current_pair_used_at=NULL
+      FROM mcp_oauth_grants g,organization_memberships m,workspaces w
+      WHERE s.refresh_token_hash=$1 AND s.parent_session_id IS NULL AND s.revoked_at IS NULL AND s.current_pair_used_at IS NULL
+        AND s.refresh_token_expires_at>$5
+        AND s.grant_id=$6 AND s.token_family_id=$7 AND s.user_id=$8 AND s.organization_id=$9 AND s.workspace_id=$10
+        AND g.id=s.grant_id AND g.revoked_at IS NULL
+        AND m.organization_id=s.organization_id AND m.user_id=s.user_id
+        AND w.id=s.workspace_id AND w.organization_id=s.organization_id
+        AND ($11::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))
+      RETURNING s.id,s.scopes,s.access_token_expires_at,s.refresh_token_expires_at`,[successorHash,hashSecret(accessToken),
+      hashSecret(nextRefresh),new Date(now.getTime()+ACCESS_TTL_MS),now,
+      expected.grantId,expected.tokenFamilyId,expected.userId,expected.organizationId,expected.workspaceId,this.options.tenancyMode]);
+    const row = result.rows[0];
+    if (!row) return null;
+    return { sessionId:row.id,tokenFamilyId:expected.tokenFamilyId,accessToken,refreshToken:nextRefresh,
+      accessTokenExpiresAt:new Date(row.access_token_expires_at).toISOString(),
+      refreshTokenExpiresAt:new Date(row.refresh_token_expires_at).toISOString(),scopes:row.scopes };
+  }
+
+  /**
+   * Stable refresh for clients whose callbacks are all Google Connected Apps callbacks: the presented refresh token
+   * stays on its root session (the anchor), whose refresh expiry is extended; access, refresh hash and
+   * current_pair_used_at of the anchor are untouched. The new access token is a child row of the anchor whose own
+   * refresh token is never returned and expires with that access token, so earlier access tokens stay valid until
+   * their own expiry. The UPDATE is the anchor's row lock and refresh CAS; it applies the same grant, membership,
+   * workspace and tenancy guards as rotate. Children past expiry are deleted here (nothing else prunes sessions);
+   * a child is never a code receipt and has no children, so the delete cascades nothing.
+   */
+  async refreshStable(tx: SqlExecutor, refreshToken: string, expected: McpOAuthSessionOwner): Promise<McpOAuthIssuedPair | null> {
+    if (!REFRESH_PATTERN.test(refreshToken)) return null;
+    const now = this.now(), refreshExpires = new Date(now.getTime()+REFRESH_TTL_MS);
+    const result = await tx.query<{ id: string; scopes: string[] }>(`UPDATE mcp_oauth_sessions s
+      SET refresh_token_expires_at=$2,last_refreshed_at=$3,updated_at=$3
+      FROM mcp_oauth_grants g,organization_memberships m,workspaces w
+      WHERE s.refresh_token_hash=$1 AND s.parent_session_id IS NULL AND s.revoked_at IS NULL AND s.refresh_token_expires_at>$3
+        AND s.grant_id=$4 AND s.token_family_id=$5 AND s.user_id=$6 AND s.organization_id=$7 AND s.workspace_id=$8
+        AND g.id=s.grant_id AND g.revoked_at IS NULL
+        AND m.organization_id=s.organization_id AND m.user_id=s.user_id
+        AND w.id=s.workspace_id AND w.organization_id=s.organization_id
+        AND ($9::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))
+      RETURNING s.id,s.scopes`,[hashSecret(refreshToken),refreshExpires,now,
+      expected.grantId,expected.tokenFamilyId,expected.userId,expected.organizationId,expected.workspaceId,this.options.tenancyMode]);
+    const anchor = result.rows[0];
+    if (!anchor) return null;
+    await tx.query(`DELETE FROM mcp_oauth_sessions s WHERE s.parent_session_id=$1 AND s.refresh_token_expires_at<=$2
+        AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_codes c WHERE c.issued_session_id=s.id)`,[anchor.id,now]);
+    const child = await this.insert(tx, expected, anchor.scopes, now, new Date(now.getTime()+ACCESS_TTL_MS), anchor.id);
+    return { ...child,refreshToken,refreshTokenExpiresAt:refreshExpires.toISOString() };
   }
 
   async revokeFamily(tx: SqlExecutor, owner: McpOAuthSessionOwner, reason: string): Promise<void> {
     await revokeMcpOAuthSessionFamily(tx, owner, reason, this.now());
   }
 
+  /** Ends one root session and its stable-refresh children. */
   async revokeSession(tx: SqlExecutor, sessionId: string, owner: McpOAuthSessionOwner, reason: string): Promise<void> {
     await tx.query(`UPDATE mcp_oauth_sessions SET revoked_at=$7,revoked_reason=$8,updated_at=$7
-      WHERE id=$1 AND grant_id=$2 AND token_family_id=$3 AND user_id=$4 AND organization_id=$5 AND workspace_id=$6 AND revoked_at IS NULL`,
+      WHERE (id=$1 OR parent_session_id=$1) AND grant_id=$2 AND token_family_id=$3 AND user_id=$4 AND organization_id=$5 AND workspace_id=$6 AND revoked_at IS NULL`,
     [sessionId,owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,this.now(),reason]);
   }
 
@@ -140,9 +214,10 @@ export class McpOAuthSessions {
     const resourcePath = this.options.protocol.parseMcpResource(url.toString());
     if (!resourcePath) return null;
     const resource = this.options.protocol.mcpResourceUrl(resourcePath);
+    const now = this.now();
     const result = await this.database.query<SessionRow & {
       email: string; user_name: string; organization_name: string; workspace_name: string; role: Principal["role"];
-      agent_name: string; agent_remote_id: string | null;
+      agent_name: string; agent_remote_id: string | null; current_pair_used_at: Date | string | null;
     }>(`SELECT s.*,g.scopes AS grant_scopes,g.resource,g.client_id,g.revoked_at AS grant_revoked_at,
         g.agent_name,g.agent_remote_id,u.email,u.name AS user_name,o.name AS organization_name,w.name AS workspace_name,m.role
       FROM mcp_oauth_sessions s JOIN mcp_oauth_grants g ON g.id=s.grant_id
@@ -152,11 +227,16 @@ export class McpOAuthSessions {
       WHERE s.access_token_hash=$1 AND s.revoked_at IS NULL AND s.access_token_expires_at>$2
         AND g.revoked_at IS NULL AND g.resource=$3
         AND ($4::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))`,
-    [hashSecret(token),this.now(),resource,this.options.tenancyMode]);
+    [hashSecret(token),now,resource,this.options.tenancyMode]);
     const row = result.rows[0];
     if (!row) return null;
     const scopes=row.scopes.filter(scope=>row.grant_scopes.includes(scope));
     if(scopes.length===0) return null;
+    // First use of this pair, written once. The hash predicate keeps a request racing a rotation off the new pair;
+    // a pair rotated or re-issued away since the read admits nothing, so an unused pair is never both used and re-issued.
+    if(row.current_pair_used_at===null && (await this.database.query(`UPDATE mcp_oauth_sessions
+      SET current_pair_used_at=COALESCE(current_pair_used_at,$3) WHERE id=$1 AND access_token_hash=$2 AND revoked_at IS NULL
+      RETURNING id`,[row.id,hashSecret(token),now])).rows.length===0) return null;
     return { principal: {
       sessionId:row.id,tokenFamilyId:row.token_family_id,userId:row.user_id,email:row.email,name:row.user_name,
       organizationId:row.organization_id,organizationName:row.organization_name,workspaceId:row.workspace_id,

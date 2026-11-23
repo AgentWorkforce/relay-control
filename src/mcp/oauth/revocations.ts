@@ -10,7 +10,6 @@ export async function revokeMcpOAuthGrantRows(tx:SqlExecutor,id:string,reason:st
   const grant=(await tx.query<Grant>("SELECT * FROM mcp_oauth_grants WHERE id=$1 FOR UPDATE",[id])).rows[0];
   if(!grant) return false;
   await tx.query("DELETE FROM grok_bot_routines WHERE grant_id=$1", [id]);
-  await tx.query("DELETE FROM grok_bot_events WHERE grant_id=$1", [id]);
   await tx.query(`UPDATE mcp_oauth_grants SET revoked_at=$2,revoked_reason=$3 WHERE id=$1 AND revoked_at IS NULL`,[id,now,reason]);
   await tx.query(`UPDATE capy_grant_permits SET revoked_at=$2,revoke_reason='grant_revoked'
     WHERE grant_id=$1 AND revoked_at IS NULL`,[id,now]);

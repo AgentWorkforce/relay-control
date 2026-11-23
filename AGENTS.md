@@ -17,7 +17,9 @@ npm run build
 
 - Act autonomously on routine assigned work; ask forgiveness rather than permission. Preserve explicit production, release and credential gates.
 - For guidance, ask the engineering leads, the agent that spawned you, or the layered owner on Agent Relay.
-- Only a truly pressing or blocking question goes to `khaliq-gant` or `will-washburn` (CODEOWNERS) on Agent Relay.
+- Worker agents (any agent that is not a layered agent or a Grok bot) do not message `khaliq-gant` directly. Send questions and approval requests to your lead, who takes them to Khaliq.
+- An approval or direction Khaliq gives a lead covers that lead’s worker agents for that work only. It does not extend to other work, other repositories or another lead’s workers.
+- Layered agents and Grok bots take only a truly pressing or blocking question to `khaliq-gant` or `will-washburn` (CODEOWNERS) on Agent Relay.
 
 ## Cross-repo context
 
@@ -29,5 +31,5 @@ npm run build
 - Open PRs ready for review, never as drafts. If merging requires Khaliq’s OK, use `merge-train:hold`.
 - Immediately subscribe to PR feedback through Agent Relay using [this skill](https://github.com/AgentWorkforce/skills/blob/main/skills/subscribing-relay-webhooks-and-writebacks/SKILL.md), and verify the subscription.
 - Evaluate every finding. Address applicable feedback and explain declined changes; a PR with unaddressed feedback or conflicts is not ready.
-- When ready, loudly alert the CODEOWNERS and the agent that spawned you on Agent Relay.
-- Keep related older PRs moving by contacting their author agent; if unavailable, escalate to the CODEOWNERS or layered owner.
+- When ready, loudly alert your lead and the agent that spawned you on Agent Relay. Leads alert the CODEOWNERS.
+- Keep related older PRs moving by contacting their author agent; if unavailable, escalate to your lead or the layered owner.

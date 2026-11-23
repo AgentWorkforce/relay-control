@@ -3,6 +3,7 @@ import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
 import { readerKindOf } from "../session-read.js";
 import { recordedSummary } from "./summary.js";
+import { handleSessionAccessRoutes } from "./access-routes.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
 import {
@@ -45,9 +46,21 @@ export type SessionRouteContext = {
   now?: () => Date;
   /** Usage page: a first-page search by a member of this organization (counts only). */
   onSearch?: (organizationId: string, userId: string) => void;
+  /** Session access writes (./access-routes.ts): the JSON body, size-limited like neighbouring routes. */
+  readBody?: () => Promise<Record<string, unknown>>;
+  /** Session access writes: the same-origin check for a cookie-carried PATCH or POST. */
+  originAllowed?: () => boolean;
+  /** True when the request carries a bearer token rather than the dashboard cookie. */
+  hasBearer?: () => boolean;
 };
 
 const PREFIX = /^\/api\/v1\/workspaces\/([^/]+)\/sessions(?:\/(.*))?$/;
+/**
+ * Cloud's path for one session's events, which Agent Relay Desktop calls
+ * (`GET /api/v1/workspaces/:ws/reflex/sessions/:id/events`). Served here so a
+ * self-hosted desktop reads transcripts the same way.
+ */
+const REFLEX_EVENTS = /^\/api\/v1\/workspaces\/([^/]+)\/reflex\/sessions\/([^/]+)\/events$/;
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 const DAY_MS = 86_400_000;
 /** Most UTC days RelayHistory serves in one activity or output read. */
@@ -264,7 +277,74 @@ const LIST_RULES: Record<string, Rule> = {
   agent: { max: MAX_AGENT_LENGTH, pattern: AGENT_VALUE },
 };
 
+const EVENTS_RULES: Record<string, Rule> = {
+  source: { max: 512 },
+  cursor: { max: 4_096 },
+  order: { values: ["asc", "desc"] },
+  limit: { pattern: /^\d{1,4}$/ },
+};
+
+function eventsLimit(ctx: SessionRouteContext, raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const limit = Number(raw);
+  if (limit < 1 || limit > 1_000) {
+    throw ctx.httpError(400, "invalid_request", "limit must be between 1 and 1000");
+  }
+  return limit;
+}
+
+/** One page of a session's events, read for the caller's workspace only. */
+async function readSessionEvents(
+  ctx: SessionRouteContext,
+  workspaceId: string,
+  sessionId: string,
+  upstream: Record<string, string | undefined>,
+) {
+  const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+  const read = await readWorkspaceHistory(
+    ctx.config,
+    identityOf(access, ctx.request),
+    `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
+    params(upstream),
+  );
+  if (read.status !== "ok" || !Array.isArray(read.body.events)) {
+    throw upstreamShape("RelayHistory returned invalid events");
+  }
+  return { access, events: read.body.events.map(eventItem), nextCursor: cursorOf(read.body) };
+}
+
+/**
+ * `GET .../reflex/sessions/:sessionId/events`, answered as Cloud's route does
+ * (AgentWorkforce/cloud#6464): RelayHistory's `{sessionId, events, nextCursor}`,
+ * events in the order requested, read for exactly the authorized workspace and
+ * refused unless the page attests it. A caller's `workspace` selector is
+ * discarded, never forwarded. `source` is optional here, as it is upstream:
+ * the desktop does not send it.
+ */
+async function reflexSessionEvents(ctx: SessionRouteContext, match: RegExpExecArray): Promise<boolean> {
+  let workspaceId: string;
+  try {
+    workspaceId = decodeURIComponent(match[1]!);
+  } catch {
+    return false;
+  }
+  const sessionId = sessionPathId(ctx, match[2]!);
+  const url = new URL(ctx.url);
+  url.searchParams.delete("workspace");
+  const input = query({ ...ctx, url }, EVENTS_RULES);
+  const limit = eventsLimit(ctx, input.limit);
+  const page = await readSessionEvents(ctx, workspaceId, sessionId, {
+    source: input.source,
+    order: input.order,
+    limit: limit === undefined ? undefined : String(limit),
+    cursor: input.cursor,
+  });
+  ctx.json(ctx.response, 200, { sessionId, events: page.events, nextCursor: page.nextCursor }, true);
+  return true;
+}
+
 export async function handleSessionRoutes(ctx: SessionRouteContext): Promise<boolean> {
+  if (await handleSessionAccessRoutes(ctx)) return true;
   try {
     return await routeSessions(ctx);
   } catch (error) {
@@ -283,6 +363,8 @@ export async function handleSessionRoutes(ctx: SessionRouteContext): Promise<boo
 }
 
 async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
+  const reflex = REFLEX_EVENTS.exec(ctx.path);
+  if (reflex && ctx.method === "GET") return reflexSessionEvents(ctx, reflex);
   const match = PREFIX.exec(ctx.path);
   if (!match || ctx.method !== "GET") return false;
   let workspaceId: string;
@@ -510,42 +592,25 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       return true;
     }
     if (resource === "events") {
-      const input = query(ctx, {
-        source: { max: 512 },
-        cursor: { max: 4_096 },
-        order: { values: ["asc", "desc"] },
-        limit: { pattern: /^\d{1,4}$/ },
-      }, ["source"]);
-      const limit = input.limit === undefined ? 1_000 : Number(input.limit);
-      if (limit < 1 || limit > 1_000) {
-        throw ctx.httpError(400, "invalid_request", "limit must be between 1 and 1000");
-      }
+      const input = query(ctx, EVENTS_RULES, ["source"]);
+      const limit = eventsLimit(ctx, input.limit) ?? 1_000;
       const order = input.order ?? "asc";
-      const access = await ctx.workspaceAccess(ctx.request, workspaceId);
-      const read = await readWorkspaceHistory(
-        ctx.config,
-        identityOf(access, ctx.request),
-        `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
-        params({
-          source: input.source,
-          order,
-          limit: String(limit),
-          maxContent: "100000",
-          includeMessageId: "true",
-          cursor: input.cursor,
-        }),
-      );
-      if (read.status !== "ok" || !Array.isArray(read.body.events)) {
-        throw upstreamShape("RelayHistory returned invalid events");
-      }
-      const events = read.body.events.map(eventItem).sort((left, right) => {
+      const page = await readSessionEvents(ctx, workspaceId, sessionId, {
+        source: input.source,
+        order,
+        limit: String(limit),
+        maxContent: "100000",
+        includeMessageId: "true",
+        cursor: input.cursor,
+      });
+      const events = page.events.sort((left, right) => {
         const byTime = Date.parse(String(left.ts)) - Date.parse(String(right.ts));
         return byTime || String(left.eventId).localeCompare(String(right.eventId));
       });
       send({
         events,
-        members: await workspaceMembers(ctx, access.workspace.organizationId),
-        nextCursor: cursorOf(read.body),
+        members: await workspaceMembers(ctx, page.access.workspace.organizationId),
+        nextCursor: page.nextCursor,
         error: false,
       });
       return true;

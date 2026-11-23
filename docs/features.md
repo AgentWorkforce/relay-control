@@ -18,7 +18,7 @@ else is core and always on.
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool, "enrollment_keys": true, "enrollment_self_mint": bool } }` (`enrollment_keys` is always true; `enrollment_self_mint` is false only when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`; see [identity.md](identity.md#desktop-enrollment-keys)).
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool, "session_access": bool, "enrollment_keys": true, "enrollment_self_mint": bool } }` (`enrollment_keys` is always true; `enrollment_self_mint` is false only when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`; see [identity.md](identity.md#desktop-enrollment-keys)).
 - `/readyz` includes the same `capabilities` object.
 
 `session_delete` is derived from configuration, not selected by `SELFHOST_FEATURES`:
@@ -28,6 +28,13 @@ offer hard delete; it does not grant authorization, probe upstream health, or
 promise that a particular session's storage can be erased. The owner/admin,
 CSRF, operator-gate and pipeline checks still apply. Older servers omit this key;
 clients must treat absence as false. See [session-erasure.md](session-erasure.md).
+
+`session_access` is also derived from configuration: true only when session
+access management is on (read token mints carry the reader kind,
+`SESSION_READ_API_MCP_READS=true`, and a History URL is set). It tells the
+dashboard whether to offer per-session access; it grants nothing, and relaygate
+still decides who administers each session. Older servers omit it; treat
+absence as false. See [sessions-read-api.md](sessions-read-api.md#session-access).
 
 ## Refusals
 

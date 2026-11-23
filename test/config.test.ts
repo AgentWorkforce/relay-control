@@ -54,6 +54,65 @@ test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origi
   }
 });
 
+test("SELFHOST_ROUTED_SITE_URL is optional and must be an https origin", () => {
+  assert.equal(loadConfig(completeEnv).routedSiteOrigin, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: "  " }).routedSiteOrigin, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: "https://site.example.test" }).routedSiteOrigin,
+    "https://site.example.test");
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: " https://Site.Example.Test/ " }).routedSiteOrigin,
+    "https://site.example.test");
+  for (const bad of ["http://site.example.test", "https://site.example.test/cloud", "https://site.example.test/?a=1",
+    "https://site.example.test/#top", "https://u:p@site.example.test", "not a url"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: bad }),
+      /SELFHOST_ROUTED_SITE_URL must be an https origin without credentials, path, query, or fragment/, bad);
+  }
+});
+
+test("SELFHOST_EXTRA_SITES is optional and parses dashboard|API origin pairs", () => {
+  const extra = (value: string) => loadConfig({ ...completeEnv, SELFHOST_EXTRA_SITES: value }).extraSites;
+  assert.deepEqual(loadConfig(completeEnv).extraSites, []);
+  assert.deepEqual(extra("  "), []);
+  assert.deepEqual(extra("https://app.second.example.com|https://api.second.example.com"),
+    [{ dashboardOrigin: "https://app.second.example.com", apiOrigin: "https://api.second.example.com" }]);
+  assert.deepEqual(extra(" https://App.Second.Example.com/ | https://api.second.example.com ,\n https://app.third.example.com|https://api.third.example.com/ "), [
+    { dashboardOrigin: "https://app.second.example.com", apiOrigin: "https://api.second.example.com" },
+    { dashboardOrigin: "https://app.third.example.com", apiOrigin: "https://api.third.example.com" },
+  ]);
+  // A single-host site: both sides one origin, as the primary site allows.
+  assert.deepEqual(extra("https://one.second.example.com|https://one.second.example.com"),
+    [{ dashboardOrigin: "https://one.second.example.com", apiOrigin: "https://one.second.example.com" }]);
+  assert.equal(extra(Array.from({ length: 8 }, (_, i) => `https://app${i}.example.com|https://api${i}.example.com`).join(","))?.length, 8);
+});
+
+test("SELFHOST_EXTRA_SITES rejects malformed entries without echoing them", () => {
+  const load = (value: string, env: Record<string, string> = {}) =>
+    () => loadConfig({ ...completeEnv, ...env, SELFHOST_EXTRA_SITES: value });
+  const api = "https://api.second.example.com";
+  for (const bad of ["http://app.second.example.com", "https://app.second.example.com/dashboard",
+    "https://app.second.example.com/?a=1", "https://app.second.example.com/#top", "https://user:secret@app.second.example.com",
+    "not a url"]) {
+    assert.throws(load(`${bad}|${api}`),
+      /SELFHOST_EXTRA_SITES entry 1 must name https origins without credentials, path, query, or fragment/, bad);
+    assert.throws(load(`${api}|${bad}`), /SELFHOST_EXTRA_SITES entry 1 must name https origins/, bad);
+    assert.throws(load(`${bad}|${api}`), (error: Error) => !error.message.includes("secret") && !error.message.includes("second"), bad);
+  }
+  assert.throws(load("https://app.second.example.com"), /SELFHOST_EXTRA_SITES entry 1 must be <dashboard origin>\|<API origin>/);
+  assert.throws(load(`https://app.second.example.com|${api}|https://other.example.com`),
+    /SELFHOST_EXTRA_SITES entry 1 must be <dashboard origin>\|<API origin>/);
+  assert.throws(load(Array.from({ length: 9 }, (_, i) => `https://app${i}.example.com|https://api${i}.example.com`).join(",")),
+    /SELFHOST_EXTRA_SITES allows at most 8 sites/);
+
+  // A host belongs to one site only.
+  const clash = /SELFHOST_EXTRA_SITES entry \d reuses host .*, which already belongs to another site/;
+  assert.throws(load(`https://control.internal.example|${api}`), clash, "public URL host");
+  assert.throws(load(`https://app.second.example.com|${api}`, { SELFHOST_DASHBOARD_URL: "https://app.second.example.com/dashboard/" }),
+    clash, "dashboard URL host");
+  assert.throws(load(`https://app.second.example.com|https://site.example.test`, { SELFHOST_ROUTED_SITE_URL: "https://site.example.test" }),
+    clash, "routed site host");
+  assert.throws(load(`https://app.second.example.com|${api}, https://app.third.example.com|${api}`),
+    /SELFHOST_EXTRA_SITES entry 2 reuses host api\.second\.example\.com/, "another entry");
+});
+
 test("SELFHOST_DEFAULT_SHARING_MODE is optional and one of all, new or selected", () => {
   const unset = loadConfig(completeEnv);
   assert.equal(unset.defaultSharingMode, undefined);
@@ -123,6 +182,18 @@ test("session search @name parsing is default off and strictly boolean", () => {
   assert.equal(loadConfig(completeEnv).sessionSearchAgentTokens, false);
   assert.equal(loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "true" }).sessionSearchAgentTokens, true);
   assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
+});
+
+test("SESSION_READ_MINT_INCLUDE_READER_KIND overrides the relaygate default and is strictly boolean", () => {
+  const relaygate = { SELFHOST_RELAYGATE_PUBLIC_URL: "https://cast.selfhosted.company" };
+  assert.equal(loadConfig(completeEnv).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "  " }).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate, SESSION_READ_MINT_INCLUDE_READER_KIND: "" }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "true" }).sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, ...relaygate, SESSION_READ_MINT_INCLUDE_READER_KIND: "false" }).sessionReadApi.mintReaderKind, false);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_READER_KIND: "yes" }),
+    /SESSION_READ_MINT_INCLUDE_READER_KIND must be true or false/);
 });
 
 test("the read API mint role is default off and strictly boolean", () => {

@@ -59,6 +59,11 @@ All-zero counts therefore mean nothing was found, so check the id, workspace and
 returns the pipeline's receipt, with ids and counts only and never content. 404 `erasure_not_found` means no erase
 exists for that session.
 
+Under per-session access (see [sessions-read-api.md](sessions-read-api.md#session-access)) neither route checks
+whether the caller may read the session, and neither needs to: the target is only the ids the caller supplied
+(organization, workspace, source, session), and the receipt carries those ids, the request id, status, timestamps,
+artifact counts and states, flags and the acting user id, never the session's owner, title or content.
+
 ```json
 {
   "orgId": "…", "workspaceId": "…", "source": "…", "sessionId": "…", "requestId": "…",

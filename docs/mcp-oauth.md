@@ -132,9 +132,58 @@ and is refused with `invalid_scope` unless `relay:mcp` is requested with it
 (see Session reads).
 
 Access tokens last one hour; refresh tokens last 30 days. Refresh rotates the
-pair and preserves its issued scope limit. Retired refresh tokens are always
-refused. Verified reuse within 30 seconds leaves the family live to tolerate
-racing refresh requests; verified reuse after that window revokes the grant.
+pair and preserves its issued scope limit. A retired refresh token presented
+within 30 seconds of its rotation is refused and the connection stays live, to
+tolerate racing refresh requests. After that window, if the exact pair it was
+rotated into has never been used as a bearer token, the client is assumed to
+have lost the refresh response: the server rotates that unused pair again and
+returns the new pair on the same connection and approved agent. Recovery is
+available for 36 hours after the token's first rotation and never past the
+retired token's own expiry. A re-issued pair keeps the refresh expiry it had;
+its access expiry never passes it. A retry within 30 seconds of a recovery is
+refused without revoking, like a retry within 30 seconds of the rotation.
+Otherwise the retired token counts as reuse
+and revokes the grant. Revoking a retired refresh token at the revocation
+endpoint ends the grant. Each refresh logs one `mcp_oauth_refresh` line with
+`outcome` (`rotated`, `extended`, `reissued_undelivered`, `refused` or
+`revoked`), the
+grant ID, a reason and the seconds since retirement; it never logs tokens,
+hashes, user IDs or agent names.
+
+Google Connected Apps requires a refresh to return the refresh token it was
+given. A client whose every registered redirect URI is a Google Connected Apps
+callback (`https://oauth-redirect.googleusercontent.com`, or its `-sandbox`
+and `-test` hosts, with a single `/r/<id>` or `/a/<id>` path segment and no
+query, fragment or userinfo) therefore gets stable refresh instead of
+rotation: the refresh response returns the presented refresh token, its
+expiry moves to 30 days after that refresh, and the new access token is
+issued as a separate session row linked to the code-issued session. Earlier
+access tokens stay valid until their own one-hour expiry. A linked row's own
+refresh token is never returned and is refused if presented; expired linked
+rows are deleted at the next refresh. This is a weaker bearer lifecycle than
+rotation: a copied refresh token keeps working until it expires or is
+revoked, with no reuse detection or undelivered-response recovery, so it is
+limited to that callback set. A client with any other redirect URI keeps
+rotation. Revoking the refresh token or the grant ends every access token it
+issued. A replayed authorization code that continued an existing connection
+revokes only the session that code issued and the access tokens refreshed
+from it; continuation detection does not count those refreshed rows.
+
+Upgrading to migration 0084: rotations made before the upgrade are not
+recoverable, so their reuse revokes the grant as before. During a rolling
+upgrade a server still on the previous version neither records first use nor
+writes the successor link.
+
+Upgrading to migration 0085 (`mcp_oauth_sessions.parent_session_id`): apply it
+before the new version serves traffic, because new sessions write that
+column. During a rolling upgrade a server still on the previous version
+rotates the refresh token of a Google callback client as before and counts
+its refreshed rows in continuation detection, and its code-replay
+revocation of a continuation session leaves that session's linked rows live
+until their one-hour expiry. A Google callback connection whose refresh
+token a previous version already rotated is not repaired by the upgrade: a
+client that kept the earlier token presents a retired token, which follows
+the reuse rules above, and the connector must be reconnected once.
 
 Each connection acts only as its approved relay agent. First use pins the
 agent's immutable ID. A rename follows that same ID; a replacement holding

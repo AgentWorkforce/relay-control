@@ -207,9 +207,12 @@ test("on a gate-only install a hosted participant enrols at relaygate and every 
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   assert.ok(listed.agents.some((agent: any) => agent.name === peer.name));
   structured(await client.callTool({ name: "subscribe_relay_channel", arguments: { channel: "team", create: true } }));
-  structured(await client.callTool({ name: "post_relay_channel", arguments: { channel: "team", text: "posted through the gate" } }));
+  const teamPost = structured(await client.callTool({ name: "post_relay_channel", arguments: { channel: "team", text: "posted through the gate" } }));
   const history = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "team" } }));
   assert.deepEqual(history.messages.map((message: any) => message.text), ["posted through the gate"]);
+  structured(await client.callTool({ name: "post_relay_channel", arguments: { channel: "team", text: "threaded through the gate", thread_id: teamPost.message_id } }));
+  const thread = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "team", thread_id: teamPost.message_id } }));
+  assert.deepEqual(thread.replies.map((message: any) => message.text), ["threaded through the gate"]);
   structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   structured(await client.callTool({ name: "relay_status", arguments: {} }));
   structured(await client.callTool({ name: "set_relay_agent_card", arguments: { description: "Takes notes", skills: [] } }));
@@ -219,7 +222,7 @@ test("on a gate-only install a hosted participant enrols at relaygate and every 
   // one control-plane check that the name is free before enrolling.
   assert.deepEqual(directSince(mark), ["GET /v1/agents/notes-agent workspace-key"]);
   for (const expected of ["POST /v1/register", "GET /v1/whoami", "POST /v1/dm", "GET /v1/deliveries", "GET /v1/agents", "POST /v1/channels",
-    "GET /v1/channels", "PATCH /v1/agent"]) {
+    "GET /v1/channels", `GET /v1/messages/${teamPost.message_id}/replies`, "PATCH /v1/agent"]) {
     assert.ok(state.seen.includes(expected), `${expected} went through relaygate: ${JSON.stringify(state.seen)}`);
   }
 });

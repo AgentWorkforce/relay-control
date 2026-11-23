@@ -19,9 +19,9 @@ There are three phases, all in relay-control:
 
 ## 0. Current state
 
-### 0.1 Cloud (source of the copy; read only)
+### 0.1 Agent Relay Cloud (source of the copy)
 
-| Piece | Location in `cloud` | What it does |
+| Piece | Where it lives in Cloud | What it does |
 |---|---|---|
 | Routine contract | Cloud's Grok routine module | `parseGrokRoutineUrl`, `parseGrokRoutineKey`, `parseGrokRoutineDetails` (one-paste), `parseGrokRoutineAgentName`, `perBotConnectionRequired`, `grokRoutineHeaders` (Bearer `crsr_` key + `X-MCP-Subscription-Id` + `webhook-id`), `SHOW_UI_GUIDANCE`, and **`grokRoutinePrompt()`**: a hardcoded template for webhook or polling mode, with or without reply rights |
 | Sender-check strings | Cloud's sender-check module | `SENDER_CHECK` / `REPLY_SETTING` labels, quoted by both the prompt and `get_event`'s app block |

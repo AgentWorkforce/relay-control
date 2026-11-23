@@ -6,10 +6,10 @@ import { connectorKind, isGrokRoutineKind } from "./mcp/oauth/connector-kind.js"
 import { createCursorCloud } from "./mcp/cursor-cloud.js";
 import type { CursorJwks } from "./mcp/cursor-oidc.js";
 import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
-import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
+import { agentIdentityHoldsName, ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
-import { GrokRoutines } from "./mcp/grok-routines.js";
+import { GrokRoutines, grokRoutinesOptions } from "./mcp/grok-routines.js";
 import { AgentRules, isAgentRulesAudience } from "./agent-rules/service.js";
 import { AgentRulesInputError } from "./agent-rules/overlays.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
@@ -21,10 +21,11 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
+import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
-import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
+import { ApiTokenStore, ENROLLMENT_KEY_PREFIX, type AgentIdentityRosterCheck } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
@@ -42,7 +43,11 @@ import {
 } from "./fleet/view.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
-import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
+import {
+  listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError, restrictReadAudit, type ReadAuditAccessProbe,
+} from "./mcp/read-audit.js";
+import { accessViaDashboardReader, readWorkspaceHistory, type HistoryIdentity } from "./sessions/history.js";
+import { confirmsAccessAdministrator, sessionAccessConfigured } from "./sessions/access.js";
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
@@ -387,13 +392,8 @@ function routeMatch(pathname: string, pattern: RegExp): string[] | null {
   return match ? match.slice(1).map(decodeURIComponent) : null;
 }
 
-/** Origins allowed to send cookie-authenticated writes. */
-export function browserOriginsFor(config: SelfhostConfig): string[] {
-  return [...new Set([
-    new URL(config.publicBaseUrl).origin,
-    new URL(config.dashboardUrl).origin,
-  ])];
-}
+// Re-exported: src/server.ts and tests import it from here.
+export { browserOriginsFor };
 
 /** A bodiless cookie DELETE needs an allowed Origin, or same-origin fetch metadata. */
 function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[]): boolean {
@@ -512,6 +512,8 @@ export function createApp(input: {
   const capabilities = () => ({
     ...features,
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
+    // Session reads follow per-session access (docs/sessions-read-api.md#session-access).
+    session_access: sessionAccessConfigured(config) && Boolean(config.relayhistoryUrl),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
     // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
@@ -592,13 +594,57 @@ export function createApp(input: {
   // api_url == <its site>/cloud, so sign-in answers name the origin the
   // request arrived on. Only these configured origins are ever echoed, so a
   // forged Host header cannot point a client elsewhere.
+  //
+  // A third origin (SELFHOST_ROUTED_SITE_URL, docs/repository-guide.md): an edge
+  // router on another site origin forwards <site>/cloud/... here, so those
+  // requests arrive with this service's own Host, and the router sets
+  // x-original-host to its site's host. That header only selects among
+  // configured values; nothing from it is echoed. It is honoured without proof
+  // from the router because the origin goes back only to the caller that sent
+  // the header, is an operator-configured public value, scopes no cookie, is
+  // never the target of a redirect sent here and is not stored. That is also
+  // why only the Desktop/CLI API answers use apiSiteBaseUrl: emailed links,
+  // OIDC redirect URIs and the MCP endpoint URL keep the Host-selected origin.
+  //
+  // Extra sites (SELFHOST_EXTRA_SITES) are more host sets in front of this same
+  // deployment: each of their hosts maps to its own configured origin here, so
+  // a request arriving on one is answered with that origin. Config validation
+  // keeps every host in one site only.
   const siteBases = new Map<string, string>([
     [new URL(config.dashboardUrl).host.toLowerCase(), new URL(config.dashboardUrl).origin],
     [new URL(config.publicBaseUrl).host.toLowerCase(), config.publicBaseUrl.replace(/\/+$/, "")],
+    ...(config.extraSites ?? []).flatMap((site): [string, string][] => [
+      [new URL(site.dashboardOrigin).host.toLowerCase(), site.dashboardOrigin],
+      [new URL(site.apiOrigin).host.toLowerCase(), site.apiOrigin],
+    ]),
   ]);
+  // Either host of an extra site -> that site's dashboard origin.
+  const extraDashboards = new Map<string, string>((config.extraSites ?? []).flatMap((site): [string, string][] => [
+    [new URL(site.dashboardOrigin).host.toLowerCase(), site.dashboardOrigin],
+    [new URL(site.apiOrigin).host.toLowerCase(), site.dashboardOrigin],
+  ]));
+  function requestHost(request: IncomingMessage): string {
+    return typeof request.headers.host === "string" ? request.headers.host.trim().toLowerCase() : "";
+  }
   function siteBaseUrl(request: IncomingMessage): string {
-    const host = typeof request.headers.host === "string" ? request.headers.host.trim().toLowerCase() : "";
-    return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
+    return siteBases.get(requestHost(request)) ?? config.publicBaseUrl.replace(/\/+$/, "");
+  }
+  /** The dashboard URL for the site the request arrived on: an extra site's origin with the configured path, else dashboardUrl. */
+  function dashboardUrlFor(request: IncomingMessage): string {
+    const origin = extraDashboards.get(requestHost(request));
+    if (!origin) return config.dashboardUrl;
+    const primary = new URL(config.dashboardUrl);
+    return new URL(`${primary.pathname}${primary.search}`, origin).toString();
+  }
+  const routedSiteOrigin = config.routedSiteOrigin ?? null;
+  const routedSiteHost = routedSiteOrigin ? new URL(routedSiteOrigin).host.toLowerCase() : null;
+  function apiSiteBaseUrl(request: IncomingMessage): string {
+    if (routedSiteOrigin && routedSiteHost) {
+      // One header, one value: Node joins repeats with ", ", which never matches.
+      const forwarded = request.headers["x-original-host"];
+      if (typeof forwarded === "string" && forwarded.trim().toLowerCase() === routedSiteHost) return routedSiteOrigin;
+    }
+    return siteBaseUrl(request);
   }
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
@@ -626,6 +672,19 @@ export function createApp(input: {
       setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
+  // Agent-identity mint: same "mine vs taken" rule as the hosted registration
+  // path. The mint route's access check binds the workspace before this runs;
+  // a still-unbound workspace (a direct store caller) is not provisioned here
+  // and reads as free. Any roster agent other than the identity's own,
+  // released or not, holds the name.
+  const agentIdentityRoster: AgentIdentityRosterCheck = async (workspaceId, agentName, ownerRef) => {
+    const apiKey = await store.existingRelaycastApiKey(workspaceId);
+    if (apiKey === null) return "free";
+    const remote = await oauthRelay.getAgent(apiKey, agentName);
+    if (!remote) return "free";
+    return ownerRef !== null && !isBindingOwnedIdentity(remote.metadata) && remote.metadata.source === HOSTED_SOURCE &&
+      remote.metadata.cloud_workspace_id === workspaceId && remote.metadata.owner_hash === ownerHash(ownerRef) ? "free" : "held";
+  };
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
@@ -634,14 +693,9 @@ export function createApp(input: {
   }) : null;
   // Loaded once: a malformed or unpinned bundle fails start-up.
   const agentRules = input.agentRules ?? new AgentRules({ database: store.database, now: input.now });
-  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
-      database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
-      cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
-      ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
-      publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
-      cloudCopy:config.mcpOAuth?.grokCloudCopy===true,
-      ...(config.mcpOAuth?.grokDynamicPrompt ? { dynamicPrompt:{ bootstrapVersion:agentRules.bundle.bootstrapVersion } } : {}),
-    }) : undefined;
+  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines(grokRoutinesOptions(config,{
+      database:store.database,tenancyMode:store.tenancy,client:oauthRelay,fetchImpl:input.messagingFetch,now:input.now,
+    })) : undefined;
   // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
   const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({
     config:config.cursorCloud,publicOrigin:config.publicBaseUrl,keyring:config.encryptionKeyring,database:store.database,
@@ -675,6 +729,8 @@ export function createApp(input: {
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
+      // A workspace agent identity's name (any letter case) is never approvable for a person.
+      if(await agentIdentityHoldsName(store.database,principal.workspaceId,name)) return "taken";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
       if(isBindingOwnedIdentity(remote.metadata) || remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
@@ -1065,6 +1121,41 @@ export function createApp(input: {
     return { principal: auth.principal, workspace, token: auth.token };
   }
 
+  // The audit exporter's own session access, asked with its own read token.
+  // A credential that cannot hold a person's read token reads nothing (null).
+  function readAuditAccessProbe(
+    access: Awaited<ReturnType<typeof workspaceAccess>>,
+    request: IncomingMessage,
+  ): ReadAuditAccessProbe | null {
+    if (!access.principal.scopes.includes("rth:read") || access.principal.pendingHandoff || !config.relayhistoryUrl) return null;
+    const identity: HistoryIdentity = {
+      userId: access.principal.userId,
+      organizationId: access.workspace.organizationId,
+      workspaceId: access.workspace.id,
+      role: access.workspace.role,
+      callerToken: access.token,
+      readerKind: readerKindOf(request),
+    };
+    return {
+      // Fails closed (confirmsAccessAdministrator): a 200 naming the asked
+      // session, or relaygate's session-not-found 404 (it checks administration
+      // before existence). Any other answer, including another 404 body, is not
+      // an administrator, so a backend without the access routes cannot make
+      // every exporter one.
+      administrator: async (sessionId) => {
+        const reply = await accessViaDashboardReader(config, identity, {
+          method: "GET", path: `/v1/sessions/${encodeURIComponent(sessionId)}/access`,
+        });
+        return reply.kind === "response" && confirmsAccessAdministrator(reply.status, reply.body, sessionId);
+      },
+      readable: async (sessionId) => {
+        const read = await readWorkspaceHistory(config, identity, `/v1/sessions/${encodeURIComponent(sessionId)}/metadata`,
+          new URLSearchParams(), { allowNotFound: true });
+        return read.status === "ok" && read.body.sessionId === sessionId;
+      },
+    };
+  }
+
   // Deployment sharing-mode values (docs/capture-policy.md), applied per caller.
   const sharing = sharingDeployment(config);
   const sharingConfigured = sharing.defaultSharingMode !== undefined || sharing.overrideRoles !== undefined;
@@ -1330,7 +1421,8 @@ export function createApp(input: {
     // Agent Relay Desktop's Cloud-shaped browser links on a separate dashboard host.
     const dashboardLink = dashboardLinkRedirect({
       method, target: request.url ?? "/", host: request.headers.host,
-      publicBaseUrl: config.publicBaseUrl, dashboardUrl: config.dashboardUrl,
+      // An extra site's links open that site's dashboard, not the primary one.
+      publicBaseUrl: config.publicBaseUrl, dashboardUrl: dashboardUrlFor(request),
     });
     if (dashboardLink) {
       response.writeHead(302, { location: dashboardLink, "cache-control": "no-store", "referrer-policy": "no-referrer" });
@@ -1660,7 +1752,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           ...(consentedHostName ? { consentedHostName } : {}),
         });
         response.writeHead(status, {
-          location: handoffCallbackUrl(login, issued, `${siteBaseUrl(request)}/cloud`),
+          location: handoffCallbackUrl(login, issued, `${apiSiteBaseUrl(request)}/cloud`),
           "cache-control": "no-store",
           "referrer-policy": "no-referrer",
         });
@@ -1755,7 +1847,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         accessTokenExpiresAt: issued.accessTokenExpiresAt,
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
         tokenType: "Bearer",
       }, true);
       return;
@@ -1910,7 +2002,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         accessTokenExpiresAt: issued.accessTokenExpiresAt,
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
         tokenType: "Bearer",
         workspace: {
           id: target.id,
@@ -1942,7 +2034,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Under /cloud/api so it reaches this service on a shared dashboard
       // origin too (the ingress sends only /cloud/api and /login here). A GET
       // redirects to the dashboard's approval page.
-      const verification = `${siteBaseUrl(request)}/cloud/api/v1/auth/device/approve`;
+      const verification = `${apiSiteBaseUrl(request)}/cloud/api/v1/auth/device/approve`;
       json(response, 201, {
         device_code: started.deviceCode,
         user_code: started.userCode,
@@ -1958,7 +2050,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // verification_uri(_complete): a person opened it; send them to the
       // dashboard's approval page, which signs them in first if needed.
       response.writeHead(303, {
-        location: deviceApprovalPageUrl(config.dashboardUrl, url.searchParams.get("user_code")),
+        location: deviceApprovalPageUrl(dashboardUrlFor(request), url.searchParams.get("user_code")),
         "cache-control": "no-store",
         "referrer-policy": "no-referrer",
       });
@@ -2083,7 +2175,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         scope: result.tokens.scopes.join(" "),
         // Hosted Cloud's shape: the API base is the site's /cloud mount, and
         // Desktop refuses a sign-in whose api_url is anything else.
-        api_url: `${siteBaseUrl(request)}/cloud`,
+        api_url: `${apiSiteBaseUrl(request)}/cloud`,
       }, true);
       return;
     }
@@ -2143,7 +2235,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         access_token_expires_at: result.tokens.accessTokenExpiresAt,
         refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
         scope: result.tokens.scopes.join(" "),
-        api_url: `${siteBaseUrl(request)}/cloud`,
+        api_url: `${apiSiteBaseUrl(request)}/cloud`,
         // Workspace policy (docs/workspace-policy.md): whether this session is
         // managed (the key carries admin policy consent), the revision to
         // compare a cached policy against, and the document itself so the
@@ -2179,7 +2271,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
         tokenType: "Bearer",
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
       }, true);
       return;
     }
@@ -2524,6 +2616,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw error;
       }
       const page = await listReadAudit(store.database, access.workspace.id, query);
+      // With per-session access, a non-administrator exporter sees only the
+      // session ids it may itself read (docs/shared-session-read-audit.md).
+      const shown = config.sessionReadApi?.mintReaderKind
+        ? await restrictReadAudit(page.records, readAuditAccessProbe(access, request))
+        : { restricted: false as const, records: page.records };
       if (query.format === "csv") {
         response.writeHead(200, {
           "content-type": "text/csv; charset=utf-8",
@@ -2531,10 +2628,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           "content-disposition": `attachment; filename="shared-session-read-audit-${access.workspace.id}.csv"`,
           ...(page.nextCursor ? { "x-next-cursor": page.nextCursor } : {}),
         });
-        response.end(readAuditCsv(page.records));
+        response.end(readAuditCsv(shown.records, { restricted: shown.restricted }));
         return;
       }
-      json(response, 200, { workspace_id: access.workspace.id, records: page.records, next_cursor: page.nextCursor }, true);
+      json(response, 200, { workspace_id: access.workspace.id, records: shown.records, next_cursor: page.nextCursor }, true);
       return;
     }
 
@@ -3139,6 +3236,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         recordUsage(() => usage.increment(organizationId, "searches"));
         recordPeople(() => people.recordSearch(organizationId, userId));
       },
+      readBody: () => requestObject(request),
+      originAllowed: () => cookieRequestAllowed(request, browserOrigins),
+      hasBearer: () => Boolean(bearer(request)),
     })) {
       return;
     }
@@ -3416,6 +3516,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      agentRoster: agentIdentityRoster,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
     })) {
@@ -3476,6 +3577,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const adminError = adminErrorResponse(error);
       if (adminError) {
+        if (adminError.retryAfterSeconds !== undefined) response.setHeader("retry-after", String(adminError.retryAfterSeconds));
         json(response, adminError.status, adminError.body, true);
         return;
       }
