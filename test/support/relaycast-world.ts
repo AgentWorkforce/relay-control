@@ -38,7 +38,7 @@ export function createRelaycastWorld(roster: unknown[]) {
   const subscriptions = new Map<string, Subscription>();
   const idempotent = new Map<string, unknown>();
   /** Every request body, for assertions about what was sent upstream. */
-  const bodies: Array<{ method: string; path: string; body: Record<string, any> | null }> = [];
+  const bodies: Array<{ method: string; path: string; body: Record<string, any> | null; query?: string }> = [];
   /**
    * Injected failures keyed by `METHOD path`. `after` applies the request
    * first and then fails the response (a lost response); otherwise the
@@ -47,6 +47,10 @@ export function createRelaycastWorld(roster: unknown[]) {
   const failures = new Map<string, Array<{ status: number; code: string; after: boolean }>>();
   /** Fleet nodes per workspace key (GET /v1/nodes), raw as Relaycast serves them. */
   const nodes = new Map<string, Array<Record<string, any>>>();
+  /** While positive, the every-state roster read (GET /v1/nodes without status=online) fails with 503 and decrements. */
+  const everyStateNodesFailures = { remaining: 0 };
+  /** When true, GET /v1/nodes ignores history=true and answers the legacy bare array (an older Relaycast). */
+  const nodesHistory = { unsupported: false };
   /** Native spawn/release invocations. `spawnOutcome` decides how the next spawn completes. */
   const invocations = new Map<string, Record<string, any>>();
   const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
@@ -103,7 +107,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   async function handle(method: string, path: string, query: URLSearchParams, bearer: string, body: Record<string, any> | null,
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
-    bodies.push({ method, path, body });
+    bodies.push({ method, path, body, query: query.toString() });
     const queued = failures.get(`${method} ${path}`);
     const failure = queued?.shift();
     if (queued && queued.length === 0) failures.delete(`${method} ${path}`);
@@ -152,8 +156,19 @@ export function createRelaycastWorld(roster: unknown[]) {
       return ok(leadersDocument(workspace ? bearer : caller!.workspaceKey));
     }
     if (method === "GET" && path === "/v1/nodes" && workspace) {
+      if (query.get("status") !== "online" && everyStateNodesFailures.remaining > 0) {
+        everyStateNodesFailures.remaining -= 1;
+        return fail(503, "unavailable");
+      }
+      // As Relaycast serves it: status=online honors limit; history=true is the paginated every-state read
+      // ({ nodes, next_cursor }, limit default 100, max 500); otherwise the bare array is every node.
       const listed = (nodes.get(bearer) ?? []).filter(node => query.get("status") !== "online" || node.live === true);
-      return ok(listed);
+      if (query.get("history") === "true" && !nodesHistory.unsupported) {
+        const limit = Math.min(Math.max(1, Number(query.get("limit") ?? 100)), 500);
+        const page = listed.slice(0, limit);
+        return ok({ nodes: page, next_cursor: listed.length > limit ? page.at(-1)!.id : null });
+      }
+      return ok(query.get("status") === "online" && query.get("limit") ? listed.slice(0, Number(query.get("limit"))) : listed);
     }
     if (method === "POST" && path === "/v1/actions/spawn/invoke" && caller) {
       const input = body!.input as Record<string, any>;
@@ -370,7 +385,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
+    nodes, everyStateNodesFailures, nodesHistory, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);

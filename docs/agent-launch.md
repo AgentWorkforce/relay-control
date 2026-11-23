@@ -58,7 +58,9 @@ and memory) ranks above everything but permission; see [Free memory](#free-memor
 
 1. `list_relay_spawn_targets`: choose an `allowed` `target_node` and one of its
    `harnesses`.
-2. `spawn_relay_agent` with `name`, `cli`, `target_node`, `task` (at most
+2. `spawn_relay_agent` with `name`, `cli`, `target_node` (a node id, or the
+   name of exactly one live node; see [Target node input](#target-node-input)),
+   `task` (at most
    8,192 UTF-8 bytes), optional `worker_cwd` (literal absolute path) and a
    stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
@@ -76,6 +78,94 @@ and memory) ranks above everything but permission; see [Free memory](#free-memor
 3. `get_relay_spawn_status` until `ready` (with the agent's address),
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
+
+## Target node input
+
+`target_node` is free text: it is trimmed, then accepts 1 to 128 characters
+with no control, format or line/paragraph separator characters (Unicode `Cc`,
+`Cf`, `Zl`, `Zp`: bidi overrides, zero-width characters, U+2028/U+2029).
+
+Relaycast keeps node names unique per workspace, and its spawn selector trims
+the requested name and matches it exactly, case-sensitively, against stored
+names of nodes in every state. This server always sends the stored name of the
+node it resolved, so each node id seen in the page read reaches exactly one
+machine.
+
+- **Id first.** A value equal to a live node's id selects it; that launch never
+  reads offline nodes. On a miss, nodes of every state are read: an offline
+  node's id keeps its offline (or not-allowed) refusal and is never reread as
+  another node's name. If that read is incomplete, a live name match is
+  refused, since it might be an unseen node's id, and so is a value matching
+  nothing (both still list the live ids and names):
+  - the read failed, or answered anything but `{ nodes, next_cursor }`
+    (including a bare array), logged as the counter-only
+    `spawn_every_state_roster_failed`: `retryable: true`, try again or pass
+    the node's id;
+  - Relaycast reported another page (`next_cursor`): `retryable: false`, since
+    the same roster gives the same answer; pass the node's id.
+- **Past the live page.** A node that the every-state read shows as live but
+  that is not on the live page (more than 100 live nodes) cannot be ranked or
+  checked for capacity. By id or by name it is refused with
+  `spawn_target_unavailable`, `retryable: true`: try again, or pass the id of
+  a node from `list_relay_spawn_targets`.
+- **Name fallback.** Otherwise the value is compared with node names of every
+  state (Relaycast's selector matches stored names of every state), one entry
+  per node id with the live page's view first, after trimming, NFC
+  normalization, curly apostrophes (U+2018, U+2019, U+02BC) as a straight
+  `'`, and lowercasing. It resolves only when exactly one node carries that
+  key and the node is live (see the tiebreak below). Admission (permission,
+  harness, capacity, memory) then runs on that node as it would for its id, and the receipt and
+  journal record its id. A lone offline match keeps its offline (or
+  not-allowed) refusal, so an offline node's own name never launches on a live
+  look-alike; an offline node whose stored name is padded gets the
+  padded-name refusal below instead.
+- **Exact-name tiebreak.** When several nodes of any state share the key, the
+  one whose stored name equals the trimmed value exactly (case-sensitive, byte
+  for byte) is used if it is live: that is the node Relaycast's exact selector
+  reaches. With a live `Studio` and an offline `studio`, `Studio` launches on
+  the live node, while `studio` and `STUDIO` stay refused. The trade-off: a
+  caller who types one variant's exact spelling gets that machine without
+  being told a look-alike exists, in exchange for not refusing a value that
+  names exactly one node to Relaycast. An exact match that is offline is never
+  swapped for a live variant. If the every-state read is incomplete, a live
+  exact match gets the could-not-read refusal above (retryable by its cause),
+  not the ambiguity refusal.
+- **Ambiguous names.** Otherwise several nodes of any state on that key are
+  refused with `spawn_target_unavailable`, `retryable: false`, listing their
+  `id (name)` pairs; pass one of those ids. Case or apostrophe variants are distinct
+  machines to Relaycast, so a launch by either id is fine and live ones remain
+  alternatives.
+- **Padded names.** A node whose stored name has surrounding whitespace
+  (`" lab "`) can never be reached by its own name, because the selector trims
+  it. It is refused by id or by name, live or offline, `retryable: false`,
+  asking the owner to rename it, and is never offered as an alternative.
+- **No match.** Refused with `spawn_target_unavailable`, `retryable: false`,
+  listing live ids and names in the message and in `valid_targets` (at most
+  20, with an "(and N more; call list_relay_spawn_targets)" suffix; ambiguous
+  matches are capped the same way).
+- **Echoed text.** Node, machine and owner names and the ranking reason in
+  refusal messages, `node`, `owner`, `alternatives`, `valid_targets` and
+  `list_relay_spawn_targets` results come
+  from the roster or user profiles, so control, format and separator
+  characters in them are shown as `\u{...}` escapes. `node` is for display
+  only: pass ids back as `target_node`.
+- **Replayed failures.** Reusing the key of a failed launch returns its
+  receipt with `alternatives` as of now, from the live read only (no
+  every-state read), excluding the receipt's node by id however `target_node`
+  was spelled. If that read fails, the receipt is returned without them.
+- **Idempotency.** An `idempotency_key` covers the trimmed `target_node` as
+  given, so reusing a key after switching from a node's name to its id (or to
+  another spelling of its name) is refused as a different launch.
+- **Limits.** Each roster read is one page of Relaycast's `GET /v1/nodes`.
+  The live read (`status=online&limit=100`) sees at most 100 live nodes. The
+  every-state read uses the paginated `history=true` contract (`{ nodes,
+  next_cursor }`) at Relaycast's maximum `limit` of 500
+  (`NODE_LIST_HISTORY_MAX_LIMIT`); a `next_cursor` means more nodes exist and
+  the read is incomplete, as above. Relaycast has served that contract since
+  `@relaycast/engine` 8.9.0; any other answer, including the older bare
+  array, is treated as a failed read.
+  Matching is only as complete as the page read: an id or name beyond it is
+  not seen.
 
 Native clients must retain `Mcp-Session-Id`: their launches belong to that
 session. OAuth launches belong to the exact grant and remain accessible after
