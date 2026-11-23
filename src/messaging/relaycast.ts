@@ -894,14 +894,14 @@ export function createRelaycastClient(input: {
 
     /**
      * Nodes of every state visible to this workspace key: one page of the paginated history read, at most
-     * RELAY_NODE_HISTORY_LIMIT. `complete` is false when Relaycast reports a next page (`next_cursor`). A
-     * Relaycast without the history read answers the legacy bare array, which is the whole roster.
+     * RELAY_NODE_HISTORY_LIMIT. `complete` is false when Relaycast reports a next page (`next_cursor`).
+     * Relaycast has served `{ nodes, next_cursor }` here since @relaycast/engine 8.9.0; any other shape,
+     * including the older bare array, is an invalid response, which callers treat as a failed read.
      */
     async listAllSpawnTargets(workspaceKey: string): Promise<{ targets: RelaySpawnTarget[]; complete: boolean }> {
       const data = await labeled("list_spawn_targets", () =>
         call("GET", `/v1/nodes?history=true&limit=${RELAY_NODE_HISTORY_LIMIT}`, workspaceKey));
-      if (Array.isArray(data)) return { targets: data.flatMap(spawnTargetFrom), complete: true };
-      const page = record(data);
+      const page = Array.isArray(data) ? null : record(data);
       if (!page || !Array.isArray(page.nodes)) throw new RelaycastCallError(502, "", true);
       const cursor = page.next_cursor;
       if (cursor !== null && cursor !== undefined && typeof cursor !== "string") throw new RelaycastCallError(502, "", true);

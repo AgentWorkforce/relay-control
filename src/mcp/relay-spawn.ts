@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { SqlExecutor } from "../database.js";
 import {
-  RELAY_HARNESS_ID_PATTERN, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
+  RELAY_HARNESS_ID_PATTERN, RELAY_NODE_PAGE_LIMIT, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
 } from "../messaging/relaycast.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import type { McpContext } from "./context.js";
@@ -412,7 +412,18 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const previous = await deps.store.findKey(owned, idempotencyHash);
         if (previous) {
           if (previous.requestHash !== requestHash) throw new RelayToolError("This idempotency key already describes a different launch.");
-          return result(previous);
+          if (previous.state !== "failed") return result(previous);
+          // A replayed failure offers alternatives as of now, from the live read only (no every-state read). They are
+          // advice, so an unreachable roster must not block receipt recovery. The receipt already names its node:
+          // that id is excluded, however target_node was spelled.
+          const alternatives = await (async () => {
+            const live = (await deps.client.listSpawnTargets(deps.workspaceKey)).filter(eligible);
+            const ranking = rankTargets(live, await deps.owners(live.map(item => item.id)), userId, await placementOptions(input.cli));
+            const recorded = ranking.targets.find(item => item.target_node === previous.nodeId);
+            return alternativesFor({ ...ranking, ranked: ranking.ranked.filter(entry => !padded(entry.candidate.placed)) }, input.cli,
+              { id: previous.nodeId, repositories: recorded?.repositories }).map(displayPlaced);
+          })().catch(() => null);
+          return alternatives ? { ...result(previous), alternatives } : result(previous);
         }
         const online = await deps.client.listSpawnTargets(deps.workspaceKey);
         // Ids first. Only an id miss on the live page reads nodes of every state, so offline nodes never displace
@@ -436,7 +447,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         // launches on a live look-alike. Without the every-state read neither can be ruled out, so a single live
         // name match is held back and refused as retryable instead.
         const nameKey = nodeNameKey(input.target_node);
-        const roster = everyState ? [...online, ...everyState.filter(node => !online.some(live => live.id === node.id))] : listable(online);
+        // One entry per id, the live page's view first.
+        const roster = everyState ? [...new Map([...everyState, ...online].map(node => [node.id, node] as const)).values()] : listable(online);
         const named = byId || idHolder ? [] : roster.filter(item => item.name !== "self" && nodeNameKey(item.name) === nameKey);
         // Tiebreak: when several nodes share the key, the one whose stored name equals the trimmed input exactly
         // (case-sensitive, byte for byte) is the node Relaycast's exact selector reaches, so it is used when live.
@@ -523,6 +535,12 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
             message: `Node "${displayName(paddedNode.name)}" (${paddedNode.id}) has whitespace around its name. Relaycast trims the name a ` +
               "launch selects by, so this node cannot be chosen and a launch could start on a node named without it. " +
               "The owner must rename it without surrounding whitespace." });
+        }
+        if (!target && known.live) {
+          // Live, but seen only in the every-state read: past the live page this server ranks and checks capacity on.
+          throw refuse("spawn_target_unavailable", known, placed, undefined, { retryable: true,
+            message: `Node "${displayName(known.name)}" (${known.id}) is live but past the first ${RELAY_NODE_PAGE_LIMIT} live nodes ` +
+              "this server reads, so it cannot be checked for this launch. Try again, or pass the id of a node from list_relay_spawn_targets." });
         }
         if (!target || !target.live) throw refuse("spawn_target_offline", known, placed);
         if (!target.handlersLive || target.stale || target.name === "self") throw refuse("spawn_target_unavailable", target, placed);

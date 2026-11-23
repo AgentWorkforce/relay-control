@@ -38,7 +38,7 @@ export function createRelaycastWorld(roster: unknown[]) {
   const subscriptions = new Map<string, Subscription>();
   const idempotent = new Map<string, unknown>();
   /** Every request body, for assertions about what was sent upstream. */
-  const bodies: Array<{ method: string; path: string; body: Record<string, any> | null }> = [];
+  const bodies: Array<{ method: string; path: string; body: Record<string, any> | null; query?: string }> = [];
   /**
    * Injected failures keyed by `METHOD path`. `after` applies the request
    * first and then fails the response (a lost response); otherwise the
@@ -107,7 +107,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   async function handle(method: string, path: string, query: URLSearchParams, bearer: string, body: Record<string, any> | null,
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
-    bodies.push({ method, path, body });
+    bodies.push({ method, path, body, query: query.toString() });
     const queued = failures.get(`${method} ${path}`);
     const failure = queued?.shift();
     if (queued && queued.length === 0) failures.delete(`${method} ${path}`);

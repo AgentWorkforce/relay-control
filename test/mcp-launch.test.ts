@@ -790,14 +790,88 @@ test("target_node: an every-state read with another page is permanent: a name ma
     arguments: launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-2" }) })).target_node, "mine");
 });
 
-test("target_node: a legacy bare-array every-state answer is the whole roster, however long", async (t) => {
+test("target_node: a bare-array every-state answer, of any length, is a failed read; the live read keeps its array", async (t) => {
   const env = await setup(t);
   env.world.nodesHistory.unsupported = true;
-  const filler = Array.from({ length: 600 }, (_, index) => node(`asleep-${index}`, `asleep-${index}`, { live: false }));
-  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler]);
-  await env.claim("mine");
   const client = await env.connect();
+  for (const [index, count] of [0, 99, 100, 601].entries()) {
+    const filler = Array.from({ length: count }, (_, item) => node(`asleep-${item}`, `asleep-${item}`, { live: false }));
+    env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), ...filler]);
+    if (index === 0) await env.claim("mine");
+    const lone = await refusalOf(client, launch("Studio-Desktop", { idempotency_key: `bare-key-${count}` }));
+    assert.equal(lone.retryable, true, String(count));
+    assert.match(lone.message, /matches a live node's name, but offline nodes could not be read/, String(count));
+    const missing = await refusalOf(client, launch("nowhere", { idempotency_key: `bare-miss-${count}` }));
+    assert.equal(missing.retryable, true, String(count));
+    assert.match(missing.message, /offline nodes could not be read/, String(count));
+  }
+  // The live read is still the bare array: a live id launches.
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine") })).target_node, "mine");
+  assert.equal(sentTargets(env).length, 1);
+});
+
+test("target_node: the merged roster has one entry per id, the live view first", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [
+    node("mine", "studio-desktop"), node("mine", "studio-desktop", { live: false }),
+    node("asleep", "lab", { live: false }), node("asleep", "lab", { live: false }),
+  ]);
+  await env.claim("mine");
+  await env.claim("asleep");
+  const client = await env.connect();
+  // A stale offline copy of a live node is not a second match: the live view wins and the name launches.
   assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") })).target_node, "mine");
+  // Two copies of one offline node are one match: the offline refusal, not ambiguity.
+  const offline = await refusalOf(client, launch("LAB", { idempotency_key: "target-key-2" }));
+  assert.equal(offline.code, "spawn_target_offline");
+  assert.equal(offline.node, "lab");
+});
+
+test("target_node: a live node past the live page is refused as retryable, by id and by name", async (t) => {
+  const env = await setup(t);
+  const first = Array.from({ length: 100 }, (_, index) => node(`live-${index}`, `live-${index}`));
+  env.world.nodes.set(FIRST_KEY, [...first, node("far", "far-desktop")]);
+  await env.claim("far");
+  const client = await env.connect();
+  for (const [value, key] of [["far", "target-key-1"], ["Far-Desktop", "target-key-2"]] as const) {
+    const refused = await refusalOf(client, launch(value, { idempotency_key: key }));
+    assert.equal(refused.code, "spawn_target_unavailable", value);
+    assert.equal(refused.retryable, true, value);
+    assert.match(refused.message, /Node "far-desktop" \(far\) is live but past the first 100 live nodes this server reads/, value);
+    assert.match(refused.message, /Try again, or pass the id of a node from list_relay_spawn_targets\.$/, value);
+  }
+  assert.equal(sentTargets(env).length, 0);
+});
+
+test("target_node: replaying a failed receipt reads only the live roster and excludes the receipt's node by id", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), node("alt", "alt-desktop")]);
+  await env.claim("mine");
+  await env.claim("alt");
+  const client = await env.connect();
+  env.world.spawnOutcome.mode = "rejected";
+  const failed = await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") });
+  const first = failed.structuredContent as Record<string, any>;
+  assert.equal(first.status, "failed");
+  assert.deepEqual(targetIds(first.alternatives), ["alt"]);
+  const everyStateReads = () => env.world.bodies.filter(body => body.path === "/v1/nodes" && new URLSearchParams(body.query).get("history") === "true").length;
+  const nodeReads = () => env.world.bodies.filter(body => body.path === "/v1/nodes").length;
+  const [reads, allReads] = [nodeReads(), everyStateReads()];
+  const replayed = await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") });
+  assert.equal(replayed.isError, true);
+  const again = replayed.structuredContent as Record<string, any>;
+  assert.equal(again.spawn_id, first.spawn_id);
+  assert.equal(again.target_node, "mine");
+  assert.deepEqual(targetIds(again.alternatives), ["alt"]);
+  // One live read, no every-state read, and nothing sent again.
+  assert.equal(nodeReads(), reads + 1);
+  assert.equal(everyStateReads(), allReads);
+  assert.equal(sentTargets(env).length, 1);
+  // An unreachable roster never blocks receipt recovery.
+  env.world.failNext("GET", "/v1/nodes", 503);
+  const recovered = await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") });
+  assert.equal((recovered.structuredContent as Record<string, any>).spawn_id, first.spawn_id);
+  assert.equal("alternatives" in (recovered.structuredContent as Record<string, any>), false);
 });
 
 test("target_node: with an incomplete read, a live exact-name tiebreak gets the could-not-read refusal, retryable by cause", async (t) => {
