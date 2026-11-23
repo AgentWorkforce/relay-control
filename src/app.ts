@@ -6,7 +6,7 @@ import { connectorKind, isGrokRoutineKind } from "./mcp/oauth/connector-kind.js"
 import { createCursorCloud } from "./mcp/cursor-cloud.js";
 import type { CursorJwks } from "./mcp/cursor-oidc.js";
 import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
-import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
+import { agentIdentityHoldsName, ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { GrokRoutines } from "./mcp/grok-routines.js";
@@ -23,7 +23,7 @@ import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
-import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
+import { ApiTokenStore, ENROLLMENT_KEY_PREFIX, type AgentIdentityRosterCheck } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
@@ -662,6 +662,19 @@ export function createApp(input: {
       setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
+  // Agent-identity mint: same "mine vs taken" rule as the hosted registration
+  // path. The mint route's access check binds the workspace before this runs;
+  // a still-unbound workspace (a direct store caller) is not provisioned here
+  // and reads as free. Any roster agent other than the identity's own,
+  // released or not, holds the name.
+  const agentIdentityRoster: AgentIdentityRosterCheck = async (workspaceId, agentName, ownerRef) => {
+    const apiKey = await store.existingRelaycastApiKey(workspaceId);
+    if (apiKey === null) return "free";
+    const remote = await oauthRelay.getAgent(apiKey, agentName);
+    if (!remote) return "free";
+    return ownerRef !== null && !isBindingOwnedIdentity(remote.metadata) && remote.metadata.source === HOSTED_SOURCE &&
+      remote.metadata.cloud_workspace_id === workspaceId && remote.metadata.owner_hash === ownerHash(ownerRef) ? "free" : "held";
+  };
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
@@ -707,6 +720,8 @@ export function createApp(input: {
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
+      // A workspace agent identity's name (any letter case) is never approvable for a person.
+      if(await agentIdentityHoldsName(store.database,principal.workspaceId,name)) return "taken";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
       if(isBindingOwnedIdentity(remote.metadata) || remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
@@ -3390,6 +3405,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      agentRoster: agentIdentityRoster,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
     })) {
@@ -3450,6 +3466,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const adminError = adminErrorResponse(error);
       if (adminError) {
+        if (adminError.retryAfterSeconds !== undefined) response.setHeader("retry-after", String(adminError.retryAfterSeconds));
         json(response, adminError.status, adminError.body, true);
         return;
       }
