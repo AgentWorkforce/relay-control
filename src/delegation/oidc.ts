@@ -72,7 +72,9 @@ export function workflowOidcVerifier(input: {
     const discovery = await fetchJson(`${issuer}/.well-known/openid-configuration`);
     const jwksUri = typeof discovery.jwks_uri === "string" ? discovery.jwks_uri : null;
     // The keys must be served from the issuer's own origin.
-    if (!jwksUri || discovery.issuer !== issuer || new URL(jwksUri).origin !== new URL(issuer).origin) {
+    // Compare issuers without a trailing slash, as the token's issuer is compared.
+    const published = typeof discovery.issuer === "string" ? discovery.issuer.replace(/\/+$/, "") : null;
+    if (!jwksUri || published !== issuer || new URL(jwksUri).origin !== new URL(issuer).origin) {
       throw new OidcInvalid("jwks_unavailable");
     }
     const jwks = await fetchJson(jwksUri);

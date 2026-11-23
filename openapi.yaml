@@ -10270,6 +10270,7 @@ components:
       properties:
         gate_id: { type: string }
         repo: { type: string }
+        issuer: { type: string, description: Present only for a gate on a self-host issuer (relay-control) }
         workflow_ref: { type: string }
         job_workflow_ref: { type: string, description: Present only for a gate on a reusable workflow }
         ref: { type: string }
@@ -10285,6 +10286,7 @@ components:
       description: Exactly one of `ref` and `ref_pattern`.
       properties:
         repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
+        issuer: { type: string, description: "relay-control only: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. A same-named repository on another issuer is another repository." }
         workflow_ref: { type: string, maxLength: 512, example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
         job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@refs/heads/main" }
         ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }

@@ -316,6 +316,14 @@ ref_pattern, event, target_prefix}`. For example:
 A gate sets exactly one of `ref` (exact, `refs/heads/...` or `refs/tags/...`)
 and `ref_pattern`. A `ref_pattern` is `refs/tags/<literal prefix>*`, with one
 trailing `*` and nothing else wild, and it is matched against the token's `ref`.
+A gate trusts one OIDC issuer: GitHub Actions by default, or a self-host
+issuer from `SELFHOST_DELEGATION_OIDC_ISSUERS` named in `issuer` (shown on the
+gate only when it is not GitHub). A same-named repository on another issuer is
+a different repository. When several members register the same workflow, the
+approval owner's own gate is used. At the commit, the approval (revoked,
+withdrawn, expired), the gate (deleted) and a tier D grant (revoked, expired,
+narrowed) are re-read under their locks.
+
 `workflow_ref` must be a workflow in the gate's repo, pinned to a ref. When
 the publishing job runs inside a reusable workflow, the gate also sets
 `job_workflow_ref` (that workflow's file and ref, which may be in another

@@ -31,7 +31,8 @@ function oidcFetch(issuers: Issuer[]): typeof fetch {
     const url = String(input instanceof Request ? input.url : input);
     for (const item of issuers) {
       if (url === `${item.iss}/.well-known/openid-configuration`) {
-        return Response.json({ issuer: item.iss, jwks_uri: `${item.iss}/.well-known/jwks` });
+        // The self-host issuer publishes its identifier with a trailing slash.
+        return Response.json({ issuer: item.iss === GHES ? `${item.iss}/` : item.iss, jwks_uri: `${item.iss}/.well-known/jwks` });
       }
       if (url === `${item.iss}/.well-known/jwks`) return Response.json({ keys: [item.jwk] });
     }
@@ -212,14 +213,21 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
   assert.equal(missing.body.code, "unauthorized");
   // Still unconsumed: the real workflow redeems it.
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims()), approvalId)).body, { ok: true, consumed: true });
-  // A self-host's configured issuer is accepted the same way.
+  // A self-host's configured issuer (whose discovery issuer has a trailing
+  // slash) is accepted, through a gate registered for that issuer.
   const second = await env.approval([BETA]);
   const ghesToken = mint(env.ghes, env.workflowClaims({ iss: GHES, run_id: "42" }));
+  // A same-named repository on another issuer is another repository: the GitHub gate does not match it.
+  assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: false, reason: "gate_mismatch" });
+  const ghesGate = await env.gate({ issuer: GHES });
+  assert.equal(ghesGate.issuer, GHES);
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: true, consumed: true });
+  assert.equal((await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main",
+    event: "workflow_dispatch", target_prefix: `${REPO}:`, issuer: "https://token.evil.example" })).status, 400);
   const refused = await env.events("gate.refused");
   assert.equal(refused.filter(row => row.reason === "oidc_invalid").length, cases.length);
   // An unverified token's claims are never logged.
-  assert.ok(refused.every(row => row.data.repository === undefined));
+  assert.ok(refused.filter(row => row.reason === "oidc_invalid").every(row => row.data.repository === undefined));
 });
 
 test("gate redeem: repository, workflow_ref, ref and event must all match a registered gate", async (t) => {
@@ -430,4 +438,51 @@ test("gate redeem: single use is per action; another action of the same approval
   assert.equal(withdrawn.status, 200, withdrawn.raw);
   assert.deepEqual((await env.redeem(run("13"), fresh, `${REPO}:stable:v2026.11.8:${SHA}:123456790`)).body,
     { ok: false, reason: "revoked" });
+});
+
+test("gate redeem: another member's matching gate never blocks the approval owner's own gate", async (t) => {
+  const env = await setup(t);
+  // Bob registers the same workflow first; the owner registers it too.
+  const bobId = await env.addMember("bob@acme.test");
+  const bob = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  assert.equal((await env.bearer("/delegates/gates", "POST", body, bob.accessToken)).status, 201);
+  const own = await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims()), approvalId)).body, { ok: true, consumed: true });
+  const redeemed = await env.events("gate.redeemed");
+  assert.equal(redeemed[0]!.data.gate_id, own.gate_id);
+});
+
+test("gate redeem: a gate deleted, an approval revoked or a grant narrowed during the checks is decided at commit", async (t) => {
+  const env = await setup(t);
+  const gate = await env.gate();
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId }));
+  // The gate is deleted while the delegate's binding is re-checked.
+  const first = await env.approval([STABLE]);
+  during = async () => { await env.database.query("UPDATE delegation_gates SET deleted_at = now() WHERE id = $1", [gate.gate_id]); };
+  assert.deepEqual((await env.redeem(token("1"), first)).body, { ok: false, reason: "gate_unknown" });
+  await env.gate();
+  // The approval expires meanwhile.
+  during = async () => { await env.database.query("UPDATE delegation_approvals SET expires_at = now() WHERE id = $1", [first]); };
+  assert.deepEqual((await env.redeem(token("2"), first)).body, { ok: false, reason: "expired" });
+  // The grant is narrowed meanwhile.
+  const second = await env.approval([BETA]);
+  during = async () => {
+    await env.database.query(`UPDATE delegation_grants SET scopes = '[{"class":"release","targets":["${REPO}"]}]'::jsonb`);
+  };
+  assert.deepEqual((await env.redeem(token("3"), second, BETA)).body, { ok: false, reason: "out_of_scope" });
+  // Nothing was consumed by any of these.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  env.world.handle = handle;
 });

@@ -596,6 +596,7 @@ export function createApp(input: {
       fetchImpl: input.delegationOidcFetch,
       now: input.now,
     }),
+    oidcIssuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
     // Never provisions: these lookups can run before any caller is proven.
     relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),

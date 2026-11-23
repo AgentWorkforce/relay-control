@@ -105,6 +105,8 @@ export type DelegationRoutesInput = {
   json: JsonWriter;
   /** Release gates (§11a.3): the workflow OIDC verifier for gate redeem. */
   workflowOidc: WorkflowOidcVerifier;
+  /** The issuers that verifier accepts (GitHub Actions first); a gate names one of them. */
+  oidcIssuers: readonly string[];
   /** A workspace's organization and Relaycast binding, without a person. */
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
   /** Redacts a quote in Relaycast's stored owner_approval; null: redactions stay queued. */
@@ -234,6 +236,8 @@ const WORKFLOW_FILE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,10
  * inside a reusable workflow (which may live in another repo).
  */
 const gateBody = z.object({
+  /** Optional: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. */
+  issuer: z.string().max(512).optional(),
   repo: z.string().regex(GATE_REPO),
   workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF),
   job_workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF).optional(),
@@ -721,14 +725,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       if (method === "POST") {
         const body = parse(gateBody, await readJson(request), "Invalid gate");
+        const issuer = (body.issuer ?? input.oidcIssuers[0]!).replace(/\/+$/, "");
+        if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
         await requireEnabled(workspace.id);
         const row = await input.database.transaction(async (tx) => {
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
-               (id, workspace_id, owner_user_id, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
+               (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
                 target_prefix, created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-            [mintId("gate"), workspace.id, principal.userId, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+            [mintId("gate"), workspace.id, principal.userId, issuer, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
               body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, caller.authMethod],
           )).rows[0]!;
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,

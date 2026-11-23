@@ -90,7 +90,7 @@
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
     {"name":"0088_owner_delegates.sql","sha256":"f759b032e916120075c15350baeda9a80a930baf96911e74de2ae88c666a43ef"},
-    {"name":"0089_delegation_release_gates.sql","sha256":"95e2868d3bb11f9493b3d24a64d37d80c974ed1c39854531fa0d7bb874a14be1"}
+    {"name":"0089_delegation_release_gates.sql","sha256":"104c2a0514f8fa82b4ff290a3294836f47267a317030e121720fd5d596742860"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -360,18 +360,19 @@
     {"kind":"column","name":"public.delegation_gate_redemptions.run_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
     {"kind":"column","name":"public.delegation_gate_redemptions.target","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
     {"kind":"column","name":"public.delegation_gate_redemptions.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
-    {"kind":"column","name":"public.delegation_gates.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
-    {"kind":"column","name":"public.delegation_gates.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.deleted_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":13,"type":"timestamp with time zone"}},
-    {"kind":"column","name":"public.delegation_gates.event","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":9,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":13,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_gates.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":12,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.deleted_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":14,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_gates.event","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.job_workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.issuer","definition":{"collation":"pg_catalog.default","default":"'https://token.actions.githubusercontent.com'::text","generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.job_workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.owner_user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
-    {"kind":"column","name":"public.delegation_gates.ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.ref_pattern","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.repo","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.target_prefix","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
-    {"kind":"column","name":"public.delegation_gates.workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.ref_pattern","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.repo","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.target_prefix","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
+    {"kind":"column","name":"public.delegation_gates.workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_grants.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_grants.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
@@ -2430,5 +2431,5 @@
   "optional":{
 
   },
-  "sha256":"e26db7e5673f68e9759d7e9cb2e95779e4ec97cc0e24ce0fe2997003e44d6dcd"
+  "sha256":"e5445aec22ff52f5bca445081ff51e7f1bf1293c4c2bcf5ffdb636f8ee13db22"
 }

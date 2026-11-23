@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS delegation_gates (
   id text PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- The OIDC issuer whose tokens this gate trusts: a same-named repository on
+  -- another trusted issuer is a different repository.
+  issuer text NOT NULL DEFAULT 'https://token.actions.githubusercontent.com',
   repo text NOT NULL,
   -- The workflow file and ref the run started from (the token's workflow_ref).
   workflow_ref text NOT NULL,
