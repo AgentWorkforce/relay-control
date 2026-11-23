@@ -4,6 +4,7 @@ import {
   EXPORT_COLUMNS, RESTRICT_PROBE_CONCURRENCY, RESTRICT_PROBE_MAX, readAuditCsv, restrictReadAudit,
   type ReadAuditAccessProbe, type ReadAuditExportRow,
 } from "../src/mcp/read-audit.js";
+import { confirmsAccessAdministrator } from "../src/sessions/access.js";
 
 /**
  * Read audit export redaction under per-session access
@@ -63,6 +64,33 @@ test("an administrator's export is unchanged after exactly one administrator che
   assert.deepEqual(calls.administrator, ["sess-a"], "one check, with an id from the page");
   assert.deepEqual(calls.readable, []);
   assert.equal(readAuditCsv(shown.records, { restricted: shown.restricted }), readAuditCsv(before));
+});
+
+test("the administrator check asks about the first id relaygate accepts, and is skipped when none is", async () => {
+  const { probe: p, calls } = probe({ admin: true });
+  const rows = [row({ requested_session_id: "bad id/with space" }), row({ requested_session_id: "sess-ok" })];
+  const shown = await restrictReadAudit(rows, p);
+  assert.deepEqual(calls.administrator, ["sess-ok"]);
+  assert.equal(shown.restricted, false);
+
+  const { probe: q, calls: none } = probe({ admin: true, readable: ["bad id/with space"] });
+  const refused = await restrictReadAudit([row({ requested_session_id: "bad id/with space" })], q);
+  assert.deepEqual(none.administrator, [], "no id relaygate accepts: no check, not an administrator");
+  assert.equal(refused.restricted, true);
+});
+
+test("confirmsAccessAdministrator fails closed on every answer but relaygate's own", () => {
+  assert.equal(confirmsAccessAdministrator(200, { runtime: true, access: { sessionId: "sess-a", version: 1 } }, "sess-a"), true);
+  assert.equal(confirmsAccessAdministrator(200, { access: { sessionId: "sess-b" } }, "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(200, { sessionId: "sess-a" }, "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(200, "", "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(404, { ok: false, error: { code: "relaygate_not_found", message: "x" } }, "sess-a"), true);
+  assert.equal(confirmsAccessAdministrator(404, { error: "relaygate_not_found" }, "sess-a"), true);
+  assert.equal(confirmsAccessAdministrator(404, { ok: false, error: { code: "relaygate_route_not_proxied" } }, "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(404, { error: "Not Found" }, "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(404, null, "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(404, "<html>not found</html>", "sess-a"), false);
+  assert.equal(confirmsAccessAdministrator(403, { error: { code: "relaygate_not_found" } }, "sess-a"), false);
 });
 
 test("a failed administrator check is the restrictive answer", async () => {

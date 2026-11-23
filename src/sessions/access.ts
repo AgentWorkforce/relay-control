@@ -149,7 +149,8 @@ export const MAX_REASON_LENGTH = 200;
 export const DEFAULT_HISTORY_LIMIT = 50;
 export const MAX_HISTORY_LIMIT = 200;
 
-const SESSION_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
+/** Session ids relaygate accepts; any other id is refused (400) before access is checked. */
+export const SESSION_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
 const MODE = /^[0246]{3}$/;
 const LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$/;
 const CONTROL = /[\u0000-\u001f\u007f]/u;
@@ -179,6 +180,27 @@ function failure(outcome: Exclude<AccessFailure["outcome"], "conflict" | "unknow
 
 function sessionPath(sessionId: string, suffix = ""): string {
   return `/v1/sessions/${encodeURIComponent(sessionId)}/access${suffix}`;
+}
+
+/**
+ * Whether a `GET /v1/sessions/{id}/access` answer proves the caller is a
+ * session access administrator. Fails closed: a backend without the access
+ * routes (relaygate's own `relaygate_route_not_proxied`, or any other server's
+ * plain 404 for an unknown path) must not make everyone an administrator.
+ * - 200 counts only with `{ access: { sessionId: <the asked id> } }`;
+ * - 404 counts only with relaygate's session-not-found code
+ *   `relaygate_not_found` (`{ error: { code } }` or `{ error: "<code>" }`),
+ *   because relaygate checks administration before existence;
+ * - anything else is not an administrator.
+ */
+export function confirmsAccessAdministrator(status: number, body: unknown, sessionId: string): boolean {
+  if (!isRecord(body)) return false;
+  if (status === 200) return isRecord(body.access) && body.access.sessionId === sessionId;
+  if (status === 404) {
+    const code = isRecord(body.error) ? body.error.code : body.error;
+    return code === "relaygate_not_found";
+  }
+  return false;
 }
 
 function validSessionId(sessionId: unknown): sessionId is string {

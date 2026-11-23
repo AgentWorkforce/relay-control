@@ -45,7 +45,7 @@ import {
   listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError, restrictReadAudit, type ReadAuditAccessProbe,
 } from "./mcp/read-audit.js";
 import { accessViaDashboardReader, readWorkspaceHistory, type HistoryIdentity } from "./sessions/history.js";
-import { sessionAccessConfigured } from "./sessions/access.js";
+import { confirmsAccessAdministrator, sessionAccessConfigured } from "./sessions/access.js";
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
@@ -1130,13 +1130,16 @@ export function createApp(input: {
       readerKind: readerKindOf(request),
     };
     return {
-      // relaygate checks access administration before existence, so 404 also
-      // means an administrator.
+      // Fails closed (confirmsAccessAdministrator): a 200 naming the asked
+      // session, or relaygate's session-not-found 404 (it checks administration
+      // before existence). Any other answer, including another 404 body, is not
+      // an administrator, so a backend without the access routes cannot make
+      // every exporter one.
       administrator: async (sessionId) => {
         const reply = await accessViaDashboardReader(config, identity, {
           method: "GET", path: `/v1/sessions/${encodeURIComponent(sessionId)}/access`,
         });
-        return reply.kind === "response" && (reply.status === 200 || reply.status === 404);
+        return reply.kind === "response" && confirmsAccessAdministrator(reply.status, reply.body, sessionId);
       },
       readable: async (sessionId) => {
         const read = await readWorkspaceHistory(config, identity, `/v1/sessions/${encodeURIComponent(sessionId)}/metadata`,

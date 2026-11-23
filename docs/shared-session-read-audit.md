@@ -127,10 +127,19 @@ export does not reveal sessions the exporter cannot read:
 
 - Each page is read from the database exactly as above (same filters, order,
   page size and cursor), then checked with the exporter's own read token.
-- One administrator check: `GET /v1/sessions/{id}/access` for one session id
-  on the page. A 200 or 404 means the exporter is a session access
-  administrator, and the page is exported unchanged. Anything else, including
-  a timeout or an error, means it is not.
+- One administrator check: `GET /v1/sessions/{id}/access` for the first
+  session id on the page that the read API accepts (`^[A-Za-z0-9._:@-]{1,256}$`;
+  it refuses any other id before checking administration). With no such id on
+  the page, there is no check and the exporter is not an administrator.
+- The exporter is a session access administrator, and the page is exported
+  unchanged, only on a 200 whose body is `{ access: { sessionId } }` naming
+  the asked session, or on a 404 carrying the read API's session-not-found
+  code `relaygate_not_found` (`{ error: { code: "relaygate_not_found" } }` or
+  `{ error: "relaygate_not_found" }`), because it checks administration before
+  existence. Anything else, including any other 404 body, an empty or non-JSON
+  body, another status, a timeout or an error, means it is not: a backend
+  without the access routes answers a 404 for the unknown path, and that must
+  not make every exporter an administrator.
 - Otherwise each distinct session id on the page (`requested_session_id`,
   `native_session_id`, `result_sessions[].session_id`) is checked with a read
   of that session: at most 100 per page, 4 at a time, within 15 seconds for

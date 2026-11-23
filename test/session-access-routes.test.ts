@@ -43,6 +43,8 @@ function relaygateStub() {
   const actor = { id: "agent-7", name: null as string | null };
   /** Per-path forced answers: status, or "drop" to destroy the connection. */
   const forced = new Map<string, number | "drop">();
+  /** Per-path exact answers (status and raw body), for answers other than the stub's own. */
+  const replies = new Map<string, { status: number; body: string; contentType?: string }>();
   /** Per-session metadata reads, and the sessions this reader may not read (404). */
   const metadata: Upstream[] = [];
   const unreadable = new Set<string>();
@@ -103,9 +105,19 @@ function relaygateStub() {
       req.socket.destroy();
       return;
     }
+    const reply = replies.get(`${req.method} ${sessionId}`);
+    if (reply) {
+      res.statusCode = reply.status;
+      if (reply.contentType) res.setHeader("content-type", reply.contentType);
+      res.end(reply.body);
+      return;
+    }
     if (typeof force === "number") {
       res.statusCode = force;
-      res.end(JSON.stringify({ error: { code: "forced", message: "forced" } }));
+      // A forced 404 is relaygate's session-not-found answer.
+      res.end(JSON.stringify(force === 404
+        ? { ok: false, error: { code: "relaygate_not_found", message: "Session not found" } }
+        : { error: { code: "forced", message: "forced" } }));
       return;
     }
     const bearer = req.headers.authorization?.replace(/^Bearer /, "") ?? "";
@@ -147,7 +159,7 @@ function relaygateStub() {
     });
     res.end(JSON.stringify(answer(sessionId, reset)));
   });
-  return { server, mints, access, forced, policies, history, actor, metadata, unreadable };
+  return { server, mints, access, forced, replies, policies, history, actor, metadata, unreadable };
 }
 
 /**
@@ -596,6 +608,41 @@ test("read audit export: a session access administrator gets the export unchange
   assert.deepEqual(env.gate.access.map((call) => [call.method, call.path]), [["GET", "/v1/sessions/fake-open/access"]]);
   assert.match(env.gate.access[0]!.bearer!, /^Bearer rth_at_read_/);
   assert.equal(env.gate.metadata.length, 0);
+});
+
+test("read audit export: the administrator check fails closed on any answer but relaygate's own", async (t) => {
+  const json = "application/json";
+  const cases: Array<[string, { status: number; body: string; contentType?: string } | number, boolean]> = [
+    // An administrator asking about a session that does not exist: relaygate's session-not-found 404.
+    ["404 relaygate_not_found", 404, false],
+    ["404 relaygate_not_found, string shape", { status: 404, body: JSON.stringify({ error: "relaygate_not_found" }), contentType: json }, false],
+    ["404 relaygate_route_not_proxied", {
+      status: 404, body: JSON.stringify({ ok: false, error: { code: "relaygate_route_not_proxied", message: "not proxied" } }), contentType: json,
+    }, true],
+    ["404 empty body", { status: 404, body: "" }, true],
+    ["404 non-JSON body", { status: 404, body: "<html>Not Found</html>", contentType: "text/html" }, true],
+    ["200 naming another session", {
+      status: 200, body: JSON.stringify({ runtime: true, access: { sessionId: "fake-other", version: 1 } }), contentType: json,
+    }, true],
+  ];
+  for (const [label, answer, restricted] of cases) {
+    const env = await setup(t);
+    const { path, seeded } = await seedAudit(env);
+    if (typeof answer === "number") env.gate.forced.set("GET fake-open", answer);
+    else env.gate.replies.set("GET fake-open", answer);
+    const read = await env.http("GET", path);
+    assert.equal(read.status, 200, label);
+    assert.deepEqual(env.gate.access.map((call) => call.path), ["/v1/sessions/fake-open/access"], label);
+    if (restricted) {
+      assert.equal(read.body.records.every((record: any) => typeof record.restricted === "boolean"), true, label);
+      assert.equal(read.body.records.some((record: any) => record.restricted), false, `${label}: every session readable here`);
+      assert.equal(env.gate.metadata.length, 2, label);
+    } else {
+      assert.equal(JSON.stringify(read.body).includes("restricted"), false, label);
+      assert.deepEqual(read.body.records.map((record: any) => [record.id, record.requested_session_id, record.result_sessions]), seeded, label);
+      assert.equal(env.gate.metadata.length, 0, label);
+    }
+  }
 });
 
 test("read audit export: a non-administrator sees only the sessions its own read token can read", async (t) => {

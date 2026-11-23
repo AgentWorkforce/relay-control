@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { randomUUID } from "node:crypto";
 import type { SqlExecutor } from "../database.js";
 import type { McpContext } from "./context.js";
+import { SESSION_ID } from "../sessions/access.js";
 
 /**
  * Shared-session read audit (docs/shared-session-read-audit.md): one
@@ -588,7 +589,11 @@ export async function restrictReadAudit(
   const deadline = Date.now() + (limits.deadlineMs ?? RESTRICT_DEADLINE_MS);
   const readable = new Set<string>();
   if (probe) {
-    const administrator = await beforeDeadline(() => probe.administrator(ids[0]!), deadline).catch(() => false);
+    // Asked about an id relaygate accepts (it refuses any other before checking
+    // administration); with none on the page, the exporter is not confirmed.
+    const askable = ids.find((id) => SESSION_ID.test(id));
+    const administrator = askable === undefined ? false
+      : await beforeDeadline(() => probe.administrator(askable), deadline).catch(() => false);
     if (administrator === true) return { restricted: false, records: rows };
     const pending = ids.slice(0, RESTRICT_PROBE_MAX);
     let next = 0;
