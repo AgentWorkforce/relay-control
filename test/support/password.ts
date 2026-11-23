@@ -11,7 +11,7 @@ import { ControlPlaneStore } from "../../src/store.js";
 import { ARGON2_BASELINE, loadIdentityConfig, type PasswordConfig } from "../../src/identity/config.js";
 import { IdentityStore } from "../../src/identity/store.js";
 import { createIdentityModule } from "../../src/identity/routes.js";
-import { bootstrapOnce, relaycastProvisioner } from "../../src/identity/bootstrap.js";
+import { bootstrapOnce, relaycastProvisioner, type RelaycastProvisioner } from "../../src/identity/bootstrap.js";
 import type { Mailer, OutgoingEmail } from "../../src/identity/mailer.js";
 import type { HibpFetch } from "../../src/identity/password/policy.js";
 import type { PasswordHasher } from "../../src/identity/password/hashing.js";
@@ -111,6 +111,8 @@ export async function setup(t: test.TestContext, options: {
   smtp?: boolean;
   /** SELFHOST_ENROLLMENT_SELF_RENEWAL as loaded (absent: on). */
   enrollmentSelfRenewal?: boolean;
+  /** Multi mode: creates personal organizations' Relaycast workspaces (absent: none). */
+  provisioner?: RelaycastProvisioner;
 } = {}) {
   // The tests stand behind one proxy (they send X-Forwarded-For) unless a
   // test asks otherwise; the variable is read per request.
@@ -166,6 +168,7 @@ export async function setup(t: test.TestContext, options: {
     tenancy: identityConfig.tenancy,
     issueSession: (tx, session) => store.issueBrowserSession(tx, session),
     adminEmails: bootstrap.adminEmails.filter((email) => email !== bootstrap.adminEmail),
+    ...(options.provisioner ? { provisioner: options.provisioner } : {}),
   });
   const identity = createIdentityModule({
     config: identityConfig,

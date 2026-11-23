@@ -6,7 +6,7 @@ import type { GrokRoutines } from "./grok-routines.js";
 import { connectorKind, isGrokRoutineKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { ApiTokenStore } from "../admin/api-tokens.js";
+import { AGENT_IDENTITY_SCOPE, ApiTokenStore } from "../admin/api-tokens.js";
 import { STAFF_READ_GRANT_PREFIX, StaffReadGrants } from "../admin/staff-read-grants.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
 import { DesktopMcpCredentials } from "../auth/desktop-mcp-credentials.js";
@@ -20,9 +20,10 @@ import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { relayLaunchCheck } from "./relay-launch-check.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
-import type { ControlPlaneStore } from "../store.js";
-import { MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
-import { historyReader, type McpContext, type McpMember } from "./context.js";
+import type { ControlPlaneStore, Principal } from "../store.js";
+import { AGENT_IDENTITY_TOOLS, MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
+import { historyReadable, historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
+import { sessionAccessConfigured } from "../sessions/access.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
@@ -34,6 +35,7 @@ import type { McpOAuthSessions } from "./oauth/sessions.js";
 import { MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./oauth/protocol.js";
 import { sendCustomerSupport } from "./customer-support.js";
 import { customerSupportDesktop } from "./customer-support-notice.js";
+import { ownerLockFetch } from "./owner-lock-deadline.js";
 import { controlSessionToken } from "../auth/session-cookie.js";
 
 /**
@@ -74,6 +76,20 @@ function rpcError(response: ServerResponse, status: number, code: number, messag
  * message without an id counts as a notification only under `notifications/`.
  */
 export function staffReadGrantAllows(body: unknown): boolean {
+  return allowlistAllows(body, STAFF_READ_GRANT_TOOLS);
+}
+
+/**
+ * A workspace agent identity token is fenced the same way as a staff read
+ * grant, to the Relay messaging tools and describe_capabilities
+ * (AGENT_IDENTITY_TOOLS). Every other tools/call is refused before a server
+ * is built, so no unlisted handler runs.
+ */
+export function agentIdentityAllows(body: unknown): boolean {
+  return allowlistAllows(body, AGENT_IDENTITY_TOOLS);
+}
+
+function allowlistAllows(body: unknown, tools: readonly string[]): boolean {
   const messages = Array.isArray(body) ? body : [body];
   if (messages.length === 0) return false;
   return messages.every((message) => {
@@ -84,7 +100,7 @@ export function staffReadGrantAllows(body: unknown): boolean {
     if (method === "initialize" || method === "ping" || method === "tools/list") return true;
     if (method !== "tools/call" || !params || typeof params !== "object") return false;
     const name = (params as { name?: unknown }).name;
-    return typeof name === "string" && STAFF_READ_GRANT_TOOLS.includes(name);
+    return typeof name === "string" && tools.includes(name);
   });
 }
 
@@ -169,7 +185,9 @@ export function createMcpHandler(input: {
   const desktopCredentials = new DesktopMcpCredentials(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
-  const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Calls made under the hosted-MCP owner lock share one time budget; all others are unchanged.
+  const relayFetch = ownerLockFetch(input.fetchImpl);
+  const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: relayFetch });
   function reportUnexpected(error: unknown, request: IncomingMessage, response: ServerResponse, path: string): void {
     let errorPath = path;
     try { errorPath = new URL(request.url ?? path, config.publicBaseUrl).pathname; } catch { /* Use the matched route. */ }
@@ -180,7 +198,7 @@ export function createMcpHandler(input: {
   }
   // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
   const gateClient = config.relaygatePublicUrl
-    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
+    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: relayFetch })
     : undefined;
   // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
   const launchCheck = config.relaygatePublicUrl
@@ -227,6 +245,47 @@ export function createMcpHandler(input: {
     if (headerToken && config.internalServiceToken && secureEqual(headerToken, config.internalServiceToken)) {
       forbidden();
       return null;
+    }
+    // A workspace agent identity token: header bearer only, only on the
+    // shared-sessions facade, live with a non-null expiry, purpose
+    // agent-identity and exactly relay:agent. The workspace, organization and
+    // agent come only from the token row; it is never a person and holds no
+    // membership. Every other sh_wk_ token, and this one on any other path,
+    // keeps the 403 below.
+    if (headerToken?.startsWith("sh_wk_") && resourceFor(rawPath) === "/api/v1/mcp/shared-sessions") {
+      const agent = await apiTokens.authenticateAgentIdentity(headerToken);
+      if (agent) {
+        const binding = await store.relaycastBinding(agent.workspaceId);
+        if (!binding) {
+          forbidden();
+          return null;
+        }
+        const principal: Principal = {
+          sessionId: agent.tokenId,
+          tokenFamilyId: agent.agentIdentityId,
+          userId: agent.agentIdentityId,
+          email: "",
+          name: agent.agentName,
+          organizationId: agent.organizationId,
+          organizationName: agent.organizationName,
+          workspaceId: agent.workspaceId,
+          workspaceName: agent.workspaceName,
+          // Not a membership: the least role, never read for authorization on this path.
+          role: "member",
+          scopes: [AGENT_IDENTITY_SCOPE],
+        };
+        const workspace: McpWorkspace = {
+          id: agent.workspaceId,
+          organizationId: agent.organizationId,
+          name: agent.workspaceName,
+          relaycastWorkspaceId: binding.relaycastWorkspaceId,
+          relaycastApiKey: binding.relaycastApiKey,
+          role: "member",
+        };
+        return { principal, workspace, authMode: "agent_identity" as McpAuthMode, token: headerToken,
+          provider: undefined as string | undefined, oauth: undefined as McpOAuthConnection | undefined,
+          agentIdentity: { id: agent.agentIdentityId, name: agent.agentName } };
+      }
     }
     if (headerToken?.startsWith("sh_wk_") && await apiTokens.authenticate(headerToken)) {
       forbidden();
@@ -334,7 +393,8 @@ export function createMcpHandler(input: {
       // may be larger. A Cursor proof may also arrive on the app bearer with
       // the Desktop marker, which binds no provider (never an OAuth or staff grant).
       const desktopMarked = admitted.provider === undefined && !admitted.oauth &&
-        admitted.authMode !== "staff_read_grant" && request.headers["x-agent-relay-desktop"] === "1";
+        admitted.authMode !== "staff_read_grant" && admitted.authMode !== "agent_identity" &&
+        request.headers["x-agent-relay-desktop"] === "1";
       raw = await boundedBody(request, admitted.provider === "copilot" || admitted.provider === "cursor" || desktopMarked
         ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
     } catch (error) {
@@ -353,6 +413,7 @@ export function createMcpHandler(input: {
       return true;
     }
     const { principal, workspace, authMode, token, provider, oauth } = admitted;
+    const agentIdentity = "agentIdentity" in admitted ? admitted.agentIdentity : undefined;
     // Before any server is built: a staff read grant reaches only its allowlist.
     const staffGrant = authMode === "staff_read_grant";
     if (staffGrant && !staffReadGrantAllows(body)) {
@@ -361,6 +422,16 @@ export function createMcpHandler(input: {
         parsed.success ? parsed.data.id : null);
       return true;
     }
+    // Likewise, a workspace agent identity token reaches only its allowlist.
+    const agentToken = authMode === "agent_identity";
+    if (agentToken && !agentIdentityAllows(body)) {
+      const parsed = JSONRPCRequestSchema.safeParse(body);
+      rpcError(response, 403, -32003, "Forbidden: a workspace agent identity token reaches only the Relay messaging tools.",
+        parsed.success ? parsed.data.id : null);
+      return true;
+    }
+    // Features a person's connection may reach and a grant or an agent identity never does.
+    const personOnly = !staffGrant && !agentToken;
     const headers = webHeaders(request);
     let desktopCall;
     let stage: NativeContextStage = provider === "copilot" ? "copilot_attestation" : "claude_attestation";
@@ -372,7 +443,7 @@ export function createMcpHandler(input: {
       const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
-      const callHeaders = oauth || staffGrant ? withoutDesktopMarker(headers) : headers;
+      const callHeaders = oauth || staffGrant || agentToken ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
         : await claudeAttestationFor(body, callHeaders, auth, attestations);
@@ -403,23 +474,35 @@ export function createMcpHandler(input: {
     }
 
     const site = input.siteBaseUrl(request);
+    const members = async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
+      userId: String(row.userId),
+      email: String(row.email),
+      name: typeof row.name === "string" && row.name.trim() ? row.name : null,
+    }));
+    // Session access management: a person's own exchanged session only (never
+    // OAuth, a Desktop provider credential, a staff grant or an agent
+    // identity), on a relaygate read path.
+    const sessionAccess = !oauth && personOnly && provider === undefined && sessionAccessConfigured(config) &&
+      token.startsWith("sh_at_") && principal.scopes.includes("rth:read") && !principal.pendingHandoff
+      ? sessionAccessDeps(config, principal, workspace, token, members) : undefined;
     const context: McpContext = {
       principal,
       workspace,
       authMode,
-      // A grant holds no membership in the workspace it reads.
-      role: staffGrant ? "none" : workspace.role,
+      // A grant or an agent identity holds no membership in the workspace.
+      role: personOnly ? workspace.role : "none",
       origin: citationOrigin,
       endpointUrl: `${site}${rawPath}`,
       desktopCall,
       ...(oauth ? { oauth } : {}),
+      ...(agentIdentity ? { agentIdentity } : {}),
       readHistory: historyReader(config, principal, workspace, token),
+      // Per-session access mode: roster session bindings follow the caller's
+      // own read access (list_team_activity).
+      ...(config.sessionReadApi?.mintReaderKind
+        ? { sessionBindings: historyReadable(principal, token) ? "probe" as const : "none" as const } : {}),
       agentTokens: config.sessionSearchAgentTokens,
-      members: async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
-        userId: String(row.userId),
-        email: String(row.email),
-        name: typeof row.name === "string" && row.name.trim() ? row.name : null,
-      })),
+      members,
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
@@ -437,13 +520,14 @@ export function createMcpHandler(input: {
         ...(gateClient ? { gateClient } : {}),
         ...(config.spawnMemoryPolicy ? { spawnMemoryPolicy: config.spawnMemoryPolicy } : {}),
       },
-      ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
-      ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),
-      ...(!oauth && !staffGrant && input.webhookInbox ? { webhookInbox: input.webhookInbox } : {}),
-      ...(!oauth && !staffGrant && input.factory ? { factory: input.factory } : {}),
-      ...(!oauth && !staffGrant && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
+      ...(!oauth && personOnly && input.amp ? { amp: input.amp } : {}),
+      ...(!oauth && personOnly && input.replicas ? { replicas: input.replicas } : {}),
+      ...(!oauth && personOnly && input.webhookInbox ? { webhookInbox: input.webhookInbox } : {}),
+      ...(!oauth && personOnly && input.factory ? { factory: input.factory } : {}),
+      ...(!oauth && personOnly && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
-      ...(input.launch && !staffGrant ? { launch: true } : {}),
+      ...(input.launch && personOnly ? { launch: true } : {}),
+      ...(sessionAccess ? { sessionAccess } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
@@ -454,7 +538,7 @@ export function createMcpHandler(input: {
         context.grokRoutines = input.grokRoutines;
       }
     }
-    if (config.customerSupport && !staffGrant) context.customerSupport = {
+    if (config.customerSupport && personOnly) context.customerSupport = {
       origin: new URL(config.publicBaseUrl).origin,
       send: request => sendCustomerSupport(config.customerSupport!, request),
       notifyTarget: () => customerSupportDesktop(context),

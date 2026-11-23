@@ -46,6 +46,10 @@ async function startHistory(t: TestContext) {
   const handoffs: Array<Record<string, any>> = [];
   const tokens = new Map<string, string>();
   const events: HistoryEvent[] = [];
+  /** Session ids whose metadata answers 404 (not readable by the caller). */
+  const hiddenSessions = new Set<string>();
+  /** Every read after the mint: path and the bearer it carried. */
+  const reads: Array<{ path: string; authorization: string | null }> = [];
   let mints = 0;
   let origin = "";
   let eventsFailure: { status: number; body: unknown } | null = null;
@@ -85,6 +89,7 @@ async function startHistory(t: TestContext) {
       });
       return;
     }
+    reads.push({ path: url.pathname, authorization: request.headers.authorization ?? null });
     const token = /^Bearer (.+)$/.exec(request.headers.authorization ?? "")?.[1];
     const tokenWorkspace = token ? tokens.get(token) : undefined;
     if (!tokenWorkspace) {
@@ -121,6 +126,13 @@ async function startHistory(t: TestContext) {
       });
       return;
     }
+    const metadata = /^\/v1\/sessions\/([^/]+)\/metadata$/.exec(url.pathname);
+    if (metadata) {
+      const sessionId = decodeURIComponent(metadata[1]!);
+      if (hiddenSessions.has(sessionId)) send(404, { error: { code: "not_found" } });
+      else send(200, { sessionId, source: "codex" });
+      return;
+    }
     const detail = /^\/v1\/sessions\/([^/]+)\/events$/.exec(url.pathname);
     if (detail) {
       const sessionId = decodeURIComponent(detail[1]!);
@@ -140,7 +152,7 @@ async function startHistory(t: TestContext) {
   origin = await listen(server);
   t.after(() => close(server));
   return {
-    origin, paths, events, handoffs,
+    origin, paths, events, handoffs, hiddenSessions, reads,
     failEvents(status: number, body: unknown) { eventsFailure = { status, body }; },
   };
 }
@@ -720,6 +732,36 @@ test("list_team_activity merges the Relaycast roster, presence, and History", as
   const degraded = structured(await client.callTool({ name: "list_team_activity", arguments: { status: "all" } }));
   assert.equal(degraded.presence_source, "unavailable");
   assert.equal(degraded.agents[0].presence.liveness, "unknown");
+});
+
+test("list_team_activity with per-session access shows only bindings the caller's own read token can read", async (t) => {
+  const env = await setup(t);
+  env.config.sessionReadApi = { ...env.config.sessionReadApi, mintReaderKind: true };
+  const seen = new Date().toISOString();
+  const declared = (id: string, name: string, session: string) => ({
+    id, name, type: "agent", status: "online", last_seen: seen,
+    metadata: { session_id: session, session_kind: "codex", injectable: "true" },
+  });
+  env.relay.agents = [declared("a1", "builder", "sess-1"), declared("a2", "open", "sess-open"), declared("a3", "private", "sess-private")];
+  env.history.hiddenSessions.add("sess-private");
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const data = structured(await client.callTool({ name: "list_team_activity", arguments: { max_agents_with_activity: 1 } }));
+  assert.deepEqual(data.agents.map((agent: any) => [agent.name, agent.session_id]),
+    [["builder", "sess-1"], ["open", "sess-open"], ["private", null]]);
+  const hidden = data.agents[2];
+  assert.equal(hidden.session_kind, null);
+  assert.equal(hidden.session_attribution, null);
+  assert.equal(hidden.activity_status, "no_session_declared");
+  const probes = env.history.reads.filter((read) => read.path.endsWith("/metadata"));
+  assert.deepEqual(probes.map((read) => read.path).sort(), ["/v1/sessions/sess-open/metadata", "/v1/sessions/sess-private/metadata"]);
+  // The probes carry a read token minted for the caller, never the workspace key or the caller's own token.
+  for (const probe of probes) {
+    assert.match(probe.authorization ?? "", /^Bearer rth_at_read_/);
+    assert.equal(probe.authorization!.includes("rk_live_first"), false);
+    assert.equal(probe.authorization!.includes(env.accessToken), false);
+  }
+  assert.ok(env.history.handoffs.length >= 1);
+  for (const handoff of env.history.handoffs) assert.equal(handoff.userId, env.ownerId);
 });
 
 // relay_messaging -----------------------------------------------------------
@@ -1326,14 +1368,67 @@ test("channels: list, subscribe, post, thread, read, inbox, and unsubscribe", as
   const read = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops" } }));
   assert.deepEqual(read.messages.map((message: any) => [message.text, message.mine, message.reply_count]),
     [["deploying", true, 1], ["ack from peer", false, 0]]);
+  assert.match(read.reply_guidance, /read_relay_channel thread_id=<message_id>, or include_replies: true/);
+  assert.equal(read.messages[0].replies, undefined);
 
-  const left = structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } }));
+  // Thread replies (how Grok Bot and Muse answer) are readable with thread_id, from the root or any reply.
+  const peerToken = env.relay.world.agents.get("peer-bot")!.token;
+  await env.relay.world.handle("POST", `/v1/messages/${posted.message_id}/replies`, new URLSearchParams(), peerToken,
+    { text: "peer answer in thread" }, null);
+  const thread = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id } }));
+  assert.equal(thread.thread_id, posted.message_id);
+  assert.deepEqual([thread.post.text, thread.post.mine, thread.post.reply_count], ["deploying", true, 2]);
+  assert.deepEqual(thread.replies.map((reply: any) => [reply.text, reply.mine]), [["done", true], ["peer answer in thread", false]]);
+  assert.equal(thread.more_after, null);
+  assert.match(thread.reply_guidance, new RegExp(`post_relay_channel channel=ops thread_id=${posted.message_id}`));
+  const fromReply = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: threaded.message_id } }));
+  assert.equal(fromReply.thread_id, posted.message_id);
+  const firstPage = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, limit: 1 } }));
+  assert.deepEqual(firstPage.replies.map((reply: any) => reply.text), ["done"]);
+  assert.equal(firstPage.more_after, threaded.message_id);
+  const secondPage = structured(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, after: firstPage.more_after, limit: 1 } }));
+  assert.deepEqual(secondPage.replies.map((reply: any) => reply.text), ["peer answer in thread"]);
+  // include_replies inlines each post's first replies on a top-level read.
+  const inline = structured(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", include_replies: true } }));
+  assert.deepEqual(inline.messages.map((message: any) => [message.text, message.replies?.map((reply: any) => reply.text) ?? null]),
+    [["deploying", ["done", "peer answer in thread"]], ["ack from peer", null]]);
+  assert.equal(inline.messages[0].replies_truncated, undefined);
+  assert.match(inline.reply_guidance, /replies_truncated/);
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, include_replies: true } })), /include_replies reads top-level posts/);
+  // A thread in another channel, a DM, or a missing message is refused without leaking its contents.
+  const elsewhere = env.relay.world.channelAs("peer-bot", "secret", "private plan")!;
+  const dm = env.relay.world.sendAs("peer-bot", me, "private plan by dm").message;
+  for (const thread_id of [elsewhere.id, dm.id, "999999"]) {
+    const refused = toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", thread_id } }));
+    assert.match(refused, /thread_id must be a message in #ops/);
+    assert.doesNotMatch(refused, /private plan/);
+  }
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops", after: posted.message_id } })),
+    /pass thread_id with it/);
+  assert.match(toolError(await client.callTool({ name: "read_relay_channel",
+    arguments: { channel: "ops", thread_id: posted.message_id, before: posted.message_id } })), /To page a thread, pass after/);
+
+  const left =structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } }));
   assert.equal(left.already_unsubscribed, false);
   assert.equal(structured(await client.callTool({ name: "unsubscribe_relay_channel", arguments: { channel: "ops" } })).already_unsubscribed, true);
   assert.match(toolError(await client.callTool({ name: "read_relay_channel", arguments: { channel: "ops" } })), /not subscribed to #ops/);
   assert.match(toolError(await client.callTool({ name: "post_relay_channel", arguments: { channel: "ops", text: "x" } })), /not subscribed to #ops/);
   assert.match(toolError(await client.callTool({ name: "subscribe_relay_channel", arguments: { channel: "agent-events-x" } })),
     /Channel names are lowercase/);
+});
+
+test("a person's own MCP session is not held to the OAuth assistant channel-creation limit", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  for (let i = 1; i <= 6; i++) {
+    assert.equal(structured(await client.callTool({ name: "subscribe_relay_channel",
+      arguments: { channel: `team-${i}`, create: true, hosted: true } })).created, true);
+  }
 });
 
 test("leave_relay releases the remote agent and deletes the participant", async (t) => {

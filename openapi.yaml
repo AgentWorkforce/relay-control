@@ -1457,6 +1457,68 @@ paths:
           description: Session revoked
         "404":
           description: Token not found
+  /api/v1/auth/cloud-bridge/start:
+    get:
+      security: []
+      operationId: cloudBridgeStart
+      description: >-
+        Session bridge for organizations moved from Agent Relay Cloud
+        (docs/identity.md). 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Sets the
+        encrypted attempt cookie agent_relay_cloud_bridge (SameSite=None,
+        Path /cloud/api/v1/auth/cloud-bridge/consume, 5 minutes) and redirects
+        to SELFHOST_CLOUD_BRIDGE_HANDOFF_URL with only a nonce. Public form
+        /cloud/api/v1/auth/cloud-bridge/start.
+      parameters:
+        - name: next
+          in: query
+          required: false
+          schema: { type: string }
+          description: Same-site path to land on after sign-in; anything else becomes /.
+      responses:
+        "302":
+          description: Redirect to the Cloud handoff page
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts from this address
+  /api/v1/auth/cloud-bridge/consume:
+    post:
+      security: []
+      operationId: cloudBridgeConsume
+      description: >-
+        Cloud's handoff page posts the signed assertion here (public form
+        /cloud/api/v1/auth/cloud-bridge/consume). Origin must equal the
+        handoff URL's origin. On success sets the session cookie and answers
+        303 to the start's next. Refusals are HTML pages; the x-error-code
+        header carries cloud_bridge_invalid or an account-level
+        cloud_bridge_* code. 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [assertion]
+              properties:
+                assertion:
+                  type: string
+                  description: Compact EdDSA JWS, typ cloud-bridge+jwt
+      responses:
+        "303":
+          description: Signed in; redirect to next
+        "400":
+          description: cloud_bridge_invalid
+        "403":
+          description: >-
+            cloud_bridge_user_unknown, cloud_bridge_org_not_moved,
+            cloud_bridge_not_member, cloud_bridge_auth_too_old or
+            cloud_bridge_signed_out
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts
+        "503":
+          description: not_ready (no organization or workspace yet)
   /api/v1/cli/login:
     get:
       security: [{ cookieAuth: [] }]
@@ -1475,7 +1537,8 @@ paths:
         handoff access token bound to the challenge and redirects (307) to the
         loopback redirect_uri with state, access_token,
         access_token_expires_at and api_url (<site>/cloud: the dashboard or
-        public origin the request arrived on). No
+        public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL
+        through its edge router). No
         refresh token is placed in the URL. With desktop_host_name, a consent
         page asks the person to approve "Agent Relay Desktop on <host>" first;
         its Approve posts the same parameters back (303 on approval).
@@ -1565,7 +1628,7 @@ paths:
                   accessTokenExpiresAt: { type: string, format: date-time }
                   refreshToken: { type: string }
                   refreshTokenExpiresAt: { type: string, format: date-time }
-                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on)" }
+                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)" }
                   tokenType: { type: string, enum: [Bearer] }
         "400":
           description: Missing codeVerifier
@@ -1701,6 +1764,86 @@ paths:
           description: Invalid body
         "403":
           description: Bootstrap bearer required
+  /api/v1/installation/cloud-bridge/organizations:
+    get:
+      security: [{ bearerAuth: [] }]
+      operationId: listCloudBridgeOrganizations
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Organizations listed for the session bridge from Agent Relay Cloud,
+        open or not.
+      responses:
+        "200":
+          description: Bridge windows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CloudBridgeOrganization"
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: The bridge is off
+  /api/v1/installation/cloud-bridge/organizations/{organizationId}:
+    parameters:
+      - name: organizationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      security: [{ bearerAuth: [] }]
+      operationId: setCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Opens
+        or changes the organization's bridge window. List an organization
+        only after its import has been applied and verified. closesAt must be
+        in the future and at most 90 days after opensAt (default now).
+        Audited as installation.cloud_bridge.organization_set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [closesAt, setBy]
+              properties:
+                closesAt: { type: string, format: date-time }
+                opensAt: { type: string, format: date-time }
+                setBy: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        "200":
+          description: The stored window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CloudBridgeOrganization"
+        "400":
+          description: Invalid body or window
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: Organization not found, or the bridge is off
+        "409":
+          description: organization_empty (the organization has no members)
+    delete:
+      security: [{ bearerAuth: [] }]
+      operationId: removeCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Removes the window. Audited as
+        installation.cloud_bridge.organization_removed.
+      responses:
+        "204":
+          description: Removed
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: No window for this organization, or the bridge is off
   /api/v1/auth/whoami:
     get:
       operationId: whoami
@@ -3933,6 +4076,167 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnsupportedByBackend"
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccess
+      description: |
+        Who may read one session (docs/sessions-read-api.md, "Session
+        access"). Served only when read token mints carry the reader kind
+        (`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+        `SELFHOST_RELAYGATE_PUBLIC_URL` set) and
+        `SESSION_READ_API_MCP_READS=true`, with the session read API URL
+        pointing at relaygate's sessions listener; otherwise 404
+        `session_access_not_configured`. Also served at the same path without
+        the `/cloud` prefix for a bearer. Control forwards relaygate
+        `GET /v1/sessions/{sessionId}/access` with the caller's own read
+        token; relaygate decides who is a session access administrator,
+        before it looks the session up. An administrator may manage a session
+        they cannot read; a non-administrator gets 403 whether or not the
+        session exists. Per-person entries name current members by email and name; a user
+        who is no longer a member is `member: false`.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+    patch:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: setSessionAccess
+      description: |
+        Change who may read one session. `members` and `groups`, when given,
+        REPLACE the current per-person and group lists; they are not merged.
+        Emails resolve to current members of the workspace's organization;
+        any unknown or ambiguous email refuses the whole change (400
+        `unknown_members`) and nothing is sent upstream. Only user ids go
+        upstream. Without `expectedVersion` the current version is read
+        first. A stale version is 409 `conflict` with `currentVersion` and is
+        never retried. A cookie-carried request needs an allowed Origin (403
+        `csrf_rejected`). A 504 `session_access_outcome_unknown` means the
+        change may have applied: read the access again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionAccessChange"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/reset:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: resetSessionAccess
+      description: |
+        Remove the session's access override so the installation's default
+        policy applies again. Versioned and audited like a PATCH; same
+        Origin check, conflict and unknown-outcome rules.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: Audited. Never put session content in it.
+                expectedVersion:
+                  type: integer
+                  minimum: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/history:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccessHistory
+      description: |
+        The audited before/after rows of every access change, oldest first.
+        Follow `nextAfter` (null on the last page). `actor` is the Control
+        person behind a row whose `actorName` is `ctl:<userId>`, else null;
+        `before` is null on a session's first change.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rows, nextAfter]
+                properties:
+                  rows:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SessionAccessHistoryRow"
+                  nextAfter:
+                    type: [integer, "null"]
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
   /api/v1/workspaces/{workspaceId}/relayhistory/origin:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5817,7 +6121,7 @@ paths:
           in: query
           required: false
           description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
-          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -5879,16 +6183,35 @@ paths:
         Any other purpose from it is 403 enrollment_operator_scope; a
         revoked, expired or other-workspace one is 401. Every other admin
         route refuses it (401) and introspection reports `wrong-kind`.
+        agent-identity grants exactly relay:agent and requires agentName
+        (trimmed, at most 64 characters, the Relay agent-name rules, no
+        reserved name in any letter case; 400 otherwise). label defaults to
+        the name. It always expires: neverExpires is a 400, expiryDays 1-365,
+        default 90. Minting again for the same name (case-blind) rotates: the
+        new token acts as the same agent and older tokens stay live until
+        revoked or expired. A name a person's hosted Relay participant or a
+        linked Desktop agent already uses in this workspace is a 409
+        name_taken, and so is a name another agent holds on the workspace's
+        Relaycast roster (released or not; the identity's own agent from an
+        earlier join does not count). The roster is read before the mint
+        transaction; an unreadable roster is a 503 relay_unavailable with
+        Retry-After and nothing is written. For an owner or admin caller the
+        route's workspace access check first binds a workspace that has no
+        Relaycast binding yet (as on every owner/admin route), so the roster
+        read always has a binding to read. Only the hosted MCP route
+        /api/v1/mcp/shared-sessions admits it, as a bearer, and there it
+        reaches the Relay messaging tools and describe_capabilities only.
+        Every other gate refuses it and introspection reports it inactive.
+        See docs/identity.md "Workspace agent identity tokens".
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [label]
               properties:
-                label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+                label: { type: string, maxLength: 128, description: "Required for every purpose but agent-identity, where it defaults to agentName." }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
                 expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: default 7, ceiling 30 single-use / 90 multi-use (operator-configurable)" }
                 email:
                   type: string
@@ -5921,8 +6244,9 @@ paths:
                 neverExpires:
                   type: boolean
                   description: >-
-                    workflow, relayfile-agent and acquisition-operator only; cannot be
-                    combined with expiryDays.
+                    workflow, relayfile-agent and acquisition-operator only (a 400 for
+                    agent-identity, which always expires); cannot be combined with
+                    expiryDays.
                 agent_name:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -5930,6 +6254,13 @@ paths:
                     relayfile-agent only, required. The agent the token speaks for;
                     unique per workspace among non-revoked relayfile-agent tokens
                     (409 agent_name_conflict otherwise).
+                agentName:
+                  type: string
+                  maxLength: 64
+                  description: >-
+                    agent-identity only, required. The workspace agent the token acts
+                    as on the hosted MCP Relay messaging tools. Unique per workspace
+                    case-blind; minting again for the same name rotates.
                 nodeName:
                   type: string
                   pattern: "^[A-Za-z0-9._:-]{1,200}$"
@@ -5957,9 +6288,13 @@ paths:
                   - type: object
                     properties:
                       accessToken: { type: string }
-        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, agentName, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
         "403": { description: "enrollment_operator_scope: an enrollment-operator token asked for a purpose other than desktop-enrollment" }
-        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
+        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization; name_taken: a person's hosted Relay participant, a linked Desktop agent, or another agent on the workspace's Relaycast roster already uses the agent-identity agentName" }
+        "503":
+          description: "relay_unavailable: the workspace's Relaycast roster could not be read to check the agent-identity agentName; nothing was minted. relaycast_not_ready: the workspace has no Relaycast binding yet and this installation could not provision one (owner/admin callers, any purpose); nothing was minted. Retry after the Retry-After seconds."
+          headers:
+            Retry-After: { schema: { type: integer } }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -6325,6 +6660,16 @@ paths:
         `docs/shared-session-read-audit.md`): one record per MCP
         shared-session read tool call, oldest first, keyset-paginated. Never
         contains transcript content. A member is 403; another workspace 404.
+
+        When session reads follow per-session access
+        (SESSION_READ_MINT_INCLUDE_READER_KIND on), an exporter that does
+        not administer session access sees a session id, and its owners,
+        only for a session it may read itself. Other ids and owners are null
+        and the record carries `restricted: true`; on such a page every
+        record carries `restricted`, and the CSV gets a last `restricted`
+        column. Administrators, pages naming no session, and every export
+        without per-session access are unchanged and carry no `restricted`.
+        Filtering, ordering, page size and cursors are the same either way.
       parameters:
         - { name: since, in: query, required: false, schema: { type: string, format: date-time }, description: Inclusive }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: Exclusive }
@@ -6380,12 +6725,15 @@ paths:
                           items:
                             type: object
                             properties:
-                              session_id: { type: string }
+                              session_id: { type: [string, "null"], description: Null only when restricted }
                               source: { type: [string, "null"] }
-                              owner_user_ids: { type: array, maxItems: 10, items: { type: string } }
+                              owner_user_ids: { type: [array, "null"], maxItems: 10, items: { type: string }, description: Null only when restricted }
                         result_sessions_truncated: { type: boolean }
                         correlation_id: { type: [string, "null"] }
                         duration_ms: { type: integer }
+                        restricted:
+                          type: boolean
+                          description: Present only for an exporter that does not administer per-session access. True when a session id in this record was withheld (set to null) because the exporter may not read that session.
             text/csv:
               schema: { type: string }
         "400":
@@ -9737,9 +10085,9 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys, enrollment_self_mint]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, session_access, enrollment_keys, enrollment_self_mint]
       additionalProperties: false
-      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, not SELFHOST_FEATURES.
+      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, and session_access from session-read configuration, not SELFHOST_FEATURES.
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
@@ -9751,6 +10099,9 @@ components:
         session_delete:
           type: boolean
           description: True when the erase API URL and dedicated secret are configured and operator controls permit writes. Configuration availability only, not an upstream health or per-session storage verdict; owner/admin authorization is still required for DELETE.
+        session_access:
+          type: boolean
+          description: True when the session access routes are configured (SESSION_READ_MINT_INCLUDE_READER_KIND and SESSION_READ_API_MCP_READS on, and a History URL configured), so the dashboard may offer per-session access management. Configuration availability only; it grants nothing, and the routes still check rth:read and relaygate still decides who administers each session.
         enrollment_keys:
           type: boolean
           description: Always true. POST /api/v1/auth/enrollment/token exchanges desktop enrollment keys.
@@ -9837,7 +10188,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
+          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_ROUTED_SITE_URL when set and the request carries one x-original-host header naming its host, else SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
     DeviceLookup:
       type: object
       required: [user_code, client_name, desktop_host_name, status, expires_at, current_workspace_id, workspaces]
@@ -9892,7 +10243,16 @@ components:
         apiUrl:
           type: string
           format: uri
-          description: "`<site>/cloud` (the dashboard or public origin the request arrived on)"
+          description: "`<site>/cloud` (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)"
+    CloudBridgeOrganization:
+      type: object
+      required: [organizationId, opensAt, closesAt, setBy, updatedAt]
+      properties:
+        organizationId: { type: string, format: uuid }
+        opensAt: { type: string, format: date-time }
+        closesAt: { type: string, format: date-time }
+        setBy: { type: string }
+        updatedAt: { type: string, format: date-time }
     Whoami:
       type: object
       required:
@@ -10222,6 +10582,192 @@ components:
                 coverage:
                   type: object
             - type: "null"
+    SessionAccessGrant:
+      type: object
+      required: [userId, perm, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        perm:
+          type: string
+          enum: [r, w, rw]
+        member:
+          type: boolean
+          description: False for a user who is no longer a member; remove the entry with a PATCH.
+    SessionAccessGroup:
+      type: object
+      required: [gid, perm]
+      properties:
+        gid:
+          type: integer
+          minimum: 0
+        perm:
+          type: string
+          enum: [r, w, rw]
+    SessionAccessPolicy:
+      type: object
+      required: [sessionId, runtime, reset, version, mode, gid, groups, members, label, updatedAt]
+      properties:
+        sessionId:
+          type: string
+        runtime:
+          type: boolean
+          description: True when a runtime override is in force.
+        reset:
+          type: boolean
+        version:
+          type: integer
+          minimum: 0
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        updatedAt:
+          type: [string, "null"]
+    SessionAccessAnswer:
+      type: object
+      required: [access]
+      properties:
+        access:
+          $ref: "#/components/schemas/SessionAccessPolicy"
+    SessionAccessChange:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      description: At least one of mode, members, groups or label.
+      properties:
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+          description: Owner, group and other digits. "000" plus r entries restricts reading to those entries.
+        members:
+          type: array
+          maxItems: 64
+          description: Replaces the per-person list.
+          items:
+            type: object
+            required: [email, perm]
+            properties:
+              email:
+                type: string
+                maxLength: 320
+              perm:
+                type: string
+                enum: [r, w, rw]
+        groups:
+          type: array
+          maxItems: 64
+          description: Replaces the group list.
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        label:
+          type: [string, "null"]
+          pattern: "^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$"
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Audited. Never put session content in it.
+        expectedVersion:
+          type: integer
+          minimum: 0
+    SessionAccessSnapshot:
+      type: [object, "null"]
+      properties:
+        mode:
+          type: [string, "null"]
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        reset:
+          type: boolean
+    SessionAccessHistoryRow:
+      type: object
+      required: [seq, at, actorId, actorName, actor, version, reason, before, after]
+      properties:
+        seq:
+          type: integer
+        at:
+          type: string
+        actorId:
+          type: [string, "null"]
+          description: relaygate's internal agent id, as recorded.
+        actorName:
+          type: [string, "null"]
+          description: relaygate's actor name, as recorded; `ctl:<userId>` for a Control person.
+        actor:
+          $ref: "#/components/schemas/SessionAccessActor"
+        version:
+          type: integer
+        reason:
+          type: [string, "null"]
+        before:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+          description: Null on a session's first change.
+        after:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+    SessionAccessActor:
+      type: [object, "null"]
+      description: |
+        The Control person named by `actorName` `ctl:<userId>`, resolved like a
+        per-person entry: email and name for a current member of the
+        organization, `member: false` with the user id only otherwise. Null
+        when `actorName` is not of that form.
+      required: [userId, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        member:
+          type: boolean
+    SessionAccessError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, unknown_members, not_access_admin, csrf_rejected, forbidden, handoff_not_exchanged, not_found, session_access_not_configured, conflict, session_access_unavailable, session_access_outcome_unknown]
+        message:
+          type: string
+        currentVersion:
+          type: [integer, "null"]
+          description: With conflict.
+        emails:
+          type: array
+          items:
+            type: string
+          description: With unknown_members, the emails that name no single current member.
     DashboardSessionCatalog:
       type: object
       required: [catalog, parents, children, commitLinks, truncated]
@@ -10657,8 +11203,8 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
-        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator, agent-identity] }
+        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); agent-identity: the workspace agent the token acts as; null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
         scopes:
@@ -11340,6 +11886,19 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    SessionAccessFailure:
+      description: |
+        400 invalid_request or unknown_members; 403 not_access_admin (relaygate
+        refused: not a session access administrator, decided before the
+        session is looked up, so it says nothing about whether the session
+        exists), csrf_rejected, forbidden or handoff_not_exchanged; 404
+        not_found (an administrator naming a session relaygate does not know),
+        session_access_not_configured or a workspace outside the tenant; 409
+        conflict with currentVersion; 503 session_access_unavailable; 504
+        session_access_outcome_unknown (a write whose answer was lost).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SessionAccessError" }
     RelayNodeTokenInvalid:
       description: "token_invalid: no bearer, or not a live (unrevoked, unexpired) relay-node token."
       content:

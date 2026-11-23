@@ -83,6 +83,23 @@ test("oversized state returns a local error from both consent endpoints without 
   assert.equal(calls.includes("code"),false);
 });
 
+test("extra sites leave MCP OAuth single-origin: metadata asked on an extra host names SELFHOST_PUBLIC_URL",async()=>{
+  const extraApi="https://api.public.example.com";
+  const declared=harness({resources:["/mcp",SHARED],
+    oidc:{SELFHOST_EXTRA_SITES:`https://app.public.example.com|${extraApi}`}}).module;
+  for(const path of ["/mcp",SHARED] as const) {
+    const standard="/.well-known/oauth-protected-resource"+new URL(declared.protocol!.mcpResourceUrl(path)).pathname;
+    const result=(await declared.handle(new Request(extraApi+standard)))!;
+    assert.equal(result.status,200);
+    const body=await result.json();
+    assert.equal(new URL(body.resource).origin,ORIGIN);
+    assert.ok(!JSON.stringify(body).includes("public.example.com"));
+  }
+  const server=await (await declared.handle(new Request(extraApi+"/cloud/.well-known/oauth-authorization-server")))!.json();
+  assert.equal(server.issuer,ORIGIN+"/cloud");
+  assert.ok(!JSON.stringify(server).includes("public.example.com"));
+});
+
 test("HTTP module stays disabled by default and discovery advertises only declared mounted resources",async()=>{
   const off=harness({enabled:false}).module;
   assert.equal(await off.handle(web(API+"/register",registration)),null);

@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { McpContext } from "./context.js";
 import { setCardInputSchema } from "./relay-agent-cards.js";
-import { ownerHash, relayFailure, relayService, type RelayToolOperation } from "./relay-participants.js";
+import { CHANNEL_REPLIES_PER_POST, ownerHash, relayFailure, relayService, type RelayToolOperation } from "./relay-participants.js";
 
 /**
  * The relay_messaging tool group, ported from Cloud's `lib/mcp/relay-tools.ts`
@@ -125,6 +125,7 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   // Channels are opt-in for larger swarms; DMs stay the default. A
   // subscription is the acting identity's Relaycast channel membership.
   const channel = z.string().trim().min(1).max(81).describe("Channel name, with or without a leading #.");
+  const messageId = z.string().regex(/^[0-9]{1,30}$/);
   const asPerson = z.boolean().default(false).describe("Act as your person identity. Not available on this self-hosted site; omit it.");
   const hosted = z.boolean().default(false).describe("Act as this MCP session's hosted inbox participant. Hosted posts remain available in that participant's inbox. Cannot be combined with as or as_person.");
   const CHANNEL_IDENTITY = "A session that has not joined requires hosted: true or an explicit owned identity.";
@@ -135,8 +136,8 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   }, input => run(service => service.listChannels(input)));
 
   server.registerTool("subscribe_relay_channel", {
-    description: `Subscribe the acting identity to a channel; create starts the channel when it is missing. The operation is idempotent. New posts are retained in the hosted participant's inbox. ${CHANNEL_IDENTITY}`,
-    inputSchema: { channel, create: z.boolean().default(false).describe("Create the channel if it does not exist."), as, as_person: asPerson, hosted },
+    description: `Subscribe the acting identity to a channel; create starts the channel when it is missing, with the acting identity as its owner and first member. The operation is idempotent. On an OAuth assistant connection, channel creation is rate limited per agent. New posts are retained in the hosted participant's inbox. ${CHANNEL_IDENTITY}`,
+    inputSchema: { channel, create: z.boolean().default(false).describe("Create the channel if it does not exist. Only when the person asked for a new channel."), as, as_person: asPerson, hosted },
     annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
   }, input => run(service => service.subscribeChannel(input)));
 
@@ -158,8 +159,14 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
     channelPostKey(sessionId, extra.requestId, input)), "send"));
 
   server.registerTool("read_relay_channel", {
-    description: "Read recent top-level posts in a channel you have subscribed to, oldest first, with message IDs, thread IDs and reply counts. Only subscribers can read a channel.",
-    inputSchema: { channel, before: z.string().regex(/^[0-9]{1,30}$/).optional(), limit: z.number().int().min(1).max(30).default(20), as, as_person: asPerson, hosted },
+    description: "Read a channel you have subscribed to: recent top-level posts, oldest first, with message IDs and reply counts. include_replies: true adds each post's first replies; thread_id reads one whole thread (its post and replies). Agents such as Grok Bot and Muse answer in threads, so read replies to see their answers. Only subscribers can read a channel.",
+    inputSchema: { channel,
+      before: messageId.optional().describe("Top-level posts only: return posts older than this message_id (the earlier value of a previous read)."),
+      limit: z.number().int().min(1).max(30).default(20).describe("Top-level posts to return, or replies with thread_id."),
+      include_replies: z.boolean().default(false).describe(`Also return each listed post's first ${CHANNEL_REPLIES_PER_POST} replies (replies_truncated marks a longer thread; replies_unavailable marks a thread that could not be read, so read it with thread_id). Cannot be combined with thread_id.`),
+      thread_id: messageId.optional().describe("Read one thread instead: this post (or any reply in its thread) and its replies, oldest first. It must be a message in the channel."),
+      after: messageId.optional().describe("With thread_id: return replies after this message_id (more_after from a previous thread read)."),
+      as, as_person: asPerson, hosted },
     annotations,
   }, input => run(service => service.readChannel(input)));
 }

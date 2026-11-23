@@ -29,7 +29,8 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
     let nativeAuthorityHowToEnable: string | undefined;
     // Staff read grants do not serve relay_messaging, so probing their native
     // identity would add a database and Relay round trip without changing the report.
-    if (managed && context.authMode !== "staff_read_grant") {
+    // An agent identity is never desktop-managed (admission strips the marker).
+    if (managed && context.authMode !== "staff_read_grant" && context.authMode !== "agent_identity") {
       try {
         await withinRelayRead(
           () => options.nativeStatus ? options.nativeStatus() : relayService(context).status(),
@@ -65,6 +66,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
       grokEvents: Boolean(context.grokRoutines?.cloudCopy),
+      sessionAccess: Boolean(context.sessionAccess),
       nativeAuthorityAvailable,
       nativeAuthorityReason,
       nativeAuthorityHowToEnable,

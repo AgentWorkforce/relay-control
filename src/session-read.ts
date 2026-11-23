@@ -86,9 +86,11 @@ export type ReadIdentity = {
  * The internal mint/refresh body. `role` is sent only when
  * SESSION_READ_MINT_INCLUDE_ROLE is on: read APIs that predate it refuse
  * unknown fields, so turn it on only after the read API accepts `role`.
- * `reader_kind` is sent only behind relaygate (config.mintReaderKind), which
- * records it and strips it before proxying; the read API's strict mint schema
- * rejects unknown fields.
+ * `reader_kind` is sent only when config.mintReaderKind is true: by default
+ * when a relaygate public URL is set, or as chosen by
+ * SESSION_READ_MINT_INCLUDE_READER_KIND. The receiving service must accept or
+ * strip it: relaygate records it and strips it before proxying, while the read
+ * API's strict mint schema rejects unknown fields.
  */
 export function readSessionBody(
   config: NonNullable<SelfhostConfig["sessionReadApi"]>,

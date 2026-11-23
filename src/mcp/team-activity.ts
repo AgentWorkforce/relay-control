@@ -27,9 +27,19 @@ export const ROSTER_TIMEOUT_MS = 10_000;
 const PRESENCE_TIMEOUT_MS = 2_000;
 /** Total time for the History activity reads; later rows are marked unavailable. */
 const ACTIVITY_DEADLINE_MS = 20_000;
+/**
+ * Per-session access mode: at most this many distinct roster session ids get
+ * a readability probe per call, this many at a time, inside the same deadline
+ * as the activity reads. An id left unprobed is not shown.
+ */
+export const BINDING_PROBE_MAX = 40;
+export const BINDING_PROBE_CONCURRENCY = 4;
 
 /** Overrides for the read bounds (tests); the registered tool uses the defaults. */
 export type TeamActivityLimits = { rosterTimeoutMs?: number; presenceTimeoutMs?: number; activityDeadlineMs?: number };
+
+/** The cheapest per-session read: relaygate checks `r` on the session before answering. */
+export const bindingProbePath = (sessionId: string) => `/v1/sessions/${encodeURIComponent(sessionId)}/metadata`;
 
 /**
  * Run `read` with a signal aborted after `ms`, and stop waiting then even if
@@ -305,6 +315,51 @@ export function mergeActivity(agents: TeamAgent[], reads: Map<string, ActivityRe
   });
 }
 
+/**
+ * Session ids the caller has proven readable with its own read token: an
+ * activity read that returned a page for exactly that session, then one
+ * metadata probe per remaining id in ranking order (bounded, see
+ * BINDING_PROBE_MAX). An activity read that failed is not probed again.
+ * Anything else (refused, not found, timeout, transport error, a mismatched
+ * or unrecognised answer, over the bound or past the deadline) is unproven.
+ */
+async function readableBindings(
+  context: McpContext, agents: TeamAgent[], candidates: ActivityCandidate[], reads: Map<string, ActivityRead>, deadline: number,
+): Promise<Set<string>> {
+  const readable = new Set<string>();
+  const tried = new Set<string>();
+  for (const { key, sessionId } of candidates) {
+    const read = reads.get(key);
+    if (!read) continue;
+    tried.add(sessionId);
+    if (read.status !== "unavailable") readable.add(sessionId);
+  }
+  const pending = [...new Set(rankTeamAgents(agents).flatMap(agent => agent.session_id ? [agent.session_id] : []))]
+    .filter(sessionId => !tried.has(sessionId)).slice(0, BINDING_PROBE_MAX);
+  let next = 0;
+  const worker = async () => {
+    while (next < pending.length) {
+      const sessionId = pending[next++]!;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      try {
+        // A probe still pending at the deadline is unproven; its late answer is dropped.
+        const body = await withinRelayRead(() => context.readHistory(bindingProbePath(sessionId)), remaining);
+        if (isRecordValue(body) && body.sessionId === sessionId) readable.add(sessionId);
+      } catch {
+        // Fail closed: the binding stays hidden.
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(BINDING_PROBE_CONCURRENCY, pending.length) }, worker));
+  return readable;
+}
+
+/** The roster entry without its session binding; the agent itself stays listed. */
+function withoutBinding(agent: TeamAgent): TeamAgent {
+  return { ...agent, session_id: null, session_kind: null, session_attribution: null };
+}
+
 export type TeamActivityInput = {
   status: "live" | "all"; stale_after_seconds: number; max_agents: number;
   max_agents_with_activity: number; max_content: number;
@@ -322,8 +377,11 @@ export async function readTeamActivity(
   // Rank before capping, so the freshest agents are never the ones cut;
   // the rows that survive keep the roster's order.
   const kept = new Set(rankTeamAgents(team.agents).slice(0, input.max_agents));
-  const agents = team.agents.filter(agent => kept.has(agent));
-  const candidates = selectActivityCandidates(agents, input.max_agents_with_activity);
+  const listed = team.agents.filter(agent => kept.has(agent));
+  // Per-session access mode: a caller the History reader would refuse reads
+  // nothing and sees no binding.
+  const candidates = context.sessionBindings === "none" ? []
+    : selectActivityCandidates(listed, input.max_agents_with_activity);
   const reads = new Map<string, ActivityRead>();
   for (let i = 0; i < candidates.length; i += 5) {
     const remaining = deadline - Date.now();
@@ -355,6 +413,15 @@ export async function readTeamActivity(
       }
     }));
   }
+  let agents = listed;
+  if (context.sessionBindings) {
+    // Per-session access mode: a binding the caller has not proven readable is
+    // dropped with its activity read, so the agent is no activity candidate.
+    const readable = context.sessionBindings === "probe"
+      ? await readableBindings(context, listed, candidates, reads, deadline) : new Set<string>();
+    agents = listed.map(agent => agent.session_id && !readable.has(agent.session_id) ? withoutBinding(agent) : agent);
+    for (const { key, sessionId } of candidates) if (!readable.has(sessionId)) reads.delete(key);
+  }
   return TeamActivityOutputSchema.parse({
     workspace_id: workspaceId, observed_at: new Date(now).toISOString(),
     presence_source: team.presenceAvailable ? "ok" : "unavailable",
@@ -376,7 +443,7 @@ export async function readTeamActivity(
 export function registerTeamActivity(server: McpServer, context: McpContext): void {
   server.registerTool("list_team_activity", {
     title: "List workspace team activity",
-    description: "Read workspace agents, their declared current or most-recent sessions, latest recorded activity, and freshness-bounded presence in one call. Requires a personal Agent Relay CLI or browser credential. Session claims are self-declared, not verified ownership. Activity is bounded and may be old; null activity does not mean idle. Running flows are not listed by this self-hosted endpoint (flows is always empty). Pinned to the credential's workspace.",
+    description: "Read workspace agents, their declared current or most-recent sessions, latest recorded activity, and freshness-bounded presence in one call. Requires a personal Agent Relay CLI or browser credential. Session claims are self-declared, not verified ownership; where sessions have per-session access, a claim is shown only for a session the caller may read. Activity is bounded and may be old; null activity does not mean idle. Running flows are not listed by this self-hosted endpoint (flows is always empty). Pinned to the credential's workspace.",
     inputSchema: {
       status: z.enum(["live", "all"]).default("live").describe("live uses broker roster status; all also includes offline history."),
       stale_after_seconds: z.number().int().min(30).max(86_400).default(300),

@@ -157,12 +157,19 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_FLOWS_RUNTIME_ENV_URL` | Origin serving that internal route, default `http://127.0.0.1:$PORT` (this process) |
 | `SELFHOST_OAUTH_REDIRECT_URL` | Optional. OAuth redirect URI registered in each provider OAuth app. Default `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` |
 | `SELFHOST_DASHBOARD_URL` | Optional dashboard origin. Link shown on the OAuth result page (default `$SELFHOST_PUBLIC_URL/`) and, when https, `runUrl` on mirrored flow runs |
+| `SELFHOST_ROUTED_SITE_URL` | Optional https origin of a third site whose edge router forwards `<site>/cloud/...` here and overwrites `x-original-host` with that site's host. When one such header names this origin's host, the Desktop/CLI sign-in answers (`api_url`, `apiUrl`, `verification_uri`) name it instead of the Host-selected origin. Unset: unchanged. See [Desktop sign-in through an edge router](#desktop-sign-in-through-an-edge-router) |
+| `SELFHOST_EXTRA_SITES` | Optional comma-separated list (at most 8) of more public host sets in front of this same deployment, each `<dashboard origin>\|<API origin>` (https origins, may be equal). Browser origin checks accept them, and Host-selected answers name the site a request arrived on. Unset: one site only. See [Several public host sets](#several-public-host-sets) |
 | `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together (or the org name with `SELFHOST_ADMIN_EMAILS`). First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](identity.md) |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` / `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional display name for the admin (default: the email's local part) and the workspace name (default `Default`) |
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
 | `SELFHOST_OIDC_ISSUER` / `SELFHOST_OIDC_CLIENT_ID` / `SELFHOST_OIDC_CLIENT_SECRET[_FILE]` | Optional OpenID Connect sign-in (Google Workspace, Okta, Entra ID, Keycloak...). Authorization code + PKCE. See [docs/identity.md](identity.md) |
 | `SELFHOST_OIDC_ALLOWED_DOMAINS` / `SELFHOST_OIDC_DISPLAY_NAME` / `SELFHOST_OIDC_SCOPES` / `SELFHOST_OIDC_REDIRECT_URL` | Optional OIDC refinements: email domains allowed to sign in, button label, scopes (default `openid email profile`), and a fixed redirect URI (default `<site>/login/oidc/callback`) |
 | `SELFHOST_MICROSOFT_CLIENT_ID` / `SELFHOST_MICROSOFT_CLIENT_SECRET[_FILE]` / `SELFHOST_MICROSOFT_TENANT` / `SELFHOST_MICROSOFT_REDIRECT_URL` | Optional "Continue with Microsoft" sign-in for personal Microsoft accounts (Outlook.com, Hotmail) and Entra ID work or school accounts. Client ID and secret are set together; tenant `common` (default), `consumers`, `organizations` or a tenant ID; redirect URI default `<site>/login/microsoft/callback`. Works beside `SELFHOST_OIDC_*`. See [docs/identity.md](identity.md#microsoft-accounts-outlookcom-hotmail-and-entra-id) |
+| `SELFHOST_CLOUD_BRIDGE_ENABLED` | Optional, default off (`true`/`false`, anything else fails start-up). Turns on the session bridge for organizations moved from Agent Relay Cloud ([docs/identity.md](identity.md#session-bridge-for-organizations-moved-from-agent-relay-cloud)); off, no other bridge variable is read and the bridge routes answer 404 |
+| `SELFHOST_CLOUD_BRIDGE_ISSUER` / `SELFHOST_CLOUD_BRIDGE_AUDIENCE` | Required when the bridge is enabled. The exact `iss` and (string) `aud` Cloud signs |
+| `SELFHOST_CLOUD_BRIDGE_HANDOFF_URL` | Required when the bridge is enabled. Cloud's handoff page; https (http only on localhost), no query or fragment. Its origin is the only `Origin` the consume route accepts |
+| `SELFHOST_CLOUD_BRIDGE_PUBLIC_KEYS[_FILE]` | Required when the bridge is enabled. A JWKS (`{"keys":[...]}`) of 1-4 public Ed25519 keys (`kty` `OKP`, `crv` `Ed25519`), each with a unique `kid` and no private `d` member |
+| `SELFHOST_CLOUD_BRIDGE_MAX_AUTH_AGE_SECONDS` | Optional, default `2592000` (30 days), at most `7776000` (90 days). The oldest Cloud sign-in (`auth_time`) the bridge accepts |
 | `SELFHOST_SMTP_HOST` / `_PORT` / `_SECURITY` / `_USERNAME` / `_PASSWORD[_FILE]`, `SELFHOST_EMAIL_FROM` | Optional SMTP for invite emails and sign-in links |
 | `SELFHOST_EMAIL_LOGIN` | Optional `true`: email sign-in links (requires SMTP) |
 | `SELFHOST_SIGNIN_METHODS` | Optional comma list of `email_link` and `password`. `email_link` requires SMTP; `password` does not (without SMTP only its emailed register and reset are off, answering 404 `email_not_configured`). Default: `email_link` when `SELFHOST_EMAIL_LOGIN=true`. Unlisted methods answer 404 `signin_method_disabled`. Failed password sign-ins lock per account and client (5 free, then 30 s doubling to 15 min) and per account across all clients (50 in an hour locks it for 15 min and mails the owner, at most once a day). See [docs/identity.md](identity.md#email-and-password-optional) and [Lockout](identity.md#lockout) |
@@ -219,7 +226,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_MCP_OAUTH` | Optional, default on. Hosted MCP OAuth connectors; `off`, `false` or `0` disables them (`on`/`true`/`1` enables; other spellings fail start-up). A missing or partial signing-key set, invalid key material or an unreadable MCP OIDC `_FILE` leaves the server running (routes answer 501 `mcp_oauth_unavailable`); a value supplied both directly and via `_FILE` still fails start-up. See [docs/mcp-oauth.md](mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS` | Optional, default off (`on`/`true`/`1` or `off`/`false`/`0`). Setting for the separate MCP Events module, which this server does not mount. See [docs/mcp-oauth.md](mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS_PUMP` | Optional, default off, same spellings. Events pump setting; `on` requires `SELFHOST_MCP_EVENTS=on` or start-up fails |
-| `SELFHOST_GROK_ROUTINES_CLOUD_COPY` | Optional, default off, same spellings. Grok Bot routines use Agent Relay Cloud's copied prompt, polling mode, encrypted event log and per-message wakes (migration `0082`). See [docs/grok-bot.md](grok-bot.md#cloud-copy-mode-selfhost_grok_routines_cloud_copy) |
+| `SELFHOST_GROK_ROUTINES_CLOUD_COPY` | Optional, default off, same spellings. Grok Bot routines use Agent Relay Cloud's copied prompt, polling mode, encrypted event log and per-message wakes (migration `0088`). See [docs/grok-bot.md](grok-bot.md#cloud-copy-mode-selfhost_grok_routines_cloud_copy) |
 | `AMP_TRANSPORT_ORIGIN` / `AMP_TRANSPORT_TOKEN[_FILE]` | Optional, set together. Bare https origin of the persistent Amp process service and its bearer (at least 32 bytes); calls go to `POST /v1/internal/amp/operation`. Unset: every Amp operation answers 503 `amp_transport_not_configured` |
 | `SELFHOST_AMP_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes. Bearer for `POST /api/v1/internal/amp/job` (scheduler sweeps and inject jobs). Unset: that route answers 404 |
 | `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
@@ -313,6 +320,14 @@ secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
 carries `role: "owner" | "admin" | "member"`, the caller's live organization
 role ([docs/sessions-read-api.md](sessions-read-api.md#read-credentials)).
+`reader_kind: "browser" | "device" | "mcp"` is added when
+`SESSION_READ_MINT_INCLUDE_READER_KIND=true`; unset, it is sent exactly when
+`SELFHOST_RELAYGATE_PUBLIC_URL` is set, and `false` omits it. A site that
+routes only the internal session read API through relaygate, without a public
+relaygate URL, sets it to `true` so that relaygate policy rules using
+`readerKinds` can match; with `false` (or unset without a relaygate URL) such
+rules match nothing
+([docs/sessions-read-api.md](sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
@@ -523,6 +538,100 @@ Self-host has no Desktop-authority grant: approving a named host records
 nothing beyond the session itself. A session is bound to one workspace, so a
 `workspace` parameter naming another is refused (403).
 
+### Desktop sign-in through an edge router
+
+Some deployments are reached through an edge router on a third site origin
+that forwards `<site>/cloud/...` here. Those requests arrive with this
+service's own Host, so the rule above would name the API or dashboard origin,
+and a Desktop that signed in through `<site>` would refuse the answer. Set
+`SELFHOST_ROUTED_SITE_URL` to that site's https origin (no path, query,
+fragment or credentials).
+
+The rule: when the request carries exactly one `x-original-host` header whose
+value, trimmed and lower-cased, equals the host of `SELFHOST_ROUTED_SITE_URL`,
+these answers name `SELFHOST_ROUTED_SITE_URL` instead of the Host-selected
+origin:
+
+- the browser handoff's loopback redirect `api_url` (`GET`/`POST /cloud/api/v1/cli/login`;
+  the redirect target itself is still the loopback `redirect_uri`)
+- `apiUrl` from `POST /cloud/api/v1/auth/desktop/session`
+- `apiUrl` from `POST /cloud/api/v1/auth/desktop/workspaces`
+- `verification_uri` and `verification_uri_complete` from `POST /cloud/api/v1/auth/device/start`
+- `api_url` from `POST /cloud/api/v1/auth/device/token`
+- `api_url` from `POST /cloud/api/v1/auth/enrollment/token`
+- `apiUrl` from `POST /cloud/api/v1/auth/token/refresh`
+
+A repeated header or one naming any other host falls back to the
+Host-selected origin. Nothing else uses the setting: emailed sign-in and
+password links carry one-time tokens and keep the Host-selected origin, OIDC
+redirect URIs are registered per origin, the MCP endpoint URL is unchanged,
+and browser origin checks and cookies are unchanged. A browser sign-in page
+reached through that router is therefore not covered by this setting: the
+Desktop consent form, like every cookie-authenticated write, still admits
+only the API and dashboard origins, so a consent posted from the routed site
+is refused. The device and enrollment-key sign-ins and every session-bearer
+call are covered.
+
+The header only selects a configured value and is never echoed. A caller that
+reaches the service directly and sends the header itself only receives the
+operator-configured public origin in its own response; that origin scopes no
+cookie, is never the target of a redirect this service sends and is not
+stored. The router must
+overwrite `x-original-host` with its own site's host rather than pass a
+client's copy through.
+
+### Several public host sets
+
+An operator can put a second public host set (another load balancer, same
+routes) in front of one deployment; its requests arrive with the new Host
+header. List each extra set in `SELFHOST_EXTRA_SITES`:
+
+```
+SELFHOST_EXTRA_SITES=https://app.public.example.com|https://api.public.example.com, https://one.example.net|https://one.example.net
+```
+
+Each comma-separated entry is `<dashboard origin>|<API origin>`; whitespace
+around entries and around `|` is ignored. Both sides must be https origins
+without credentials, path, query or fragment, and may be the same origin (a
+single-host site). At most 8 entries. A host belongs to one site only:
+startup fails when an extra host equals the host of `SELFHOST_DASHBOARD_URL`,
+`SELFHOST_PUBLIC_URL`, `SELFHOST_ROUTED_SITE_URL` or another entry's host.
+Errors name the entry by position and never echo it.
+
+For each extra site:
+
+- both origins join the browser origin allowlist (sign-in forms, Desktop
+  consent, every cookie-authenticated write and the MCP Origin check);
+- a request arriving on either host gets that host's origin wherever the
+  answer is Host-selected (the Desktop/CLI sign-in answers listed above,
+  emailed sign-in and password links, OIDC and Microsoft redirect URIs
+  without a fixed redirect URL);
+- `GET /cloud/api/v1/auth/device/approve` and the Desktop dashboard links
+  (`/dashboard/...`, `/cloud/dashboard/...`) redirect to the site's own
+  dashboard (the `SELFHOST_DASHBOARD_URL` path on the extra dashboard origin);
+- an integrations connect `returnTo` on its dashboard origin is accepted
+  (relative values still resolve against `SELFHOST_DASHBOARD_URL`).
+
+A Host that is not configured still answers with `SELFHOST_PUBLIC_URL`, and
+the `x-original-host` rule above is unchanged and takes precedence.
+
+These stay single-origin:
+
+- MCP OAuth issuer, resource URLs and consent origin: always
+  `SELFHOST_PUBLIC_URL` ([docs/mcp-oauth.md](mcp-oauth.md)).
+- Invite links, the password page's forgot-password and register links, MCP
+  citation links and the Flows run URL: the primary dashboard.
+- The integrations OAuth callback URL (`SELFHOST_OAUTH_REDIRECT_URL`).
+- The session read API public URL (`SESSION_READ_API_PUBLIC_URL`).
+- Cookies stay host-only: each host has its own session, and signing in on
+  one site does not sign the browser in on another.
+- With a fixed `SELFHOST_OIDC_REDIRECT_URL` (or Microsoft redirect URL),
+  sign-in through that provider only completes on that URL's host.
+
+CORS allowlists outside this service (the edge router, relaygate and the
+sessions read API) are configured in those services; add the extra dashboard
+origins there as well.
+
 ### Desktop enrollment keys (no browser)
 
 For managed rollouts an organization owner or admin mints a one-time key per
@@ -695,6 +804,16 @@ The dashboard session endpoints are deliberately not a general proxy:
   error, and an absent summary stays `status: empty`. With the direct read API
   configured, this read uses the caller's workspace-bound token without issuing
   a History session or falling back to another backend.
+- `GET|PATCH /cloud/api/v1/workspaces/:id/sessions/:sessionId/access`,
+  `POST .../access/reset` and `GET .../access/history` manage who may read one
+  session when the read API is relaygate's sessions listener and read token
+  mints carry the reader kind (`src/sessions/access-routes.ts`; the public
+  relaygate URL is not required). The policy
+  is relaygate's; `src/sessions/access.ts` validates input, resolves member
+  emails to user ids and maps relaygate's answers, and the MCP tools in
+  `src/mcp/session-access.ts` use the same service. Each call carries the
+  person's own read token to relaygate's per-session access routes, which take
+  no `workspace=` (docs/sessions-read-api.md, "Session access").
 
 These upstream requests add `workspace=` from the tenant-authorized database
 record. Caller-supplied origins, paths, workspace IDs, and credentials are
