@@ -47,6 +47,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   const failures = new Map<string, Array<{ status: number; code: string; after: boolean }>>();
   /** Fleet nodes per workspace key (GET /v1/nodes), raw as Relaycast serves them. */
   const nodes = new Map<string, Array<Record<string, any>>>();
+  /** While positive, the every-state roster read (GET /v1/nodes without status=online) fails with 503 and decrements. */
+  const everyStateNodesFailures = { remaining: 0 };
   /** Native spawn/release invocations. `spawnOutcome` decides how the next spawn completes. */
   const invocations = new Map<string, Record<string, any>>();
   const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
@@ -152,6 +154,10 @@ export function createRelaycastWorld(roster: unknown[]) {
       return ok(leadersDocument(workspace ? bearer : caller!.workspaceKey));
     }
     if (method === "GET" && path === "/v1/nodes" && workspace) {
+      if (query.get("status") !== "online" && everyStateNodesFailures.remaining > 0) {
+        everyStateNodesFailures.remaining -= 1;
+        return fail(503, "unavailable");
+      }
       const listed = (nodes.get(bearer) ?? []).filter(node => query.get("status") !== "online" || node.live === true);
       return ok(listed);
     }
@@ -358,7 +364,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
+    nodes, everyStateNodesFailures, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);

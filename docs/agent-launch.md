@@ -58,7 +58,9 @@ and memory) ranks above everything but permission; see [Free memory](#free-memor
 
 1. `list_relay_spawn_targets`: choose an `allowed` `target_node` and one of its
    `harnesses`.
-2. `spawn_relay_agent` with `name`, `cli`, `target_node`, `task` (at most
+2. `spawn_relay_agent` with `name`, `cli`, `target_node` (a node id, or the
+   name of exactly one live node; see [Target node input](#target-node-input)),
+   `task` (at most
    8,192 UTF-8 bytes), optional `worker_cwd` (literal absolute path) and a
    stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
@@ -76,6 +78,54 @@ and memory) ranks above everything but permission; see [Free memory](#free-memor
 3. `get_relay_spawn_status` until `ready` (with the agent's address),
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
+
+## Target node input
+
+`target_node` is free text: it is trimmed, then accepts 1 to 128 characters
+with no control, format or line/paragraph separator characters (Unicode `Cc`,
+`Cf`, `Zl`, `Zp`: bidi overrides, zero-width characters, U+2028/U+2029).
+
+Relaycast keeps node names unique per workspace, and its spawn selector trims
+the requested name and matches it exactly, case-sensitively, against stored
+names of nodes in every state. This server always sends the stored name of the
+node it resolved, so each node id reaches exactly one machine.
+
+- **Id first.** A value equal to a live node's id selects it; that launch never
+  reads offline nodes. On a miss, nodes of every state are read: an offline
+  node's id keeps its offline (or not-allowed) refusal and is never reread as
+  another node's name. If that read fails there is no offline information
+  (logged as the counter-only `spawn_every_state_roster_failed`): a single
+  name match is then refused as retryable, since it might be an offline node's
+  id, and a value matching nothing is refused as retryable, still listing the
+  live ids and names.
+- **Name fallback.** Otherwise the value is compared with live node names
+  after trimming, NFC normalization, curly apostrophes (U+2018, U+2019, U+02BC)
+  as a straight `'`, and lowercasing. Exactly one match selects that node.
+  Admission (permission, harness, capacity, memory) then runs on that node as
+  it would for its id, and the receipt and journal record its id.
+- **Ambiguous names.** Several live nodes on that key (for example `Studio`
+  and `studio`) are refused with `spawn_target_unavailable`, `retryable:
+  false`, listing their `id (name)` pairs; pass one of those ids. Case or
+  apostrophe variants are distinct machines to Relaycast, so a launch by
+  either id is fine and both remain alternatives.
+- **Padded names.** A node whose stored name has surrounding whitespace
+  (`" lab "`) can never be reached by its own name, because the selector trims
+  it. It is refused by id or by name, `retryable: false`, asking the owner to
+  rename it, and is never offered as an alternative.
+- **No match.** Refused with `spawn_target_unavailable`, `retryable: false`,
+  listing live ids and names in the message and in `valid_targets` (at most
+  20, with an "(and N more; call list_relay_spawn_targets)" suffix; ambiguous
+  matches are capped the same way).
+- **Echoed text.** Node, machine and owner names and the ranking reason in
+  refusal messages, `node`, `owner`, `alternatives` and `valid_targets` come
+  from the roster or user profiles, so control, format and separator
+  characters in them are shown as `\u{...}` escapes. `node` is for display
+  only: pass ids back as `target_node`.
+- **Idempotency.** An `idempotency_key` covers the trimmed `target_node` as
+  given, so reusing a key after switching from a node's name to its id (or to
+  another spelling of its name) is refused as a different launch.
+- **Limits.** Each roster read is one page of at most 100 nodes; an id or name
+  beyond that page is not seen.
 
 Native clients must retain `Mcp-Session-Id`: their launches belong to that
 session. OAuth launches belong to the exact grant and remain accessible after

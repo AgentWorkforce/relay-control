@@ -506,3 +506,208 @@ test("memory off: no memory fields, today's output", async (t) => {
   assert.equal(listed.targets[0].why, "Your computer.");
   assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("small", { cli: "claude" }) })).status, "accepted");
 });
+
+// ---------------------------------------------------------------------------
+// target_node: id first, then a unique live node name.
+
+type Refusal = Record<string, any>;
+async function refusalOf(client: Client, args: Record<string, unknown>): Promise<Refusal> {
+  const result = await client.callTool({ name: "spawn_relay_agent", arguments: args });
+  assert.equal(result.isError, true, JSON.stringify(result.content));
+  return (result.structuredContent as { error: Refusal }).error;
+}
+const sentTargets = (env: Env) => env.world.bodies.filter(body => body.path === "/v1/actions/spawn/invoke")
+  .map(body => body.body!.input.target_node as string);
+const targetIds = (items: Array<{ target_node: string }>) => items.map(item => item.target_node).sort();
+
+test("target_node: an id selects its node; a unique live name (case and apostrophe variants) resolves to its id", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), node("lab-1", "Lab\u2019s Desktop"), node("alt", "alt-desktop")]);
+  for (const id of ["mine", "lab-1", "alt"]) await env.claim(id);
+  const client = await env.connect();
+  const byId = data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine", { name: "by-id", idempotency_key: "target-key-1" }) }));
+  assert.equal(byId.target_node, "mine");
+  const byName = data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("  STUDIO-Desktop ", { name: "by-name", idempotency_key: "target-key-2" }) }));
+  assert.equal(byName.status, "accepted");
+  // The receipt carries the resolved id, never the typed name.
+  assert.equal(byName.target_node, "mine");
+  // A straight apostrophe matches the stored curly one.
+  const apostrophe = data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("lab's desktop", { name: "by-apostrophe", idempotency_key: "target-key-3" }) }));
+  assert.equal(apostrophe.target_node, "lab-1");
+  // Downstream still selects by the stored node name.
+  assert.deepEqual(sentTargets(env), ["studio-desktop", "studio-desktop", "Lab\u2019s Desktop"]);
+  const rows = await env.database.query<{ agent_name: string; node_id: string }>("SELECT agent_name, node_id FROM relay_spawns ORDER BY agent_name");
+  assert.deepEqual(rows.rows.map(row => [row.agent_name, row.node_id]),
+    [["by-apostrophe", "lab-1"], ["by-id", "mine"], ["by-name", "mine"]]);
+  // Readiness is reconciled against the resolved id.
+  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: byName.spawn_id } })).status, "ready");
+});
+
+test("target_node: an id always wins over another node's equal name; an offline id keeps its offline refusal", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [
+    node("alt", "alt-desktop"), node("other", "alt"),
+    node("asleep", "asleep-desktop", { live: false }), node("awake", "asleep"),
+  ]);
+  for (const id of ["alt", "other", "asleep", "awake"]) await env.claim(id);
+  const client = await env.connect();
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("alt") })).target_node, "alt");
+  assert.deepEqual(sentTargets(env), ["alt-desktop"]);
+  const offline = await refusalOf(client, launch("asleep", { idempotency_key: "target-key-2" }));
+  assert.equal(offline.code, "spawn_target_offline");
+  assert.equal(offline.node, "asleep-desktop");
+  assert.equal(sentTargets(env).length, 1);
+});
+
+test("target_node: case-variant names are distinct machines; an id launches, the shared key is an ambiguity refusal", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("studio-a", "Studio"), node("studio-b", "studio")]);
+  await env.claim("studio-a");
+  await env.claim("studio-b");
+  const client = await env.connect();
+  const ambiguous = await refusalOf(client, launch("STUDIO"));
+  assert.equal(ambiguous.code, "spawn_target_unavailable");
+  assert.equal(ambiguous.retryable, false);
+  assert.match(ambiguous.message, /matches no node id and the names of 2 live nodes; pass one of their ids as target_node: /);
+  assert.match(ambiguous.message, /studio-a \(Studio\)/);
+  assert.match(ambiguous.message, /studio-b \(studio\)/);
+  assert.deepEqual(ambiguous.valid_targets.map((item: { id: string }) => item.id).sort(), ["studio-a", "studio-b"]);
+  // Both remain alternatives: either id reaches exactly one machine.
+  assert.deepEqual(targetIds(ambiguous.alternatives), ["studio-a", "studio-b"]);
+  assert.equal(sentTargets(env).length, 0);
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("studio-b") })).target_node, "studio-b");
+  assert.deepEqual(sentTargets(env), ["studio"]);
+});
+
+test("target_node: ambiguity and no-match lists are capped at 20 and say how many more", async (t) => {
+  const env = await setup(t);
+  // Case variants of one name: all share the normalized key.
+  const variants = Array.from({ length: 22 }, (_, index) =>
+    [..."labnode"].map((char, bit) => (index >> bit) & 1 ? char.toUpperCase() : char).join(""));
+  env.world.nodes.set(FIRST_KEY, variants.map((name, index) => node(`lab-${index}`, name)));
+  const client = await env.connect();
+  const ambiguous = await refusalOf(client, launch("LabNode"));
+  assert.match(ambiguous.message, /the names of 22 live nodes/);
+  assert.match(ambiguous.message, /\(and 2 more; call list_relay_spawn_targets\)$/);
+  assert.equal(ambiguous.valid_targets.length, 20);
+  const missing = await refusalOf(client, launch("nowhere", { idempotency_key: "target-key-2" }));
+  assert.equal(missing.retryable, false);
+  assert.match(missing.message, /\(and 2 more; call list_relay_spawn_targets\)$/);
+  assert.equal(missing.valid_targets.length, 20);
+});
+
+test("target_node: no match is non-retryable and lists the live ids and names; nothing is journaled or sent", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop"), node("asleep", "asleep-desktop", { live: false })]);
+  await env.claim("mine");
+  const client = await env.connect();
+  const missing = await refusalOf(client, launch("nowhere"));
+  assert.equal(missing.code, "spawn_target_unavailable");
+  assert.equal(missing.retryable, false);
+  assert.equal(missing.message, 'target_node "nowhere" matches no live node id or name; valid ids and names: mine (studio-desktop)');
+  assert.deepEqual(missing.valid_targets, [{ id: "mine", name: "studio-desktop" }]);
+  // Offline nodes are never matched by name.
+  assert.equal((await refusalOf(client, launch("asleep-desktop", { idempotency_key: "target-key-2" }))).retryable, false);
+  assert.equal(sentTargets(env).length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM relay_spawns")).rows.length, 0);
+});
+
+test("target_node: a failed every-state read never blocks a live id; a miss or a lone name match is retryable", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop")]);
+  await env.claim("mine");
+  const client = await env.connect();
+  env.world.everyStateNodesFailures.remaining = 1;
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine") })).status, "accepted");
+  // A live id is never followed by the every-state read.
+  assert.equal(env.world.everyStateNodesFailures.remaining, 1);
+
+  const missing = await refusalOf(client, launch("nowhere", { idempotency_key: "target-key-2" }));
+  assert.equal(missing.code, "spawn_target_unavailable");
+  assert.equal(missing.retryable, true);
+  assert.match(missing.message, /offline nodes could not be read to check whether it is an offline node's id/);
+  assert.deepEqual(missing.valid_targets, [{ id: "mine", name: "studio-desktop" }]);
+
+  env.world.everyStateNodesFailures.remaining = 1;
+  const lone = await refusalOf(client, launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-3" }));
+  assert.equal(lone.retryable, true);
+  assert.match(lone.message, /matches a live node's name, but offline nodes could not be read/);
+  assert.equal(sentTargets(env).length, 1);
+  // Once the read recovers, the same name launches.
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent",
+    arguments: launch("studio-desktop", { name: "by-name", idempotency_key: "target-key-3" }) })).target_node, "mine");
+});
+
+test("target_node: a name match onto a node you may not use is refused as not allowed", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("unclaimed", "loose-desktop"), node("alt", "alt-desktop")]);
+  await env.claim("alt");
+  const client = await env.connect();
+  const refused = await refusalOf(client, launch("Loose-Desktop"));
+  assert.equal(refused.code, "spawn_target_not_allowed");
+  assert.equal(refused.retryable, false);
+  assert.equal(refused.node, "loose-desktop");
+  assert.deepEqual(targetIds(refused.alternatives), ["alt"]);
+  assert.equal(sentTargets(env).length, 0);
+});
+
+test("target_node: a node whose stored name is padded is refused by id and by name and is never an alternative", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("pad", " lab "), node("alt", "alt-desktop"), node("unclaimed", "loose-desktop")]);
+  await env.claim("pad");
+  await env.claim("alt");
+  const client = await env.connect();
+  for (const [value, key] of [["pad", "target-key-1"], ["lab", "target-key-2"]] as const) {
+    const refused = await refusalOf(client, launch(value, { idempotency_key: key }));
+    assert.equal(refused.code, "spawn_target_unavailable", value);
+    assert.equal(refused.retryable, false, value);
+    assert.match(refused.message, /Node " lab " \(pad\) has whitespace around its name/);
+    assert.deepEqual(targetIds(refused.alternatives), ["alt"]);
+  }
+  assert.deepEqual(targetIds((await refusalOf(client, launch("unclaimed", { idempotency_key: "target-key-3" }))).alternatives), ["alt"]);
+  assert.equal(sentTargets(env).length, 0);
+});
+
+test("target_node: control and bidi characters are refused in input and escaped in echoed roster text", async (t) => {
+  const env = await setup(t);
+  const mate = randomUUID();
+  await env.database.query("INSERT INTO users (id, email, name) VALUES ($1, 'mate@example.test', $2)", [mate, "Mate\u200bX"]);
+  await env.database.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')", [env.orgId, mate]);
+  env.world.nodes.set(FIRST_KEY, [node("bidi", "lab\u202edesktop"), node("mate", "mate-desktop")]);
+  await env.claim("bidi");
+  await env.claim("mate", mate);
+  const client = await env.connect();
+  for (const value of ["lab\u202edesktop", "lab\u200bdesktop", "lab\u2028desktop", "lab\u0007desktop"]) {
+    assert.match(errorText(await client.callTool({ name: "spawn_relay_agent", arguments: launch(value) })),
+      /target_node must not contain control, format or line separator characters/);
+  }
+  const missing = await client.callTool({ name: "spawn_relay_agent", arguments: launch("nowhere") });
+  const text = JSON.stringify(missing);
+  assert.equal(/[\u202e\u200b]/.test(text), false);
+  const error = (missing.structuredContent as { error: Refusal }).error;
+  assert.match(error.message, /bidi \(lab\\u\{202e\}desktop\)/);
+  assert.ok(error.valid_targets.some((item: { name: string }) => item.name === "lab\\u{202e}desktop"));
+  const notAllowed = await client.callTool({ name: "spawn_relay_agent", arguments: launch("mate", { idempotency_key: "target-key-2" }) });
+  assert.equal(/[\u202e\u200b]/.test(JSON.stringify(notAllowed)), false);
+  const refusal = (notAllowed.structuredContent as { error: Refusal }).error;
+  assert.equal(refusal.code, "spawn_target_not_allowed");
+  assert.equal(refusal.owner.name, "Mate\\u{200b}X");
+  assert.match(refusal.message, /Mate\\u\{200b\}X/);
+  assert.ok(refusal.alternatives.some((item: { name: string }) => item.name === "lab\\u{202e}desktop"));
+});
+
+test("target_node idempotency: the key covers the trimmed value as given, so switching between name and id is a different launch", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("mine", "studio-desktop")]);
+  await env.claim("mine");
+  const client = await env.connect();
+  const first = data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("studio-desktop") }));
+  assert.equal(first.target_node, "mine");
+  // The same value with surrounding spaces is the same launch.
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("  studio-desktop ") })).spawn_id, first.spawn_id);
+  assert.match(errorText(await client.callTool({ name: "spawn_relay_agent", arguments: launch("mine") })), /different launch/);
+  assert.match(errorText(await client.callTool({ name: "spawn_relay_agent", arguments: launch("Studio-Desktop") })), /different launch/);
+  assert.equal(sentTargets(env).length, 1);
+});
