@@ -59,10 +59,12 @@ export type SelfhostConfig = {
   customerSupport?: { url: string; token: string } | null;
   /**
    * Independent read service; owns issuance, rotation and verification of its tokens. Required.
-   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
-   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
-   * it before proxying, and the read API's strict mint schema rejects it.
-   * Absent means false.
+   * mintReaderKind: send `reader_kind` in the mint body. An explicit
+   * SESSION_READ_MINT_INCLUDE_READER_KIND (true or false) wins; unset, it is
+   * true exactly when SELFHOST_RELAYGATE_PUBLIC_URL is set. The receiving
+   * service must accept or strip the field: relaygate reads it and strips it
+   * before proxying, and the read API's strict mint schema rejects it, which is
+   * why it stays off by default without relaygate. Absent means false.
    */
   sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
@@ -570,7 +572,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
   const relaygatePublicUrl = loadRelaygatePublicUrl(env);
-  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: loadSessionReadMintIncludeReaderKind(env, relaygatePublicUrl !== null) };
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
   const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
@@ -660,6 +662,14 @@ function loadSessionReadMintIncludeRole(env: Env): boolean {
   if (!value || value === "false") return false;
   if (value !== "true") throw new Error("SESSION_READ_MINT_INCLUDE_ROLE must be true or false");
   return true;
+}
+
+function loadSessionReadMintIncludeReaderKind(env: Env, defaultValue: boolean): boolean {
+  const value = env.SESSION_READ_MINT_INCLUDE_READER_KIND?.trim();
+  if (!value) return defaultValue;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("SESSION_READ_MINT_INCLUDE_READER_KIND must be true or false");
 }
 
 function loadSessionReadMcpReads(env: Env): boolean {

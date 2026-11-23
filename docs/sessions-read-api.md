@@ -74,19 +74,29 @@ workspaceId, audience, scopes: ["rth:read"], label? }`, with `refreshToken`
 instead of `label` on refresh. The caller's own token never reaches the read
 API.
 
-On gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the body also
-carries `reader_kind`, taken from how the caller authenticated and never from
+When `SELFHOST_RELAYGATE_PUBLIC_URL` is set, or `SESSION_READ_MINT_INCLUDE_READER_KIND=true`,
+the body also carries `reader_kind`, taken from how the caller authenticated and never from
 the request body: `browser` for a cookie session with no bearer, `device` for
 an `sh_at_` bearer (a request with both a cookie and a bearer is `device`),
 and `mcp` for every MCP read made on the person's behalf. Relaygate records it
 and strips it before proxying, because the read API's internal schema is
-strict; on other installs the body is exactly as above. MCP reads that hop
+strict; otherwise the body is exactly as above. MCP reads that hop
 over Control's public session-read route prove themselves with the
 `x-relaycontrol-session-reader` header, an HMAC of a fixed string keyed by
 `SESSION_READ_API_SECRET`; a cookie request ignores the header, and a bearer
 without a matching header is `device`. Control validates the reply's identity, audience, read-only scope, token
 format (`rth_at_read_`/`rth_rt_read_`) and expiry, and sets `baseUrl` from
 configuration. Keep the internal routes off public ingress.
+
+`SESSION_READ_MINT_INCLUDE_READER_KIND` (`true` or `false`; any other value
+is a startup error) decides whether `reader_kind` is sent. Unset or empty, it
+is sent exactly when `SELFHOST_RELAYGATE_PUBLIC_URL` is set; an explicit value
+wins in both directions. A site that routes only the internal session read API
+through relaygate, without a public relaygate URL, sets this to `true` so that
+relaygate policy rules using `readerKinds` can match. With `false` (or unset
+without a relaygate public URL) such rules match nothing. Set it to `true` only
+when the service receiving the mint accepts or strips the field, as relaygate
+does; a read API that receives it directly refuses the body.
 
 `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) adds `role` to both
 bodies: `"owner"`, `"admin"` or `"member"`, the caller's organization role
