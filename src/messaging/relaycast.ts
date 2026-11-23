@@ -175,6 +175,12 @@ function errorCode(body: string): string | null {
   }
 }
 
+/** A message's reply count: the engine serves its SQL count as a number or a decimal string. Anything else is 0. */
+function replyCountOf(value: unknown): number {
+  const count = typeof value === "string" && /^[0-9]{1,15}$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(count) && (count as number) >= 0 ? count as number : 0;
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -841,7 +847,7 @@ export function createRelaycastClient(input: {
         return [{
           id, sender: text(message.agent_name), text: typeof message.text === "string" ? message.text : "",
           threadId: text(message.thread_id),
-          replyCount: Number.isInteger(message.reply_count) ? message.reply_count as number : 0,
+          replyCount: replyCountOf(message.reply_count),
           createdAt: text(message.created_at),
         }];
       });
@@ -869,7 +875,7 @@ export function createRelaycastClient(input: {
       const row = (message: Record<string, unknown>, id: string): ChannelMessage => ({
         id, sender: text(message.agent_name), text: typeof message.text === "string" ? message.text : "",
         threadId: text(message.thread_id),
-        replyCount: Number.isInteger(message.reply_count) ? message.reply_count as number : 0,
+        replyCount: replyCountOf(message.reply_count),
         createdAt: text(message.created_at),
       });
       const replies = (data!.replies as unknown[]).flatMap((item): ChannelMessage[] => {
@@ -879,8 +885,7 @@ export function createRelaycastClient(input: {
         return reply && id && text(reply.thread_id) === parentId ? [row(reply, id)] : [];
       });
       replies.sort((left, right) => left.id.length - right.id.length || left.id.localeCompare(right.id));
-      // The engine's thread count can arrive as a string (a SQL count), so it is parsed.
-      return { parent: { ...row(parent, parentId), replyCount: Number(parent.reply_count) || 0, channelId: text(parent.channel_id) }, replies };
+      return { parent: { ...row(parent, parentId), replyCount: replyCountOf(parent.reply_count), channelId: text(parent.channel_id) }, replies };
     },
 
     /**

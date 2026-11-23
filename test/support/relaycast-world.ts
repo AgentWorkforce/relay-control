@@ -360,8 +360,9 @@ export function createRelaycastWorld(roster: unknown[]) {
         const limit = Number(query.get("limit") ?? 50);
         const rows = [...messages.values()].filter(row => row.channel_id === channel.id && !row.thread_id
           && (!before || BigInt(row.id) < BigInt(before)));
+        // Postgres serves the engine's count(*) as a string.
         return ok(rows.slice(-limit).reverse().map(row => ({ ...row,
-          reply_count: [...messages.values()].filter(reply => reply.thread_id === row.id).length })));
+          reply_count: String([...messages.values()].filter(reply => reply.thread_id === row.id).length) })));
       }
     }
     return null;
