@@ -1,4 +1,5 @@
 import { createPublicKey, verify as verifySignature, type KeyObject } from "node:crypto";
+import { logDependencyFailed } from "./observe.js";
 
 /**
  * Workflow OIDC tokens for release-gate redeem (relay
@@ -12,6 +13,10 @@ import { createPublicKey, verify as verifySignature, type KeyObject } from "node
 
 export const GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 const JWKS_TTL_MS = 10 * 60 * 1000;
+/** An unknown `kid` refetches at most once a minute, so forged tokens cannot drive outbound calls (as Cloud). */
+const REFRESH_COOLDOWN_MS = 60 * 1000;
+/** After a failed fetch, no new fetch starts for this long: an outage does not add a fetch to every redeem (as Cloud). */
+const FAILURE_BACKOFF_MS = 30 * 1000;
 const CLOCK_SKEW_SECONDS = 60;
 const MAX_TOKEN_CHARS = 16_384;
 
@@ -38,6 +43,17 @@ export class OidcInvalid extends Error {
   }
 }
 
+/**
+ * The issuer's keys could not be read (discovery or JWKS fetch failed, or is
+ * backing off) and no good keys are cached: an outage, never a forged token.
+ * Gate redeem answers `unavailable`.
+ */
+export class OidcKeysUnavailable extends Error {
+  constructor(readonly status: number | null = null) {
+    super("oidc_keys_unavailable");
+  }
+}
+
 type Jwk = { kty?: string; kid?: string; alg?: string; use?: string; n?: string; e?: string; crv?: string; x?: string; y?: string };
 
 /**
@@ -55,30 +71,51 @@ export function workflowOidcVerifier(input: {
   const now = input.now ?? (() => new Date());
   const issuers = new Set(input.issuers.map(issuer => issuer.replace(/\/+$/, "")));
   const cache = new Map<string, { at: number; keys: Jwk[] }>();
+  const failedAt = new Map<string, number>();
 
   async function fetchJson(url: string): Promise<Record<string, unknown>> {
-    let response: Response;
-    try {
-      response = await fetchImpl(url, { headers: { accept: "application/json" }, redirect: "error" });
-    } catch {
-      throw new OidcInvalid("jwks_unavailable");
-    }
-    if (!response.ok) throw new OidcInvalid("jwks_unavailable");
+    const response = await fetchImpl(url, { headers: { accept: "application/json" }, redirect: "error" });
+    if (!response.ok) throw new OidcKeysUnavailable(response.status);
     const body = await response.json().catch(() => null) as unknown;
-    if (!body || typeof body !== "object" || Array.isArray(body)) throw new OidcInvalid("jwks_unavailable");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new OidcKeysUnavailable(response.status);
     return body as Record<string, unknown>;
   }
 
+  /**
+   * The issuer's keys, as Cloud's githubJwks: cached for 10 minutes, an
+   * unknown kid refetches at most once a minute, and after a failed fetch no
+   * refetch starts for 30 seconds. A failure serves the last good keys, or
+   * (with none) throws OidcKeysUnavailable; either way it is logged
+   * (`delegation.dependency_failed`, op github_oidc_jwks).
+   */
   async function keys(issuer: string, refresh: boolean): Promise<Jwk[]> {
     const cached = cache.get(issuer);
-    if (cached && !refresh && now().getTime() - cached.at < JWKS_TTL_MS) return cached.keys;
+    const at = now().getTime();
+    const age = cached ? at - cached.at : Number.POSITIVE_INFINITY;
+    if (cached && (refresh ? age < REFRESH_COOLDOWN_MS : age < JWKS_TTL_MS)) return cached.keys;
+    if (at - (failedAt.get(issuer) ?? Number.NEGATIVE_INFINITY) < FAILURE_BACKOFF_MS) {
+      if (cached) return cached.keys;
+      throw new OidcKeysUnavailable();
+    }
+    try {
+      return await fetchKeys(issuer);
+    } catch (error) {
+      failedAt.set(issuer, at);
+      logDependencyFailed("github_oidc_jwks", error, { stale_cache_served: Boolean(cached), refresh,
+        ...(error instanceof OidcKeysUnavailable && error.status !== null ? { status: error.status } : {}) });
+      if (cached) return cached.keys;
+      throw error instanceof OidcKeysUnavailable ? error : new OidcKeysUnavailable();
+    }
+  }
+
+  async function fetchKeys(issuer: string): Promise<Jwk[]> {
     const discovery = await fetchJson(`${issuer}/.well-known/openid-configuration`);
     const jwksUri = typeof discovery.jwks_uri === "string" ? discovery.jwks_uri : null;
     // The keys must be served from the issuer's own origin.
     // Compare issuers without a trailing slash, as the token's issuer is compared.
     const published = typeof discovery.issuer === "string" ? discovery.issuer.replace(/\/+$/, "") : null;
     if (!jwksUri || published !== issuer || new URL(jwksUri).origin !== new URL(issuer).origin) {
-      throw new OidcInvalid("jwks_unavailable");
+      throw new OidcKeysUnavailable();
     }
     const jwks = await fetchJson(jwksUri);
     const list = Array.isArray(jwks.keys) ? jwks.keys.filter((key): key is Jwk => Boolean(key) && typeof key === "object") : [];

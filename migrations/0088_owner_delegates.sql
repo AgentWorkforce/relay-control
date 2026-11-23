@@ -196,7 +196,11 @@ CREATE TABLE IF NOT EXISTS delegation_audit_events (
   quote text,
   quote_hash text,
   quote_redacted_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  -- The writing transaction's id. Paged reads order by (xact_id, id) and
+  -- return only events of transactions older than every one still in flight,
+  -- so a page never has to come back for a row behind its cursor.
+  xact_id bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint)
 );
 
 CREATE INDEX IF NOT EXISTS delegation_audit_events_workspace_idx
@@ -205,6 +209,42 @@ CREATE INDEX IF NOT EXISTS delegation_audit_events_owner_idx
   ON delegation_audit_events (workspace_id, owner_user_id, id);
 CREATE INDEX IF NOT EXISTS delegation_audit_events_quote_idx
   ON delegation_audit_events (created_at) WHERE quote IS NOT NULL;
+CREATE INDEX IF NOT EXISTS delegation_audit_events_commit_order_idx
+  ON delegation_audit_events (workspace_id, xact_id, id);
+
+-- Rows are never edited. The one permitted change redacts the quote text to
+-- its digest (retention or the owner's request); a workspace deletion cascades.
+CREATE OR REPLACE FUNCTION delegation_audit_events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.id = OLD.id AND NEW.workspace_id = OLD.workspace_id AND NEW.event = OLD.event
+    AND NEW.actor_user_id IS NOT DISTINCT FROM OLD.actor_user_id
+    AND NEW.actor_agent_id IS NOT DISTINCT FROM OLD.actor_agent_id
+    AND NEW.auth_method IS NOT DISTINCT FROM OLD.auth_method
+    AND NEW.owner_user_id IS NOT DISTINCT FROM OLD.owner_user_id
+    AND NEW.grant_id IS NOT DISTINCT FROM OLD.grant_id
+    AND NEW.approval_id IS NOT DISTINCT FROM OLD.approval_id
+    AND NEW.message_id IS NOT DISTINCT FROM OLD.message_id
+    AND NEW.recipient_agent_id IS NOT DISTINCT FROM OLD.recipient_agent_id
+    AND NEW.reason IS NOT DISTINCT FROM OLD.reason
+    AND NEW.data = OLD.data
+    AND NEW.quote_hash IS NOT DISTINCT FROM OLD.quote_hash
+    AND NEW.created_at = OLD.created_at
+    AND NEW.xact_id = OLD.xact_id
+    AND OLD.quote IS NOT NULL AND NEW.quote IS NULL AND NEW.quote_redacted_at IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'DELETE' AND NOT EXISTS (SELECT 1 FROM workspaces WHERE id = OLD.workspace_id) THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'Delegation audit events are append-only' USING ERRCODE = '23514';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS delegation_audit_events_append_only ON delegation_audit_events;
+CREATE TRIGGER delegation_audit_events_append_only
+  BEFORE UPDATE OR DELETE ON delegation_audit_events
+  FOR EACH ROW EXECUTE FUNCTION delegation_audit_events_append_only();
 
 -- Quotes redacted here and still to be redacted in Relaycast's stored
 -- owner_approval (§8, §15.9); retried with back-off until Relaycast confirms.
@@ -215,6 +255,10 @@ CREATE TABLE IF NOT EXISTS delegation_quote_redactions (
   relaycast_redacted_at timestamptz,
   attempts integer NOT NULL DEFAULT 0,
   last_attempt_at timestamptz,
+  -- The last answer: redacted or absent (done), rejected (parked for an
+  -- operator, still unfinished), or null while retrying. As Cloud.
+  relaycast_outcome text,
+  relaycast_status integer,
   PRIMARY KEY (workspace_id, message_id)
 );
 

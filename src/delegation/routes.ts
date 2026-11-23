@@ -34,6 +34,7 @@ import {
 import {
   anyBinding,
   attestDelegation,
+  AuditCursorError,
   auditView,
   CLAIM_TTL_MS,
   expireLapsed,
@@ -228,7 +229,10 @@ const withdrawBody = z.object({
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
 const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
 const GATE_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
-const WORKFLOW_FILE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[^\s@*]{1,200}@refs\/[^\s*]{1,250}$/u;
+/** As Cloud: a workflow file under `.github/workflows/` at a full ref (a tag gate: its `ref_pattern`). */
+const WORKFLOW_FILE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[A-Za-z0-9_.-]{1,200}\.ya?ml@(refs\/(?:heads|tags)\/[^\s*]{1,250}\*?)$/u;
+/** A reusable workflow may also be pinned by commit SHA (`…@<40 hex>`), as GitHub reports `uses: …@<sha>`. */
+const JOB_WORKFLOW_FILE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[A-Za-z0-9_.-]{1,200}\.ya?ml@(refs\/(?:heads|tags)\/[^\s*]{1,250}\*?|[0-9a-f]{40})$/u;
 /**
  * `POST /delegates/gates` (§11a.3). Every field is matched exactly against
  * the job's OIDC token: `workflow_ref` (the workflow the run started from,
@@ -239,8 +243,8 @@ const gateBody = z.object({
   /** Optional: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. */
   issuer: z.string().max(512).optional(),
   repo: z.string().regex(GATE_REPO),
-  workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF),
-  job_workflow_ref: z.string().max(512).regex(WORKFLOW_FILE_REF).optional(),
+  workflow_ref: z.string().min(1).max(512),
+  job_workflow_ref: z.string().min(1).max(512).optional(),
   ref: z.string().regex(/^refs\/(?:heads|tags)\/[^\s*]{1,250}$/u).optional(),
   /** Tag-triggered workflows: `refs/tags/<literal prefix>*`, a single trailing `*` and nothing else. */
   ref_pattern: z.string().regex(/^refs\/tags\/[^\s*]{1,200}\*$/u).optional(),
@@ -252,9 +256,20 @@ const gateBody = z.object({
   if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
     context.addIssue({ code: "custom", message: "set exactly one of ref and ref_pattern" });
   }
-  // The run's workflow must live in the gate's own repository, pinned to a ref.
-  if (!gate.workflow_ref.startsWith(`${gate.repo}/.github/workflows/`)) {
-    context.addIssue({ code: "custom", message: "workflow_ref must be <repo>/.github/workflows/<file>@<ref>" });
+  // The run's own workflow lives in the gate's repository, at the gate's ref
+  // (or ref pattern): a file edited on another branch never matches.
+  const gateRef = gate.ref ?? gate.ref_pattern;
+  const workflow = WORKFLOW_FILE.exec(gate.workflow_ref);
+  if (!workflow || !gate.workflow_ref.startsWith(`${gate.repo}/.github/workflows/`) || workflow[1] !== gateRef) {
+    context.addIssue({ code: "custom", message: "workflow_ref must be <repo>/.github/workflows/<file>@<the gate's ref or ref_pattern>" });
+  }
+  // A reusable workflow may live in another repository; its ref must be a full
+  // ref, the gate's ref pattern, or (preferred across repositories) a commit SHA.
+  if (gate.job_workflow_ref !== undefined) {
+    const job = JOB_WORKFLOW_FILE.exec(gate.job_workflow_ref);
+    if (!job || (job[1]!.endsWith("*") && job[1] !== gate.ref_pattern)) {
+      context.addIssue({ code: "custom", message: "job_workflow_ref must be <owner>/<repo>/.github/workflows/<file>@<ref or commit SHA>" });
+    }
   }
   // A prefix not anchored to this repository would let one gate redeem another repo's releases.
   if (!gate.target_prefix.startsWith(`${gate.repo}:`) || /\s|\*/u.test(gate.target_prefix)) {
@@ -883,11 +898,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
-      // Resume after an event id, as Cloud: `?after_id=<last event id>`.
-      // Events are returned in id order and a page never runs past an event
-      // that could still be committing (listAuditPage's watermark), so
-      // resuming after the last id never skips an event committed out of
-      // id order. As Cloud, a paged read also leaves out the last 30 seconds.
+      // Resume after an event id, as Cloud: `?after_id=<last event id>` (0:
+      // from the start). Pages are commit-safe (listAuditPage), so resuming
+      // never skips an event committed out of id order. An id that names no
+      // event of this workspace is invalid_request.
       const after = params.get("after_id");
       if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
@@ -898,6 +912,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const events = (await listAuditPage(input.database, {
         workspaceId: workspace.id, all: caller.admin, viewerUserId: principal.userId, since: since || null,
         grantId: grantId || null, limit, afterId: after,
+      }).catch((error: unknown) => {
+        if (error instanceof AuditCursorError) return fail("invalid_request", "after_id must be an event id", 400);
+        throw error;
       })).map(auditView);
       if (format === "jsonl") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });

@@ -133,6 +133,16 @@ async function ready(t: TestContext, options: { relaycastInternal?: boolean } = 
   return { env, recipient, bot, grantId: created.grant_id as string };
 }
 
+/** Rewrites audit rows as a test operator would, past the append-only trigger (to age them). */
+async function backdateAudit(env: Env, sql: string, params: unknown[] = []) {
+  await env.database.query("ALTER TABLE delegation_audit_events DISABLE TRIGGER delegation_audit_events_append_only");
+  try {
+    await env.database.query(sql, params);
+  } finally {
+    await env.database.query("ALTER TABLE delegation_audit_events ENABLE TRIGGER delegation_audit_events_append_only");
+  }
+}
+
 function send(env: Env, bot: { name: string }, recipient: { name: string }, ownerApproval: unknown) {
   return env.world.sendApprovalAs(bot.name, recipient.name, "Khaliq approved: merge #2250 once CI is green.", ownerApproval).message.id;
 }
@@ -762,7 +772,7 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
 test("quote text is redacted to its hash after 90 days", async (t) => {
   const { env, recipient, bot } = await ready(t);
   await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#3" }])));
-  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
   const audit = await env.bearer("/delegates/audit");
   const attested = audit.body.events.find((event: { event: string }) => event.event === "approval.attested");
   assert.equal(attested.quote, null);
@@ -1003,10 +1013,8 @@ test("quote_retention_days is an org setting (1–3650, default 90) that every w
   };
   const old = await quoted("AgentWorkforce/relay#31");
   const recent = await quoted("AgentWorkforce/relay#29");
-  await env.database.query(
-    "UPDATE delegation_audit_events SET created_at = now() - interval '31 days' WHERE data->>'jti' = $1", [old]);
-  await env.database.query(
-    "UPDATE delegation_audit_events SET created_at = now() - interval '29 days' WHERE data->>'jti' = $1", [recent]);
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '31 days' WHERE data->>'jti' = $1", [old]);
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '29 days' WHERE data->>'jti' = $1", [recent]);
   type Event = { data: { jti?: string }; quote: string | null; quote_hash: string | null; quote_redacted_at: string | null };
   const audit = async () => (await env.bearer("/delegates/audit")).body.events as Event[];
   const byJti = (events: Event[], jti: string) => events.find(event => event.data.jti === jti)!;
@@ -1129,9 +1137,6 @@ test("review: tokens act only in their own workspace; oversized bodies get 413; 
   for (let index = 0; index < 3; index += 1) {
     await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: `AgentWorkforce/relay#${50 + index}` }])));
   }
-  // A paged read leaves out the last 30 seconds (a late commit with a lower id is never skipped).
-  assert.deepEqual((await env.bearer("/delegates/audit?after_id=0")).body.events, []);
-  await env.database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute'");
   const all = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
   const first = (await env.bearer("/delegates/audit?limit=2")).body.events as Array<{ id: string }>;
   const rest = (await env.bearer(`/delegates/audit?after_id=${first.at(-1)!.id}`)).body.events as Array<{ id: string }>;
@@ -1225,7 +1230,7 @@ test("review: PATCH applies to the locked current row; a new grant re-checks the
 test("review: the retention sweep redacts quotes and expires grants without delegation traffic", async (t) => {
   const { env, recipient, bot, grantId } = await ready(t);
   await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#70" }])));
-  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
   await env.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [grantId]);
   const { createDelegationRetention } = await import("../src/delegation/retention.js");
   const sweep = await createDelegationRetention({ database: env.database }).sweep();
@@ -1357,19 +1362,52 @@ test("the owner redacts one message's quote; Relaycast is asked, and a failure s
   // Relaycast refuses: the redaction stays queued, and the sweep retries it after its back-off.
   const second = send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#121" }]));
   assert.equal((await env.attest(recipient, second)).status, 200);
-  const path = `/internal/workspaces/rw_primary/messages/${second}/owner-approval/redact`;
-  env.world.failNext("POST", path, 503);
+  const path = (id: string) => `/internal/workspaces/rw_primary/messages/${id}/owner-approval/redact-quote`;
+  // The route is called with no body.
+  assert.equal(env.world.bodies.filter(item => item.path === path(messageId)).at(-1)!.body, null);
+  env.world.failNext("POST", path(second), 503);
   const queued = await env.bearer("/delegates/quotes/redact", "POST", { message_id: second });
   assert.deepEqual(queued.body, { message_id: second, redacted_events: 1, relaycast: "queued" });
-  await env.database.query("UPDATE delegation_quote_redactions SET last_attempt_at = now() - interval '1 hour'");
+  const outcome = async (id: string) => (await env.database.query<{ relaycast_outcome: string | null;
+    relaycast_status: number | null; attempts: number; done: boolean }>(
+    `SELECT relaycast_outcome, relaycast_status, attempts, relaycast_redacted_at IS NOT NULL AS done
+       FROM delegation_quote_redactions WHERE message_id = $1`, [id])).rows[0];
+  assert.deepEqual(await outcome(second), { relaycast_outcome: null, relaycast_status: 503, attempts: 1, done: false });
   const { createDelegationRetention } = await import("../src/delegation/retention.js");
   const { relaycastQuoteRedactor } = await import("../src/delegation/service.js");
-  const sweep = await createDelegationRetention({ database: env.database,
+  const sweeper = createDelegationRetention({ database: env.database,
     relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: env.config.relaycastUrl, internalSecret: RELAYCAST_INTERNAL_SECRET,
       fetchImpl: env.messagingFetch }),
-    relaycastBinding: async () => ({ relaycastWorkspaceId: "rw_primary" }) }).sweep();
-  assert.equal(sweep.relaycastPending, 0);
+    relaycastBinding: async () => ({ relaycastWorkspaceId: "rw_primary" }) });
+  // Not due yet: the back-off holds it (2 minutes after one try).
+  assert.equal((await sweeper.sweep()).relaycastPending, 1);
+  assert.equal((await outcome(second))!.attempts, 1);
+  // No attempt cap: after many failures it is still retried once due.
+  await env.database.query("UPDATE delegation_quote_redactions SET attempts = 60, last_attempt_at = now() - interval '7 hours' WHERE message_id = $1", [second]);
+  assert.equal((await sweeper.sweep()).relaycastPending, 0);
+  assert.deepEqual(await outcome(second), { relaycast_outcome: "redacted", relaycast_status: 200, attempts: 60, done: true });
   assert.deepEqual(env.world.quoteRedactions.map(row => row.messageId), [messageId, second]);
+
+  // 404 owner_approval_not_found is final (absent); another 4xx is parked as rejected, still unfinished.
+  const third = send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#122" }]));
+  const fourth = send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#123" }]));
+  for (const id of [third, fourth]) assert.equal((await env.attest(recipient, id)).status, 200);
+  env.world.failNext("POST", path(third), 404, { code: "owner_approval_not_found" });
+  env.world.failNext("POST", path(fourth), 403, { code: "forbidden" });
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: third })).body.relaycast, "redacted");
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: fourth })).body.relaycast, "queued");
+  assert.deepEqual(await outcome(third), { relaycast_outcome: "absent", relaycast_status: 404, attempts: 0, done: true });
+  assert.deepEqual(await outcome(fourth), { relaycast_outcome: "rejected", relaycast_status: 403, attempts: 1, done: false });
+  // A rejected one is not retried by the sweep, and stays counted.
+  await env.database.query("UPDATE delegation_quote_redactions SET last_attempt_at = now() - interval '7 hours' WHERE message_id = $1", [fourth]);
+  assert.equal((await sweeper.sweep()).relaycastPending, 1);
+  assert.equal((await outcome(fourth))!.attempts, 1);
+  // A 404 without that code (the route not deployed yet) is retried.
+  const fifth = send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#124" }]));
+  assert.equal((await env.attest(recipient, fifth)).status, 200);
+  env.world.failNext("POST", path(fifth), 404, { code: "not_found" });
+  await env.bearer("/delegates/quotes/redact", "POST", { message_id: fifth });
+  assert.deepEqual(await outcome(fifth), { relaycast_outcome: null, relaycast_status: 404, attempts: 1, done: false });
 });
 
 test("routes that run before any caller is proven never provision a Relaycast binding", async (t) => {
@@ -1544,7 +1582,7 @@ test("review: a message whose quote was redacted is never stored or signed again
   const first = await env.attest(recipient, messageId);
   assert.equal(first.body.claims.quote, "yes merge 2250 when green");
   // The first record passes the retention window and the sweep redacts it.
-  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  await backdateAudit(env, "UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
   const { createDelegationRetention } = await import("../src/delegation/retention.js");
   await createDelegationRetention({ database: env.database }).sweep();
   // Attesting the same message again: no quote is signed or stored, the digest is kept.
@@ -1573,39 +1611,69 @@ test("review: a message whose quote was redacted is never stored or signed again
   assert.equal(other.body.claims.quote, "yes merge 2250 when green");
 });
 
-test("review: audit pages never run past an event that may still be committing", async (t) => {
+test("review: audit pages follow commit order (xact_id, id); after_id resolves to its event", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  for (let index = 0; index < 3; index += 1) {
+    await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: `AgentWorkforce/relay#${220 + index}` }])));
+  }
+  const all = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
+  assert.ok(all.length >= 3);
+  // Every event records the transaction that wrote it, and pages follow (xact_id, id).
+  const order = (await env.database.query<{ id: string }>(
+    "SELECT id::text FROM delegation_audit_events WHERE workspace_id = $1 ORDER BY xact_id, id", [env.workspaceId])).rows;
+  assert.deepEqual(all.map(event => event.id), order.map(row => row.id));
+  // after_id=0 starts from the beginning; paging resumes from its event's (xact_id, id).
+  assert.deepEqual(((await env.bearer("/delegates/audit?after_id=0")).body.events as Array<{ id: string }>).map(event => event.id),
+    all.map(event => event.id));
+  const first = (await env.bearer("/delegates/audit?limit=2")).body.events as Array<{ id: string }>;
+  const rest = (await env.bearer(`/delegates/audit?after_id=${first.at(-1)!.id}&format=jsonl`));
+  assert.equal(rest.status, 200, rest.raw);
+  const restIds = rest.raw.trim().split("\n").map(line => (JSON.parse(line) as { id: string }).id);
+  assert.deepEqual([...first.map(event => event.id), ...restIds], all.map(event => event.id));
+  // An id that names no event of this workspace is invalid_request.
+  const unknown = await env.bearer("/delegates/audit?after_id=999999999");
+  assert.equal(unknown.status, 400, unknown.raw);
+  assert.equal(unknown.body.code, "invalid_request");
+  // The log is append-only: only a quote redaction may change a row.
+  await assert.rejects(env.database.query("UPDATE delegation_audit_events SET event = 'x' WHERE id = $1", [all[0]!.id]),
+    /append-only/);
+  await assert.rejects(env.database.query("UPDATE delegation_audit_events SET xact_id = 1 WHERE id = $1", [all[0]!.id]),
+    /append-only/);
+  await assert.rejects(env.database.query("DELETE FROM delegation_audit_events WHERE id = $1", [all[0]!.id]), /append-only/);
+});
+
+test("review: decided under locks: code_owner_match changed is unavailable; exp follows the fresh grant; an owner redaction is honored", async (t) => {
   const { env, recipient, bot, grantId } = await ready(t);
-  await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#220" }])));
-  const settled = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
-  assert.ok(settled.length > 0);
-  // An event whose insert time is past the watermark stands for a transaction
-  // still in flight: it and every later id are held back, even though a later
-  // event has committed.
-  const inFlight = (await env.database.query<{ id: string }>(
-    `INSERT INTO delegation_audit_events (workspace_id, event, owner_user_id, created_at)
-     VALUES ($1, 'grant.updated', $2, clock_timestamp() + interval '1 hour') RETURNING id::text`,
-    [env.workspaceId, env.ownerId])).rows[0]!.id;
-  await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#221" }])));
-  const held = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
-  assert.deepEqual(held.map(event => event.id), settled.map(event => event.id));
-  const resumed = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}&format=jsonl`));
-  assert.equal(resumed.status, 200, resumed.raw);
-  assert.equal(resumed.raw, "");
-  // Once it settles (and, as Cloud, is past the 30-second paging hold-back),
-  // resuming from the last id returns it and the later event, in id order.
-  await env.database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute' WHERE id <> $1",
-    [inFlight]);
-  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() - interval '1 minute' WHERE id = $1",
-    [inFlight]);
-  const rest = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}`)).body.events as Array<{ id: string; event: string }>;
-  assert.equal(rest[0]!.id, inFlight);
-  assert.ok(rest.length >= 2);
-  assert.deepEqual(rest.map(event => BigInt(event.id)), rest.map(event => BigInt(event.id)).sort((a, b) => (a < b ? -1 : 1)));
-  // A filter that hides the in-flight event still stops before it.
-  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() + interval '1 hour' WHERE id = $1",
-    [inFlight]);
-  const filtered = await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}&grant_id=${grantId}`);
-  assert.equal(filtered.status, 200, filtered.raw);
-  assert.deepEqual(filtered.body.events, []);
-  assert.deepEqual((await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}`)).body.events, []);
+  const during = duringRosterLookup(env, t);
+  const put = async (body: Record<string, unknown>) => {
+    const response = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, ...body });
+    assert.equal(response.status, 200, response.raw);
+  };
+  // The code-owner rule standing was resolved under changed meanwhile: retry later.
+  during(() => put({ code_owner_match: "all_paths" }));
+  const stale = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#230" }])));
+  assert.deepEqual(stale.body, { verdict: "none", reason: "unavailable" });
+  await put({});
+  // The grant is shortened meanwhile: the attestation never outlives the fresh grant.
+  const shortened = new Date(Date.now() + 120_000);
+  during(async () => {
+    const patched = await env.browser(`/delegates/${grantId}`, "PATCH", { expires_at: shortened.toISOString() });
+    assert.equal(patched.status, 200, patched.raw);
+  });
+  const bounded = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#231" }])));
+  assert.equal(bounded.body.verdict, "delegate", bounded.raw);
+  assert.ok(bounded.body.claims.exp <= Math.floor(shortened.getTime() / 1000));
+  // The owner redacts a message's quote: attesting it again signs and stores no quote.
+  const messageId = send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#232" }]));
+  assert.equal((await env.attest(recipient, messageId)).body.claims.quote, "yes merge 2250 when green");
+  assert.equal((await env.bearer("/delegates/quotes/redact", "POST", { message_id: messageId })).status, 200);
+  const again = await env.attest(recipient, messageId);
+  assert.equal(again.body.verdict, "delegate", again.raw);
+  assert.equal(again.body.claims.quote, null);
+  const last = (await env.database.query<{ quote: string | null; quote_hash: string | null; quote_redacted_at: Date | null }>(
+    `SELECT quote, quote_hash, quote_redacted_at FROM delegation_audit_events
+      WHERE message_id = $1 AND event = 'approval.attested' ORDER BY id DESC LIMIT 1`, [messageId])).rows[0]!;
+  assert.equal(last.quote, null);
+  assert.match(last.quote_hash!, /^hmac-sha256:/);
+  assert.ok(last.quote_redacted_at);
 });

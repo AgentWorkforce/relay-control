@@ -53,13 +53,33 @@ test("audit pages never skip an event committed out of id order", options, async
     assert.deepEqual(ids(await page(settled.at(-1)!)), []);
     assert.deepEqual(ids(await page(null)), settled);
     await slow.query("COMMIT");
-    // Past Cloud's 30-second paging hold-back.
-    await database.query("UPDATE delegation_audit_events SET created_at = created_at - interval '1 minute'");
     // Resuming from the last id returns both, in id order: nothing was skipped.
     assert.deepEqual(ids(await page(settled.at(-1)!)), [pending, fast]);
   } finally {
     slow.release();
   }
+
+  // A transaction that took its id early but writes its event late is ordered
+  // by its transaction, ahead of an event a younger transaction committed first.
+  const early = await pool.connect();
+  let late: string;
+  const before = ids(await page(null)).at(-1)!;
+  try {
+    await early.query("BEGIN");
+    await early.query("SELECT pg_current_xact_id()");
+    await recordDelegationAudit(database, { workspaceId, event: "younger" });
+    assert.deepEqual(ids(await page(before)), []);
+    late = (await early.query<{ id: string }>(
+      "INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'older') RETURNING id::text", [workspaceId],
+    )).rows[0]!.id;
+    await early.query("COMMIT");
+  } finally {
+    early.release();
+  }
+  const resumed = await page(before);
+  assert.deepEqual(resumed.map(row => row.event), ["older", "younger"]);
+  assert.ok(BigInt(String(resumed[0]!.id)) > BigInt(String(resumed[1]!.id)));
+  assert.equal(String(resumed[0]!.id), late);
 
   // A rolled-back transaction leaves a gap that does not hold the log back.
   const aborted = await pool.connect();
@@ -71,5 +91,5 @@ test("audit pages never skip an event committed out of id order", options, async
     aborted.release();
   }
   await recordDelegationAudit(database, { workspaceId, event: "after-gap" });
-  assert.deepEqual((await page(null)).map(row => row.event), ["first", "slow", "fast", "after-gap"]);
+  assert.deepEqual((await page(null)).map(row => row.event), ["first", "slow", "fast", "older", "younger", "after-gap"]);
 });

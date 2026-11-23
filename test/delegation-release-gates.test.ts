@@ -98,7 +98,7 @@ async function setup(t: TestContext) {
     const now = Math.floor(Date.now() / 1000);
     return { iss: GITHUB, aud: env.origin, sub: `repo:${REPO}:ref:refs/heads/main`, repository: REPO,
       workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "workflow_dispatch", run_id: "777000111",
-      run_attempt: "1", iat: now - 5, nbf: now - 5, exp: now + 300, ...extra };
+      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", iat: now - 5, nbf: now - 5, exp: now + 300, ...extra };
   };
   const redeem = (token: string | null, approvalId: string, target = STABLE, extra: Record<string, unknown> = {}) =>
     request(env.origin, `${base}/delegates/gates/redeem`, {
@@ -224,10 +224,10 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
   assert.deepEqual((await env.redeem(ghesToken, second, BETA)).body, { ok: true, consumed: true });
   assert.equal((await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main",
     event: "workflow_dispatch", target_prefix: `${REPO}:`, issuer: "https://token.evil.example" })).status, 400);
+  // As Cloud: a caller no gate matched is nobody in particular, so an
+  // unverified or unmatched token writes nothing to the workspace's log.
   const refused = await env.events("gate.refused");
-  assert.equal(refused.filter(row => row.reason === "oidc_invalid").length, cases.length);
-  // An unverified token's claims are never logged.
-  assert.ok(refused.filter(row => row.reason === "oidc_invalid").every(row => row.data.repository === undefined));
+  assert.equal(refused.filter(row => row.reason === "oidc_invalid" || row.reason === "gate_mismatch").length, 0);
 });
 
 test("gate redeem: repository, workflow_ref, ref and event must all match a registered gate", async (t) => {
@@ -312,15 +312,15 @@ test("gate redeem: dry_run runs every check, never consumes, and is audited as d
       WHERE event IN ('gate.redeemed', 'gate.refused', 'gate.checked') ORDER BY id`)).rows;
   const dryEvents = all.filter(event => event.data.dry_run === true);
   assert.deepEqual(dryEvents.map(event => [event.event, event.reason]), [["gate.checked", null], ["gate.checked", null],
-    ["gate.refused", "target_prefix"], ["gate.refused", "oidc_invalid"], ["gate.refused", "gate_mismatch"],
+    ["gate.refused", "target_prefix"],
     ["gate.checked", null], ["gate.refused", "consumed"]]);
   assert.deepEqual(all.filter(event => event.data.dry_run !== true).map(event => event.event), ["gate.redeemed"]);
 });
 
 test("gate ref_pattern: refs/tags/<literal prefix>* only, matched against the token's ref; event still exact", async (t) => {
   const env = await setup(t);
-  const body = { repo: REPO, workflow_ref: `${REPO}/.github/workflows/release.yml@refs/tags/v2026.11.7`,
-    event: "push", target_prefix: `${REPO}:` };
+  const tagWorkflow = (ref: string) => `${REPO}/.github/workflows/release.yml@${ref}`;
+  const body = { repo: REPO, workflow_ref: tagWorkflow("refs/tags/v2026.*"), event: "push", target_prefix: `${REPO}:` };
   for (const bad of [
     { ...body, ref_pattern: "refs/heads/*" },
     { ...body, ref_pattern: "refs/tags/*v" },
@@ -340,7 +340,7 @@ test("gate ref_pattern: refs/tags/<literal prefix>* only, matched against the to
   assert.equal(gate.body.ref, undefined);
   assert.equal(gate.body.ref_pattern, "refs/tags/v2026.*");
   const tag = (ref: string, extra: Record<string, unknown> = {}) => mint(env.github, env.workflowClaims({
-    workflow_ref: body.workflow_ref, job_workflow_ref: body.workflow_ref, ref, event_name: "push", run_id: `${Math.floor(Math.random() * 1e9) + 1}`, ...extra }));
+    workflow_ref: tagWorkflow(ref), job_workflow_ref: tagWorkflow(ref), ref, event_name: "push", run_id: `${Math.floor(Math.random() * 1e9) + 1}`, ...extra }));
   const approvalId = await env.approval([STABLE]);
   const dry = { dry_run: true };
   assert.deepEqual((await env.redeem(tag("refs/tags/v2026.11.7"), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
@@ -529,6 +529,13 @@ test("gates: allowed events, one live gate per workflow identity, pinned reposit
   const reused = mint(env.github, env.workflowClaims({ repository_id: "99999999", repository_owner_id: "90122" }));
   assert.deepEqual((await env.redeem(reused, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims(ids)), approvalId)).body, { ok: true, consumed: true });
+  // An unpinned gate never serves a token without the repository ids, and that job writes nothing to the log.
+  assert.equal((await env.bearer(`/delegates/gates?gate_id=${pinned.gate_id}`, "DELETE")).status, 200);
+  await env.gate();
+  const before = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event LIKE 'gate.%'")).rows.length;
+  const idless = mint(env.github, env.workflowClaims({ repository_id: undefined, repository_owner_id: undefined }));
+  assert.deepEqual((await env.redeem(idless, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event LIKE 'gate.%'")).rows.length, before);
 });
 
 test("gates: a gate serves only while its owner is a member; policy at the commit decides", async (t) => {
@@ -567,4 +574,62 @@ test("gates: a gate serves only while its owner is a member; policy at the commi
   assert.equal(left.body.ok, false, left.raw);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
   env.world.handle = handle;
+});
+
+test("gate redeem: a dry run answers from a fresh re-read; gate.redeemed commits with the consumption", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  t.after(() => { env.world.handle = handle; });
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId }));
+  const approvalId = await env.approval([STABLE]);
+  // Delegation turned off while the delegate's binding is re-checked: the dry run sees it.
+  during = async () => {
+    assert.equal((await env.browser("/delegates/policy", "PUT", { delegation_enabled: false })).status, 200);
+  };
+  assert.deepEqual((await env.redeem(token("700"), approvalId, STABLE, { dry_run: true })).body,
+    { ok: false, reason: "not_enabled", dry_run: true });
+  assert.equal((await env.browser("/delegates/policy", "PUT", { delegation_enabled: true })).status, 200);
+  // A failed gate.redeemed write rolls the consumption back: the answer is unavailable and nothing is spent.
+  await env.database.query(`CREATE FUNCTION refuse_gate_redeemed() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.event = 'gate.redeemed' THEN RAISE EXCEPTION 'audit down'; END IF; RETURN NEW; END; $$`);
+  await env.database.query(`CREATE TRIGGER refuse_gate_redeemed BEFORE INSERT ON delegation_audit_events
+    FOR EACH ROW EXECUTE FUNCTION refuse_gate_redeemed()`);
+  assert.deepEqual((await env.redeem(token("701"), approvalId)).body, { ok: false, reason: "unavailable" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_gate_redemptions")).rows.length, 0);
+  await env.database.query("DROP TRIGGER refuse_gate_redeemed ON delegation_audit_events");
+  assert.deepEqual((await env.redeem(token("702"), approvalId)).body, { ok: true, consumed: true });
+  assert.equal((await env.events("gate.redeemed")).length, 1);
+});
+
+test("gates: workflow_ref is at the gate's ref; a reusable workflow may be pinned to a commit SHA, matched exactly", async (t) => {
+  const env = await setup(t);
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  // The run's own workflow must be at the gate's ref.
+  const otherRef = await env.browser("/delegates/gates", "POST", { ...body, workflow_ref: WORKFLOW.replace("refs/heads/main", "refs/heads/dev") });
+  assert.equal(otherRef.status, 400, otherRef.raw);
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const reusable = `AgentWorkforce/workflows/.github/workflows/publish.yml@${sha}`;
+  for (const bad of [sha.toUpperCase(), sha.slice(1)]) {
+    const refused = await env.browser("/delegates/gates", "POST", { ...body, job_workflow_ref: reusable.replace(sha, bad) });
+    assert.equal(refused.status, 400, refused.raw);
+  }
+  await env.gate({ job_workflow_ref: reusable });
+  const approvalId = await env.approval([STABLE]);
+  const dry = { dry_run: true };
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable })), approvalId, STABLE, dry)).body,
+    { ok: true, consumed: false, dry_run: true });
+  const otherSha = reusable.replace(sha, "f".repeat(40));
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: otherSha })), approvalId, STABLE, dry)).body,
+    { ok: false, reason: "gate_mismatch", dry_run: true });
 });

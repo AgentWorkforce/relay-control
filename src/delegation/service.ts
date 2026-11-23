@@ -300,7 +300,33 @@ export function quoteDigest(quoteKey: Buffer, workspaceId: string, quote: string
   return `hmac-sha256:${createHmac("sha256", workspaceKey).update(quote, "utf8").digest("hex")}`;
 }
 
+/**
+ * Serializes every quote write and redaction of one message, as Cloud's
+ * lockMessageQuote: a transaction-scoped advisory lock on (workspace,
+ * message), then whether a redaction was ever requested for it (queued or
+ * done). Redaction takes the same lock before nulling quotes, so a quote write
+ * either commits first (and is nulled by the redaction) or sees the
+ * redaction and stores no quote. Call inside a transaction.
+ */
+export async function lockMessageQuote(tx: SqlExecutor, workspaceId: string, messageId: string): Promise<boolean> {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`delegation-quote:${workspaceId}:${messageId}`]);
+  return (await tx.query(
+    "SELECT 1 FROM delegation_quote_redactions WHERE workspace_id = $1 AND message_id = $2 LIMIT 1",
+    [workspaceId, messageId],
+  )).rows.length > 0;
+}
+
+/**
+ * Appends one audit event. A quote about a message whose quote was redacted
+ * (a Relaycast redaction is queued or done) is never stored again: the row
+ * keeps only its keyed digest, marked redacted. A caller writing a quote passes
+ * `quoteRedacted` from lockMessageQuote in its own transaction; otherwise the
+ * lock is taken on `executor`.
+ */
 export async function recordDelegationAudit(executor: SqlExecutor, input: AuditInput): Promise<void> {
+  if (input.quote && input.messageId && input.quoteRedacted === undefined) {
+    input = { ...input, quoteRedacted: await lockMessageQuote(executor, input.workspaceId, input.messageId) };
+  }
   await executor.query(
     `INSERT INTO delegation_audit_events
        (workspace_id, event, actor_user_id, actor_agent_id, auth_method, owner_user_id, grant_id,
@@ -339,12 +365,12 @@ export function auditView(row: Record<string, unknown>) {
  * window applies to existing quotes at the next sweep; a longer one cannot
  * restore a quote already redacted.
  *
- * Redaction is per message: once any row's quote for a message is redacted,
- * every other row quoting that message is redacted too. Attestation already
- * refuses to store a redacted message's quote; this second rule catches an
- * attestation that committed concurrently with the redaction. Runs in the
- * hourly sweep, on every attestation and on every audit read, as one
- * statement, so a crash cannot leave half of it applied.
+ * Redaction is per message: a row still quoting a message whose redaction
+ * was requested (by its owner or by retention) is redacted too, which covers
+ * a write that committed concurrently with the request. Redacting and queueing
+ * the Relaycast redaction are one statement, so a crash cannot redact a quote
+ * here and lose its Relaycast redaction. Runs in the hourly sweep and on every
+ * audit read.
  */
 export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> {
   await executor.query(
@@ -356,9 +382,8 @@ export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> 
                    JOIN workspaces w ON w.organization_id = p.organization_id
                   WHERE w.id = e.workspace_id), $1))
             OR (e.message_id IS NOT NULL AND EXISTS (
-                SELECT 1 FROM delegation_audit_events r
-                 WHERE r.workspace_id = e.workspace_id AND r.message_id = e.message_id
-                   AND r.quote_redacted_at IS NOT NULL)))
+                SELECT 1 FROM delegation_quote_redactions q
+                 WHERE q.workspace_id = e.workspace_id AND q.message_id = e.message_id)))
         RETURNING e.workspace_id, e.message_id)
      INSERT INTO delegation_quote_redactions (workspace_id, message_id)
      SELECT DISTINCT workspace_id, message_id FROM redacted WHERE message_id IS NOT NULL
@@ -367,81 +392,48 @@ export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> 
   );
 }
 
-/** Whether any audit row's quote for this message has been redacted (§15.9). */
-export async function messageQuoteRedacted(executor: SqlExecutor, workspaceId: string, messageId: string): Promise<boolean> {
-  return (await executor.query(
-    `SELECT 1 FROM delegation_audit_events
-      WHERE workspace_id = $1 AND message_id = $2 AND quote_redacted_at IS NOT NULL LIMIT 1`,
-    [workspaceId, messageId],
-  )).rows.length > 0;
+/** `after_id` names no event of this workspace (400 invalid_request, as Cloud). */
+export class AuditCursorError extends Error {
+  constructor() {
+    super("after_id must be an event id");
+  }
 }
 
 /**
- * The audit log's commit-safe watermark. Event ids come from a sequence when
- * a row is inserted, but rows become visible when their transaction commits,
- * so a reader can see id N+1 before id N. Every row a transaction still in
- * flight has written, or is writing, has `created_at` (clock_timestamp() at
- * insert) at or after that transaction's start, or (before it has a
- * transaction id) its current statement's start. The watermark is the
- * earliest of those across the database's other backends, capped at now: no
- * row with `created_at` before it can still appear.
- *
- * It is read in its own statement, before the page's snapshot, so a
- * transaction that commits between the two is visible to the page. Only
- * Control's own database role writes this log, and pg_stat_activity shows a
- * role's own sessions. With activity tracking off it falls back to a
- * five-minute lag.
+ * One page of a workspace's audit log, commit-safe, as Cloud's listAudit. A
+ * bigserial id is drawn before its transaction commits, so ids do not arrive
+ * in commit order. Each event records the id of the transaction that wrote it
+ * (`xact_id`); events are ordered by (xact_id, id), and only those written by
+ * transactions older than the oldest one still in flight (this statement's
+ * snapshot xmin) are returned. That set is final, so a later page never needs
+ * a row behind its cursor. `after_id` resolves to its event's (xact_id, id);
+ * an unknown id is AuditCursorError; 0 (or none) starts from the beginning.
  */
-export async function auditWatermark(executor: SqlExecutor): Promise<string> {
-  return (await executor.query<{ watermark: string }>(
-    `SELECT (CASE WHEN current_setting('track_activities') = 'on' THEN LEAST(clock_timestamp(), (
-               SELECT min(CASE WHEN backend_xid IS NOT NULL THEN xact_start
-                               WHEN state = 'active' THEN query_start END)
-                 FROM pg_stat_activity
-                WHERE datname = current_database() AND pid <> pg_backend_pid()))
-             ELSE clock_timestamp() - interval '5 minutes' END)::text AS watermark`,
-  )).rows[0]!.watermark;
-}
-
-/**
- * One page of a workspace's audit log in id order, after `afterId`, that
- * never skips an event: it stops before the first event (of any viewer or
- * filter) at or after the commit-safe watermark, so an event committed after
- * this read can only ever have an id above the page's last. A page can be
- * short, or empty, while writes are in flight; the next read with the same
- * `after_id` returns the rest.
- */
-/** As Cloud: a paged audit read (after_id) also leaves out the last 30 seconds. */
-export const AUDIT_SETTLE_SECONDS = 30;
-
 export async function listAuditPage(executor: SqlExecutor, input: {
   workspaceId: string; all: boolean; viewerUserId: string; since: string | null; grantId: string | null;
   limit: number; afterId: string | null;
 }): Promise<Record<string, unknown>[]> {
-  const watermark = await auditWatermark(executor);
-  const rows = (await executor.query<Record<string, unknown>>(
+  let cursor: { xact_id: string; id: string } | null = null;
+  if (input.afterId && input.afterId !== "0") {
+    const row = (await executor.query<{ xact_id: string }>(
+      "SELECT xact_id::text FROM delegation_audit_events WHERE workspace_id = $1 AND id = $2::bigint",
+      [input.workspaceId, input.afterId],
+    )).rows[0];
+    if (!row) throw new AuditCursorError();
+    cursor = { xact_id: row.xact_id, id: input.afterId };
+  }
+  return (await executor.query<Record<string, unknown>>(
     `SELECT * FROM delegation_audit_events
       WHERE workspace_id = $1
         AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
         AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
         AND ($5::text IS NULL OR grant_id = $5)
-        AND ($7::bigint IS NULL OR (id > $7::bigint
-             AND created_at <= now() - make_interval(secs => $9)))
-        AND created_at < $8::timestamptz
-      ORDER BY id LIMIT $6`,
-    [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit, input.afterId, watermark,
-      AUDIT_SETTLE_SECONDS],
+        AND ($7::bigint IS NULL OR (xact_id, id) > ($7::bigint, $8::bigint))
+        AND xact_id < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+      ORDER BY xact_id, id LIMIT $6`,
+    [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit,
+      cursor?.xact_id ?? null, cursor?.id ?? null],
   )).rows;
-  if (!rows.length) return rows;
-  // An event at or after the watermark below the page's last id (sequence
-  // order and clock order can differ by a few microseconds between
-  // concurrent inserts) ends the page before it.
-  const cut = (await executor.query<{ id: string | null }>(
-    `SELECT min(id)::text AS id FROM delegation_audit_events
-      WHERE workspace_id = $1 AND id > COALESCE($2::bigint, 0) AND id <= $3::bigint AND created_at >= $4::timestamptz`,
-    [input.workspaceId, input.afterId, String(rows.at(-1)!.id), watermark],
-  )).rows[0]?.id;
-  return cut ? rows.filter(row => BigInt(String(row.id)) < BigInt(cut)) : rows;
 }
 
 /**
@@ -454,6 +446,8 @@ export async function listAuditPage(executor: SqlExecutor, input: {
 export async function redactMessageQuotes(database: Database, input: { workspaceId: string; messageId: string;
   actorUserId: string; authMethod: string; asAdmin: boolean }): Promise<number> {
   return database.transaction(async (tx) => {
+    // The same lock every quote write of this message takes (lockMessageQuote).
+    await lockMessageQuote(tx, input.workspaceId, input.messageId);
     const rows = (await tx.query<{ workspace_id: string; message_id: string }>(
       `UPDATE delegation_audit_events SET quote = NULL, quote_redacted_at = now()
         WHERE workspace_id = $1 AND message_id = $2 AND quote IS NOT NULL
@@ -473,47 +467,68 @@ export async function redactMessageQuotes(database: Database, input: { workspace
   });
 }
 
-/**
- * Asks Relaycast to redact one message's stored owner_approval quote; true
- * only when Relaycast confirmed. Null when no Relaycast internal credential is
- * configured: redactions then stay queued.
- */
-export type RelaycastQuoteRedactor = ((relaycastWorkspaceId: string, messageId: string) => Promise<boolean>) | null;
+/** How one Relaycast redaction try ended, as Cloud's RelaycastRedactOutcome. */
+export type RelaycastRedactOutcome = "redacted" | "absent" | "retry" | "rejected";
 
 /**
- * Works through the queued Relaycast redactions that are due a try (retry
- * back-off doubles per attempt, capped at 6 hours), as Cloud's flush. Returns
- * how many Relaycast confirmed and how many remain unfinished overall.
+ * Asks Relaycast to redact one message's stored owner_approval quote. Null
+ * when no Relaycast internal credential is configured: redactions then stay
+ * queued.
+ */
+export type RelaycastQuoteRedactor = ((relaycastWorkspaceId: string, messageId: string) =>
+  Promise<{ outcome: RelaycastRedactOutcome; status: number | null }>) | null;
+
+/**
+ * Works through the queued Relaycast redactions due a try, oldest first, as
+ * Cloud's flushRelaycastRedactions. A retryable failure is never dropped: it
+ * waits 2^attempts minutes (at most 6 hours) between tries, with no attempt
+ * cap. `redacted` and `absent` finish a request; `rejected` parks it for an
+ * operator (clear `relaycast_outcome` to retry it), still counted unfinished.
  */
 export async function flushRelaycastRedactions(database: Database, deps: {
   redact: RelaycastQuoteRedactor;
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string } | null>;
-}): Promise<{ redacted: number; pending: number }> {
+}): Promise<{ redacted: number; absent: number; rejected: number; pending: number }> {
   const unfinished = async () => Number((await database.query<{ count: number }>(
     "SELECT count(*)::int AS count FROM delegation_quote_redactions WHERE relaycast_redacted_at IS NULL",
   )).rows[0]?.count ?? 0);
-  if (!deps.redact) return { redacted: 0, pending: await unfinished() };
+  const counts = { redacted: 0, absent: 0, rejected: 0 };
+  if (!deps.redact) return { ...counts, pending: await unfinished() };
   const due = (await database.query<{ workspace_id: string; message_id: string }>(
     `SELECT workspace_id, message_id FROM delegation_quote_redactions
       WHERE relaycast_redacted_at IS NULL
+        AND relaycast_outcome IS DISTINCT FROM 'rejected'
         AND (last_attempt_at IS NULL OR last_attempt_at <= now() -
              make_interval(mins => least(power(2, least(attempts, 9))::int, 360)))
       ORDER BY requested_at LIMIT 100`,
   )).rows;
-  let redacted = 0;
   for (const row of due) {
     const binding = await deps.relaycastBinding(row.workspace_id).catch(() => null);
-    const done = binding ? await deps.redact(binding.relaycastWorkspaceId, row.message_id).catch(() => false) : false;
-    await database.query(
-      done
-        ? "UPDATE delegation_quote_redactions SET relaycast_redacted_at = now() WHERE workspace_id = $1 AND message_id = $2"
-        : `UPDATE delegation_quote_redactions SET attempts = attempts + 1, last_attempt_at = now()
-            WHERE workspace_id = $1 AND message_id = $2`,
-      [row.workspace_id, row.message_id],
-    );
-    if (done) redacted += 1;
+    // A workspace whose Relaycast side cannot be resolved right now is retried.
+    const answer = binding ? await deps.redact(binding.relaycastWorkspaceId, row.message_id)
+      .catch(() => ({ outcome: "retry" as const, status: null })) : { outcome: "retry" as const, status: null };
+    await recordRelaycastRedaction(database, { workspaceId: row.workspace_id, messageId: row.message_id, ...answer });
+    if (answer.outcome !== "retry") counts[answer.outcome] += 1;
   }
-  return { redacted, pending: await unfinished() };
+  return { ...counts, pending: await unfinished() };
+}
+
+/**
+ * Records one try, as Cloud: `redacted` and `absent` finish the request,
+ * `retry` backs it off, `rejected` parks it (still unfinished).
+ */
+export async function recordRelaycastRedaction(executor: SqlExecutor, input: { workspaceId: string; messageId: string;
+  outcome: RelaycastRedactOutcome; status: number | null }): Promise<void> {
+  const done = input.outcome === "redacted" || input.outcome === "absent";
+  await executor.query(
+    done
+      ? `UPDATE delegation_quote_redactions SET relaycast_redacted_at = now(), relaycast_outcome = $3, relaycast_status = $4
+          WHERE workspace_id = $1 AND message_id = $2`
+      : `UPDATE delegation_quote_redactions SET attempts = attempts + 1, last_attempt_at = now(), relaycast_status = $4,
+            relaycast_outcome = CASE WHEN $3 = 'rejected' THEN 'rejected' END
+          WHERE workspace_id = $1 AND message_id = $2`,
+    [input.workspaceId, input.messageId, input.outcome, input.status],
+  );
 }
 
 /**
@@ -814,58 +829,72 @@ export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy
   return null;
 }
 
+/** What the final decision reads under locks (Cloud's DecisionState). */
+export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: GrantRow | null; approval: ApprovalRow | null };
+
 /**
- * The commit-point check, run inside the transaction that signs an
- * attestation or consumes an action, after every slow lookup. Everything is
- * read again from committed state under locks, never from the policy or grant
- * read before the lookups:
- *
- * - the workspace policy, share-locked (a policy PUT locks it FOR UPDATE):
- *   delegation off is `not_enabled`;
- * - the grant, locked FOR UPDATE (revocation and narrowing lock it too):
- *   `revoked` or `expired`;
- * - the actions against the current grant and policy (allowed classes, the
- *   grant's fit, scope coverage, the recipient's own target): `out_of_scope`;
- * - for tier D, the current policy's and grant's tier O classes:
- *   `tier_o_required`.
- *
- * Lock order is policy row, then grant row, then (in the callers) the
- * membership, session and approval rows. A policy PUT takes the policy row,
- * then grants, then approvals; revocation takes grants, then approvals. So
- * none of them can deadlock with this.
+ * The final re-check's transaction, as Cloud's decideUnderLocks: it share-
+ * locks, in this order, the membership rows of `memberUserIds` (sorted), the
+ * workspace policy row, the grant row and the approval row, reads them, and
+ * runs `decide` on that state in the same transaction. The caller then
+ * re-proves its bearer (share-locking the session row) and commits what it
+ * decided (the attestation, a consumption) in that transaction. Policy PUT
+ * (policy, grants, approvals) and revocation (grants, approvals) take the same
+ * rows in the same order, so a change committing meanwhile decides the answer.
  */
-export async function recheckAtCommit(tx: SqlExecutor, input: {
-  workspaceId: string; grantId: string; tier: "D" | "O"; actions: readonly Action[]; recipientAgentId: string;
-  nowMs: number;
-}): Promise<{ grant: GrantRow; policy: DelegationPolicy }> {
-  const policy = await loadPolicy(tx, input.workspaceId, true);
-  if (!policy.delegation_enabled) refuse("not_enabled");
-  const grant = (await tx.query<GrantRow>(
-    "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [input.grantId, input.workspaceId],
-  )).rows[0];
-  if (!grant || grant.status === "revoked") refuse("revoked");
-  if (grant!.status === "expired" || time(grant!.expires_at) <= input.nowMs) refuse("expired");
-  const outOfScope = scopeRefusal(input.actions, grant!, policy, input.recipientAgentId);
-  if (outOfScope) refuse(outOfScope);
-  if (input.tier === "D") {
-    const required = tierOClasses(policy, grant!);
-    if (input.actions.some(action => required.has(action.class))) refuse("tier_o_required");
-  }
-  return { grant: grant!, policy };
+export async function decideUnderLocks<T>(database: Database, input: { workspaceId: string; memberUserIds: string[];
+  grantId: string | null; approvalId: string }, decide: (state: DecisionState, tx: SqlExecutor) => Promise<T>): Promise<T> {
+  return database.transaction(async (tx) => {
+    let member = true;
+    for (const userId of [...new Set(input.memberUserIds)].sort()) {
+      member = Boolean(await memberRole(tx, input.workspaceId, userId, true));
+      if (!member) break;
+    }
+    const policy = await loadPolicy(tx, input.workspaceId, true);
+    const grant = input.grantId ? (await tx.query<GrantRow>(
+      "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.grantId],
+    )).rows[0] ?? null : null;
+    const approval = (await tx.query<ApprovalRow>(
+      "SELECT * FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.approvalId],
+    )).rows[0] ?? null;
+    return decide({ member, policy, grant, approval }, tx);
+  });
 }
 
 /**
- * The approval row at the commit point, locked (after the grant): an approval
- * revoked by its owner or an admin, withdrawn by its delegate, or invalidated
- * with its grant while the caller waited is `revoked`.
+ * The final re-check on state read under locks (Cloud's freshRefusal): the
+ * caller's membership, delegation being on, the approval's revocation and
+ * expiry, the grant's status and expiry, the actions against the current
+ * grant and policy, and (tier D) the current Tier O lists. `policy` is the one
+ * standing was resolved under: if its code-owner rule changed, the standing
+ * found is stale and the call is refused as `unavailable`, to be retried. A
+ * gate redeeming a tier O approval stands on no grant (`noGrant`); a gate
+ * names what a departed member means (`memberGone`).
  */
-export async function approvalStillLive(tx: SqlExecutor, workspaceId: string, approvalId: string,
-  lock: "FOR SHARE" | "FOR UPDATE"): Promise<void> {
-  const live = (await tx.query(
-    `SELECT 1 FROM delegation_approvals WHERE id = $1 AND workspace_id = $2 AND invalidated_at IS NULL ${lock}`,
-    [approvalId, workspaceId],
-  )).rows.length > 0;
-  if (!live) refuse("revoked");
+export function freshRefusal(state: DecisionState, input: { actions: readonly Action[]; tier: "D" | "O";
+  policy: DelegationPolicy; recipientAgentId: string; nowMs: number; memberGone?: ReasonCode; noGrant?: boolean }):
+  ReasonCode | null {
+  if (!state.member) return input.memberGone ?? "not_pending";
+  if (!state.policy.delegation_enabled) return "not_enabled";
+  if (!state.approval || state.approval.invalidated_at) return "revoked";
+  if (input.noGrant) {
+    if (time(state.approval.expires_at) <= input.nowMs) return "expired";
+    if (state.policy.allowed_classes && input.actions.some(action => !state.policy.allowed_classes!.includes(action.class))) {
+      return "out_of_scope";
+    }
+    return state.policy.code_owner_match !== input.policy.code_owner_match ? "unavailable" : null;
+  }
+  if (!state.grant || state.grant.status === "revoked") return "revoked";
+  if (state.grant.status === "expired" || time(state.grant.expires_at) <= input.nowMs) return "expired";
+  if (time(state.approval.expires_at) <= input.nowMs) return "expired";
+  const outOfScope = scopeRefusal(input.actions, state.grant, state.policy, input.recipientAgentId);
+  if (outOfScope) return outOfScope;
+  if (input.tier === "D") {
+    const required = tierOClasses(state.policy, state.grant);
+    if (input.actions.some(action => required.has(action.class))) return "tier_o_required";
+  }
+  if (state.policy.code_owner_match !== input.policy.code_owner_match) return "unavailable";
+  return null;
 }
 
 /**
@@ -991,28 +1020,28 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     const owner = (await deps.database.query<{ name: string | null }>(
       "SELECT name FROM users WHERE id = $1", [approval.owner_id],
     )).rows[0];
-    const { attestation, claims } = await deps.database.transaction(async (tx) => {
-      // The policy, grant and approval may have changed during the Relaycast
-      // lookups: recheck all of them from committed state, under locks, before
-      // signing or recording anything a redeem could rely on.
-      await recheckAtCommit(tx, { workspaceId: workspace.id, grantId: grant.id, tier, actions,
-        recipientAgentId: recipient.agentId, nowMs: deps.now().getTime() });
-      // The caller's membership and bearer, under share locks, so a revocation
-      // between the earlier check and this commit cannot be missed.
-      if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
-          (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
-      await approvalStillLive(tx, workspace.id, context.approvalId!, "FOR SHARE");
-      // Standing against the target owners as committed now.
+    // The Relaycast lookups take time: the membership, policy, grant and
+    // approval are re-checked under locks, and the attestation is recorded in
+    // the same transaction, so a change committing meanwhile decides.
+    const { attestation, claims } = await decideUnderLocks(deps.database, { workspaceId: workspace.id,
+      memberUserIds: [input.callerUserId], grantId: grant.id, approvalId: context.approvalId! }, async (state, tx) => {
+      const stale = freshRefusal(state, { actions, tier, policy, recipientAgentId: recipient.agentId,
+        nowMs: deps.now().getTime() });
+      if (stale) refuse(stale);
+      if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
+      // Standing against the target owners as committed now (relay-control
+      // reads them locally, so this costs no external call).
       if (await standingFor(tx, workspace.id, { approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId,
         accept: input.accept, actions }) !== standing) refuse("recipient_policy");
-      // §15.9: a message whose quote has been redacted is never stored or
-      // signed again; the row keeps only the digest.
-      const quoteRedacted = Boolean(approval.quote) && await messageQuoteRedacted(tx, workspace.id, input.messageId);
-      // Time the claims at signing, after every wait above: an attestation is
-      // never signed already expired.
+      // A quote the owner redacted (or whose redaction is queued) is never
+      // signed or stored again; the row keeps only the digest.
+      const quoteRedacted = approval.quote ? await lockMessageQuote(tx, workspace.id, input.messageId) : false;
       const signedAt = deps.now().getTime();
-      if (expiresAt <= signedAt) refuse("expired");
       const iat = Math.floor(signedAt / 1000);
+      // Never past the approval's window, nor the grant's or the approval's
+      // expiry as read under the locks.
+      const until = Math.min(expiresAt, time(state.grant!.expires_at), time(state.approval!.expires_at));
+      if (until <= signedAt) refuse("expired");
       const claims: AttestationClaims = {
         v: 1,
         ws: workspace.id,
@@ -1029,7 +1058,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         single_use: singleUse,
         quote: quoteRedacted ? null : approval.quote ?? null,
         iat,
-        exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
+        exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(until / 1000)),
         jti: randomUUID(),
       };
       if (claims.exp <= iat) refuse("expired");
@@ -1051,7 +1080,6 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         quoteHash: approval.quote ? quoteDigest(deps.quoteKey, workspace.id, approval.quote) : null,
         quoteRedacted,
       });
-      await redactExpiredQuotes(tx);
       // Signed last, inside the transaction: a refusal above signs nothing.
       return { attestation: deps.signer!.sign(claims), claims };
     });
@@ -1150,18 +1178,15 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     if (conditions.kind === "unmet") throw new ConditionUnmet(conditions.unmet);
     if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
         (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
-    await deps.database.transaction(async (tx) => {
-      // The policy, grant and approval may have changed during the Relaycast
-      // lookups: recheck all of them from committed state, under locks, in
-      // both paths, then consume a single-use action in the same transaction.
-      await recheckAtCommit(tx, { workspaceId: workspace.id, grantId: grant!.id, tier: approval!.tier, actions: [action!],
+    // The lookups above take time: the membership, policy, grant and approval
+    // are re-checked under locks, and a single-use action is consumed in the
+    // same transaction.
+    await decideUnderLocks(deps.database, { workspaceId: workspace.id, memberUserIds: [input.callerUserId],
+      grantId: grant!.id, approvalId: input.approvalId }, async (state, tx) => {
+      const stale = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
-      // The caller's membership and bearer, under share locks: a revocation
-      // while this waited on the grant lock is never missed before consuming.
-      if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
-          (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
-      // The approval may have been revoked or withdrawn meanwhile.
-      await approvalStillLive(tx, workspace.id, input.approvalId, "FOR UPDATE");
+      if (stale) refuse(stale);
+      if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
       if (!singleUse) return;
       // Single use is per action (§5.1): one atomic insert per action.
@@ -1235,10 +1260,19 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
 export { CLAIM_TTL_MS };
 
 /**
- * Relaycast's Cloud-only internal redaction route (relaycast#710), called
- * with RELAYCAST_INTERNAL_SECRET:
- * `POST {relaycast}/internal/workspaces/{id}/messages/{id}/owner-approval/redact` → 2xx `{ok: true}`.
- * Any other answer leaves the redaction queued.
+ * Relaycast's internal quote redaction route (relaycast#710, advertised as
+ * `owner_approval.redact_quote`), called with RELAYCAST_INTERNAL_SECRET and no
+ * body:
+ *
+ *   POST {relaycast}/internal/workspaces/{relay workspace id}/messages/{message id}/owner-approval/redact-quote
+ *
+ * How an answer is treated, as Cloud's redactRelaycastQuote:
+ *   2xx (a repeat returns the first redaction)        → redacted, done
+ *   404 owner_approval_not_found                      → absent, done
+ *   5xx, 429, a network error or timeout, or a 404
+ *       without that code (route not deployed yet)    → retry with backoff
+ *   any other answer (400, 401, 403, a redirect)      → rejected: not retried,
+ *       still counted as unfinished for an operator
  */
 export function relaycastQuoteRedactor(input: { relaycastUrl: string; internalSecret: string | null;
   fetchImpl?: typeof fetch }): RelaycastQuoteRedactor {
@@ -1249,14 +1283,20 @@ export function relaycastQuoteRedactor(input: { relaycastUrl: string; internalSe
   return async (relaycastWorkspaceId, messageId) => {
     try {
       const response = await fetchImpl(`${base}/internal/workspaces/${encodeURIComponent(relaycastWorkspaceId)}/messages/${
-        encodeURIComponent(messageId)}/owner-approval/redact`, {
-        method: "POST", headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-        body: "{}", redirect: "manual", signal: AbortSignal.timeout(10_000),
+        encodeURIComponent(messageId)}/owner-approval/redact-quote`, {
+        method: "POST", headers: { authorization: `Bearer ${secret}` },
+        redirect: "manual", signal: AbortSignal.timeout(10_000),
       });
-      const body = await response.json().catch(() => null) as { ok?: boolean } | null;
-      return response.ok && body?.ok === true;
+      const status = response.status;
+      if (status >= 200 && status < 300) return { outcome: "redacted", status };
+      if (status === 404) {
+        const body = await response.json().catch(() => null) as { error?: { code?: unknown } } | null;
+        return { outcome: body?.error?.code === "owner_approval_not_found" ? "absent" : "retry", status };
+      }
+      if (status === 429 || status >= 500) return { outcome: "retry", status };
+      return { outcome: "rejected", status };
     } catch {
-      return false;
+      return { outcome: "retry", status: null };
     }
   };
 }

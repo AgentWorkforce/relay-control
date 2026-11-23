@@ -132,9 +132,9 @@ export function createRelaycastWorld(roster: unknown[]) {
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
     const ok = (data: unknown, status = 200) => ({ status, body: { ok: true, data } });
     const fail = (status: number, code: string) => ({ status, body: { ok: false, error: { code } } });
-    const internal = /^\/internal\/workspaces\/([^/]+)\/messages\/([^/]+)\/owner-approval\/redact$/.exec(path);
+    const internal = /^\/internal\/workspaces\/([^/]+)\/messages\/([^/]+)\/owner-approval\/redact-quote$/.exec(path);
     if (internal && method === "POST") {
-      // relaycast#710: Cloud's internal credential only.
+      // relaycast#710: the internal credential only, no body.
       if (bearer !== RELAYCAST_INTERNAL_SECRET) return fail(401, "unauthorized");
       quoteRedactions.push({ workspaceId: decodeURIComponent(internal[1]!), messageId: decodeURIComponent(internal[2]!) });
       return ok({ redacted: true });
