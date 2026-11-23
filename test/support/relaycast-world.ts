@@ -17,6 +17,8 @@ type Message = {
   conversation_id: string | null; channel_id: string | null; thread_id: string | null;
   /** Relaycast's immutable, server-stored owner_approval (relay owner-trusted-delegates §16.2). */
   owner_approval?: unknown;
+  /** The send time the by-message proof reports as `created_at` (null: not reported). */
+  sent_at?: string | null;
 };
 /** Acknowledged rows are kept, owner-scoped, as Relaycast does; only unacknowledged ones are pending. */
 /** `agentId` is the recipient's immutable id at delivery time; a same-name replacement never sees it. */
@@ -327,7 +329,8 @@ export function createRelaycastWorld(roster: unknown[]) {
       if (!row) return fail(404, "delivery_not_found");
       return ok({ message_id: row.message.id, sender_agent_id: row.message.agent_id, workspace_id: deliveryWorkspace.id,
         channel_id: row.message.channel_id ?? row.message.conversation_id, delivery_reason: row.reason,
-        owner_approval: row.message.owner_approval ?? null });
+        owner_approval: row.message.owner_approval ?? null,
+        ...(row.message.sent_at ? { created_at: row.message.sent_at } : {}) });
     }
     if ((match = /^\/v1\/deliveries\/([^/]+)\/ack$/.exec(path)) && method === "POST" && caller) {
       // Relaycast ackDelivery (engine/delivery.ts at ac38905): a repeat ack by
@@ -434,9 +437,23 @@ export function createRelaycastWorld(roster: unknown[]) {
       return directMessage(agents.get(from)!, to, text);
     },
     /** A DM carrying a server-stored owner_approval, as Relaycast would store it at send. */
-    sendApprovalAs(from: string, to: string, text: string, ownerApproval: unknown) {
+    /**
+     * A peer sends a message carrying an owner_approval. The by-message proof
+     * reports its send time as `created_at` (now, unless `createdAt` names one;
+     * null reports none). `id` gives the message a chosen id (a snowflake).
+     */
+    sendApprovalAs(from: string, to: string, text: string, ownerApproval: unknown,
+      options: { createdAt?: string | null; id?: string } = {}) {
       const sent = directMessage(agents.get(from)!, to, text);
-      messages.get(sent.message.id)!.owner_approval = ownerApproval;
+      const stored = messages.get(sent.message.id)!;
+      stored.owner_approval = ownerApproval;
+      stored.sent_at = options.createdAt === undefined ? new Date().toISOString() : options.createdAt;
+      if (options.id) {
+        messages.delete(stored.id);
+        stored.id = options.id;
+        messages.set(stored.id, stored);
+        sent.message.id = options.id;
+      }
       return sent;
     },
     /** A peer agent creates or joins a channel and optionally posts to it. */

@@ -210,8 +210,12 @@ CREATE INDEX IF NOT EXISTS delegation_audit_events_workspace_idx
   ON delegation_audit_events (workspace_id, id);
 CREATE INDEX IF NOT EXISTS delegation_audit_events_owner_idx
   ON delegation_audit_events (workspace_id, owner_user_id, id);
+-- Retention reads due quotes as one (workspace_id, created_at) range per
+-- workspace; quote writes and redactions find a message's rows by message id.
 CREATE INDEX IF NOT EXISTS delegation_audit_events_quote_idx
-  ON delegation_audit_events (created_at) WHERE quote IS NOT NULL;
+  ON delegation_audit_events (workspace_id, created_at) WHERE quote IS NOT NULL;
+CREATE INDEX IF NOT EXISTS delegation_audit_events_message_idx
+  ON delegation_audit_events (workspace_id, message_id) WHERE message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS delegation_audit_events_commit_order_idx
   ON delegation_audit_events (workspace_id, xact_id, id);
 

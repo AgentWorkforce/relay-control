@@ -168,9 +168,14 @@ Control then:
    checks tier O requirements: the policy's and the grant's
    `require_tier_o` (no class needs tier O by default, §15). Last, standing (§5.4) for
    every action under `accept` (default `code_owners`);
-7. fixes a tier D approval's expiry at its first attestation, as Cloud's
-   `approvalExpiry` does. The base time is Relaycast's `created_at` when it
-   reports one, otherwise now. The expiry is the approval's `expires_at`
+7. reads a tier D message's send time, as Cloud: Relaycast's `created_at`
+   when it reports one, else the time in its snowflake id (top 42 bits:
+   milliseconds since 2025-01-01T00:00:00Z; at most 5 minutes in the future).
+   An unknown send time is `unavailable`. A message sent before the grant was
+   created (before a revoke and re-grant, or before any grant) was never
+   authorized by it: `revoked`. Then it fixes the approval's expiry at its
+   first attestation, as Cloud's `approvalExpiry` does. The base time is the
+   send time. The expiry is the approval's `expires_at`
    (default base + 1 hour), capped at base + 24 hours and at the grant's
    expiry. Later attestations keep the stored value;
 8. at the commit point, in one transaction after every Relaycast lookup,
@@ -313,6 +318,8 @@ consumption rolls back and the answer is `unavailable`: no use goes
 unrecorded. Refusal events (`approval.refused`, `redeem.refused`) are
 written only once the recipient is proven; a refusal before that (delegation
 off, no key, a bad token) is logged as `delegation.refused`, never audited.
+An identical `approval.refused` (message, recipient, reason) is written once
+per 10 minutes; repeats are still logged.
 They stay best-effort; a failed write is logged
 (`delegation.audit_write_failed`), as is every `unavailable` caused by an
 exception (`delegation.unavailable`). See
@@ -392,7 +399,8 @@ snapshot xmin, read with the rows: events of transactions below it are final.
   itself when none is.
 - `complete` is true when the page is not full and nothing was held back.
   Events after the cursor may repeat; none is ever skipped.
-- An id that names no event of this workspace is 400 `invalid_request`.
+- An id that names no event of this workspace, or one this viewer cannot list,
+  is 400 `invalid_request`.
 
 The log is append-only (a trigger refuses every change but a
 quote redaction, and deletes outside a workspace deletion). Each event is `id, event,
@@ -411,7 +419,7 @@ itself is also in the signed claims (`quote`). Quote text is redacted to `quote_
 `quote_retention_days`. An hourly sweep (started with the server) also runs the
 redaction and marks lapsed grants `expired`, so a quiet workspace does not keep
 quote text past its window. Each run handles at most 500 grants and 500
-quotes, then tries the due Relaycast redactions and reports the queue's
+quotes (read per workspace as one index range up to its org's cutoff), then tries the due Relaycast redactions and reports the queue's
 backlog (see `docs/delegation-quote-redaction-runbook.md`).
 
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,

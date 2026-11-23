@@ -1809,3 +1809,63 @@ test("review: the sweep is bounded per run and reports the Relaycast redaction b
   assert.equal(backlog.rejected, 1);
   assert.equal(backlog.stale, 1);
 });
+
+test("Relaycast message ids decode to their send time (snowflake, 2025-01-01 epoch)", async () => {
+  const { relaycastMessageTime, messageSentAt } = await import("../src/delegation/relaycast-ids.js");
+  // A real production Relaycast message id, checked against its post time.
+  assert.equal(relaycastMessageTime("250715275347181568", new Date("2026-11-23T21:00:00Z"))?.toISOString(),
+    "2026-11-23T20:12:59.707Z");
+  // Not a plausible snowflake: a leading zero, too large, at or before the epoch, or more than 5 minutes ahead.
+  for (const id of ["0250715275347181568", "9223372036854775808", "1", "abc"]) {
+    assert.equal(relaycastMessageTime(id, new Date("2026-11-23T21:00:00Z")), null, id);
+  }
+  assert.equal(relaycastMessageTime("250715275347181568", new Date("2026-11-23T20:00:00Z")), null);
+  // Relaycast's created_at wins when it is reported.
+  assert.equal(messageSentAt("250715275347181568", "2026-11-23T10:00:00Z", new Date())?.toISOString(), "2026-11-23T10:00:00.000Z");
+});
+
+test("review: tier D never attests a message sent before its grant; an unknown send time fails closed", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const merge = (n: number) => [{ class: "merge", target: `AgentWorkforce/relay#${n}` }];
+  // A message sent, the grant revoked and re-granted, then the old message attested: revoked.
+  const old = send(env, bot, recipient, env.approval(merge(260)));
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await env.grant(bot.id, [{ class: "merge", targets: ["AgentWorkforce/*"] }]);
+  assert.deepEqual((await env.attest(recipient, old)).body, { verdict: "none", reason: "revoked" });
+  // A message sent after the new grant attests.
+  assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval(merge(261))))).body.verdict, "delegate");
+  // No created_at and an id that is not a snowflake: unavailable.
+  const unknown = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(262)), { createdAt: null }).message.id;
+  assert.deepEqual((await env.attest(recipient, unknown)).body, { verdict: "none", reason: "unavailable" });
+  // No created_at but a snowflake id minted now: its encoded time is the send time, and the window starts there.
+  const snowflake = String(BigInt(Date.now() - Date.UTC(2025, 0, 1)) << 22n);
+  const fromId = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(263)),
+    { createdAt: null, id: snowflake }).message.id;
+  const attested = await env.attest(recipient, fromId);
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  // A snowflake from before the grant: revoked.
+  const stale = String(BigInt(Date.now() - 3_600_000 - Date.UTC(2025, 0, 1)) << 22n);
+  const before = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(264)),
+    { createdAt: null, id: stale }).message.id;
+  assert.deepEqual((await env.attest(recipient, before)).body, { verdict: "none", reason: "revoked" });
+});
+
+test("review: identical refusals are audited once per 10 minutes; an audit cursor must be visible to the viewer", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const messageId = send(env, bot, recipient, env.approval([{ class: "merge", target: "other/repo#1" }]));
+  for (let index = 0; index < 3; index += 1) {
+    assert.deepEqual((await env.attest(recipient, messageId)).body, { verdict: "none", reason: "out_of_scope" });
+  }
+  const rows = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'approval.refused' AND message_id = $1",
+    [messageId])).rows;
+  assert.equal(rows.length, 1);
+  // Another member's view: an admin event id is not a cursor they can page from.
+  const adminEvent = (await env.database.query<{ id: string }>(
+    "SELECT id::text FROM delegation_audit_events WHERE event = 'policy.updated' LIMIT 1")).rows[0]!.id;
+  const memberId = await env.addMember("viewer@acme.test");
+  const member = await env.desktopSignIn({ hostName: "viewer-box", userId: memberId });
+  const hidden = await env.bearer(`/delegates/audit?after_id=${adminEvent}`, "GET", undefined, member.accessToken);
+  assert.equal(hidden.status, 400, hidden.raw);
+  assert.equal(hidden.body.code, "invalid_request");
+});
