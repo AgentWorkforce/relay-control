@@ -21,26 +21,56 @@ Attestation also needs a signing key (below).
 
 ## Configuration
 
-| Variable                                                 | Meaning                                                                                                  |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`)           | base64url 32-byte Ed25519 seed. Generate: `node -e "console.log(crypto.randomBytes(32).toString('base64url'))"` |
-| `SELFHOST_DELEGATION_SIGNING_KID`                        | key id published in the JWKS and the JWS header (1–64 of `A-Za-z0-9._-`)                                 |
-| `SELFHOST_DELEGATION_PREVIOUS_KEYS`                      | optional JSON array of up to 8 `{kid, x}` retired public keys kept in the JWKS during rotation           |
+| Variable | Meaning |
+| --- | --- |
+| `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`) | The Ed25519 signing key: a PKCS#8 PEM, or Cloud's keyring JSON (below). A base64url 32-byte seed (the earlier form) is still read. |
+| `SELFHOST_DELEGATION_SIGNING_KID` | Optional. The key id, 1–64 of `A-Za-z0-9._-`. Default: the RFC 7638 thumbprint of the public key, as Cloud. |
+| `SELFHOST_DELEGATION_PREVIOUS_KEYS` | Optional JSON array of up to 3 public keys `{kid?, x}` (or OKP JWKs) kept in the JWKS: retired keys, or a key published before it signs. Not together with a keyring's `previousPublicJwks`. |
 
-The first two are required together. Without them, attestation answers
-`{"verdict":"none","reason":"unavailable"}` and the JWKS is `{"keys":[]}`.
-Rotate quarterly, publishing the new key before signing with it, so that
-relay-nodes with a cached JWKS (an hour) already know the new `kid`:
+Not configured (empty, `unset`, or a `*-disabled` placeholder, as Cloud):
+attestation answers `{"verdict":"none","reason":"unavailable"}` and the JWKS
+is `{"keys":[]}`. A value that is set but malformed stops startup, as every
+other relay-control secret does, rather than running with attestation silently
+off.
 
-1. Generate a new seed and kid. Add the new public `{kid, x}` to
-   `SELFHOST_DELEGATION_PREVIOUS_KEYS` (which publishes any extra keys) and
-   redeploy. Wait at least one JWKS cache hour.
-2. Switch `SELFHOST_DELEGATION_SIGNING_KEY`/`_KID` to the new key, and replace
-   its entry in `SELFHOST_DELEGATION_PREVIOUS_KEYS` with the old key's public
-   `{kid, x}` (from the JWKS).
-3. After the attestation TTL plus a cache hour, drop the old key.
+The kid defaults to the RFC 7638 thumbprint, as Cloud's. An explicit kid
+(`SELFHOST_DELEGATION_SIGNING_KID` or the keyring's `kid`) is kept as given
+and not checked against the thumbprint: verifiers match a kid exactly, so an
+install that already published one keeps it. Every published kid must be
+distinct.
 
-Every published kid must be distinct.
+### Generating and rotating the key
+
+Generate a key and point the server at it (the file stays mode 0600):
+
+```sh
+openssl genpkey -algorithm ed25519 -out delegation-signing.pem
+chmod 600 delegation-signing.pem
+SELFHOST_DELEGATION_SIGNING_KEY_FILE=/path/to/delegation-signing.pem
+```
+
+Its kid is shown in `GET /.well-known/relay-delegation-keys.json`.
+
+Rotate (quarterly, or at once if the key leaked) with Cloud's keyring JSON,
+which keeps up to 3 retired public keys in the JWKS so that attestations they
+signed keep verifying for their 300-second life and beyond:
+
+1. Read the current public key from the JWKS:
+   `curl -s https://<origin>/.well-known/relay-delegation-keys.json`.
+2. Generate a new key as above, and write the keyring:
+
+   ```json
+   {"currentPrivateKeyPem": "<new PEM, newlines as \n>",
+    "previousPublicJwks": [{"kty": "OKP", "crv": "Ed25519", "x": "<old x>", "kid": "<old kid>"}]}
+   ```
+
+   Keep at most 3 previous keys; drop the oldest.
+3. Set `SELFHOST_DELEGATION_SIGNING_KEY_FILE` to the keyring file and restart.
+
+Relay-nodes cache the JWKS for up to an hour and refetch on an unknown kid.
+To avoid even one refetch, publish the new public key first: add it to
+`SELFHOST_DELEGATION_PREVIOUS_KEYS`, wait an hour, then switch the signing
+key and move the old public key into the previous list.
 
 ## Who may call what
 
@@ -276,8 +306,18 @@ that state rather than on anything read before the slow Relaycast lookups:
 9. standing against the target owners as committed now: `recipient_policy`
    (relay-control reads them locally).
 
-The attestation (or the consumption) is written in the same transaction, and
-the attestation is signed last, so a refusal signs nothing. Its `exp` is the
+The attestation (or, for redeem, the consumption and the `approval.redeemed`
+event) is written in the same transaction, and the attestation is signed
+last, so a refusal signs nothing. If the `approval.redeemed` write fails, the
+consumption rolls back and the answer is `unavailable`: no use goes
+unrecorded. Refusal events stay best-effort; a failed write is logged
+(`delegation.audit_write_failed`), as is every `unavailable` caused by an
+exception (`delegation.unavailable`). See
+`docs/delegation-quote-redaction-runbook.md` for the log lines.
+
+Once every single-use action of an approval has been consumed, the approval
+is stamped `consumed_at` in the consuming transaction. A fully spent approval
+is no longer unredeemed: grant revocation and `revoke-all` leave it alone. Its `exp` is the
 least of 300 seconds after issue, the approval window found earlier, and the
 grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take
@@ -311,7 +351,9 @@ Revocation happens in these cases:
 
 Revoking invalidates every unredeemed approval under the grant at once.
 `revoke-all` also invalidates the owner's (or, with `all`, the workspace's)
-unredeemed tier O approvals, and answers `{revoked: [grant ids]}`.
+unredeemed approvals, writes one `approval.revoked` event for them with data
+`{scope: "revoke_all", count, approval_ids}`, and answers
+`{revoked: [grant ids]}`.
 Turning `delegation_enabled` off makes every attestation and redeem
 `not_enabled` without deleting grants.
 
@@ -351,7 +393,9 @@ itself is also in the signed claims (`quote`). Quote text is redacted to `quote_
 `quote_redacted_at` set) once it is older than the org's
 `quote_retention_days`. An hourly sweep (started with the server) also runs the
 redaction and marks lapsed grants `expired`, so a quiet workspace does not keep
-quote text past its window.
+quote text past its window. Each run handles at most 500 grants and 500
+quotes, then tries the due Relaycast redactions and reports the queue's
+backlog (see `docs/delegation-quote-redaction-runbook.md`).
 
 - This is §15.9, Khaliq's decision: an org setting from 1 to 3650 days,
   default 90. It is set with `GET`/`PUT /api/v1/orgs/{org}/delegation-policy`

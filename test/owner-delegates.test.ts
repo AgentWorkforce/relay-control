@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import { loadDelegationSigning } from "../src/config.js";
 import { encryptSecret } from "../src/crypto.js";
-import { verifyDelegationJws } from "../src/delegation/jws.js";
+import { DelegationSigner, verifyDelegationJws } from "../src/delegation/jws.js";
 import {
   actionsCovered,
   base62,
@@ -217,17 +217,42 @@ test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
   assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u.test(emoji), false);
 });
 
-test("signing key config: seed and kid together, previous keys validated", () => {
+test("signing key config: PEM, keyring or seed; kid defaults to the RFC 7638 thumbprint; previous keys validated", () => {
   assert.equal(loadDelegationSigning({}), null);
+  // As Cloud: `unset` and `*-disabled` placeholders are not configured (attestation answers unavailable).
+  assert.equal(loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: "unset" }), null);
+  assert.equal(loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: "relay-delegation-signing-disabled" }), null);
   const seed = randomBytes(32).toString("base64url");
-  const loaded = loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k1" });
-  assert.equal(loaded?.kid, "k1");
-  assert.equal(loaded?.seed.byteLength, 32);
-  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: seed }), /required together/);
-  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: "short", SELFHOST_DELEGATION_SIGNING_KID: "k1" }), /32-byte/);
+  const thumb = (x: string) => createHash("sha256").update(`{"crv":"Ed25519","kty":"OKP","x":"${x}"}`).digest("base64url");
+  const xOf = (key: KeyObject) => (createPublicKey(key).export({ format: "jwk" }) as { x: string }).x;
+  // A bare seed: the kid is the thumbprint unless named.
+  const bare = loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: seed })!;
+  assert.equal(bare.kid, thumb(new DelegationSigner(bare).jwks().keys[0]!.x));
+  assert.equal(loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k1" })?.kid, "k1");
+  // A PKCS#8 PEM, as `openssl genpkey -algorithm ed25519` writes it.
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const fromPem = loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: pem })!;
+  assert.equal(fromPem.kid, thumb(xOf(privateKey)));
+  assert.equal(new DelegationSigner(fromPem).jwks().keys[0]!.x, xOf(privateKey));
+  // Cloud's keyring JSON keeps retired keys in the JWKS (kid defaults to their thumbprint), at most 3.
+  const old = generateKeyPairSync("ed25519");
+  const oldJwk = { kty: "OKP", crv: "Ed25519", x: xOf(old.privateKey) };
+  const ring = loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: JSON.stringify({ currentPrivateKeyPem: pem,
+    previousPublicJwks: [oldJwk] }) })!;
+  assert.deepEqual(new DelegationSigner(ring).jwks().keys.map(key => key.kid), [thumb(xOf(privateKey)), thumb(oldJwk.x)]);
+  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: JSON.stringify({ currentPrivateKeyPem: pem,
+    previousPublicJwks: [1, 2, 3, 4].map(() => ({ x: randomBytes(32).toString("base64url") })) }) }), /At most 3/);
+  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: JSON.stringify({ currentPrivateKeyPem: pem,
+    previousPublicJwks: [{ ...oldJwk, d: "secret" }] }) }), /public Ed25519/);
+  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: JSON.stringify({ previousPublicJwks: [] }) }),
+    /currentPrivateKeyPem/);
+  // A kid or previous keys without a key, or a malformed key, stop startup.
+  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KID: "k1" }), /need SELFHOST_DELEGATION_SIGNING_KEY/);
+  assert.throws(() => loadDelegationSigning({ SELFHOST_DELEGATION_SIGNING_KEY: "short" }), /PKCS#8 PEM, a keyring JSON/);
   assert.throws(() => loadDelegationSigning({
     SELFHOST_DELEGATION_SIGNING_KEY: seed, SELFHOST_DELEGATION_SIGNING_KID: "k1",
-    SELFHOST_DELEGATION_PREVIOUS_KEYS: JSON.stringify([{ kid: "k1", x: seed }]),
+    SELFHOST_DELEGATION_PREVIOUS_KEYS: JSON.stringify([{ kid: "k1", x: randomBytes(32).toString("base64url") }]),
   }), /distinct kids/);
   // Two retired keys may not share a kid.
   assert.throws(() => loadDelegationSigning({
@@ -1676,4 +1701,91 @@ test("review: decided under locks: code_owner_match changed is unavailable; exp 
   assert.equal(last.quote, null);
   assert.match(last.quote_hash!, /^hmac-sha256:/);
   assert.ok(last.quote_redacted_at);
+});
+
+test("review: approval.redeemed commits with the consumption; swallowed failures are logged without secrets", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const { setDelegationLogSinkForTesting } = await import("../src/delegation/observe.js");
+  const lines: Array<{ level: string; line: string }> = [];
+  setDelegationLogSinkForTesting((level, line) => { lines.push({ level, line }); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  const deploy = { class: "deploy", target: "web:staging" };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([deploy])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const approvalId = attested.body.claims.approval_id as string;
+  // A failed approval.redeemed write rolls the consumption back and answers unavailable.
+  await env.database.query(`CREATE FUNCTION refuse_redeemed() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.event = 'approval.redeemed' THEN RAISE EXCEPTION 'insert failed: %', NEW.approval_id
+      USING ERRCODE = '57P01'; END IF; RETURN NEW; END; $$`);
+  await env.database.query(`CREATE TRIGGER refuse_redeemed BEFORE INSERT ON delegation_audit_events
+    FOR EACH ROW EXECUTE FUNCTION refuse_redeemed()`);
+  assert.deepEqual((await env.redeem(recipient, approvalId, deploy)).body, { ok: false, reason: "unavailable" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  const logged = lines.map(entry => ({ ...JSON.parse(entry.line) as Record<string, unknown>, level: entry.level }) as Record<string, unknown>);
+  const failure = logged.find(entry => entry.message === "delegation.unavailable");
+  assert.ok(failure, JSON.stringify(logged));
+  assert.equal(failure.level, "error");
+  assert.equal(failure.op, "redeem");
+  assert.equal(failure.approvalId, approvalId);
+  assert.equal(failure.error_code, "57P01");
+  assert.ok(logged.some(entry => entry.message === "delegation.refused" && entry.reason === "unavailable" && entry.level === "info"));
+  const text = lines.map(entry => entry.line).join("\n");
+  for (const secret of [recipient.token, env.desktop.accessToken, "yes merge 2250", "insert failed"]) assert.ok(!text.includes(secret));
+  await env.database.query("DROP TRIGGER refuse_redeemed ON delegation_audit_events");
+  // Now it redeems, consumes and logs the redeem in one go; consumed_at is stamped once every single-use action is spent.
+  assert.deepEqual((await env.redeem(recipient, approvalId, deploy)).body, { ok: true, consumed: true });
+  const row = (await env.database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM delegation_approvals WHERE id = $1",
+    [approvalId])).rows[0]!;
+  assert.ok(row.consumed_at);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows.length, 1);
+  // A spent approval is left alone by revoke-all, which logs one approval.revoked summary.
+  const minted = await env.browser("/delegates/approvals", "POST", { actions: [{ class: "merge", target: "AgentWorkforce/relay#240" }] });
+  assert.equal(minted.status, 201, minted.raw);
+  assert.equal((await env.bearer("/delegates/revoke-all", "POST", {})).status, 200);
+  const spent = (await env.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId])).rows[0]!;
+  assert.equal(spent.invalidated_at, null);
+  const summary = (await env.database.query<{ reason: string; data: Record<string, unknown> }>(
+    "SELECT reason, data FROM delegation_audit_events WHERE event = 'approval.revoked'")).rows;
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0]!.data.scope, "revoke_all");
+  assert.equal(summary[0]!.data.count, 1);
+  assert.deepEqual(summary[0]!.data.approval_ids, [minted.body.approval_id]);
+});
+
+test("review: the sweep is bounded per run and reports the Relaycast redaction backlog", async (t) => {
+  const env = await setup(t);
+  const { createDelegationRetention } = await import("../src/delegation/retention.js");
+  const { setDelegationLogSinkForTesting } = await import("../src/delegation/observe.js");
+  const lines: Array<{ level: string; line: string }> = [];
+  setDelegationLogSinkForTesting((level, line) => { lines.push({ level, line }); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  for (let index = 0; index < 3; index += 1) {
+    const agent = await env.desktopIdentity(`expiring-${index}`);
+    await env.database.query(
+      `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+         scopes, expires_at, created_auth_method)
+       VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, now() - interval '1 minute', 'session')`,
+      [`grt_expiring${index}abcdef`, env.workspaceId, env.orgId, env.ownerId, agent.id, `expiring-${index}`]);
+  }
+  const sweeper = createDelegationRetention({ database: env.database, limit: 2 });
+  assert.equal((await sweeper.sweep()).expired, 2);
+  assert.equal((await sweeper.sweep()).expired, 1);
+  assert.equal((await sweeper.sweep()).expired, 0);
+  // The backlog: unfinished (any state), rejected, stale (> 24 h) and the oldest age.
+  await env.database.query(`INSERT INTO delegation_quote_redactions (workspace_id, message_id, requested_at, relaycast_outcome)
+    VALUES ($1, 'm-old', now() - interval '25 hours', NULL), ($1, 'm-rej', now(), 'rejected'),
+           ($1, 'm-done', now() - interval '3 days', 'redacted')`, [env.workspaceId]);
+  await env.database.query("UPDATE delegation_quote_redactions SET relaycast_redacted_at = now() WHERE message_id = 'm-done'");
+  const result = await sweeper.sweep();
+  assert.equal(result.relaycastPending, 2);
+  assert.equal(result.relaycastRejectedTotal, 1);
+  assert.equal(result.relaycastStale, 1);
+  assert.ok(result.relaycastOldestPendingSeconds! >= 25 * 3600 - 5);
+  const backlog = lines.map(entry => ({ ...JSON.parse(entry.line) as Record<string, unknown>, level: entry.level }) as Record<string, unknown>)
+    .filter(entry => entry.message === "delegation.redaction_backlog").at(-1)!;
+  assert.equal(backlog.level, "warn");
+  assert.equal(backlog.unfinished, 2);
+  assert.equal(backlog.rejected, 1);
+  assert.equal(backlog.stale, 1);
 });

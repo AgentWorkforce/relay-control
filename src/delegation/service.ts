@@ -2,6 +2,7 @@ import { createHmac, hkdfSync, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
+import { logAuditWriteFailed, logRefused, logRevokeFailed, logUnavailable } from "./observe.js";
 import {
   actionIsValid,
   actionsCovered,
@@ -133,6 +134,8 @@ type ApprovalRow = {
   single_use: boolean;
   expires_at: Date | string;
   invalidated_at: Date | string | null;
+  /** Set once every single-use action has been consumed (markSpentIfComplete). */
+  consumed_at: Date | string | null;
 };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -372,24 +375,59 @@ export function auditView(row: Record<string, unknown>) {
  * here and lose its Relaycast redaction. Runs in the hourly sweep and on every
  * audit read.
  */
-export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> {
-  await executor.query(
-    `WITH redacted AS (
-       UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
+export async function redactExpiredQuotes(executor: SqlExecutor, limit?: number): Promise<number> {
+  return Number((await executor.query<{ count: number }>(
+    `WITH due AS (
+       SELECT e.id FROM delegation_audit_events AS e
         WHERE e.quote IS NOT NULL
-          AND (e.created_at <= now() - make_interval(days => COALESCE(
+          AND ((
+                -- The shortest window an org can set is one day: a constant
+                -- bound lets the partial (created_at) WHERE quote IS NOT NULL
+                -- index prune the scan before the per-org window is evaluated.
+                e.created_at <= now() - interval '1 day'
+            AND e.created_at <= now() - make_interval(days => COALESCE(
                 (SELECT p.quote_retention_days FROM delegation_org_policies p
                    JOIN workspaces w ON w.organization_id = p.organization_id
-                  WHERE w.id = e.workspace_id), $1))
+                  WHERE w.id = e.workspace_id), $1)))
             OR (e.message_id IS NOT NULL AND EXISTS (
                 SELECT 1 FROM delegation_quote_redactions q
                  WHERE q.workspace_id = e.workspace_id AND q.message_id = e.message_id)))
-        RETURNING e.workspace_id, e.message_id)
-     INSERT INTO delegation_quote_redactions (workspace_id, message_id)
-     SELECT DISTINCT workspace_id, message_id FROM redacted WHERE message_id IS NOT NULL
-     ON CONFLICT DO NOTHING`,
-    [QUOTE_RETENTION_DAYS],
-  );
+        LIMIT $2),
+     redacted AS (
+       UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
+        WHERE e.id IN (SELECT id FROM due) AND e.quote IS NOT NULL
+        RETURNING e.workspace_id, e.message_id),
+     queued AS (
+       INSERT INTO delegation_quote_redactions (workspace_id, message_id)
+       SELECT DISTINCT workspace_id, message_id FROM redacted WHERE message_id IS NOT NULL
+       ON CONFLICT DO NOTHING)
+     SELECT count(*)::int AS count FROM redacted`,
+    [QUOTE_RETENTION_DAYS, limit ?? null],
+  )).rows[0]?.count ?? 0);
+}
+
+/** Hours after which an unfinished Relaycast redaction needs an operator (docs/delegation-quote-redaction-runbook.md). */
+export const REDACTION_STALE_HOURS = 24;
+
+/**
+ * The Relaycast redaction queue for operators, as Cloud's
+ * relaycastRedactionBacklog: unfinished (not yet confirmed, any state),
+ * rejected (parked for an operator), stale (unfinished and requested more
+ * than REDACTION_STALE_HOURS ago) and the oldest unfinished request's age in
+ * seconds (null when none).
+ */
+export async function relaycastRedactionBacklog(executor: SqlExecutor): Promise<{ unfinished: number; rejected: number;
+  stale: number; oldestAgeSeconds: number | null }> {
+  const row = (await executor.query<{ unfinished: number; rejected: number; stale: number; oldest: number | null }>(
+    `SELECT count(*)::int AS unfinished,
+            (count(*) FILTER (WHERE relaycast_outcome = 'rejected'))::int AS rejected,
+            (count(*) FILTER (WHERE requested_at <= now() - make_interval(hours => $1)))::int AS stale,
+            floor(extract(epoch FROM now() - min(requested_at)))::int AS oldest
+       FROM delegation_quote_redactions WHERE relaycast_redacted_at IS NULL`,
+    [REDACTION_STALE_HOURS],
+  )).rows[0];
+  return { unfinished: Number(row?.unfinished ?? 0), rejected: Number(row?.rejected ?? 0), stale: Number(row?.stale ?? 0),
+    oldestAgeSeconds: row?.oldest === null || row?.oldest === undefined ? null : Math.max(0, Number(row.oldest)) };
 }
 
 /** `after_id` names no event of this workspace (400 invalid_request, as Cloud). */
@@ -552,14 +590,40 @@ export async function actionConsumed(executor: SqlExecutor, approvalId: string,
   )).rows.length > 0;
 }
 
-/** Consumes one action atomically; false when it was already consumed. */
+/**
+ * Consumes one action atomically, in the caller's transaction; false when it
+ * was already consumed. Stamps the approval's `consumed_at` once every
+ * single-use action of it has been consumed (markSpentIfComplete).
+ */
 export async function consumeAction(executor: SqlExecutor, input: { approvalId: string; workspaceId: string;
   action: Pick<Action, "class" | "target">; consumedBy: string }): Promise<boolean> {
-  return (await executor.query(
+  const consumed = (await executor.query(
     `INSERT INTO delegation_action_consumptions (approval_id, workspace_id, class, target, consumed_by)
      VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING approval_id`,
     [input.approvalId, input.workspaceId, input.action.class, input.action.target, input.consumedBy],
   )).rows.length === 1;
+  if (consumed) await markSpentIfComplete(executor, input.approvalId);
+  return consumed;
+}
+
+/**
+ * Stamps `consumed_at` once every single-use action of the approval has been
+ * consumed (single use is per action, §5.1), as Cloud. A fully spent approval
+ * is then no longer "unredeemed": grant revocation and revoke-all leave it
+ * alone.
+ */
+export async function markSpentIfComplete(executor: SqlExecutor, approvalId: string): Promise<void> {
+  const approval = (await executor.query<Pick<ApprovalRow, "actions" | "single_use">>(
+    "SELECT actions, single_use FROM delegation_approvals WHERE id = $1 AND consumed_at IS NULL", [approvalId],
+  )).rows[0];
+  if (!approval) return;
+  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
+  if (!singleUse.length) return;
+  const spent = new Set((await executor.query<{ class: string; target: string }>(
+    "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approvalId],
+  )).rows.map(row => `${row.class} ${row.target}`));
+  if (!singleUse.every(action => spent.has(`${action.class} ${action.target}`))) return;
+  await executor.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL", [approvalId]);
 }
 
 export async function revokeGrants(executor: SqlExecutor, input: {
@@ -577,7 +641,7 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   const ids = revoked.map(row => row.id);
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
         AND (grant_id = ANY($2::text[])
           OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))`,
     [input.workspaceId, ids],
@@ -606,12 +670,19 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
   )).rows.map(row => row.id);
   const revoked = await revokeGrants(executor, { workspaceId: input.workspaceId, grantIds: ids,
     actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
-  await executor.query(
+  const approvals = (await executor.query<{ id: string }>(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL
-        AND ($2::uuid IS NULL OR owner_user_id = $2)`,
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
+        AND ($2::uuid IS NULL OR owner_user_id = $2)
+      RETURNING id`,
     [input.workspaceId, input.ownerUserId],
-  );
+  )).rows;
+  // One summary event for the approvals revoked here (tier O ones have no grant event), as Cloud.
+  if (approvals.length) {
+    await recordDelegationAudit(executor, { workspaceId: input.workspaceId, event: "approval.revoked",
+      actorUserId: input.actorUserId, authMethod: input.authMethod, ownerUserId: input.ownerUserId, reason: input.reason,
+      data: { scope: "revoke_all", count: approvals.length, approval_ids: approvals.map(row => row.id) } });
+  }
   return revoked.map(row => row.id);
 }
 
@@ -771,9 +842,10 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
 async function delegateStillBound(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow,
   live: boolean): Promise<ReasonCode | null> {
   const revoke = async (reason: string): Promise<ReasonCode> => {
+    // A failed write still refuses this use; it is logged.
     await deps.database.transaction(tx => revokeGrants(tx, {
       workspaceId: workspace.id, grantIds: [grant.id], actorUserId: null, reason, authMethod: "system",
-    })).catch(() => undefined);
+    })).catch((error: unknown) => logRevokeFailed("attest", error, { workspaceId: workspace.id, grantId: grant.id, reason }));
     return "revoked";
   };
   const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId,
@@ -1086,14 +1158,20 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     return { verdict: "delegate", attestation, claims };
   } catch (error) {
     // No dependency error can promote a peer message or expose a
-    // message-existence oracle.
+    // message-existence oracle. It is logged (class and SQLSTATE only).
     const reason: ReasonCode = error instanceof Refusal ? error.reason : "unavailable";
+    if (!(error instanceof Refusal)) {
+      logUnavailable("attest", error, { workspaceId: workspace.id, approvalId: context.approvalId ?? null,
+        grantId: context.grantId ?? null });
+    }
     await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "approval.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: context.approvalId ?? null, actorAgentId: context.senderId ?? null,
       messageId: input.messageId, recipientAgentId: input.recipientAgentId, reason,
-    }).catch(() => undefined);
+    }).catch((auditError: unknown) => logAuditWriteFailed("attest", auditError, { workspaceId: workspace.id,
+      approvalId: context.approvalId ?? null, grantId: context.grantId ?? null, event: "approval.refused", reason }));
+    logRefused("attest", { workspaceId: workspace.id, reason });
     return { verdict: "none", reason };
   }
 }
@@ -1188,30 +1266,36 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       if (stale) refuse(stale);
       if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
-      if (!singleUse) return;
       // Single use is per action (§5.1): one atomic insert per action.
-      if (!await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
+      if (singleUse && !await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
         consumedBy: input.recipientAgentId })) refuse("consumed");
+      // Every redeem is audited, multi-use ones included (§6.3), in the
+      // transaction that consumes: a failed audit write rolls the consumption
+      // back and the answer is `unavailable`, so no use goes unrecorded.
+      await recordDelegationAudit(tx, {
+        workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
+        authMethod: input.authMethod, ownerUserId: approval!.owner_user_id, grantId: grant!.id,
+        approvalId: input.approvalId, recipientAgentId: input.recipientAgentId,
+        data: { action: input.action, consumed: singleUse, conditions: action!.conditions ?? [] },
+      });
     });
-    // The consumption above is the authority; a failed log write must not turn
-    // a spent approval into a refusal the agent would retry.
-    await recordDelegationAudit(deps.database, {
-      workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
-      authMethod: input.authMethod, ownerUserId: approval!.owner_user_id, grantId: grant!.id,
-      approvalId: input.approvalId, recipientAgentId: input.recipientAgentId,
-      data: { action: input.action, consumed: singleUse, conditions: action!.conditions ?? [] },
-    }).catch(() => undefined);
     return { ok: true, consumed: singleUse };
   } catch (error) {
     const reason: ReasonCode = error instanceof ConditionUnmet ? "condition_unmet"
       : error instanceof Refusal ? error.reason : "unavailable";
     const unmet = error instanceof ConditionUnmet ? error.unmet : undefined;
+    if (!(error instanceof ConditionUnmet) && !(error instanceof Refusal)) {
+      logUnavailable("redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId,
+        grantId: context.grantId ?? null });
+    }
     await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,
       data: { action: input.action, ...(unmet ? { unmet } : {}) },
-    }).catch(() => undefined);
+    }).catch((auditError: unknown) => logAuditWriteFailed("redeem", auditError, { workspaceId: workspace.id,
+      approvalId: input.approvalId, grantId: context.grantId ?? null, event: "redeem.refused", reason }));
+    logRefused("redeem", { workspaceId: workspace.id, reason });
     return unmet ? { ok: false, reason, unmet } : { ok: false, reason };
   }
 }

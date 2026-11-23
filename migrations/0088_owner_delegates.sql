@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS delegation_approvals (
   single_use boolean NOT NULL,
   expires_at timestamptz NOT NULL,
   invalidated_at timestamptz,
+  -- Set once every single-use action has been consumed: a fully spent
+  -- approval is no longer "unredeemed", so revocation leaves it alone.
+  consumed_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT delegation_approvals_tier CHECK (tier IN ('D', 'O'))
 );
