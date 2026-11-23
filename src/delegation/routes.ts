@@ -4,7 +4,7 @@ import { cookieRequestAllowed } from "../auth/device-approval.js";
 import { bearer } from "../auth/bearer.js";
 import { controlSessionToken } from "../auth/session-cookie.js";
 import { hashSecret } from "../crypto.js";
-import type { Database } from "../database.js";
+import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
@@ -261,11 +261,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     quoteKey: input.quoteKey,
   };
 
-  async function sessionFacts(token: string): Promise<SessionFacts | null> {
-    return (await input.database.query<SessionFacts>(
+  /**
+   * The live session row behind a token. Inside a transaction, `lock` takes a
+   * share lock on it, so a concurrent revocation (an UPDATE of that row)
+   * serializes with whatever the transaction commits.
+   */
+  async function sessionFacts(token: string, executor: SqlExecutor = input.database, lock = false): Promise<SessionFacts | null> {
+    return (await executor.query<SessionFacts>(
       `SELECT created_at, desktop_host_name, desktop_verified_at, desktop_exchange_challenge,
               provisioned_by_token_id, scopes
-         FROM token_sessions WHERE access_token_hash = $1 AND revoked_at IS NULL AND access_token_expires_at > now()`,
+         FROM token_sessions WHERE access_token_hash = $1 AND revoked_at IS NULL AND access_token_expires_at > now()
+         ${lock ? "FOR SHARE" : ""}`,
       [hashSecret(token)],
     )).rows[0] ?? null;
   }
@@ -324,7 +330,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     if (!principal) return fail("unauthorized", "Unauthorized", 401);
     if (!desktopVerified(await sessionFacts(token), true)) fail("forbidden", "Forbidden", 403);
     const workspace = await memberWorkspace(principal, workspaceId);
-    return { principal, workspace, stillAuthorized: async () => desktopVerified(await sessionFacts(token), true) };
+    return { principal, workspace,
+      stillAuthorized: async (executor?: SqlExecutor) => desktopVerified(await sessionFacts(token, executor, Boolean(executor)), true) };
   }
 
   /**
@@ -765,7 +772,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const revoked = await input.database.transaction(async (tx) => {
         // Serialize policy writers and grant creation on the workspace row
         // (this also covers the first insert of the policy row).
-        await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR UPDATE", [workspace.id]);
+        // FOR NO KEY UPDATE: serializes policy writers without blocking the
+        // key-share lock a grant insert takes on the workspace for its foreign
+        // key (FOR UPDATE would conflict with it and could deadlock).
+        await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR NO KEY UPDATE", [workspace.id]);
         await tx.query("SELECT 1 FROM delegation_policies WHERE workspace_id = $1 FOR UPDATE", [workspace.id]);
         const before = await loadPolicy(tx, workspace.id);
         await tx.query(

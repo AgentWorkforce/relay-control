@@ -246,13 +246,16 @@ export async function anyBinding(executor: SqlExecutor, workspaceId: string, rel
 }
 
 /** The person's live role in the workspace's organization, or null when they are not a member. */
-export async function memberRole(executor: SqlExecutor, workspaceId: string, userId: string): Promise<string | null> {
+export async function memberRole(executor: SqlExecutor, workspaceId: string, userId: string,
+  lock = false): Promise<string | null> {
   if (!UUID.test(userId)) return null;
+  // `lock` (inside a transaction) share-locks the membership row, so a
+  // concurrent removal serializes with what the transaction commits.
   const row = (await executor.query<{ role: string }>(
     `SELECT m.role FROM workspaces w
        JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $2
        JOIN organizations o ON o.id = w.organization_id
-      WHERE w.id = $1`,
+      WHERE w.id = $1${lock ? " FOR SHARE OF m" : ""}`,
     [workspaceId, userId],
   )).rows[0];
   return row?.role ?? null;
@@ -657,7 +660,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
   messageId: string;
   accept: AcceptMode;
   authMethod: string;
-  stillAuthorized?: () => Promise<boolean>;
+  /** Re-proves the caller's bearer; given a transaction, under a share lock on its session row. */
+  stillAuthorized?: (executor?: SqlExecutor) => Promise<boolean>;
 }): Promise<DelegationVerdict> {
   const { workspace } = input;
   const now = deps.now();
@@ -801,6 +805,10 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       // under a row lock (revocation and narrowing take the same lock) before
       // recording anything a redeem could rely on.
       await recheckGrant(tx, workspace.id, grant.id, actions, policy, now.getTime());
+      // The caller's membership and bearer, under share locks, so a revocation
+      // between the earlier check and this commit cannot be missed.
+      if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
+          (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
       await tx.query(
         `INSERT INTO delegation_attestations
            (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id, delegate_agent_id, kid, accept,
@@ -863,7 +871,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
   approvalId: string;
   action: { class: ActionClass; target: string };
   authMethod: string;
-  stillAuthorized?: () => Promise<boolean>;
+  /** Re-proves the caller's bearer; given a transaction, under a share lock on its session row. */
+  stillAuthorized?: (executor?: SqlExecutor) => Promise<boolean>;
 }): Promise<RedeemResult> {
   const { workspace } = input;
   const now = deps.now();
@@ -919,6 +928,10 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       // lookups: recheck it under its row lock in both paths, then consume a
       // single-use approval in the same transaction.
       await recheckGrant(tx, workspace.id, grant!.id, [action!], policy, deps.now().getTime());
+      // The caller's membership and bearer, under share locks: a revocation
+      // while this waited on the grant lock is never missed before consuming.
+      if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
+          (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
       // The approval may have been revoked or withdrawn meanwhile.
       const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE",
         [input.approvalId])).rows.length > 0;

@@ -1306,3 +1306,40 @@ test("routes that run before any caller is proven never provision a Relaycast bi
     "SELECT relaycast_workspace_id, relaycast_binding_claim_id FROM workspaces WHERE id = $1", [env.workspaceId]);
   assert.deepEqual(row.rows[0], { relaycast_workspace_id: null, relaycast_binding_claim_id: null });
 });
+
+test("a bearer revoked while redeem or attestation waits is refused and nothing is recorded or consumed", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const prod = { class: "deploy", target: "web:staging" };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([prod])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  const revoke = async () => {
+    await env.database.query("UPDATE token_sessions SET revoked_at = now() WHERE access_token_hash = $1",
+      [createHash("sha256").update(env.desktop.accessToken).digest("hex")]);
+  };
+  // Redeem: the bearer is revoked during the Relaycast lookups.
+  const second = await env.desktopSignIn({ hostName: "second-box" });
+  during = revoke;
+  const refused = await env.redeem(recipient, attested.body.claims.approval_id, prod);
+  assert.deepEqual(refused.body, { ok: false, reason: "not_pending" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  // Attestation with a fresh bearer revoked mid-flight: refused, no attestation recorded for it.
+  const before = (await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length;
+  during = async () => {
+    await env.database.query("UPDATE token_sessions SET revoked_at = now() WHERE access_token_hash = $1",
+      [createHash("sha256").update(second.accessToken).digest("hex")]);
+  };
+  const late = await env.attest(recipient, send(env, bot, recipient, env.approval([prod])), "code_owners", second.accessToken);
+  assert.deepEqual(late.body, { verdict: "none", reason: "not_pending" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length, before);
+  env.world.handle = handle;
+});
