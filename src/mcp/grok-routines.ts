@@ -48,8 +48,10 @@ type Remote = Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
 type Inbox = { via: RelaycastClient; token: string; remote: Remote; relaycastWorkspaceId: string };
 type RootCheck = "bot-thread" | "other" | "unverified";
 /** A manual refresh's network half, read before the fence: the page and the thread roots it needs. */
-type PreparedRefresh = { grant: Grant; participant: Participant; renewedToken?: string; inbox: Inbox; page: HostedDelivery[];
-  roots: Map<string, RootCheck> };
+type PreparedRefresh = { grant: Grant; participant: Participant; inbox: Inbox; page: HostedDelivery[];
+  roots: Map<string, RootCheck>; claimedAt: Date };
+/** Thread-root reads in flight at once for one refresh. */
+const ROOT_READ_CONCURRENCY = 5;
 /** At most one manual inbox refresh per connection in this interval; reads within it return stored events. */
 export const INBOX_REFRESH_INTERVAL_MS = 10_000;
 /** Cloud's freshness message when the inbox could not be refreshed. */
@@ -237,6 +239,10 @@ export class GrokRoutines {
         const applied = await this.applyRefresh(tx, grant, routine, owner, prepared);
         refresh = applied === false ? { status: "failed", message: REFRESH_FAILED } : { status: "ok" };
         acknowledgement = applied === false ? null : applied;
+        if (applied === false) await this.releaseClaim(tx, grant.id, prepared.claimedAt);
+      } else if (prepared && "claimedAt" in prepared && prepared.claimedAt) {
+        // The read that claimed the interval failed: the next read tries again, so "ok" only follows a real read.
+        await this.releaseClaim(tx, grant.id, prepared.claimedAt);
       }
       return recentEvents(tx, this.options.keyring, grant, routine, input, this.retainedSince());
     });
@@ -251,31 +257,44 @@ export class GrokRoutines {
    * could not be read now (stored events are still returned); a gated participant whose relaygate enrolment lapsed
    * is left to the scan.
    */
-  private async prepareRefresh(grantId: string, owner: Owner): Promise<PreparedRefresh | { status: "ok" | "failed" } | null> {
+  private async prepareRefresh(grantId: string, owner: Owner):
+    Promise<PreparedRefresh | { status: "ok" } | { status: "failed"; claimedAt?: Date } | null> {
     if (!this.cloudCopy) return null;
     // A short fenced read: the grant, the interval claim and the participant row. No network inside.
     const claimed = await this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner, { events: true });
       const routine = (await tx.query<Routine>("SELECT cloud_copy FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
       if (!grant.agent_remote_id || (routine && !routine.cloud_copy)) return null;
-      const now = this.now();
-      const due = await tx.query(`INSERT INTO mcp_grant_event_settings(grant_id,last_inbox_read_at,updated_at) VALUES ($1,$2,$2)
-        ON CONFLICT (grant_id) DO UPDATE SET last_inbox_read_at=$2
-        WHERE mcp_grant_event_settings.last_inbox_read_at IS NULL OR mcp_grant_event_settings.last_inbox_read_at<=$3 RETURNING grant_id`,
-      [grant.id, now, new Date(now.getTime() - INBOX_REFRESH_INTERVAL_MS)]);
-      if (!due.rows.length) return "recent" as const;
-      try { return { grant, participant: await this.participantFor(tx, grant, owner) }; } catch (error) {
+      let participant: Participant;
+      try { participant = await this.participantFor(tx, grant, owner); } catch (error) {
         if (error instanceof Error && error.message === "identity_unavailable") return "failed" as const;
         throw error;
       }
+      const claimedAt = this.now();
+      const due = await tx.query(`INSERT INTO mcp_grant_event_settings(grant_id,last_inbox_read_at,updated_at) VALUES ($1,$2,$2)
+        ON CONFLICT (grant_id) DO UPDATE SET last_inbox_read_at=$2
+        WHERE mcp_grant_event_settings.last_inbox_read_at IS NULL OR mcp_grant_event_settings.last_inbox_read_at<=$3 RETURNING grant_id`,
+      [grant.id, claimedAt, new Date(claimedAt.getTime() - INBOX_REFRESH_INTERVAL_MS)]);
+      if (!due.rows.length) return "recent" as const;
+      return { grant, participant, claimedAt };
     });
     if (claimed === null) return null;
     if (claimed === "recent") return { status: "ok" };
     if (claimed === "failed") return { status: "failed" };
+    const { claimedAt } = claimed;
+    let participant = claimed.participant;
     const signal = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
     try {
-      const verified = await this.verifyInbox(claimed.participant, claimed.grant, owner, signal);
-      if (!verified.inbox) return { status: "failed" };
+      // relaygate revokes the presented token when it renews one, so the renewed token is stored at once, in its own
+      // short transaction, before any other call can fail; only if the row still holds the token that was presented.
+      const verified = await this.verifyInbox(participant, claimed.grant, owner, signal, async renewed => {
+        const ciphertext = encryptSecret(renewed, this.options.keyring.active);
+        const stored = await this.options.database.query(`UPDATE hosted_relay_participants SET token_ciphertext=$3, updated_at=now()
+          WHERE id=$1 AND token_ciphertext=$2 RETURNING id`, [participant.id, participant.token_ciphertext, ciphertext]);
+        if (!stored.rows.length) throw new Error("identity_unavailable");
+        participant = { ...participant, token_ciphertext: ciphertext, stale: false };
+      });
+      if (!verified.inbox) return { status: "failed", claimedAt };
       const inbox = verified.inbox;
       const page = (await inbox.via.readHostedInbox(inbox.token, signal)).slice(0, 100);
       // Thread roots for the replies that might be the bot's thread (a person's, the only kind that wakes through a
@@ -286,23 +305,29 @@ export class GrokRoutines {
         { workspaceId: owner.workspaceId, relaycastWorkspaceId: inbox.relaycastWorkspaceId }, replies.map(message => message.sender_id!)) : new Map();
       const threads = [...new Set(replies.filter(message => kinds.get(message.sender_id!) === "human").map(message => message.thread_id!))];
       const roots = new Map<string, RootCheck>();
-      if (threads.length) {
-        const agent = { workspaceId: owner.workspaceId, agentRemoteId: inbox.remote.id };
-        await Promise.all(threads.map(async threadId => {
+      const agent = { workspaceId: owner.workspaceId, agentRemoteId: inbox.remote.id };
+      // Five at a time, as reply reads are; a thread not reached within the request budget stays unverified (retried).
+      for (let start = 0; start < threads.length && !signal.aborted; start += ROOT_READ_CONCURRENCY) {
+        await Promise.all(threads.slice(start, start + ROOT_READ_CONCURRENCY).map(async threadId => {
           if (await addressedInThread(this.options.database, agent, threadId, this.retainedSince())) return;
           roots.set(threadId, await this.rootCheck(inbox, threadId, signal));
         }));
       }
-      return { grant: claimed.grant, participant: claimed.participant, renewedToken: verified.renewedToken, inbox, page, roots };
+      return { grant: claimed.grant, participant, inbox, page, roots, claimedAt };
     } catch (error) {
-      if (error instanceof RelaycastCallError || (error instanceof Error && error.message === "identity_unavailable")) return { status: "failed" };
+      if (error instanceof RelaycastCallError || (error instanceof Error && error.message === "identity_unavailable")) return { status: "failed", claimedAt };
       throw error;
     }
   }
 
+  /** Clears this read's interval claim, if no later read has claimed it since. */
+  private async releaseClaim(tx: SqlExecutor, grantId: string, claimedAt: Date): Promise<void> {
+    await tx.query("UPDATE mcp_grant_event_settings SET last_inbox_read_at=NULL WHERE grant_id=$1 AND last_inbox_read_at=$2", [grantId, claimedAt]);
+  }
+
   /**
-   * The fenced half of a manual refresh: the participant must be the one read before (same row and token), then the
-   * page is stored with the roots read before. False when the participant changed meanwhile (nothing is stored or
+   * The fenced half of a manual refresh: the participant must be the one read before (same row, and the token the
+   * read used: a renewed one was already stored), then the page is stored with the roots read before. False when the participant changed meanwhile (nothing is stored or
    * acknowledged); null when there is nothing to acknowledge.
    */
   private async applyRefresh(tx: SqlExecutor, grant: Grant, routine: Routine | null, owner: Owner, prepared: PreparedRefresh):
@@ -312,10 +337,6 @@ export class GrokRoutines {
     try { current = await this.participantFor(tx, grant, owner); } catch { return false; }
     if (current.id !== prepared.participant.id || current.token_ciphertext !== prepared.participant.token_ciphertext
         || grant.agent_remote_id !== prepared.inbox.remote.id) return false;
-    if (prepared.renewedToken) {
-      await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
-        [current.id, encryptSecret(prepared.renewedToken, this.options.keyring.active)]);
-    }
     const ids = await this.ingestPage(tx, grant, routine, prepared.inbox, owner, prepared.page, undefined, prepared.roots);
     return ids.length ? { via: prepared.inbox.via, token: prepared.inbox.token, ids } : null;
   }
@@ -520,11 +541,12 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
   }
 
   /**
-   * Network only, no database: picks the client (relaygate for a gated participant), renews a gated token at
-   * half-life (returned as `renewedToken` for the caller to store) and verifies the agent behind the token.
+   * Picks the client (relaygate for a gated participant), renews a gated token at half-life and verifies the agent
+   * behind the token. A renewed token is handed to `onRenewed` at once, or returned as `renewedToken` for the
+   * caller to store in its own transaction.
    */
-  private async verifyInbox(participant: Participant, grant: Grant, owner: Owner, signal: AbortSignal):
-    Promise<{ inbox: Inbox | null; rejected: boolean; renewedToken?: string }> {
+  private async verifyInbox(participant: Participant, grant: Grant, owner: Owner, signal: AbortSignal,
+    onRenewed?: (token: string) => Promise<void>): Promise<{ inbox: Inbox | null; rejected: boolean; renewedToken?: string }> {
     // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
     const gated = participant.relaygate_agent_id !== null;
     if (gated && !this.options.gate) throw new Error("identity_unavailable");
@@ -536,7 +558,9 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
     try {
       if (gated && participant.stale) {
         // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
-        token = renewedToken = await via.refreshGateToken(token, signal);
+        token = await via.refreshGateToken(token, signal);
+        // `onRenewed` stores it before anything else can fail; otherwise the caller stores renewedToken.
+        if (onRenewed) await onRenewed(token); else renewedToken = token;
       }
       remote = await via.authenticatedAgent(token, signal);
     } catch (error) {

@@ -302,8 +302,8 @@ export function describeCapabilities(input: {
       reason: "Agent Relay events serve OAuth connections (each reads its own approved agent's events), on a server with SELFHOST_GROK_ROUTINES_CLOUD_COPY on.",
       how_to_enable: "Ask your operator to set SELFHOST_GROK_ROUTINES_CLOUD_COPY=on, then connect with OAuth." };
     if (id === "events_settings" && input.authMode === "oauth" && input.grokEvents) return { ...base, status: "unavailable", tools: [...definition.tools],
-      reason: "This installation has turned off trusting workspace members' agents in channel posts (SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS). Ask your operator.",
-      how_to_enable: "This installation has turned off trusting workspace members' agents in channel posts (SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS). Ask your operator." };
+      reason: "This installation has turned off trusting workspace members' agents in channel posts (SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS).",
+      how_to_enable: "Ask your operator." };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "Webhook wake-ups require a Grok Bot OAuth connection on this self-hosted server.",
       how_to_enable: "Connect Grok Bot to this server's /cloud/api/v1/mcp/shared-sessions endpoint, then call connect_grok_bot_routine." };

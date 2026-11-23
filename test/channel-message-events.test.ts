@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
-import { encryptSecret } from "../src/crypto.js";
+import { decryptSecret, encryptSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastClient, type RelaycastClient } from "../src/messaging/relaycast.js";
@@ -54,6 +54,7 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
     relayPaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
     await relayHooks.get(`${init?.method ?? "GET"} ${url.pathname}`)?.();
+    await relayHooks.get("*")?.();
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: now.toISOString() })) });
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -65,11 +66,24 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
   // A gate-only install: participants read through relaygate with their rg_ token, which maps to the agent's own.
   const gatePaths: string[] = [];
   const gateTokens = new Map<string, string>();
+  /** Fails the next gate request to `METHOD path` with this status. */
+  const gateFailures = new Map<string, number>();
+  let gateSequence = 0;
   const gate: RelaycastClient | undefined = options.gate ? createRelaycastClient({ internalOrigin: "https://gate.example.test", fetchImpl: async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input));
-    const upstream = gateTokens.get((new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, ""));
+    const bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+    const upstream = gateTokens.get(bearer);
     if (!upstream) return Response.json({ error: "relaygate_unauthenticated" }, { status: 401 });
-    gatePaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    const key = `${init?.method ?? "GET"} ${url.pathname}`;
+    gatePaths.push(key);
+    const failure = gateFailures.get(key);
+    if (failure) { gateFailures.delete(key); return Response.json({ error: "unavailable" }, { status: failure }); }
+    if (key === "POST /v1/token/refresh") {
+      // relaygate's contract: the presented token is revoked and a new one returned.
+      const renewed = `rg_renewed_${++gateSequence}`;
+      gateTokens.delete(bearer); gateTokens.set(renewed, upstream);
+      return Response.json({ ok: true, data: { token: renewed } });
+    }
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams, upstream, init?.body ? JSON.parse(String(init.body)) : null, null);
     if (url.pathname === "/v1/agent" && result?.status === 200) (result.body as any).data.workspace_id = "fake-workspace";
     return Response.json(result?.body ?? { ok: false }, { status: result?.status ?? 404 });
@@ -161,7 +175,7 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
     for (let scan = 0; scan < 6; scan++) { now = new Date(now.getTime() + 6_000); await routines.tick(); }
   };
   return { database, owner, world, routines, calls, tool, setup, person, recordedAgent, member, participant, outsider, channel, post, reply, channelEvents, drain,
-    relayPaths, relayHooks, gatePaths, gateTokens, connect, addGrant, chatClient, grokClient,
+    relayPaths, relayHooks, gatePaths, gateTokens, gateFailures, connect, addGrant, chatClient, grokClient,
     advance: (ms: number) => { now = new Date(now.getTime() + ms); } };
 }
 
@@ -541,9 +555,16 @@ test("pull refresh: an unreadable inbox returns stored events with Cloud's fresh
   const f = await fixture(t);
   const { chat } = await pullOnly(f);
   f.world.failNext("GET", "/v1/deliveries", 503);
+  f.world.channelAs("parent", CHANNEL, "@family-chat are you there?");
+  f.relayPaths.length = 0;
   const result = (await chat("get_recent_events", {})).structuredContent as any;
   assert.equal(result.refresh.status, "failed");
   assert.match(result.refresh.message, /do not interpret an empty list as no new messages/);
+  // The failed read released its interval claim: a read straight after it reads the inbox again.
+  const retry = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(inboxReads(f), 2);
+  assert.deepEqual(retry.refresh, { status: "ok" });
+  assert.equal(retry.events.length, 1);
 });
 
 test("bot-thread: a 401 or 403 root read is unverified (retried, then dropped after the window); a 410 root is an ordinary reply", async t => {
@@ -583,4 +604,48 @@ test("retention: a pull-only connection's events are deleted after seven days by
   f.advance(8 * 24 * 3_600_000);
   await f.routines.tick();
   assert.equal((await f.database.query("SELECT 1 FROM grok_bot_events")).rows.length, 0);
+});
+
+test("pull refresh, gate-only: a renewed relaygate token is stored at once, so a failed inbox read afterwards strands nothing", async t => {
+  const f = await fixture(t, { gate: true });
+  const { grant, chat } = await pullOnly(f);
+  const agent = f.world.agents.get("family-chat")!;
+  f.gateTokens.set("rg_old", agent.token);
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{chatgpt}',
+    updated_at=now() - interval '13 hours' WHERE agent_remote_id=$2`, [encryptSecret("rg_old", KEYRING.active), agent.id]);
+  f.world.channelAs("parent", CHANNEL, "@family-chat dinner at six?");
+  f.gateFailures.set("GET /v1/deliveries", 503);
+  const failed = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.equal(failed.refresh.status, "failed");
+  assert.ok(f.gatePaths.includes("POST /v1/token/refresh"));
+  const stored = (await f.database.query<{ token_ciphertext: string }>("SELECT token_ciphertext FROM hosted_relay_participants WHERE agent_remote_id=$1", [agent.id])).rows[0]!;
+  const token = decryptSecret(stored.token_ciphertext, KEYRING);
+  assert.match(token, /^rg_renewed_/, "the renewed token is stored although the read after it failed");
+  assert.equal(f.gateTokens.has("rg_old"), false, "relaygate revoked the presented token");
+  f.advance(INBOX_REFRESH_INTERVAL_MS + 1);
+  const next = (await chat("get_recent_events", {})).structuredContent as any;
+  assert.deepEqual(next.refresh, { status: "ok" });
+  assert.equal(next.events.length, 1, "the next read succeeds with the renewed token");
+  assert.equal((await f.database.query("SELECT 1 FROM grok_bot_events WHERE grant_id=$1", [grant])).rows.length, 1);
+});
+
+test("pull refresh: thread roots are read at most five at a time", async t => {
+  const f = await fixture(t);
+  const { chat } = await pullOnly(f);
+  const roots = Array.from({ length: 12 }, (_, i) => f.world.channelAs("family-chat", CHANNEL, `root ${i}`)!);
+  await chat("get_recent_events", {});
+  f.advance(INBOX_REFRESH_INTERVAL_MS + 1);
+  for (const root of roots) await f.reply("parent", root.id, "yes");
+  let inFlight = 0, most = 0;
+  f.relayHooks.set("*", async () => {
+    const path = f.relayPaths.at(-1)!;
+    if (!path.startsWith("GET /v1/messages/")) return;
+    inFlight++; most = Math.max(most, inFlight);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    inFlight--;
+  });
+  const result = (await chat("get_recent_events", { limit: 50 })).structuredContent as any;
+  f.relayHooks.clear();
+  assert.ok(most > 0 && most <= 5, `at most five root reads at once (saw ${most})`);
+  assert.equal(result.events.filter((event: any) => event.data.addressed === "bot-thread").length, roots.length);
 });

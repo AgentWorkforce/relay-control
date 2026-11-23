@@ -131,9 +131,16 @@ migration `0088_grok_routines_cloud_copy.sql` first.
   (whichever reads first takes them); read the channel's other posts with
   `read_relay_channel`. The inbox and thread-root reads run before the user,
   organization and grant fence is taken; inside it the participant is checked
-  again and the page is stored, then acknowledged after commit. If the inbox
-  cannot be read, the stored events are returned with Cloud's `refresh`
-  warning. It does not read the inbox for a routine saved before the copy.
+  again and the page is stored, then acknowledged after commit. Thread roots
+  are read at most five at a time; one not reached within the request budget
+  is retried. If the inbox cannot be read, the stored events are returned with
+  Cloud's `refresh` warning, and the next read tries again at once. On a
+  gate-only install a relaygate token renewed during the read is stored
+  straight away, so a later failure never leaves the connection with a revoked
+  token. A gated connection with no routine that has been idle for more than
+  24 hours holds an expired relaygate token, so `get_recent_events` reports
+  that warning; calling `join_relay`, or any relay messaging tool, on the
+  connection enrols it at relaygate again (a routine's scan does this itself). It does not read the inbox for a routine saved before the copy.
   Cloud serves `check_relay_inbox` and the event tools on different endpoints;
   here they share one, which is why the race is visible. The worker ingests each inbox delivery into
   `grok_bot_events`, with message text encrypted under the Control keyring,
