@@ -54,6 +54,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "hosted_relay_participants",
   "grok_bot_events",
   "grok_bot_routines",
+  "mcp_grant_event_settings",
   "github_app_installations",
   "installation_bootstrap",
   "integration_connections",

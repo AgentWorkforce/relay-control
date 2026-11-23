@@ -18,7 +18,7 @@ const ON=["on","ON"," On ","true","TRUE","1"],OFF=["off","OFF"," Off ","false","
 
 test("connectors default on in both tenancy modes; events stay off and every flag accepts the same spellings",()=>{
   for(const tenancy of ["single","multi"]) {
-    const enabled={enabled:true,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,oidc:null};
+    const enabled={enabled:true,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,channelMemberTrust:true,oidc:null};
     assert.deepEqual(load({SELFHOST_TENANCY:tenancy}),enabled);
     assert.deepEqual(load({SELFHOST_TENANCY:tenancy,SELFHOST_MCP_OAUTH:""}),enabled);
     assert.deepEqual(load({SELFHOST_TENANCY:tenancy,SELFHOST_MCP_OAUTH:"  "}),enabled);
@@ -105,8 +105,8 @@ test("application config includes default-on MCP settings without retaining secr
     SELFHOST_PUBLIC_URL:"https://relay.example.test",RELAYCAST_URL:"http://relaycast.test",
     RELAYCAST_PUBLIC_URL:"https://relaycast.selfhosted.company",SESSION_READ_API_URL:"http://history.test",SESSION_READ_API_SECRET:"fake-read-api-secret-at-least-32-bytes",RELAYCONTROL_INTROSPECT_SECRET:"fake-introspect-secret-at-least-32-bytes",
     SESSION_READ_API_PUBLIC_URL:"https://history.selfhosted.company",SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64")};
-  assert.deepEqual(loadConfig(env).mcpOAuth,{enabled:true,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,oidc:null});
-  assert.deepEqual(loadConfig({...env,SELFHOST_MCP_OAUTH:"off"}).mcpOAuth,{enabled:false,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,oidc:null});
+  assert.deepEqual(loadConfig(env).mcpOAuth,{enabled:true,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,channelMemberTrust:true,oidc:null});
+  assert.deepEqual(loadConfig({...env,SELFHOST_MCP_OAUTH:"off"}).mcpOAuth,{enabled:false,unavailable:null,eventsEnabled:false,pumpEnabled:false,grokCloudCopy:false,channelMemberTrust:true,oidc:null});
   assert.equal(loadConfig({...env,SELFHOST_PUBLIC_URL:"http://relay.example.test"}).mcpOAuth!.unavailable?.reason,"public_url");
   const invalid="fake-secret-value-never-echo";
   const degraded=loadConfig({...env,...inputs,SELFHOST_MCP_OIDC_SIGNING_KEY:invalid}).mcpOAuth!;

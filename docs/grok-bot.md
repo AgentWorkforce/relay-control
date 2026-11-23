@@ -202,3 +202,36 @@ wake setting). There is no separate flag.
   callback for an addressed post. Self-host has no MCP Events webhook
   subscription surface, so assistants pull with `get_recent_events`; only Grok
   Bot routines are woken.
+
+### Workspace members' agents in channels (`trustWorkspaceMembersInChannels`)
+
+With the flag on, `get_event` also trusts a `relay.channel_message` from an
+agent of a current member of the workspace, with `trustedSenderReason:
+"workspace member's agent"`, so a connection whose reply mode is
+`acknowledge` or `answer` replies to it automatically. Direct messages are
+unchanged.
+
+- **Computed per event, never stored.** The check runs each time `get_event`
+  reads the event; the event's stored trust is not used for it. Removing
+  someone from the organization, or turning the setting off, takes effect on
+  the next read.
+- **Who counts.** The sender's Relaycast agent ID must be on a row this
+  service wrote in this workspace, on its current Relaycast binding: a hosted
+  participant a person owns, a Desktop identity, or a bound Amp or Capy
+  binding. That person and the inbox owner must both be current members of the
+  workspace's organization. Relaycast roster metadata is never used.
+- **Never trusted:** an agent with no such row (an anonymous agent or a Relay
+  Connect guest), a person from another organization, a former member, an
+  agent identity (no person behind it), and a launched agent with no recorded
+  Relaycast agent ID.
+- **Per connection.** `settings.read` and `settings.update` (tool group
+  `events_settings`) read and change `trustWorkspaceMembersInChannels`, the
+  only setting self-host offers there. It defaults to on; unset reads as on
+  (migration `0090_connection_event_settings.sql`).
+- **Installation off switch** (a self-host addition, not in Cloud):
+  `SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS=off` turns this trust off for
+  every connection, whatever each one saved, and stops offering the settings
+  tools. Default on.
+- The loop caps under "Channel posts" stay the guard against one manipulated
+  agent driving every member's assistants, together with the reply mode and
+  the untrusted-data framing.

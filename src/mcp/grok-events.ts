@@ -199,15 +199,56 @@ export function assertOwnIdentity(approved: string, declared: string | undefined
   if (declared !== undefined && declared !== approved) throw new GrokRoutineError(perBotConnectionRequired(declared, approved));
 }
 
-/** Cloud's getEvent for a relay.message / relay.channel_message, from this grant's retained log. */
+/**
+ * Cloud's trustWorkspaceMembersInChannels for this connection: unset (no row, or NULL) reads as on. The installation
+ * switch is applied by the caller.
+ */
+export async function trustsMembersInChannels(tx: SqlExecutor, grantId: string): Promise<boolean> {
+  const row = (await tx.query<{ trust_workspace_members_in_channels: boolean | null }>(
+    "SELECT trust_workspace_members_in_channels FROM mcp_grant_event_settings WHERE grant_id=$1", [grantId])).rows[0];
+  return row?.trust_workspace_members_in_channels !== false;
+}
+
+/**
+ * Whether a channel post's sender is an agent of a current member of the inbox owner's workspace, read now (never
+ * stored or cached): its Relaycast agent id is on a row this service wrote for that person in this workspace, on the
+ * workspace's current Relaycast binding (a hosted participant a person owns, a Desktop identity, a bound Amp or Capy
+ * binding), and both that person and the inbox owner are current members of the workspace's organization. No row
+ * (an anonymous or Connect guest agent, one from another workspace), a former member, another organization's
+ * person, an agent identity (a participant no person owns) or a launch with no recorded agent never matches.
+ */
+export async function memberAgentInWorkspace(tx: SqlExecutor, owner: { workspaceId: string; userId: string }, senderAgentId: string): Promise<boolean> {
+  return (await tx.query(`SELECT 1 FROM workspaces w
+    JOIN (SELECT workspace_id,relaycast_workspace_id,user_id FROM hosted_relay_participants WHERE agent_remote_id=$3 AND user_id IS NOT NULL
+      UNION ALL SELECT workspace_id,relaycast_workspace_id,user_id FROM desktop_relay_identities WHERE agent_remote_id=$3
+      UNION ALL SELECT workspace_id,relaycast_workspace_id,user_id FROM amp_bindings WHERE agent_remote_id=$3 AND state='bound'
+      UNION ALL SELECT workspace_id,relaycast_workspace_id,user_id FROM capy_bindings WHERE agent_remote_id=$3 AND state='bound'
+    ) rec ON rec.workspace_id=w.id AND rec.relaycast_workspace_id=w.relaycast_workspace_id
+    JOIN organization_memberships sender ON sender.organization_id=w.organization_id AND sender.user_id=rec.user_id
+    JOIN organization_memberships inbox ON inbox.organization_id=w.organization_id AND inbox.user_id=$2
+    WHERE w.id=$1 LIMIT 1`, [owner.workspaceId, owner.userId, senderAgentId])).rows.length > 0;
+}
+
+/**
+ * Cloud's getEvent for a relay.message / relay.channel_message, from this grant's retained log. `memberTrust`: the
+ * installation lets a channel post from a current workspace member's agent be trusted (the connection's own setting
+ * still decides).
+ */
 export async function getEvent(tx: SqlExecutor, keyring: EncryptionKeyring, grant: { id: string; agent_name: string },
-  replyMode: ReplyMode, eventId: string, retainedSince: Date) {
+  replyMode: ReplyMode, eventId: string, retainedSince: Date,
+  options: { owner?: { workspaceId: string; userId: string }; memberTrust?: boolean } = {}) {
   const row = (await tx.query<EventRow>(`SELECT ${COLUMNS} FROM grok_bot_events WHERE grant_id=$1 AND event_id=$2 AND created_at>=$3`,
     [grant.id, eventId, retainedSince])).rows[0];
   const event = row ? view(row, keyring, grant.agent_name) : null;
   if (!row || !event) return null;
   const settings = grantEventsSettings(replyMode);
-  const trust: SenderTrust = row.trusted_reason === "your agent" ? { trusted: true, reason: "your agent" } : UNTRUSTED;
+  let trust: SenderTrust = row.trusted_reason === "your agent" ? { trusted: true, reason: "your agent" } : UNTRUSTED;
+  // Channel posts only: a current workspace member's agent, computed now so removing someone revokes it at once.
+  const senderAgentId = typeof event.detail.senderAgentId === "string" ? event.detail.senderAgentId : null;
+  if (!trust.trusted && event.name === RELAY_CHANNEL_MESSAGE_EVENT && options.memberTrust && options.owner && senderAgentId
+      && await trustsMembersInChannels(tx, grant.id) && await memberAgentInWorkspace(tx, options.owner, senderAgentId)) {
+    trust = { trusted: true, reason: "workspace member's agent" };
+  }
   // Earlier messages of the same DM conversation, or earlier posts of the same channel thread that reached this
   // connection (Cloud keeps five, 500 characters each).
   const conversationId = typeof event.data.conversationId === "string" ? event.data.conversationId : null;

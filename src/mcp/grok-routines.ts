@@ -14,7 +14,7 @@ import {
 } from "./grok-routine.js";
 import { REPLY_MODES, UNTRUSTED, type ReplyMode, type SenderTrust } from "./grok-events-policy.js";
 import {
-  GROK_EVENT_RETENTION_MS, addressedInThread, channelWakeCounts, eventFromDelivery, eventStored, getEvent, insertEvent,
+  GROK_EVENT_RETENTION_MS, addressedInThread, trustsMembersInChannels, channelWakeCounts, eventFromDelivery, eventStored, getEvent, insertEvent,
   lockChannelWakes, ownedSenders, pendingWakes, recentEvents, senderKinds, wakeBody,
 } from "./grok-events.js";
 import { ownerHash, HOSTED_SOURCE, isChannelDelivery } from "./relay-participants.js";
@@ -179,11 +179,33 @@ export class GrokRoutines {
     });
   }
 
-  async event(grantId: string, owner: Owner, eventId: string) {
+  /** `memberTrust`: SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS, read by the caller from this server's config. */
+  async event(grantId: string, owner: Owner, eventId: string, options: { memberTrust?: boolean } = {}) {
     return this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner, { events: true });
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
-      return getEvent(tx, this.options.keyring, grant, routine?.reply_mode ?? "notes-only", eventId, this.retainedSince());
+      return getEvent(tx, this.options.keyring, grant, routine?.reply_mode ?? "notes-only", eventId, this.retainedSince(),
+        { owner, memberTrust: options.memberTrust === true });
+    });
+  }
+
+  /** The event settings self-host honours for this connection (Cloud's names; unset reads as on). */
+  async settings(grantId: string, owner: Owner) {
+    return this.options.database.transaction(async tx => {
+      const grant = await this.grant(tx, grantId, owner, { events: true });
+      return { trustWorkspaceMembersInChannels: await trustsMembersInChannels(tx, grant.id) };
+    });
+  }
+
+  async updateSettings(grantId: string, owner: Owner, input: { trustWorkspaceMembersInChannels?: boolean }) {
+    return this.options.database.transaction(async tx => {
+      const grant = await this.grant(tx, grantId, owner, { events: true });
+      if (input.trustWorkspaceMembersInChannels !== undefined) {
+        await tx.query(`INSERT INTO mcp_grant_event_settings(grant_id,trust_workspace_members_in_channels,updated_at) VALUES ($1,$2,$3)
+          ON CONFLICT (grant_id) DO UPDATE SET trust_workspace_members_in_channels=$2,updated_at=$3`,
+        [grant.id, input.trustWorkspaceMembersInChannels, this.now()]);
+      }
+      return { trustWorkspaceMembersInChannels: await trustsMembersInChannels(tx, grant.id) };
     });
   }
 

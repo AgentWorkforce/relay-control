@@ -13,6 +13,7 @@ import { createRelaycastClient, type RelaycastClient } from "../src/messaging/re
 import { GrokRoutines, GROK_SETUP_PATH } from "../src/mcp/grok-routines.js";
 import { CHANNEL_RETRY_WINDOW_MS, CHANNEL_WAKE_WINDOW_MS, MAX_AGENT_THREAD_WAKES, MAX_CHANNEL_WAKES, MAX_THREAD_WAKES } from "../src/mcp/channel-wake.js";
 import { createMcpOAuthProtocol } from "../src/mcp/oauth/protocol.js";
+import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
 import { McpOAuthSessions } from "../src/mcp/oauth/sessions.js";
 import { PGliteDatabase, listen, close } from "./support/harness.js";
 import { createRelaycastWorld } from "./support/relaycast-world.js";
@@ -25,7 +26,7 @@ const URL = "https://api2.cursor.sh/automations/webhook/rt_fake";
 const KEY = "crsr_" + "fake_routine_key_".repeat(3);
 const CHANNEL = "family";
 
-async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate?: boolean; memberTrust?: boolean } = {}) {
   const cloudCopy = options.cloudCopy ?? true;
   const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
   const owner = { userId: randomUUID(), organizationId: randomUUID(), workspaceId: randomUUID(), grantId: randomUUID(), tokenFamilyId: randomUUID() };
@@ -82,7 +83,8 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
     sessionReadApi: { url: "http://unused-history.test", publicUrl: "https://history.example.test", secret: "session-read-secret-".repeat(2) },
     internalServiceToken: null, bootstrapToken: "fake-bootstrap-token-at-least-thirty-two-bytes", encryptionKeyring: KEYRING,
     oauthRedirectUrl: ORIGIN + "/unused", host: "127.0.0.1", port: 3000,
-    mcpOAuth: { enabled: true, unavailable: null, eventsEnabled: false, pumpEnabled: false, grokCloudCopy: cloudCopy, oidc: null } };
+    mcpOAuth: { enabled: true, unavailable: null, eventsEnabled: false, pumpEnabled: false, grokCloudCopy: cloudCopy,
+      ...(options.memberTrust === undefined ? {} : { channelMemberTrust: options.memberTrust }), oidc: null } };
   const store = new ControlPlaneStore(database, KEYRING, 0, { tenancy: "multi" });
   const browser = await database.transaction(tx => store.issueBrowserSession(tx, { ...owner, label: "channel-test" }));
   const server = createServer(createApp({ config, store, messagingFetch: relayFetch, grokRoutines: routines }));
@@ -118,6 +120,27 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
     await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')", [owner.organizationId, userId]);
     return userId;
   };
+  /** A hosted participant of `userId` (null: an agent identity's, which no person owns). */
+  const participant = async (name: string, userId: string | null) => {
+    const agent = world.agents.get(name) ?? world.addAgent(name);
+    let identity: string | null = null;
+    if (!userId) {
+      identity = randomUUID();
+      await database.query("INSERT INTO agent_identities(id,workspace_id,organization_id,agent_name) VALUES ($1,$2,$3,$4)",
+        [identity, owner.workspaceId, owner.organizationId, name]);
+    }
+    await database.query(`INSERT INTO hosted_relay_participants(id,workspace_id,user_id,agent_identity_id,relaycast_workspace_id,agent_name,agent_remote_id,token_ciphertext)
+      VALUES ($1,$2,$3,$4,'fake-workspace',$5,$6,$7)`, [randomUUID(), owner.workspaceId, userId, identity, name, agent.id, encryptSecret(agent.token, KEYRING.active)]);
+    return agent;
+  };
+  /** A user who belongs to another organization only. */
+  const outsider = async () => {
+    const userId = randomUUID(), org = randomUUID();
+    await database.query("INSERT INTO users(id,email,name) VALUES ($1,$2,'Outsider')", [userId, `${userId}@example.test`]);
+    await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Other Org')", [org]);
+    await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')", [org, userId]);
+    return userId;
+  };
   /** The channel with the bot (and `others`) as members. */
   const channel = (...others: string[]) => {
     for (const name of others) world.channelAs(name, CHANNEL);
@@ -134,7 +157,7 @@ async function fixture(t: test.TestContext, options: { cloudCopy?: boolean; gate
   const drain = async () => {
     for (let scan = 0; scan < 6; scan++) { now = new Date(now.getTime() + 6_000); await routines.tick(); }
   };
-  return { database, owner, world, routines, calls, tool, setup, person, recordedAgent, member, channel, post, reply, channelEvents, drain,
+  return { database, owner, world, routines, calls, tool, setup, person, recordedAgent, member, participant, outsider, channel, post, reply, channelEvents, drain,
     relayPaths, gatePaths, gateTokens, connect, addGrant, chatClient, grokClient,
     advance: (ms: number) => { now = new Date(now.getTime() + ms); } };
 }
@@ -376,4 +399,92 @@ test("gate-only: the thread root is read through relaygate with the participant'
   assert.deepEqual(woke(f).map(data => data.addressed), ["bot-thread"]);
   assert.ok(f.gatePaths.includes(`GET /v1/messages/${ownRoot.id}`), "the root lookup went through relaygate");
   assert.deepEqual(f.relayPaths.filter(path => path.startsWith("GET /v1/messages/") || /deliveries/.test(path)), [], "no direct Relaycast read");
+});
+
+// Workspace members' agents in channel posts (trustWorkspaceMembersInChannels): computed per event by get_event.
+const trustOf = async (f: Fixture, eventId: string) => {
+  const event = await f.tool("get_event", { eventId });
+  const structured = event.structuredContent as any;
+  return { trusted: structured.trustedSender, reason: structured.trustedSenderReason, text: (event.content as any)[0].text as string };
+};
+const mentionEvent = async (f: Fixture, from: string) => {
+  f.post(from, `@fake-grok from ${from}`);
+  await f.drain();
+  return f.calls.filter(call => call.body.name === "relay.channel_message" && call.body.data.from === from).at(-1)!.body.eventId as string;
+};
+
+test("member trust: a current member's agent is trusted in a channel post, computed at get_event time; the opt-out and removal take effect at once", async t => {
+  const f = await fixture(t);
+  await webhook(f, "answer");
+  const userId = await f.member();
+  await f.participant("member-bot2", userId);
+  f.channel("member-bot2");
+  const eventId = await mentionEvent(f, "member-bot2");
+  let trust = await trustOf(f, eventId);
+  assert.deepEqual([trust.trusted, trust.reason], [true, "workspace member's agent"]);
+  assert.match(trust.text, /Sender check: trustedSender true \(workspace member's agent\)\./);
+  assert.match(trust.text, /Add text = your answer and call it now/);
+  assert.equal((await f.database.query("SELECT trusted_reason FROM grok_bot_events")).rows[0]!.trusted_reason, null, "never stored");
+
+  // Opt-out (the connection's setting), then back on: the same event follows the setting.
+  assert.deepEqual((await f.tool("settings.read")).structuredContent, { trustWorkspaceMembersInChannels: true });
+  assert.deepEqual((await f.tool("settings.update", { trustWorkspaceMembersInChannels: false })).structuredContent, { trustWorkspaceMembersInChannels: false });
+  trust = await trustOf(f, eventId);
+  assert.deepEqual([trust.trusted, trust.reason], [false, null]);
+  assert.match(trust.text, /ask the person whether to reply/);
+  await f.tool("settings.update", { trustWorkspaceMembersInChannels: true });
+  assert.equal((await trustOf(f, eventId)).trusted, true);
+
+  // Former member: the same event is no longer trusted.
+  await f.database.query("DELETE FROM organization_memberships WHERE user_id=$1", [userId]);
+  trust = await trustOf(f, eventId);
+  assert.deepEqual([trust.trusted, trust.reason], [false, null]);
+});
+
+test("member trust never covers: another organization's person, an agent identity, an agent with no record (a Connect guest), or a DM", async t => {
+  const f = await fixture(t, { memberTrust: true });
+  await webhook(f, "answer");
+  const outsiderId = await f.outsider();
+  await f.participant("outsider-bot", outsiderId);
+  await f.participant("identity-bot", null);
+  // A Connect guest or anonymous agent: on the Relaycast roster, claiming a member's ownership in its own metadata.
+  const memberId = await f.member();
+  f.world.addAgent("guest-bot", { source: "cloud-hosted", owner_hash: "claimed", user_id: memberId });
+  f.channel("outsider-bot", "identity-bot", "guest-bot");
+  for (const from of ["outsider-bot", "identity-bot", "guest-bot"]) {
+    const trust = await trustOf(f, await mentionEvent(f, from));
+    assert.deepEqual([from, trust.trusted, trust.reason], [from, false, null]);
+  }
+  await f.participant("member-bot", memberId);
+  f.world.sendAs("member-bot", "fake-grok", "a DM from a member's agent");
+  await f.drain();
+  const dm = f.calls.find(call => call.body.name === "relay.message")!.body.eventId;
+  assert.equal((await trustOf(f, dm)).trusted, false, "DMs are unchanged");
+});
+
+test("member trust: the installation off switch wins over the connection's setting and hides the settings tools", async t => {
+  const f = await fixture(t, { memberTrust: false });
+  await webhook(f, "answer");
+  const userId = await f.member();
+  await f.participant("member-bot2", userId);
+  f.channel("member-bot2");
+  const trust = await trustOf(f, await mentionEvent(f, "member-bot2"));
+  assert.deepEqual([trust.trusted, trust.reason], [false, null]);
+  assert.equal((await f.tool("settings.read")).isError, true);
+  const report = (await f.tool("describe_capabilities")).structuredContent as any;
+  assert.equal(report.groups.find((g: any) => g.id === "events_settings").status, "unavailable");
+});
+
+test("member trust: flag off offers no settings tools and no events", async t => {
+  const f = await fixture(t, { cloudCopy: false });
+  assert.equal((await f.tool("settings.update", { trustWorkspaceMembersInChannels: false })).isError, true);
+  assert.equal((await f.tool("get_event", { eventId: "evt_" + "0".repeat(32) })).isError, true);
+  const report = (await f.tool("describe_capabilities")).structuredContent as any;
+  assert.equal(report.groups.find((g: any) => g.id === "events_settings").status, "unavailable");
+});
+
+test("member trust: the switch parses on and off and defaults on", () => {
+  assert.equal(loadMcpOAuthConfig({}, () => undefined).channelMemberTrust, true);
+  assert.equal(loadMcpOAuthConfig({ SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS: "off" }, () => undefined).channelMemberTrust, false);
+  assert.throws(() => loadMcpOAuthConfig({ SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS: "maybe" }, () => undefined), /must be on or off/);
 });

@@ -66,6 +66,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
       grokEvents: Boolean(context.grokEvents),
+      eventsSettings: Boolean(context.grokEvents && context.channelMemberTrust),
       nativeAuthorityAvailable,
       nativeAuthorityReason,
       nativeAuthorityHowToEnable,

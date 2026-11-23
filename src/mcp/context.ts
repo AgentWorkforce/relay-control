@@ -60,6 +60,11 @@ export type McpContext = {
    * Set for every hosted participant (OAuth) connection while the copy is on, routine or not.
    */
   grokEvents?: GrokRoutines;
+  /**
+   * SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS (default on): whether get_event may trust a channel post from a
+   * current workspace member's agent, and whether settings.read / settings.update are offered.
+   */
+  channelMemberTrust?: boolean;
   /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
   cursorCloud?: CursorCloudDeps;
   customerSupport?: CustomerSupportConnection;

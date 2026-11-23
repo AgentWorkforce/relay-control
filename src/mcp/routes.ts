@@ -519,7 +519,10 @@ export function createMcpHandler(input: {
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
     // Every hosted participant connection reads its events while the copy is on, not only Grok Bot routines.
-    if (oauth && input.grokRoutines?.cloudCopy) context.grokEvents = input.grokRoutines;
+    if (oauth && input.grokRoutines?.cloudCopy) {
+      context.grokEvents = input.grokRoutines;
+      context.channelMemberTrust = config.mcpOAuth?.channelMemberTrust !== false;
+    }
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];

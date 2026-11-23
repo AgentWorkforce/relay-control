@@ -100,6 +100,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   grok_events: { title: "Agent Relay events (Cloud copy)", tools: GROK_EVENT_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
+  // Self-host serves it, with only trustWorkspaceMembersInChannels, while SELFHOST_GROK_ROUTINES_CLOUD_COPY is on.
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
   capability_discovery: { title: "Capability discovery", tools: [CAPABILITY_DISCOVERY_TOOL] },
 };
@@ -107,7 +108,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; eventsSettings?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -133,6 +134,9 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
   if (options.grokEvents) groups.push("grok_events");
+  // Self-host offers only the settings it honours (trustWorkspaceMembersInChannels), while the copy is on and the
+  // installation has not turned member-agent trust off.
+  if (options.grokEvents && options.eventsSettings) groups.push("events_settings");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -221,6 +225,7 @@ export function describeCapabilities(input: {
   customerSupport?: boolean;
   grokRoutines?: boolean;
   grokEvents?: boolean;
+  eventsSettings?: boolean;
   /** Whether a managed native call resolves to its synced Desktop identity. */
   nativeAuthorityAvailable?: boolean;
   /** Safe reason and remedy when the managed native identity cannot be used. */
@@ -231,7 +236,7 @@ export function describeCapabilities(input: {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents,
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents, eventsSettings: input.eventsSettings,
     staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
@@ -296,6 +301,9 @@ export function describeCapabilities(input: {
     if (id === "grok_events" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "Agent Relay events serve OAuth connections (each reads its own approved agent's events), on a server with SELFHOST_GROK_ROUTINES_CLOUD_COPY on.",
       how_to_enable: "Ask your operator to set SELFHOST_GROK_ROUTINES_CLOUD_COPY=on, then connect with OAuth." };
+    if (id === "events_settings" && input.authMode === "oauth" && input.grokEvents) return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "This installation turned off trusting workspace members' agents in channel posts, the only event setting self-host offers.",
+      how_to_enable: "Ask your operator to unset SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS or set it to on." };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "Webhook wake-ups require a Grok Bot OAuth connection on this self-hosted server.",
       how_to_enable: "Connect Grok Bot to this server's /cloud/api/v1/mcp/shared-sessions endpoint, then call connect_grok_bot_routine." };

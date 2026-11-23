@@ -4,7 +4,7 @@
 // type is narrowed to the fields relay-control stores per grant
 // (docs/specs/grok-bot-dynamic-prompt.md, Phase 1). Keep the strings identical.
 
-export type SenderTrustReason = "your agent" | "workspace member" | "in your trusted group";
+export type SenderTrustReason = "your agent" | "workspace member" | "in your trusted group" | "workspace member's agent";
 export type SenderTrust = { trusted: boolean; reason: SenderTrustReason | null };
 export const UNTRUSTED: SenderTrust = Object.freeze({ trusted: false, reason: null });
 
@@ -56,6 +56,7 @@ const VERIFIED_AS: Record<SenderTrustReason, string> = {
   "your agent": "one of the person's own agents",
   "workspace member": "a person in the person's workspace, writing as themselves",
   "in your trusted group": "an agent the person listed as trusted",
+  "workspace member's agent": "an agent run by a current member of the person's workspace, posting in a channel",
 };
 
 /**

@@ -155,7 +155,8 @@ export function registerGrokEventTools(server: McpServer, context: McpContext): 
     inputSchema: { eventId: z.string().regex(/^evt_[a-f0-9]{32}$/) },
     annotations,
   }, async ({ eventId }) => {
-    const found = await run(() => routines.event(grantId, owner, eventId).then(event => ({ event })));
+    const found = await run(() => routines.event(grantId, owner, eventId, { memberTrust: context.channelMemberTrust === true })
+      .then(event => ({ event })));
     if (found.isError) return found;
     const event = (found.structuredContent as { event: Awaited<ReturnType<typeof routines.event>> }).event;
     if (!event) return { isError: true, content: [{ type: "text" as const, text: "No event with that id belongs to you." }] };
@@ -199,4 +200,31 @@ export function registerGrokEventTools(server: McpServer, context: McpContext): 
       return fail(error, "Could not list events.");
     }
   });
+}
+
+/** Cloud's field, title and description for the one event setting self-host honours. */
+const TRUST_MEMBERS_IN_CHANNELS = {
+  title: "Trust agents of everyone in this workspace (channel posts)",
+  description: "In relay channels, posts from agents run by current members of this workspace are trusted, so automatic replies cover them; someone removed from the workspace is not. Direct messages are not affected. On by default.",
+};
+
+/**
+ * settings.read / settings.update (tool group events_settings) with only the keys self-host honours:
+ * trustWorkspaceMembersInChannels. Registered while the copy is on and the installation has not turned member-agent
+ * trust off (SELFHOST_TRUST_WORKSPACE_MEMBERS_IN_CHANNELS).
+ */
+export function registerEventsSettingsTools(server: McpServer, context: McpContext): void {
+  const run = runner(context);
+  const oauth = context.oauth!;
+  const routines = context.grokEvents!;
+  server.registerTool("settings.read", {
+    description: "Read this connection's Agent Relay message settings: whether channel posts from agents of current workspace members are trusted. This does not change any setting.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, () => run(() => routines.settings(oauth.access.grantId, oauth.access.principal)));
+  server.registerTool("settings.update", {
+    description: `Change this connection's Agent Relay message settings. trustWorkspaceMembersInChannels: ${TRUST_MEMBERS_IN_CHANNELS.title}. ${TRUST_MEMBERS_IN_CHANNELS.description} Omitted settings stay unchanged; repeating the same update has the same effect.`,
+    inputSchema: { trustWorkspaceMembersInChannels: z.boolean().optional().describe(`${TRUST_MEMBERS_IN_CHANNELS.title}. ${TRUST_MEMBERS_IN_CHANNELS.description}`) },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  }, input => run(() => routines.updateSettings(oauth.access.grantId, oauth.access.principal, input)));
 }

@@ -19,7 +19,7 @@ import { registerSharedSessionReads } from "./shared-session-reads.js";
 import { registerTeamActivity } from "./team-activity.js";
 import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
-import { registerGrokEventTools, registerGrokRoutineTools } from "./grok-routine-tools.js";
+import { registerEventsSettingsTools, registerGrokEventTools, registerGrokRoutineTools } from "./grok-routine-tools.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
 export const SELFHOST_MCP_INSTRUCTIONS =
@@ -80,7 +80,7 @@ export function buildMcpServer(context: McpContext): McpServer {
   const webhookInbox = context.webhookInbox;
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokEvents),
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokEvents), eventsSettings: Boolean(context.grokEvents && context.channelMemberTrust),
     staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
@@ -90,6 +90,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     capability_discovery: () => registerCapabilityDiscovery(server, context),
     grok_routines: () => registerGrokRoutineTools(server, context),
     grok_events: () => registerGrokEventTools(server, context),
+    events_settings: () => registerEventsSettingsTools(server, context),
     ...(launch ? { hosted_launch: () => registerRelaySpawnTools(server, context) } : {}),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
