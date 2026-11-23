@@ -158,6 +158,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_OAUTH_REDIRECT_URL` | Optional. OAuth redirect URI registered in each provider OAuth app. Default `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` |
 | `SELFHOST_DASHBOARD_URL` | Optional dashboard origin. Link shown on the OAuth result page (default `$SELFHOST_PUBLIC_URL/`) and, when https, `runUrl` on mirrored flow runs |
 | `SELFHOST_ROUTED_SITE_URL` | Optional https origin of a third site whose edge router forwards `<site>/cloud/...` here and overwrites `x-original-host` with that site's host. When one such header names this origin's host, the Desktop/CLI sign-in answers (`api_url`, `apiUrl`, `verification_uri`) name it instead of the Host-selected origin. Unset: unchanged. See [Desktop sign-in through an edge router](#desktop-sign-in-through-an-edge-router) |
+| `SELFHOST_EXTRA_SITES` | Optional comma-separated list (at most 8) of more public host sets in front of this same deployment, each `<dashboard origin>\|<API origin>` (https origins, may be equal). Browser origin checks accept them, and Host-selected answers name the site a request arrived on. Unset: one site only. See [Several public host sets](#several-public-host-sets) |
 | `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together (or the org name with `SELFHOST_ADMIN_EMAILS`). First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](identity.md) |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` / `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional display name for the admin (default: the email's local part) and the workspace name (default `Default`) |
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
@@ -569,6 +570,58 @@ cookie, is never the target of a redirect this service sends and is not
 stored. The router must
 overwrite `x-original-host` with its own site's host rather than pass a
 client's copy through.
+
+### Several public host sets
+
+An operator can put a second public host set (another load balancer, same
+routes) in front of one deployment; its requests arrive with the new Host
+header. List each extra set in `SELFHOST_EXTRA_SITES`:
+
+```
+SELFHOST_EXTRA_SITES=https://app.public.example.com|https://api.public.example.com, https://one.example.net|https://one.example.net
+```
+
+Each comma-separated entry is `<dashboard origin>|<API origin>`; whitespace
+around entries and around `|` is ignored. Both sides must be https origins
+without credentials, path, query or fragment, and may be the same origin (a
+single-host site). At most 8 entries. A host belongs to one site only:
+startup fails when an extra host equals the host of `SELFHOST_DASHBOARD_URL`,
+`SELFHOST_PUBLIC_URL`, `SELFHOST_ROUTED_SITE_URL` or another entry's host.
+Errors name the entry by position and never echo it.
+
+For each extra site:
+
+- both origins join the browser origin allowlist (sign-in forms, Desktop
+  consent, every cookie-authenticated write and the MCP Origin check);
+- a request arriving on either host gets that host's origin wherever the
+  answer is Host-selected (the Desktop/CLI sign-in answers listed above,
+  emailed sign-in and password links, OIDC and Microsoft redirect URIs
+  without a fixed redirect URL);
+- `GET /cloud/api/v1/auth/device/approve` and the Desktop dashboard links
+  (`/dashboard/...`, `/cloud/dashboard/...`) redirect to the site's own
+  dashboard (the `SELFHOST_DASHBOARD_URL` path on the extra dashboard origin);
+- an integrations connect `returnTo` on its dashboard origin is accepted
+  (relative values still resolve against `SELFHOST_DASHBOARD_URL`).
+
+A Host that is not configured still answers with `SELFHOST_PUBLIC_URL`, and
+the `x-original-host` rule above is unchanged and takes precedence.
+
+These stay single-origin:
+
+- MCP OAuth issuer, resource URLs and consent origin: always
+  `SELFHOST_PUBLIC_URL` ([docs/mcp-oauth.md](mcp-oauth.md)).
+- Invite links, the password page's forgot-password and register links, MCP
+  citation links and the Flows run URL: the primary dashboard.
+- The integrations OAuth callback URL (`SELFHOST_OAUTH_REDIRECT_URL`).
+- The session read API public URL (`SESSION_READ_API_PUBLIC_URL`).
+- Cookies stay host-only: each host has its own session, and signing in on
+  one site does not sign the browser in on another.
+- With a fixed `SELFHOST_OIDC_REDIRECT_URL` (or Microsoft redirect URL),
+  sign-in through that provider only completes on that URL's host.
+
+CORS allowlists outside this service (the edge router, relaygate and the
+sessions read API) are configured in those services; add the extra dashboard
+origins there as well.
 
 ### Desktop enrollment keys (no browser)
 
