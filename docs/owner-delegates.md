@@ -92,6 +92,11 @@ on in production, check each of these (decided 2026-11-23):
       (#289).
 - [ ] Verifier UIs label `claims.quote` as delegate-asserted text, not the
       owner's words (#312).
+- [ ] Release gates: decide who may register a gate for a repository
+      (installation coverage, code ownership or admin) before relying on
+      gates for another code owner's approvals (#313). D5 is recorded
+      (#owner-decisions 250887862744305664): relay-control lets only org
+      owners and admins own gates.
 
 ## Who may call what
 
@@ -397,7 +402,9 @@ then grants, then approvals) and revocation (grants, then approvals) take
 these rows in the same order. A consuming call (redeem, gate redeem) locks the
 approval `FOR NO KEY UPDATE` instead of `FOR SHARE`, so consumers of one
 approval run one at a time: insert the consumption, stamp `consumed_at`,
-write the event, commit. Attestation and gate dry runs keep `FOR SHARE`.
+write the event, commit. Attestation keeps `FOR SHARE`. A gate dry run takes
+no lock at all: it answers from plain reads, the last of them just before it
+answers, so a change committing after that is not reflected.
 
 ### Revoking or withdrawing one approval
 
@@ -418,6 +425,215 @@ write the event, commit. Attestation and gate dry runs keep `FOR SHARE`.
   `approval.withdrawn`.
 
 After either, the next attest or redeem of that approval is `revoked`.
+
+## Release gates (§11a)
+
+The job that publishes redeems the approval itself, under its own short-lived
+workflow OIDC token, right before its first publish step. Whatever starts the
+job therefore cannot skip the check. No stored secret is involved.
+
+**Registering a gate.** `GET`/`POST`/`DELETE /delegates/gates` are for the
+owner, by browser session or verified Desktop bearer. **Gate-owner
+qualification is Khaliq's decision D5, option (b) (#owner-decisions
+250887862744305664):** only an org owner or admin may register a gate (403 `gate_owner_unqualified` otherwise), and a
+gate serves only while its owner still is one. relay-control reads no
+CODEOWNERS, so this is stricter than Cloud's code-owner-or-admin rule. At
+most 10 live gates may share a repository and workflow file (the
+`workflow_ref` path without its `@ref`, so every ref and tag pattern of one
+file shares the cap) in a workspace (409 `gate_limit`), and one redeem
+evaluates at most 10 candidate gates, oldest first. `DELETE` names the gate
+with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, workflow_ref, job_workflow_ref?, ref,
+ref_pattern, event, target_prefix}`. For example:
+
+- `repo`: `AgentWorkforce/relay-app`
+- `workflow_ref`: `AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main`
+- `ref`: `refs/heads/main`
+- `event`: `workflow_dispatch`
+- `target_prefix`: `AgentWorkforce/relay-app:`
+
+A gate sets exactly one of `ref` (exact, `refs/heads/...` or `refs/tags/...`)
+and `ref_pattern`. A `ref_pattern` is `refs/tags/<literal prefix>*`, with one
+trailing `*` and nothing else wild, and it is matched against the token's `ref`.
+A gate trusts one OIDC issuer: GitHub Actions by default, or a self-host
+issuer from `SELFHOST_DELEGATION_OIDC_ISSUERS` named in `issuer` (shown on the
+gate only when it is not GitHub). A same-named repository on another issuer is
+a different repository. When several members register the same workflow with
+overlapping prefixes, the first (oldest) matching gate whose owner is still a
+member and has standing serves.
+
+`workflow_ref` must be a workflow in the gate's repo at the gate's own `ref`,
+or, for a tag gate, at its `ref_pattern` (`…/release.yml@refs/tags/v*`): each
+tag run's token names its own tag, and the gate matches `<file>@<that tag>`
+for a tag the pattern covers. When the publishing job runs inside a reusable
+workflow, the gate also sets `job_workflow_ref` (that workflow's file and a
+full ref, the gate's `ref_pattern`, or a 40-hex lowercase commit SHA, which
+may be in another repo), and the token's `job_workflow_ref` must match it
+exactly too. A gate without `job_workflow_ref` covers only the jobs defined
+in its own file: the token's `job_workflow_ref` must be absent or equal its
+`workflow_ref` (a job inside a reusable workflow must be named on the gate).
+A `job_workflow_ref` other than the gate's own `workflow_ref` must be pinned
+to a 40-hex commit SHA (400 otherwise): it is matched by name only, and a
+branch or tag can be moved to an edited workflow. The one exception (decided
+2026-11-23): a reusable workflow in the gate's own repository at exactly the
+gate's `ref`, when the gate does not set `allow_source_sha_mismatch`.
+`target_prefix` must start with `<repo>:`, end with `:` (a segment
+boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
+no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
+true) lets candidate-run release targets name a source commit the run is not
+on (see step 5). Only a gate on the repository's default branch
+(`ref` = `refs/heads/<default_branch>`) can set it (400 otherwise): a tag,
+exact or pattern, or any other branch can carry an edited workflow.
+
+**Pinned at registration, as Cloud.** Registering resolves the repository's
+GitHub ids through the workspace's GitHub connection (App installation or
+OAuth) when it has one, else GitHub's public API. GitHub's canonical
+`full_name` must equal the registered `repo` (case-insensitive). The gate
+stores `repository_id`, `repository_owner_id` and `default_branch` (shown on
+the gate), and `gate.pinned`
+(`{gate_id, repo, repository_id, repository_owner_id, source: "registration"}`)
+is audited after `gate.registered`. A repository GitHub doesn't know (or
+can't show this workspace, or that was renamed) is 422 `repository_unresolved`;
+a GitHub outage is 503 `unavailable`. A 404 or redirect (never followed)
+through the workspace's connection is 422 without asking the public API; no
+connection falls back to the public API, but a connection that fails is 503
+with no fallback. GitHub omitting `default_branch` is 503. relay-control only: a gate on a self-host
+issuer names `repository_id`, `repository_owner_id` and `default_branch` itself, because Control
+cannot look those repositories up on github.com; a GitHub Actions gate cannot. `event` is one
+of `push`, `workflow_dispatch`, `release` and `schedule`: only events that run
+the gated ref's own workflow code (never `pull_request*` or `workflow_run`).
+Registering needs delegation on and a current member (the membership is
+held until the insert commits). The same live gate (owner, repo,
+`workflow_ref`, `job_workflow_ref`, event, `target_prefix`) cannot be
+registered twice (the repository in any letter case): 409 `gate_exists`. A registry outage is
+logged as `delegation.unavailable` (op `gate_registry`). Each change is audited
+(`gate.registered`, `gate.pinned`, and `gate.deleted` with the whole gate and
+reason `deleted`).
+
+**Redeeming.** The job calls `POST /delegates/gates/redeem` with
+`Authorization: Bearer <workflow OIDC token>` and `{approval_id, action,
+dry_run?}`. Control checks, in order:
+
+1. **The token** (before anything about the workspace is read).
+   - Its signature verifies against the issuer's JWKS, found by OpenID
+     discovery, cached for 10 minutes and refetched for an unknown `kid`.
+   - The issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
+     or one listed in `SELFHOST_DELEGATION_OIDC_ISSUERS` (comma-separated https
+     URLs, at most 8; for example a GitHub Enterprise Server issuer).
+   - The audience is this deployment's origin (`SELFHOST_PUBLIC_URL`).
+   - The token is within its validity window, with 60 seconds of clock skew.
+   - Its `sha` (the commit the run is on) is 40 or 64 hex digits, any case,
+     kept lower-cased.
+   - Failing any of these is `oidc_invalid`. When the issuer's keys cannot be
+     read and none are cached, the answer is `unavailable` (an outage, not a
+     forged token), and so is a `kid` the cached keys don't know while the
+     issuer can't be reached, or within the 60-second refresh cooldown (it
+     may be a key just rotated in); on a fresh answer an unknown `kid` is
+     `oidc_invalid`. After a failed key fetch no
+     refetch starts for 30 seconds; meanwhile the last good keys serve, or
+     the call fails fast.
+     Each failure is logged (`delegation.dependency_failed`, op
+     `github_oidc_jwks`, with `stale_cache_served` and `status`).
+2. **The gate**, matched against the token:
+   - No gate for the token's `repository` is `gate_unknown`.
+   - A gate's `workflow_ref`, `ref` (or `ref_pattern`) and `event` must
+     match the token's `workflow_ref`, `ref` and `event_name` exactly, and
+     its `job_workflow_ref` too when set; otherwise `gate_mismatch`. Matching the repository alone is not enough.
+     Repository names (also the `owner/repo/` part of a workflow ref) match
+     case-insensitively, as on GitHub; the workflow file and ref exactly.
+   - Redeem never pins. A gate serves only a token carrying its stored
+     `repository_id` and `repository_owner_id`, so a repository that later
+     reuses the name never does. No gate matching by name is `gate_mismatch`.
+     A gate that matches by name but holds other ids is `repository_mismatch`:
+     audited as `gate.refused` for that gate's owner and logged as
+     `delegation.repository_mismatch` (warn), also on a dry run.
+   - Until a gate matches and is pinned, the caller is nobody in particular:
+     `oidc_invalid`, `gate_unknown` and `gate_mismatch` write nothing to the
+     workspace's audit log.
+3. **Delegation on**, otherwise `not_enabled`.
+4. **The target prefix**: the action's target must start with a matching
+   gate's `target_prefix`, otherwise `target_prefix`.
+5. **The approval.** Release gates redeem releases only: an action of any
+   other class is `out_of_scope`, before the commit check, standing and
+   conditions. Then the normal redeem checks run:
+   - the approval exists, and the action is one it names;
+   - revocation;
+   - for a delegate's (tier D) approval: its grant, the delegate's binding,
+     scope and tier O requirements;
+   - for an owner-minted (tier O) approval: the owner's membership and
+     policy classes;
+   - expiry;
+   - the gate owner's standing (§5.4; the gate's owner stands where a
+     recipient's owner would);
+   - conditions (`not_before`; GitHub conditions are `condition_unavailable`).
+
+   Right after the action is found, a `release` is bound to the run's commit,
+   as Cloud: the target's sha (the last segment for land and iOS, the source
+   sha for a candidate) must equal the token's `sha` (a 64-hex sha never equals
+   a 40-hex target). On a mismatch only gates on the default branch with
+   `allow_source_sha_mismatch` keep serving a candidate target, land and
+   iOS targets keep none, and with none left the answer is `sha_mismatch`.
+   For a GitHub Actions gate the default branch is then read live from
+   GitHub (never on an on-commit redeem): through the workspace's connection
+   when it has one (not cached), else the public API, whose branch answers are
+   cached per repository id for 5 minutes (a null answer never is). GitHub's id must equal the gate's
+   repository id and its `full_name` the repo. If the branch moved, or GitHub
+   no longer resolves the repository (404 or redirect), the opt-out does not
+   apply; a rate limit (403/429) or any other failure is `unavailable`, never
+   cached.
+   A self-host issuer gate keeps the default branch its owner named.
+   Other classes are not sha-bound. Every gate event carries the run's `sha`.
+
+   A `release` action must name exactly one release (§11a.2), or the
+   approval is malformed (`no_approval` at attestation, `out_of_scope` here):
+   - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
+   - `<repo>:land:<branch>:<head sha>`
+   - `<repo>:ios:<distribution>:<build number>:<sha>` (the build number is
+     dot-separated digit groups, at most 32 characters)
+
+   Rollout: a `release` approval minted before this grammar with a bare
+   `owner/repo` (or any other non-release) target is deliberately not
+   migrated and has no legacy exception. It is never redeemable: it answers
+   `out_of_scope`, fails closed, and lapses at its own expiry. Ask for a new
+   approval that names the release. Nothing is consumed or invalidated by
+   the rollout itself.
+6. **A fresh re-read** of what the redeem rests on (delegation on, the
+   approval unrevoked and unexpired, its tier D grant live and in scope and
+   the class not newly tier O, its tier O owner and the gate's owner still
+   members, the class still allowed). A dry run answers from it.
+7. **Single use per run, per action** (§5.1), decided under locks as at
+   redeem (`decideUnderLocks`: the gate owner's and, for tier O, the approval
+   owner's membership, the policy, the tier D grant, the approval, then the
+   gate row). A departed gate owner is `recipient_policy` for tier D and a
+   departed approval owner `revoked` for tier O.
+   - The first redeem of an action consumes that action and binds it to the
+     token's `run_id`, GitHub repository id (so a rename changes nothing)
+     and issuer. Other actions of the same approval are unaffected. Once every
+     single-use action is spent the approval is stamped `consumed_at`.
+   - Any later redeem in the same run, by another job or a later attempt,
+     answers `{ok:true, consumed:true, same_run:true}`.
+   - Any other run gets `consumed`.
+
+`dry_run: true` runs every check and never consumes. It answers
+`{ok:true, consumed:false, dry_run:true}` or `{ok:false, reason, dry_run:true}`.
+
+HTTP status, as Cloud: 200 for a redeem or any dry run; otherwise 401
+(`oidc_invalid`), 503 (`unavailable`, `condition_unavailable`: retry) or 403
+(every other reason: final). The body is the same either way. A consuming
+redeem locks the approval `FOR NO KEY UPDATE`, so redeems of one approval run
+one at a time; a dry run takes no locks (it answers from the fresh re-read). `gate_unknown`, like `oidc_invalid`,
+is not counted as `delegation.refused`.
+`gate.redeemed` (with the run, attempt, repository, workflow refs, ref,
+event, action and `same_run`, auth method `github_oidc`) is written in the
+consuming transaction: if the write fails, the consumption and run binding
+roll back and the job is answered `unavailable`. `gate.refused` and a passing
+dry run's `gate.checked` are best-effort (a failed write is logged), so
+`gate.redeemed` counts real uses only. A dry run carries `dry_run: true` in
+the event data, as in Cloud. An exception is logged as
+`delegation.unavailable` (op `gate_redeem`), and each refusal but
+`oidc_invalid` as `delegation.refused`.
+
+Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
+`delegation_gate_redemptions`.
 
 ## Revocation
 

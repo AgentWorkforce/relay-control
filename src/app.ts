@@ -107,8 +107,11 @@ import { identityErrorResponse, type IdentityModule } from "./identity/routes.js
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { createDelegationHandler } from "./delegation/routes.js";
+import { ConnectionError } from "./admin/connections.js";
+import { GithubUnavailable } from "./delegation/gates.js";
 import { relaycastQuoteRedactor } from "./delegation/service.js";
 import { DelegationSigner } from "./delegation/jws.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER, workflowOidcVerifier } from "./delegation/oidc.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
@@ -465,6 +468,10 @@ export function createApp(input: {
   };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
+  /** Test hook: fetch for release-gate OIDC discovery and JWKS (docs/owner-delegates.md). */
+  delegationOidcFetch?: typeof fetch;
+  /** GitHub's REST API, for resolving a gate's repository ids at registration (tests inject it). */
+  delegationGithubFetch?: typeof fetch;
   /** RELAYCAST_INTERNAL_SECRET: lets webhook inboxes issue temporary Agent Relay workspaces. */
   relaycastInternalSecret?: string | null;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -592,6 +599,27 @@ export function createApp(input: {
     authenticateAccessToken: (token) => store.authenticateAccessToken(token),
     workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
     json,
+    workflowOidc: workflowOidcVerifier({
+      issuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+      audience: new URL(config.publicBaseUrl).origin,
+      fetchImpl: input.delegationOidcFetch,
+      now: input.now,
+    }),
+    oidcIssuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+    githubFetch: input.delegationGithubFetch ?? globalThis.fetch,
+    // The workspace's GitHub connection (App installation or OAuth), when it has one, as Cloud's installation reader.
+    // No connection (404 connection_not_found) is "not installed": registration may fall back to the public API.
+    // Any other failure is an outage: no fallback (registration answers 503).
+    githubToken: async (workspaceId, userId) => {
+      if (!admin) return null;
+      try {
+        return (await admin.connections.runtimeToken({ workspaceId, provider: "github",
+          actor: userId ? { kind: "user", userId } : { kind: "service", subject: "delegation-gate-redeem" } })).accessToken;
+      } catch (error) {
+        if (error instanceof ConnectionError && error.status === 404) return null;
+        throw new GithubUnavailable();
+      }
+    },
     // Never provisions: these lookups can run before any caller is proven.
     relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
