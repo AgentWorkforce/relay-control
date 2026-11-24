@@ -263,11 +263,14 @@ export function presenceVerdict(agent: TeamAgent, { now, staleAfterSeconds }: Fr
   };
 }
 
-/** The History `source` a declared `session_kind` records under (Desktop's `SessionKind::source`). */
+/**
+ * The History `source` a declared `session_kind` records under (Desktop's `SessionKind::source`).
+ * Cursor CLI and the Cursor editor's agent both register as `cursor-cli` and upload under `cursor`.
+ */
 const HISTORY_SOURCE_BY_SESSION_KIND: Record<string, string> = {
   codex: "codex", "claude-terminal": "claude", "claude-cloud": "claude", claude: "claude",
-  grok: "grok", "grok-open": "grok", opencode: "opencode", "muse-open": "muse", muse: "muse",
-  capy: "capy",
+  grok: "grok", "grok-open": "grok", opencode: "opencode", "opencode-open": "opencode",
+  "muse-open": "muse", muse: "muse", capy: "capy", "cursor-cli": "cursor", cursor: "cursor",
 };
 
 export type ActivityCandidate = { key: string; sessionId: string; source?: string };
