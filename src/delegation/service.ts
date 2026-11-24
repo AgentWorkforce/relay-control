@@ -19,6 +19,7 @@ import {
   CLAIM_TTL_MS,
   DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
+  HIGH_RISK_CLASSES,
   highRisk,
   ownerApprovalSchema,
   ownerDisplay,
@@ -660,18 +661,34 @@ export async function recordRelaycastRedaction(executor: SqlExecutor, input: { w
  * the caller's transaction. Returns the revoked rows (inactive ones are skipped).
  */
 /**
- * Whether every single-use action of an approval has been consumed (single
- * use is per action, §5.1: a high-risk action always is, and every action of
- * an approval explicitly marked single use). False when it has none.
+ * Whether an approval is used up (cloud#6603 0592d777c): EVERY action is single
+ * use (a high-risk action always is, and every action of an approval
+ * explicitly marked single use) and every one has been consumed. An approval
+ * with a reusable action is never spent, so attest still delegates it.
  */
+function everyActionSingleUse(approval: Pick<ApprovalRow, "actions" | "single_use">): boolean {
+  return approval.actions.length > 0 && approval.actions.every(action => approval.single_use || highRisk(action));
+}
+
+/**
+ * A `consumed_at` stamp on an approval that still has a reusable action. The
+ * current rule never stamps one (markSpentIfComplete), so it is left by the
+ * earlier rule, which stamped an approval once its single-use actions were
+ * consumed. A revoke-all or grant revocation under that rule skipped it, so
+ * `invalidated_at` may be missing although its owner revoked it. Such an
+ * approval is refused as `revoked` (fail closed: its owner approves again).
+ */
+export function legacySpentStamp(approval: Pick<ApprovalRow, "consumed_at" | "actions" | "single_use">): boolean {
+  return approval.consumed_at !== null && approval.consumed_at !== undefined && !everyActionSingleUse(approval);
+}
+
 async function everySingleUseActionSpent(executor: SqlExecutor,
   approval: Pick<ApprovalRow, "id" | "actions" | "single_use">): Promise<boolean> {
-  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
-  if (!singleUse.length) return false;
+  if (!everyActionSingleUse(approval)) return false;
   const spent = new Set((await executor.query<{ class: string; target: string }>(
     "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approval.id],
   )).rows.map(row => `${row.class} ${row.target}`));
-  return singleUse.every(action => spent.has(`${action.class} ${action.target}`));
+  return approval.actions.every(action => spent.has(`${action.class} ${action.target}`));
 }
 
 /** Whether one action of an approval has been consumed. */
@@ -717,23 +734,29 @@ async function consumeLocked(tx: SqlExecutor, input: { approvalId: string; works
 }
 
 /**
- * Stamps `consumed_at` once every single-use action of the approval has been
- * consumed (single use is per action, §5.1), as Cloud. A fully spent approval
- * is then no longer "unredeemed": grant revocation and revoke-all leave it
- * alone.
+ * Stamps `consumed_at` once the approval is spent: EVERY action is single use
+ * and consumed (cloud#6603 0592d777c). A spent approval is no longer
+ * "unredeemed", so grant revocation and revoke-all leave it alone; one that
+ * still has a reusable action stays live, so a revocation still reaches it.
  */
 export async function markSpentIfComplete(executor: SqlExecutor, approvalId: string): Promise<void> {
-  const approval = (await executor.query<Pick<ApprovalRow, "actions" | "single_use">>(
-    "SELECT actions, single_use FROM delegation_approvals WHERE id = $1 AND consumed_at IS NULL", [approvalId],
+  const approval = (await executor.query<Pick<ApprovalRow, "id" | "actions" | "single_use">>(
+    "SELECT id, actions, single_use FROM delegation_approvals WHERE id = $1 AND consumed_at IS NULL", [approvalId],
   )).rows[0];
-  if (!approval) return;
-  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
-  if (!singleUse.length) return;
-  const spent = new Set((await executor.query<{ class: string; target: string }>(
-    "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approvalId],
-  )).rows.map(row => `${row.class} ${row.target}`));
-  if (!singleUse.every(action => spent.has(`${action.class} ${action.target}`))) return;
+  if (!approval || !await everySingleUseActionSpent(executor, approval)) return;
   await executor.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL", [approvalId]);
+}
+
+/**
+ * SQL: the approval row is spent under the current rule (cloud#6603): stamped,
+ * and EVERY action single use (approval-wide `single_use`, or a high-risk
+ * class; `$n` is HIGH_RISK_CLASSES). Revocation skips only these. A stamp
+ * left by the earlier rule on a mixed approval (one with a reusable action)
+ * does not keep it from being revoked.
+ */
+function spentApprovalSql(param: number): string {
+  return `(consumed_at IS NOT NULL AND (single_use OR NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(actions) AS action WHERE NOT (action->>'class' = ANY($${param}::text[])))))`;
 }
 
 export async function revokeGrants(executor: SqlExecutor, input: {
@@ -751,10 +774,10 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   const ids = revoked.map(row => row.id);
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
         AND (grant_id = ANY($2::text[])
           OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))`,
-    [input.workspaceId, ids],
+    [input.workspaceId, ids, HIGH_RISK_CLASSES],
   );
   for (const row of revoked) {
     await recordDelegationAudit(executor, {
@@ -764,6 +787,37 @@ export async function revokeGrants(executor: SqlExecutor, input: {
     });
   }
   return revoked;
+}
+
+/**
+ * Serializes grant creation and claim release for one delegate agent, before
+ * either takes a row lock. Release re-reads the grants after it holds the
+ * claim; without this, a second creation holding a new grant's row lock and
+ * waiting for the claim would deadlock with that re-read.
+ */
+async function lockDelegateAgent(tx: SqlExecutor, workspaceId: string, agentId: string): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`delegation-agent:${workspaceId}:${agentId}`]);
+}
+
+/**
+ * Grant creation's locks, in the one order releaseClaim and revocation use
+ * (cloud#6603 0592d777c): this owner's active grants to the agent (by id),
+ * then the agent's claim rows (by id). expireLapsed then updates those same
+ * grant rows, so they are taken first.
+ */
+export async function lockGrantAndClaims(tx: SqlExecutor, workspaceId: string, ownerUserId: string,
+  agentId: string): Promise<void> {
+  await lockDelegateAgent(tx, workspaceId, agentId);
+  await tx.query(
+    `SELECT id FROM delegation_grants
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
+      ORDER BY id FOR UPDATE`,
+    [workspaceId, ownerUserId, agentId],
+  );
+  await tx.query(
+    "SELECT id FROM delegation_claims WHERE workspace_id = $1 AND agent_id = $2 ORDER BY id FOR UPDATE",
+    [workspaceId, agentId],
+  );
 }
 
 /**
@@ -783,7 +837,8 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
       [input.workspaceId, input.claimId],
     )).rows[0];
     if (!seen || (seen.user_id !== input.actorUserId && !input.admin)) return null;
-    // Grants first (by id), then the claim.
+    // Serialized with grant creation for this agent, then grants (by id), then the claim.
+    if (seen.agent_id) await lockDelegateAgent(tx, input.workspaceId, seen.agent_id);
     const grantIds = seen.agent_id ? (await tx.query<{ id: string }>(
       `SELECT id FROM delegation_grants
         WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
@@ -796,12 +851,20 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
       [input.workspaceId, input.claimId],
     )).rows[0];
     if (!claim) return null;
+    // A grant created while this release waited on a lock (it holds the
+    // claim lock until it commits) is read again now and revoked too, as Cloud.
+    const allGrantIds = claim.agent_id ? (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_grants
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
+        ORDER BY id FOR UPDATE`,
+      [input.workspaceId, claim.user_id, claim.agent_id],
+    )).rows.map(row => row.id) : grantIds;
     await tx.query("UPDATE delegation_claims SET released_at = now() WHERE id = $1", [claim.id]);
     let revokedGrants: string[] = [];
     if (claim.consumed_at && claim.agent_id) {
       // The binding the claim created ends, and so does any grant through it.
       await tx.query("DELETE FROM delegation_agent_bindings WHERE workspace_id = $1 AND claim_id = $2", [input.workspaceId, claim.id]);
-      revokedGrants = (await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds, actorUserId: input.actorUserId,
+      revokedGrants = (await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds: allGrantIds, actorUserId: input.actorUserId,
         reason: "delegate_released", authMethod: input.authMethod })).map(row => row.id);
     }
     await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "delegate.released", actorUserId: input.actorUserId,
@@ -829,10 +892,10 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
     actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
   const approvals = (await executor.query<{ id: string }>(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
         AND ($2::uuid IS NULL OR owner_user_id = $2)
       RETURNING id`,
-    [input.workspaceId, input.ownerUserId],
+    [input.workspaceId, input.ownerUserId, HIGH_RISK_CLASSES],
   )).rows;
   // One summary event for the approvals revoked here (tier O ones have no grant event), as Cloud.
   if (approvals.length) {
@@ -1150,7 +1213,7 @@ export function freshRefusal(state: DecisionState, input: { actions: readonly Ac
   ReasonCode | null {
   if (!state.member) return input.memberGone ?? "not_pending";
   if (!state.policy.delegation_enabled) return "not_enabled";
-  if (!state.approval || state.approval.invalidated_at) return "revoked";
+  if (!state.approval || state.approval.invalidated_at || legacySpentStamp(state.approval)) return "revoked";
   if (input.noGrant) {
     if (time(state.approval.expires_at) <= input.nowMs) return "expired";
     if (state.policy.allowed_classes && input.actions.some(action => !state.policy.allowed_classes!.includes(action.class))) {
@@ -1239,7 +1302,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         [approval.approval_ref, workspace.id],
       )).rows[0];
       if (!minted || minted.tier !== "O" || minted.owner_user_id !== approval.owner_id) refuse("no_approval");
-      if (minted!.invalidated_at) refuse("revoked");
+      if (minted!.invalidated_at || legacySpentStamp(minted!)) refuse("revoked");
       // A tier O approval belongs to the grant's owner (§6.2).
       if (minted!.owner_user_id !== grant.owner_user_id) refuse("no_approval");
       if (await everySingleUseActionSpent(deps.database, minted!)) refuse("consumed");
@@ -1302,7 +1365,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         [context.approvalId, workspace.id],
       )).rows[0];
       if (!stored) refuse("unavailable");
-      if (stored!.invalidated_at || stored!.grant_id !== grant.id) refuse("revoked");
+      if (stored!.invalidated_at || legacySpentStamp(stored!) || stored!.grant_id !== grant.id) refuse("revoked");
       if (await everySingleUseActionSpent(deps.database, stored!)) refuse("consumed");
       expiresAt = Math.min(expiresAt, time(stored!.expires_at));
       singleUse = stored!.single_use || singleUse;
@@ -1468,7 +1531,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     context.attested = true;
     context.ownerUserId = approval!.owner_user_id;
     context.grantId = attested!.grant_id;
-    if (approval!.invalidated_at) refuse("revoked");
+    if (approval!.invalidated_at || legacySpentStamp(approval!)) refuse("revoked");
     const grant = (await deps.database.query<GrantRow>(
       "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [attested!.grant_id, workspace.id],
     )).rows[0];
@@ -1504,6 +1567,12 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       if (stale) refuse(stale);
       if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
+      // The bearer check can itself wait on a session lock (cloud#6603
+      // 0592d777c): read the clock again and re-check expiry (and the rest of
+      // the locked state) right before consuming.
+      const late = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
+        recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
+      if (late) refuse(late);
       // Single use is per action (§5.1): one atomic insert per action.
       if (singleUse && !await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
         consumedBy: input.recipientAgentId })) refuse("consumed");

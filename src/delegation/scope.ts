@@ -116,10 +116,12 @@ export const REPO_TARGET = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,1
 const PROMPT_TARGET = /^([^\s:*#/]{1,200}):([^\s:*#/]{1,200}):(approve|deny)$/u;
 /**
  * `owner/repo#N:<op>`: a pr_ops action target names one operation on one PR
- * (§5.1): open, close, reopen, label=<name>, unlabel=<name>,
- * request_review=<login>, rerun_ci or comment.
+ * (§5.1): close, reopen, label=<name>, unlabel=<name>,
+ * request_review=<login>, rerun_ci or comment. No `open`, as Cloud
+ * (cloud#6603 12ae243d6): a PR's number exists only once it is opened, so an
+ * `owner/repo#N:open` target could never be redeemed.
  */
-const PR_OPS_TARGET = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}):(open|close|reopen|rerun_ci|comment|(?:label|unlabel)=[^\s:*#/]{1,100}|request_review=[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$/u;
+const PR_OPS_TARGET = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}):(close|reopen|rerun_ci|comment|(?:label|unlabel)=[^\s:*#/]{1,100}|request_review=[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$/u;
 
 /** A pr_ops target's PR (`owner/repo#N`) and operation, or null when it is not one. */
 export function prOpsTarget(target: string): { pr: string; op: string } | null {
@@ -332,9 +334,11 @@ export function actionsCovered(scopes: readonly Scope[], actions: readonly Pick<
 }
 
 /** §16.1: high-risk actions are always single-use. */
+/** §16.1: classes that are always single use, per action; `deploy` in every environment. */
+export const HIGH_RISK_CLASSES: readonly string[] = ["release", "deploy", "secret_change", "destructive", "spend", "config_change"];
+
 export function highRisk(action: Pick<Action, "class" | "target">): boolean {
-  // §16.1: always single use, per action; `deploy` in every environment.
-  return ["release", "deploy", "secret_change", "destructive", "spend", "config_change"].includes(action.class);
+  return HIGH_RISK_CLASSES.includes(action.class);
 }
 
 /** The classes in `actions` that need tier O under the defaults, the workspace policy and the grant. */

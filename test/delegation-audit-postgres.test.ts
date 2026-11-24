@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
-import { PostgresDatabase } from "../src/database.js";
-import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit, redactExpiredQuotes, releaseClaim, revokeAllGrants } from "../src/delegation/service.js";
+import { PostgresDatabase, type SqlExecutor } from "../src/database.js";
+import { consumeAction, decideUnderLocks, expireLapsed, listAuditPage, lockGrantAndClaims, recordDelegationAudit, redactExpiredQuotes, releaseClaim, revokeAllGrants } from "../src/delegation/service.js";
 import { createDelegationRetention } from "../src/delegation/retention.js";
 import { migrate } from "../src/migrations.js";
 import { isolatedPostgresPool } from "./support/postgres.js";
@@ -288,4 +288,204 @@ test("the retention sweep takes the oldest due quotes across workspaces, so one 
   // The next batch of two takes the busy workspace's two oldest (100 and 99 days).
   assert.equal(await redactExpiredQuotes(database, 2), 2);
   assert.deepEqual(await Promise.all(busyRows.map(quoted)), [null, null, "old words", "old words", "old words"]);
+});
+
+test("grant creation locks grants (by id) then the claim: replacing an expired grant while the claim is released never deadlocks", options,
+  async (t) => {
+    const { pool, database, workspaceId, ownerId } = await fixture(t);
+    await database.query(
+      `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at, consumed_at, agent_id)
+       VALUES ('clm_lockorder00001', $1, $2, 'h1', now() + interval '10 minutes', now(), 'ag_bot')`, [workspaceId, ownerId]);
+    await database.query(
+      `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+       VALUES ($1, 'rw', 'ag_bot', 'bot', $2, 'clm_lockorder00001')`, [workspaceId, ownerId]);
+    // An active grant that has lapsed: creation's expireLapsed updates it.
+    const insertGrant = (executor: { query: typeof database.query }, id: string, expires: string) => executor.query(
+      `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+         scopes, expires_at, created_auth_method)
+       SELECT $3, $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + $4::interval, 'session'
+         FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId, id, expires]);
+    await insertGrant(database, "grt_lapsed0000001", "-1 minute");
+
+    // Creation takes its locks and holds them while a release starts.
+    const creator = await pool.connect();
+    try {
+      await creator.query("BEGIN");
+      // A pg client is all these helpers use (query only).
+      const tx = creator as unknown as SqlExecutor;
+      await lockGrantAndClaims(tx, workspaceId, ownerId, "ag_bot");
+      const release = releaseClaim(database, { workspaceId, claimId: "clm_lockorder00001", actorUserId: ownerId, admin: false,
+        authMethod: "session" });
+      // Wait until the release is blocked on one of creation's locks.
+      for (let attempt = 0; ; attempt += 1) {
+        const waiting = (await database.query<{ count: number }>(
+          "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
+        )).rows[0]!.count;
+        if (waiting > 0) break;
+        assert.ok(attempt < 200, "the release never waited on creation's locks");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      // Creation expires the lapsed grant (an update of a row the release wants) and inserts the new one.
+      await expireLapsed(tx, workspaceId, ownerId, "ag_bot");
+      await insertGrant(creator, "grt_replacement001", "1 day");
+      await creator.query("COMMIT");
+      // The release then re-reads the grants under the claim lock and revokes the new one: no deadlock.
+      const released = await release;
+      assert.deepEqual(released, { claimId: "clm_lockorder00001", revokedGrants: ["grt_replacement001"] });
+    } finally {
+      creator.release();
+    }
+    const statuses = (await database.query<{ id: string; status: string }>(
+      "SELECT id, status FROM delegation_grants ORDER BY id")).rows;
+    assert.deepEqual(statuses, [{ id: "grt_lapsed0000001", status: "expired" }, { id: "grt_replacement001", status: "revoked" }]);
+  });
+
+test("an approval is spent only when every action is single use and consumed: a mixed one stays live for revocation", options,
+  async (t) => {
+    const { database, workspaceId, ownerId } = await fixture(t);
+    const approval = async (id: string, singleUse: boolean, actions: Array<{ class: string; target: string }>) => {
+      await database.query(
+        `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+         VALUES ($1, $2, $3, 'O', $4::jsonb, $5, now() + interval '1 hour')`, [id, workspaceId, ownerId, JSON.stringify(actions), singleUse]);
+      return actions;
+    };
+    const spent = async (id: string) => (await database.query<{ consumed_at: Date | null }>(
+      "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [id])).rows[0]!.consumed_at !== null;
+    const release = { class: "release" as const, target: "AgentWorkforce/relay" };
+    const comment = { class: "pr_ops" as const, target: "AgentWorkforce/relay#5:comment" };
+    // Mixed: the release is single use, the comment is reusable. Consuming the release never spends it.
+    await approval("apv_mixed00000001", false, [release, comment]);
+    assert.equal(await consumeAction(database, { approvalId: "apv_mixed00000001", workspaceId, action: release, consumedBy: "r" }), true);
+    assert.equal(await spent("apv_mixed00000001"), false);
+    // Every action single use (two high-risk ones): spent once both are consumed.
+    const deploy = { class: "deploy" as const, target: "relay:prod" };
+    await approval("apv_allsingle0001", false, [release, deploy]);
+    await consumeAction(database, { approvalId: "apv_allsingle0001", workspaceId, action: release, consumedBy: "r" });
+    assert.equal(await spent("apv_allsingle0001"), false);
+    await consumeAction(database, { approvalId: "apv_allsingle0001", workspaceId, action: deploy, consumedBy: "r" });
+    assert.equal(await spent("apv_allsingle0001"), true);
+    // An explicit approval-wide single_use makes the comment single use too.
+    await approval("apv_explicit00001", true, [release, comment]);
+    await consumeAction(database, { approvalId: "apv_explicit00001", workspaceId, action: release, consumedBy: "r" });
+    await consumeAction(database, { approvalId: "apv_explicit00001", workspaceId, action: comment, consumedBy: "r" });
+    assert.equal(await spent("apv_explicit00001"), true);
+    // Revoke-all reaches the mixed approval (it is still unredeemed), not the spent one.
+    await database.query(
+      `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+         scopes, expires_at, created_auth_method)
+       SELECT 'grt_spentrule0001', $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + interval '1 day', 'session'
+         FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId]);
+    await database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
+      reason: "owner_revoke_all", authMethod: "session" }));
+    const invalidated = (await database.query<{ id: string }>(
+      "SELECT id FROM delegation_approvals WHERE invalidated_at IS NOT NULL ORDER BY id")).rows.map(row => row.id);
+    assert.deepEqual(invalidated, ["apv_mixed00000001"]);
+  });
+
+test("a mixed approval stamped spent by the earlier rule is still revoked; a truly spent one is not", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  const stamped = (id: string, singleUse: boolean, actions: Array<{ class: string; target: string }>) => database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at, consumed_at)
+     VALUES ($1, $2, $3, 'O', $4::jsonb, $5, now() + interval '1 hour', now())`, [id, workspaceId, ownerId, JSON.stringify(actions), singleUse]);
+  const release = { class: "release", target: "AgentWorkforce/relay" };
+  const merge = { class: "merge", target: "AgentWorkforce/relay#9" };
+  await stamped("apv_legacymixed01", false, [merge, release]);
+  await stamped("apv_trulyspent001", false, [release]);
+  await stamped("apv_explicitspent", true, [merge]);
+  await database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
+    reason: "owner_revoke_all", authMethod: "session" }));
+  const invalidated = (await database.query<{ id: string }>(
+    "SELECT id FROM delegation_approvals WHERE invalidated_at IS NOT NULL ORDER BY id")).rows.map(row => row.id);
+  assert.deepEqual(invalidated, ["apv_legacymixed01"]);
+});
+
+test("two grant creations and a claim release for one agent serialize without deadlock", options, async (t) => {
+  const { pool, database, workspaceId, ownerId } = await fixture(t);
+  await database.query(
+    `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at, consumed_at, agent_id)
+     VALUES ('clm_twocreators01', $1, $2, 'h1', now() + interval '10 minutes', now(), 'ag_bot')`, [workspaceId, ownerId]);
+  await database.query(
+    `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+     VALUES ($1, 'rw', 'ag_bot', 'bot', $2, 'clm_twocreators01')`, [workspaceId, ownerId]);
+  const insertGrant = (executor: SqlExecutor, id: string) => executor.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, expires_at, created_auth_method)
+     SELECT $3, $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + interval '1 day', 'session'
+       FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId, id]);
+  const waiters = async (count: number) => {
+    for (let attempt = 0; ; attempt += 1) {
+      const waiting = (await database.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
+      )).rows[0]!.count;
+      if (waiting >= count) return;
+      assert.ok(attempt < 300, `expected ${count} waiting transactions`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const first = await pool.connect();
+  const second = await pool.connect();
+  try {
+    // Creation A holds its locks; a release, then creation B, queue behind it.
+    await first.query("BEGIN");
+    const a = first as unknown as SqlExecutor;
+    await lockGrantAndClaims(a, workspaceId, ownerId, "ag_bot");
+    const release = releaseClaim(database, { workspaceId, claimId: "clm_twocreators01", actorUserId: ownerId, admin: false,
+      authMethod: "session" });
+    await waiters(1);
+    await second.query("BEGIN");
+    const b = second as unknown as SqlExecutor;
+    const creationB = (async () => {
+      await lockGrantAndClaims(b, workspaceId, ownerId, "ag_bot");
+      await second.query("COMMIT");
+    })();
+    await waiters(2);
+    // Both wait on the per-agent advisory lock, before any row lock: a
+    // creation can never hold a new grant's row lock while the release holds
+    // the claim and re-reads the grants.
+    const advisory = (await database.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).rows[0]!.count;
+    assert.equal(advisory, 2);
+    await insertGrant(a, "grt_creationa0001");
+    await first.query("COMMIT");
+    const [released, created] = await Promise.allSettled([release, creationB]);
+    assert.equal(released.status, "fulfilled", JSON.stringify(released));
+    assert.equal(created.status, "fulfilled", JSON.stringify(created));
+    assert.deepEqual((released as PromiseFulfilledResult<unknown>).value,
+      { claimId: "clm_twocreators01", revokedGrants: ["grt_creationa0001"] });
+  } finally {
+    first.release();
+    second.release();
+  }
+});
+
+test("concurrent revoke-alls audit each approval exactly once (only rows the guarded update changed)", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  const approval = (id: string, actions: Array<{ class: string; target: string }>, stamped: boolean) => database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at, consumed_at)
+     VALUES ($1, $2, $3, 'O', $4::jsonb, false, now() + interval '1 hour', CASE WHEN $5 THEN now() END)`,
+    [id, workspaceId, ownerId, JSON.stringify(actions), stamped]);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#11" };
+  const release = { class: "release", target: "AgentWorkforce/relay" };
+  for (let round = 0; round < 5; round += 1) {
+    // The audit log is append-only: each round reads only the events after its start.
+    const startId = (await database.query<{ id: string | null }>(
+      "SELECT max(id)::text AS id FROM delegation_audit_events")).rows[0]!.id ?? "0";
+    // Live ones, and a mixed one carrying a legacy spent stamp (not spent now): all revocable.
+    const expected = [];
+    for (let index = 0; index < 6; index += 1) {
+      const id = `apv_concurrent${round}${index}`;
+      await approval(id, index % 2 ? [merge] : [merge, release], index === 5);
+      expected.push(id);
+    }
+    // Truly spent under the current rule: never revoked, never audited.
+    await approval(`apv_spentnow0${round}`, [release], true);
+    const runs = await Promise.allSettled([1, 2, 3].map(() => database.transaction(tx => revokeAllGrants(tx, {
+      workspaceId, ownerUserId: ownerId, actorUserId: ownerId, reason: "owner_revoke_all", authMethod: "session" }))));
+    for (const run of runs) assert.equal(run.status, "fulfilled", JSON.stringify(run));
+    const audits = (await database.query<{ data: { count: number; approval_ids: string[] } }>(
+      "SELECT data FROM delegation_audit_events WHERE event = 'approval.revoked' AND id > $1::bigint", [startId])).rows;
+    const audited = audits.flatMap(row => row.data.approval_ids);
+    assert.deepEqual([...audited].sort(), [...expected].sort(), `round ${round}`);
+    assert.equal(audits.reduce((sum, row) => sum + row.data.count, 0), expected.length);
+  }
 });
