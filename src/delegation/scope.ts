@@ -403,6 +403,15 @@ export function sha256Hex(value: string): string {
 const REPO_PART = "[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}";
 const SHA40 = "[0-9a-f]{40}";
 /**
+ * A land branch: letters, digits, `.`, `_`, `/` and `-`, and only a name
+ * `git check-ref-format --branch` accepts (as the hosted twin): no leading
+ * `-`, `.` or `/`, no `..`, no component starting with `.` or ending in
+ * `.lock`, no `//`, no trailing `/` or `.`, and not `HEAD`. Git refuses every name this
+ * leaves out, so no real branch is lost, and a grant pattern such as
+ * `owner/repo:land:bad..branch:*` names nothing and is refused.
+ */
+const BRANCH = String.raw`(?!HEAD:)(?![-./])(?![^:]*\.\.)(?![^:]*/\.)(?![^:]*\.lock(?:/|:))(?![^:]*//)(?![^:]*[/.]:)[A-Za-z0-9._/-]{1,200}`;
+/**
  * Release targets (§11a.2), as Cloud's RELEASE_TARGETS. A `release` action
  * names exactly one release:
  * - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
@@ -412,7 +421,7 @@ const SHA40 = "[0-9a-f]{40}";
  */
 export const RELEASE_TARGETS: readonly RegExp[] = [
   new RegExp(`^${REPO_PART}:(?!land:|ios:)[a-z][a-z0-9_-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA40}:[1-9][0-9]{0,19}(?::[A-Za-z0-9_.-]{1,64})?$`, "u"),
-  new RegExp(`^${REPO_PART}:land:[A-Za-z0-9._/-]{1,200}:${SHA40}$`, "u"),
+  new RegExp(`^${REPO_PART}:land:${BRANCH}:${SHA40}$`, "u"),
   // A build number is dot-separated digit groups (`42`, `2026.11.7.3`), at most 32 characters.
   new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:(?=[0-9.]{1,32}:)[0-9]+(?:\\.[0-9]+)*:${SHA40}$`, "u"),
 ];
@@ -433,4 +442,41 @@ export function releaseTargetSha(target: string): { sha: string; form: "candidat
   const segments = target.slice(target.indexOf(":") + 1).split(":");
   if (segments[0] === "land" || segments[0] === "ios") return { sha: segments.at(-1)!, form: segments[0] };
   return { sha: segments[2]!, form: "candidate" };
+}
+
+/**
+ * Release grant patterns match like every other pattern (§16.1): segments
+ * between `/`, `:` and `#`, `*` standing for exactly one non-empty segment.
+ * So `owner/repo:land:*:*` covers `main` but not `feature/x`, and
+ * `owner/repo:land:feature/*:*` covers `feature/x`: a stored grant covers
+ * exactly the targets it covered before, as the hosted twin.
+ */
+
+/** Per release form, a valid value for each field after `owner/repo`, standing in for a whole-field `*`. */
+const RELEASE_FORM_SAMPLES: readonly (readonly string[])[] = [
+  ["land", "x", "0".repeat(40)],
+  ["ios", "x", "1", "0".repeat(40)],
+  ["x", "v0", "0".repeat(40), "1"],
+  ["x", "v0", "0".repeat(40), "1", "x"],
+];
+
+/**
+ * Whether a release grant pattern can cover some release target (§11a.2), as
+ * the hosted twin. It is a valid pattern (`*` a whole segment), and its
+ * literals fit one release form: the pattern with each `*` replaced by a
+ * valid value is itself a release target within the length limit.
+ * `owner/repo`, `owner/*`, `owner/repo:land:bad..branch:*` or a candidate
+ * without a 40-character sha cover nothing, so they are refused at grant
+ * create and PATCH rather than stored as a grant that silently covers nothing.
+ */
+export function validReleasePattern(pattern: string): boolean {
+  if (!validTargetPattern(pattern)) return false;
+  // Git forbids `:` in a branch and the repo has none, so `:` only ever separates fields.
+  const [head, ...fields] = pattern.split(":");
+  const fill = (field: string, sample: string) =>
+    field === "*" ? sample : field.split(/([/#])/u).map(token => token === "*" ? "x" : token).join("");
+  return RELEASE_FORM_SAMPLES.some(samples => samples.length === fields.length && (() => {
+    const target = [fill(head!, "x"), ...fields.map((field, index) => fill(field, samples[index]!))].join(":");
+    return target.length <= MAX_TARGET_CHARS && validReleaseTarget(target);
+  })());
 }

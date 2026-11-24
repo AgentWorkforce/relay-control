@@ -122,7 +122,7 @@ export function gateMatches(gate: GateMatchFields, claims: ClaimMatchFields): bo
 type GateMatchFields = Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" | "ref_pattern" | "event" |
   "repository_id" | "repository_owner_id">;
 type ClaimMatchFields = Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name" |
-  "repository_id" | "repository_owner_id">;
+  "repository_id" | "repository_owner_id" | "sha" | "job_workflow_sha">;
 
 /**
  * GitHub's stable ids, resolved at registration, as Cloud: a repository that
@@ -148,7 +148,31 @@ function gateMatchesByName(gate: GateMatchFields, claims: ClaimMatchFields): boo
     // job_workflow_ref to that workflow) must be named on the gate explicitly (as Cloud).
     (gate.job_workflow_ref === null ?
       !claims.job_workflow_ref || claims.job_workflow_ref === claims.workflow_ref :
-      workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref));
+      workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref) && reusableReadAtRunCommit(gate, claims));
+}
+
+/**
+ * A reusable workflow a gate names by branch (allowed only in the gate's own
+ * repository at the gate's ref, D2) is mutable: GitHub reports a local
+ * `uses: ./…` call and a `uses: <repo>/…@<branch>` call the same way, and the
+ * latter reads the file wherever the branch points when the run starts, not
+ * at the caller's commit. Such a job serves only when the issuer read the
+ * reusable workflow at the run's own commit (`job_workflow_sha` equals
+ * `sha`), which the release binding ties to the approved commit. A reusable
+ * workflow pinned to a 40-hex commit serves when read at that very commit;
+ * the gate's own file runs at the run's commit already (as Cloud).
+ */
+function reusableReadAtRunCommit(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
+  if (gate.job_workflow_ref === null || gate.job_workflow_ref === gate.workflow_ref) return true;
+  if (claims.job_workflow_sha === null) return false;
+  // A commit pin is judged by what the issuer read, never by the selector's
+  // shape: a branch may itself be named `…@<40 hex>` (as Cloud).
+  // The selector is everything after the FIRST `@`: owner, repo and file
+  // name hold none, so a branch such as `refs/heads/a@<40 hex>` stays a branch.
+  const selector = gate.job_workflow_ref.slice(gate.job_workflow_ref.indexOf("@") + 1);
+  // A commit pin must be the commit read; any other selector, the run's commit.
+  if (/^[0-9a-f]{40}$/u.test(selector)) return claims.job_workflow_sha === selector;
+  return claims.job_workflow_sha === claims.sha;
 }
 
 /**
@@ -399,9 +423,10 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
         return { refused: "recipient_policy" as const };
       }
       const result = await consumeForGateRun(tx, { workspaceId: workspace.id, approvalId: approval.id, gateId: servingGate.id,
-        claims: oidc, action });
+        claims: oidc, action, clock: () => deps.now(), grantId: approval.tier === "D" ? approval.grant_id : null });
       if (result === "gate_gone") return { refused: "gate_unknown" as const };
       if (result === "revoked") return { refused: "revoked" as const };
+      if (result === "expired") return { refused: "expired" as const };
       // Another run consumed the action first: this run is refused (#278 review).
       if (result === "taken") return { refused: "consumed" as const };
       await audit("gate.redeemed", null, { same_run: result === "same_run" }, tx);
@@ -433,19 +458,36 @@ async function boundRun(executor: SqlExecutor, approvalId: string, action: Pick<
  * Single use per run, in the caller's transaction (Cloud's consumeForGateRun):
  * the gate row and the approval are share-locked, the first redeem wins and
  * records the run, a later one in that run is `same_run`, any other `taken`.
+ *
+ * The approval's (and a tier D grant's) expiry is judged after both locks are
+ * held, on `clock` read then: waiting on the gate's lock (a concurrent gate
+ * delete that then rolls back) must not let an approval that expired during
+ * the wait be consumed on a time read before it (as the hosted twin).
  */
-async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: string; approvalId: string; gateId: string;
-  claims: WorkflowClaims; action: Action }): Promise<"consumed" | "same_run" | "taken" | "gate_gone" | "revoked"> {
+export async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: string; approvalId: string; gateId: string;
+  claims: WorkflowClaims; action: Action; clock: () => Date; grantId: string | null }):
+  Promise<"consumed" | "same_run" | "taken" | "gate_gone" | "revoked" | "expired"> {
   // Both scoped to the workspace, as Cloud.
   const gateLive = (await tx.query(
     "SELECT 1 FROM delegation_gates WHERE workspace_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE",
     [input.workspaceId, input.gateId])).rows.length > 0;
   if (!gateLive) return "gate_gone";
-  const live = (await tx.query(
-    "SELECT 1 FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL FOR SHARE",
-    [input.workspaceId, input.approvalId])).rows.length > 0;
+  const approval = (await tx.query<{ expires_at: Date | string }>(
+    "SELECT expires_at FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL FOR SHARE",
+    [input.workspaceId, input.approvalId])).rows[0];
   // A revoked approval at consume is `revoked`, as Cloud.
-  if (!live) return "revoked";
+  if (!approval) return "revoked";
+  // Both locks are held: the clock is read now, after any wait for them.
+  const nowMs = input.clock().getTime();
+  if (time(approval.expires_at) <= nowMs) return "expired";
+  if (input.grantId) {
+    // Share-locked already by decideUnderLocks, so this read never waits.
+    const grant = (await tx.query<{ status: string; expires_at: Date | string }>(
+      "SELECT status, expires_at FROM delegation_grants WHERE workspace_id = $1 AND id = $2 FOR SHARE",
+      [input.workspaceId, input.grantId])).rows[0];
+    if (!grant || grant.status === "revoked") return "revoked";
+    if (grant.status === "expired" || time(grant.expires_at) <= nowMs) return "expired";
+  }
   if (await consumeAction(tx, { approvalId: input.approvalId, workspaceId: input.workspaceId, action: input.action,
     consumedBy: `github-run:${input.claims.run_id}` })) {
     await tx.query(

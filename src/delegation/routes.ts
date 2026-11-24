@@ -27,6 +27,7 @@ import {
   sha256Hex,
   validConfigPattern,
   validPromptPattern,
+  validReleasePattern,
   validRfc3339,
   validTargetPattern,
   type ActionClass,
@@ -167,8 +168,10 @@ const scopeSchema = z.object({
   targets: z.array(z.string().max(256)).min(1).max(50),
 }).strict().refine(scope => scope.targets.every(target =>
   scope.class === "prompt_approval" ? validPromptPattern(target)
-    : scope.class === "config_change" ? validConfigPattern(target) : validTargetPattern(target)),
-"`*` may only stand for a whole segment; prompt_approval and config_change targets are `<agent id>:*` or `*`");
+    : scope.class === "config_change" ? validConfigPattern(target)
+    : scope.class === "release" ? validReleasePattern(target) : validTargetPattern(target)),
+"`*` may only stand for a whole segment; prompt_approval and config_change targets are `<agent id>:*` or `*`; " +
+  "release targets name release fields, such as `owner/repo:stable:*:*:*` or `owner/*:land:*:*`");
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
@@ -311,6 +314,9 @@ const gateBody = z.object({
       // or tag can be moved to an edited workflow). Decided 2026-11-23 (D2): a
       // reusable workflow in the gate's OWN repository at exactly the gate's
       // ref needs no pin, unless the gate opts out of the source-sha binding.
+      // GitHub reports a `uses: <repo>/…@<branch>` call like a local one, so a
+      // redeem through such a gate also needs the token's job_workflow_sha to
+      // be the run's own commit (reusableReadAtRunCommit in gates.ts).
       const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
       const sameRepoAtGateRef = jobRepo.toLowerCase() === gate.repo.toLowerCase() && gate.ref !== undefined &&
         job[1] === gate.ref && gate.allow_source_sha_mismatch !== true;

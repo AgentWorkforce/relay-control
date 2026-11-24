@@ -736,8 +736,9 @@ async function consumeLocked(tx: SqlExecutor, input: { approvalId: string; works
 /**
  * Stamps `consumed_at` once the approval is spent: EVERY action is single use
  * and consumed (cloud#6603 0592d777c). A spent approval is no longer
- * "unredeemed", so grant revocation and revoke-all leave it alone; one that
- * still has a reusable action stays live, so a revocation still reaches it.
+ * "unredeemed", so grant revocation and revoke-all leave it alone, unless a
+ * release gate redeemed it (revocationSkipsSql); one that still has a
+ * reusable action stays live, so a revocation still reaches it.
  */
 export async function markSpentIfComplete(executor: SqlExecutor, approvalId: string): Promise<void> {
   const approval = (await executor.query<Pick<ApprovalRow, "id" | "actions" | "single_use">>(
@@ -759,6 +760,19 @@ function spentApprovalSql(param: number): string {
     SELECT 1 FROM jsonb_array_elements(actions) AS action WHERE NOT (action->>'class' = ANY($${param}::text[])))))`;
 }
 
+/**
+ * SQL: the approval row is one revocation leaves alone, spent under the
+ * current rule AND never redeemed through a release gate. A gate-redeemed
+ * approval is not final when spent: the run that consumed an action may
+ * redeem it again (`same_run`: another job, or a later attempt), so a
+ * revocation must reach it or that run keeps publishing after the owner
+ * revoked (as the hosted twin).
+ */
+function revocationSkipsSql(param: number): string {
+  return `(${spentApprovalSql(param)} AND NOT EXISTS (
+    SELECT 1 FROM delegation_gate_redemptions AS redeemed WHERE redeemed.approval_id = delegation_approvals.id))`;
+}
+
 export async function revokeGrants(executor: SqlExecutor, input: {
   workspaceId: string; grantIds: string[]; actorUserId: string | null; reason: string; authMethod: string | null;
 }): Promise<GrantRow[]> {
@@ -772,9 +786,20 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   )).rows;
   if (!revoked.length) return [];
   const ids = revoked.map(row => row.id);
+  // The candidates are locked (by id) in a statement of their own, so the
+  // UPDATE below starts after any consume that held one has committed and its
+  // gate-redemption check sees that redemption (as in revokeAllGrants).
+  await executor.query(
+    `SELECT id FROM delegation_approvals
+      WHERE workspace_id = $1 AND invalidated_at IS NULL
+        AND (grant_id = ANY($2::text[])
+          OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))
+      ORDER BY id FOR NO KEY UPDATE`,
+    [input.workspaceId, ids],
+  );
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${revocationSkipsSql(3)}
         AND (grant_id = ANY($2::text[])
           OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))`,
     [input.workspaceId, ids, HIGH_RISK_CLASSES],
@@ -877,7 +902,8 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
 
 /**
  * The panic button (§7): every active grant of one owner (or, with null, the
- * whole workspace), plus that owner's unredeemed tier O approvals, as Cloud.
+ * whole workspace), plus that owner's unredeemed tier O approvals and every
+ * spent approval a release gate redeemed (its run could redeem it again), as Cloud.
  */
 export async function revokeAllGrants(executor: SqlExecutor, input: {
   workspaceId: string; ownerUserId: string | null; actorUserId: string | null; reason: string; authMethod: string | null;
@@ -888,11 +914,24 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
       ORDER BY id FOR UPDATE`,
     [input.workspaceId, input.ownerUserId],
   )).rows.map(row => row.id);
+  // Then every live approval it may revoke, by id, before any is updated. A
+  // gate consume holds its approval's row while it records the redemption and
+  // stamps the approval spent. An UPDATE that waited on that row would re-check
+  // the row as spent, but judge "a gate redeemed it" on its own earlier
+  // snapshot, which misses the new redemption, and leave the approval live
+  // for that run. Locking first, in its own statement, makes the UPDATEs
+  // below start after the consume committed, so they see the redemption.
+  await executor.query(
+    `SELECT id FROM delegation_approvals
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND ($2::uuid IS NULL OR owner_user_id = $2)
+      ORDER BY id FOR NO KEY UPDATE`,
+    [input.workspaceId, input.ownerUserId],
+  );
   const revoked = await revokeGrants(executor, { workspaceId: input.workspaceId, grantIds: ids,
     actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
   const approvals = (await executor.query<{ id: string }>(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${revocationSkipsSql(3)}
         AND ($2::uuid IS NULL OR owner_user_id = $2)
       RETURNING id`,
     [input.workspaceId, input.ownerUserId, HIGH_RISK_CLASSES],

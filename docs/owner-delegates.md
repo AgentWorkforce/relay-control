@@ -398,7 +398,9 @@ exception (`delegation.unavailable`). See
 An approval is spent only when EVERY action is single use and every one has
 been consumed; it is then stamped `consumed_at` in the consuming transaction.
 A spent approval is no longer unredeemed: grant revocation and `revoke-all`
-leave it alone. One that still has a reusable action (a merge next to a
+leave it alone, unless a release gate redeemed it. The run that consumed a
+gate-redeemed action may redeem it again (`same_run`), so revocation reaches
+such an approval too. One that still has a reusable action (a merge next to a
 release, say) is never spent: attest still delegates it, and a revocation
 still reaches it. Redeem reads the clock again after the bearer check (which
 can wait on a session lock) and re-checks expiry right before consuming.
@@ -492,7 +494,13 @@ A `job_workflow_ref` other than the gate's own `workflow_ref` must be pinned
 to a 40-hex commit SHA (400 otherwise): it is matched by name only, and a
 branch or tag can be moved to an edited workflow. The one exception (decided
 2026-11-23): a reusable workflow in the gate's own repository at exactly the
-gate's `ref`, when the gate does not set `allow_source_sha_mismatch`.
+gate's `ref`, when the gate does not set `allow_source_sha_mismatch`. GitHub
+reports a local `uses: ./…` call and a `uses: <repo>/…@<branch>` call with the
+same `job_workflow_ref`, and the second reads the workflow at the branch's head
+when the run starts, so a redeem through such a gate also needs the token's
+`job_workflow_sha` to equal its `sha` (the reusable workflow was read at the
+run's own, approved commit), and a commit-pinned one needs `job_workflow_sha`
+to be that commit; otherwise it answers `gate_mismatch`.
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
@@ -607,6 +615,22 @@ dry_run?}`. Control checks, in order:
    - `<repo>:ios:<distribution>:<build number>:<sha>` (the build number is
      dot-separated digit groups, at most 32 characters)
 
+   The land `<branch>` is letters, digits, `.`, `_`, `/` and `-`, and only a
+   name `git check-ref-format --branch` accepts (no `..`, no leading `-`,
+   `.` or `/`, no component starting with `.` or ending in `.lock`, no `//`,
+   no trailing `/` or `.`).
+
+   A `release` grant pattern matches like every other pattern: `*` stands
+   for exactly one segment between `/`, `:` or `#`. So
+   `owner/repo:land:*:*` covers `main` but not `feature/x`, and
+   `owner/repo:land:feature/*:*` covers `feature/x`; a stored grant covers
+   exactly what it covered before. A pattern is accepted when a grant is
+   created or patched only if replacing each `*` with a valid value gives a
+   real release target within 256 characters, so `owner/repo`, `owner/*`,
+   `*`, `owner/repo:land:bad..branch:*` and `owner/repo:stable:*:main:*`
+   are refused (`400`). A grant stored with such a pattern before this rule
+   still covers no release.
+
    Rollout: a `release` approval minted before this grammar with a bare
    `owner/repo` (or any other non-release) target is deliberately not
    migrated and has no legacy exception. It is never redeemable: it answers
@@ -620,7 +644,10 @@ dry_run?}`. Control checks, in order:
 7. **Single use per run, per action** (§5.1), decided under locks as at
    redeem (`decideUnderLocks`: the gate owner's and, for tier O, the approval
    owner's membership, the policy, the tier D grant, the approval, then the
-   gate row). A departed gate owner is `recipient_policy` for tier D and a
+   gate row). Expiry of the approval and of a tier D grant is judged on a
+   clock read once the gate and approval locks are held, so waiting on a
+   concurrent gate delete that rolls back cannot consume an approval that
+   expired during the wait (`expired`). A departed gate owner is `recipient_policy` for tier D and a
    departed approval owner `revoked` for tier O.
    - The first redeem of an action consumes that action and binds it to the
      token's `run_id`, GitHub repository id (so a rename changes nothing)

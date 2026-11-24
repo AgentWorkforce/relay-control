@@ -489,3 +489,53 @@ test("concurrent revoke-alls audit each approval exactly once (only rows the gua
     assert.equal(audits.reduce((sum, row) => sum + row.data.count, 0), expected.length);
   }
 });
+
+test("revoke-all racing a gate consume never leaves the gate-redeemed approval live (approvals locked by id first)", options,
+  async (t) => {
+    const { pool, database, workspaceId, ownerId } = await fixture(t);
+    const release = { class: "release", target: `AgentWorkforce/relay:stable:v1:${"a".repeat(40)}:1` };
+    await database.query(
+      `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+       VALUES ('apv_gateracing001', $1, $2, 'O', $3::jsonb, true, now() + interval '1 hour')`,
+      [workspaceId, ownerId, JSON.stringify([release])]);
+    await database.query(
+      `INSERT INTO delegation_gates (id, workspace_id, owner_user_id, repo, workflow_ref, ref, event, target_prefix,
+         repository_id, repository_owner_id, default_branch, created_auth_method)
+       VALUES ('gate_racing000001', $1, $2, 'AgentWorkforce/relay', 'AgentWorkforce/relay/.github/workflows/p.yml@refs/heads/main',
+         'refs/heads/main', 'push', 'AgentWorkforce/relay:', '1', '2', 'main', 'session')`, [workspaceId, ownerId]);
+    // A gate consume holds the approval while it records the redemption and stamps the approval spent.
+    const consumer = await pool.connect();
+    let revokeAll: Promise<string[]> | null = null;
+    try {
+      await consumer.query("BEGIN");
+      await consumer.query("SELECT 1 FROM delegation_approvals WHERE id = 'apv_gateracing001' FOR NO KEY UPDATE");
+      await consumer.query(
+        `INSERT INTO delegation_gate_redemptions (approval_id, class, target, workspace_id, gate_id, issuer, repository,
+           repository_id, run_id, run_attempt)
+         VALUES ('apv_gateracing001', $1, $2, $3, 'gate_racing000001', 'https://token.actions.githubusercontent.com',
+           'AgentWorkforce/relay', '1', '555', 1)`, [release.class, release.target, workspaceId]);
+      await consumer.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = 'apv_gateracing001'");
+      const consumerPid = (await consumer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+      // Revoke-all starts now, while the consume still holds the row, and waits on it.
+      revokeAll = database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
+        reason: "owner_revoke_all", authMethod: "session" }));
+      // Only a session the consumer itself blocks counts: revoke-all, waiting on the approval it holds.
+      let blocked = false;
+      for (let attempt = 0; attempt < 200 && !blocked; attempt += 1) {
+        blocked = (await database.query<{ count: number }>(
+          "SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [consumerPid],
+        )).rows[0]!.count > 0;
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(blocked, "revoke-all never waited on the consume");
+      await consumer.query("COMMIT");
+    } finally {
+      await consumer.query("ROLLBACK").catch(() => undefined);
+      consumer.release();
+    }
+    await revokeAll;
+    // The run that consumed it could redeem it again (same_run): revoke-all must reach it.
+    const row = (await database.query<{ invalidated_at: Date | null }>(
+      "SELECT invalidated_at FROM delegation_approvals WHERE id = 'apv_gateracing001'")).rows[0]!;
+    assert.notEqual(row.invalidated_at, null);
+  });

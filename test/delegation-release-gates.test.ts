@@ -5,7 +5,8 @@ import test, { type TestContext } from "node:test";
 import { parse as parseYaml } from "yaml";
 import { loadDelegationOidcIssuers } from "../src/config.js";
 import { encryptSecret } from "../src/crypto.js";
-import { validReleaseTarget } from "../src/delegation/scope.js";
+import { consumeForGateRun } from "../src/delegation/gates.js";
+import { classTargetCovered, validReleasePattern, validReleaseTarget } from "../src/delegation/scope.js";
 import { copilotDesktopSetup } from "./support/copilot-desktop.js";
 import { request } from "./support/harness.js";
 
@@ -93,7 +94,7 @@ async function setup(t: TestContext) {
     method: "POST", body: { code: claim.body.code, agent_id: assistant.id, agent_token: assistant.token },
   })).status, 200);
   const grant = await browser("/delegates", "POST", {
-    delegate_agent_id: assistant.id, scopes: [{ class: "release", targets: [`${REPO}:*:*:*:*`, REPO] }],
+    delegate_agent_id: assistant.id, scopes: [{ class: "release", targets: [`${REPO}:*:*:*:*`] }],
   });
   assert.equal(grant.status, 201, grant.raw);
 
@@ -114,7 +115,7 @@ async function setup(t: TestContext) {
     const now = Math.floor(Date.now() / 1000);
     return { iss: GITHUB, aud: env.origin, sub: `repo:${REPO}:ref:refs/heads/main`, repository: REPO,
       workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "workflow_dispatch", run_id: "777000111",
-      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", sha: SHA, iat: now - 5, nbf: now - 5, exp: now + 300,
+      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", sha: SHA, job_workflow_sha: SHA, iat: now - 5, nbf: now - 5, exp: now + 300,
       ...extra };
   };
   const redeem = (token: string | null, approvalId: string, target = STABLE, extra: Record<string, unknown> = {}) =>
@@ -545,6 +546,111 @@ test("gate redeem: target prefix, release grammar, normal checks and tier O thro
   }
 });
 
+test("gate redeem: revoke-all reaches a spent approval a gate redeemed, so its run cannot redeem it again", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const token = (runId: string, attempt = "1") => mint(env.github, env.workflowClaims({ run_id: runId, run_attempt: attempt }));
+  // Tier O: no grant stands behind it, so only the approval's own revocation stops the run.
+  const minted = await env.browser("/delegates/approvals", "POST", { actions: [{ class: "release", target: STABLE }] });
+  assert.equal(minted.status, 201, minted.raw);
+  const approvalId = minted.body.approval_id as string;
+  assert.deepEqual((await env.redeem(token("700"), approvalId)).body, { ok: true, consumed: true });
+  const stamped = await env.database.query<{ consumed_at: Date | null; invalidated_at: Date | null }>(
+    "SELECT consumed_at, invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId]);
+  assert.ok(stamped.rows[0]!.consumed_at, "fully spent");
+  assert.deepEqual((await env.redeem(token("700", "2"), approvalId)).body, { ok: true, consumed: true, same_run: true });
+  await env.browser("/delegates/revoke-all", "POST", {});
+  const after = await env.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId]);
+  assert.ok(after.rows[0]!.invalidated_at, "revoke-all revoked the gate-spent approval");
+  assert.deepEqual((await env.redeem(token("700", "3"), approvalId)).body, { ok: false, reason: "revoked" });
+  // The summary audit names it.
+  const summary = (await env.events("approval.revoked")).filter(row => row.data.scope === "revoke_all");
+  assert.ok(summary.some(row => (row.data.approval_ids as string[]).includes(approvalId)));
+  // A spent approval no gate redeemed is still left alone.
+  const spentElsewhere = await env.browser("/delegates/approvals", "POST", { actions: [{ class: "release", target: BETA }] });
+  await env.database.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1", [spentElsewhere.body.approval_id]);
+  await env.browser("/delegates/revoke-all", "POST", {});
+  const untouched = await env.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = $1", [spentElsewhere.body.approval_id]);
+  assert.equal(untouched.rows[0]!.invalidated_at, null);
+});
+
+test("gate consume: expiry is judged on a clock read after the gate and approval locks, not one read before", async (t) => {
+  const env = await setup(t);
+  const gate = await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  const row = await env.database.query<{ expires_at: Date; grant_id: string }>(
+    "SELECT expires_at, grant_id FROM delegation_approvals WHERE id = $1", [approvalId]);
+  const { expires_at: expiresAt, grant_id: grantId } = row.rows[0]!;
+  const claims = { issuer: GITHUB, repository: REPO, workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main",
+    event_name: "workflow_dispatch", run_id: "800", run_attempt: 1, repository_id: "70151234", repository_owner_id: "90122", sha: SHA, job_workflow_sha: SHA };
+  const input = { workspaceId: env.workspaceId, approvalId, gateId: gate.gate_id as string, claims,
+    action: { class: "release" as const, target: STABLE }, grantId };
+  // The caller checked expiry earlier; by the time the locks are held the approval has expired.
+  let reads = 0;
+  const late = () => { reads += 1; return new Date(new Date(expiresAt).getTime() + 1); };
+  assert.equal(await consumeForGateRun(env.database, { ...input, clock: late }), "expired");
+  assert.equal(reads, 1);
+  // A Tier D grant that lapsed by then is expired too.
+  await env.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [grantId]);
+  assert.equal(await consumeForGateRun(env.database, { ...input, clock: () => new Date() }), "expired");
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+});
+
+test("release grants keep segment matching; a pattern no release fits is refused (as the hosted twin)", async (t) => {
+  const land = `${REPO}:land:feature/x:${SHA}`;
+  assert.ok(validReleaseTarget(land));
+  // A stored grant covers exactly what it covered before: `*` is one segment, so `land:*:*` does not reach `feature/x`.
+  assert.ok(!classTargetCovered("release", `${REPO}:land:*:*`, land));
+  assert.ok(!classTargetCovered("release", "AgentWorkforce/*:land:*:*", land));
+  assert.ok(classTargetCovered("release", `${REPO}:land:*:*`, `${REPO}:land:main:${SHA}`));
+  assert.ok(classTargetCovered("release", `${REPO}:land:feature/*:*`, land));
+  assert.ok(classTargetCovered("release", `${REPO}:land:feature/x:*`, land));
+  assert.ok(!classTargetCovered("release", `${REPO}:stable:*:*:*`, land));
+  assert.ok(classTargetCovered("release", `${REPO}:stable:*:*:*`, STABLE));
+  assert.ok(!classTargetCovered("release", REPO, STABLE));
+  // Git refuses these branch names, so no land target names them.
+  for (const branch of ["bad..branch", "-x", ".x", "a/.b", "a.lock", "a/b.lock/c", "a//b", "a/", "a.", "HEAD"]) {
+    assert.ok(!validReleaseTarget(`${REPO}:land:${branch}:${SHA}`), branch);
+  }
+  // Only the exact name `HEAD` is refused, as git check-ref-format --branch does.
+  for (const branch of ["main", "feature/x", "HEADS", "x/HEAD", "HEAD/x"]) assert.ok(validReleaseTarget(`${REPO}:land:${branch}:${SHA}`), branch);
+  for (const pattern of [`${REPO}:stable:*:*:*`, `${REPO}:stable:*:*:*:*`, `${REPO}:land:*:*`, `${REPO}:land:feature/*:*`,
+    "AgentWorkforce/*:land:*:*", `${REPO}:ios:testflight:*:*`, `${REPO}:*:*:*`]) {
+    assert.ok(validReleasePattern(pattern), pattern);
+  }
+  // Each `*` replaced by a valid value must give a real release target.
+  for (const pattern of [REPO, "AgentWorkforce/*", "*", `${REPO}#1`, `${REPO}:stable:*`, `${REPO}:land:*:*:*`,
+    `${REPO}:land:bad..branch:*`, `${REPO}:stable:*:main:*`, `${REPO}:stab*:*:*:*`, `${REPO}:stable::*:*`,
+    `${REPO}/x:stable:*:*:*`, `${REPO}:land:${"b".repeat(230)}:*`,
+    // Every literal field must fit its release form's grammar: a version ending in `/`, a `HEAD` branch.
+    `${REPO}:stable:v1/:*:*`, `${REPO}:stable:v1/x:*:*`, `${REPO}:land:HEAD:*`]) {
+    assert.ok(!validReleasePattern(pattern), pattern);
+  }
+  // Grant creation refuses a release pattern that covers nothing.
+  const env = await setup(t);
+  const assistant = (await env.database.query<{ agent_id: string }>(
+    "SELECT agent_id FROM delegation_agent_bindings LIMIT 1")).rows[0]!.agent_id;
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  const refused = await env.browser("/delegates", "POST", { delegate_agent_id: assistant,
+    scopes: [{ class: "release", targets: ["AgentWorkforce/*"] }] });
+  assert.equal(refused.status, 400, refused.raw);
+  const granted = await env.browser("/delegates", "POST", { delegate_agent_id: assistant,
+    scopes: [{ class: "release", targets: ["AgentWorkforce/*:land:*:*"] }] });
+  assert.equal(granted.status, 201, granted.raw);
+  // That stored `land:*:*` grant covers a one-segment branch, and does not gain `feature/x`.
+  const recipient = env.world.agents.get("relay-coder")!;
+  const attest = async (target: string) => {
+    const messageId = env.world.sendApprovalAs("assistant", "relay-coder", "land it",
+      { v: 1, owner_id: env.ownerId, actions: [{ class: "release", target }] }).message.id;
+    return (await request(env.origin, `${env.base}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
+      body: { recipient_agent_id: recipient.id, recipient_token: recipient.token, message_id: messageId } })).body;
+  };
+  assert.equal((await attest(`${REPO}:land:main:${SHA}`)).verdict, "delegate");
+  assert.deepEqual(await attest(land), { verdict: "none", reason: "out_of_scope" });
+});
+
 test("every gate route is documented in openapi.yaml", () => {
   const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8")) as { paths: Record<string, Record<string, unknown>> };
   const expected: Record<string, string[]> = {
@@ -573,6 +679,37 @@ test("gate redeem: a gate for a reusable workflow also requires job_workflow_ref
   const gates = (await env.bearer("/delegates/gates")).body.gates;
   assert.equal(gates[0].job_workflow_ref, reusable);
   assert.equal(gates[0].workflow_ref, WORKFLOW);
+});
+
+// Parity with Cloud: GitHub reports `uses: ./…` and `uses: <repo>/…@main` alike, and the latter reads the
+// reusable workflow wherever main points when the run starts. A branch-named one serves only when read at the run's commit.
+test("gate redeem: a reusable workflow named by branch serves only when read at the run's own commit", async (t) => {
+  const env = await setup(t);
+  const local = `${REPO}/.github/workflows/publish.yml@refs/heads/main`;
+  await env.gate({ job_workflow_ref: local });
+  const approvalId = await env.approval([STABLE]);
+  const dry = { dry_run: true };
+  for (const job_workflow_sha of ["9".repeat(40), undefined]) {
+    const moved = mint(env.github, env.workflowClaims({ job_workflow_ref: local, job_workflow_sha }));
+    assert.deepEqual((await env.redeem(moved, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  }
+  const atRunCommit = mint(env.github, env.workflowClaims({ job_workflow_ref: local }));
+  assert.deepEqual((await env.redeem(atRunCommit, approvalId)).body, { ok: true, consumed: true });
+});
+
+// Parity with Cloud: a branch named `a@<40 hex>` is a branch, not a commit pin, even when GitHub read the
+// reusable workflow at the very commit its name ends with.
+test("gates: a branch whose name ends in @<40 hex> is never treated as a commit pin", async () => {
+  const { gateMatches } = await import("../src/delegation/gates.js");
+  const hex = "e".repeat(40);
+  const ref = `refs/heads/a@${hex}`;
+  const file = (name: string) => `${REPO}/.github/workflows/${name}.yml@${ref}`;
+  const gate = { issuer: GITHUB, repo: REPO, workflow_ref: file("caller"), job_workflow_ref: file("publish"), ref, ref_pattern: null,
+    event: "push", repository_id: "70151234", repository_owner_id: "90122" };
+  const claims = { issuer: GITHUB, repository: REPO, workflow_ref: file("caller"), job_workflow_ref: file("publish"), ref,
+    event_name: "push", repository_id: "70151234", repository_owner_id: "90122", sha: SHA };
+  assert.equal(gateMatches(gate, { ...claims, job_workflow_sha: hex }), false);
+  assert.equal(gateMatches(gate, { ...claims, job_workflow_sha: SHA }), true);
 });
 
 test("gate redeem: single use is per action; another action of the same approval is unaffected", async (t) => {
@@ -786,8 +923,14 @@ test("gates: workflow_ref is at the gate's ref; a reusable workflow may be pinne
   await env.gate({ job_workflow_ref: reusable });
   const approvalId = await env.approval([STABLE]);
   const dry = { dry_run: true };
-  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable })), approvalId, STABLE, dry)).body,
-    { ok: true, consumed: false, dry_run: true });
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable, job_workflow_sha: sha })), approvalId,
+    STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
+  // A pin is judged by what the issuer read: the selector names a commit the workflow was not read at,
+  // even when it was read at the run's own commit.
+  for (const job_workflow_sha of ["f".repeat(40), SHA]) {
+    assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable, job_workflow_sha })),
+      approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true }, job_workflow_sha);
+  }
   const otherSha = reusable.replace(sha, "f".repeat(40));
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: otherSha })), approvalId, STABLE, dry)).body,
     { ok: false, reason: "gate_mismatch", dry_run: true });
@@ -844,6 +987,25 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   down = false;
   clock.ms += 61_000;
   await assert.rejects(verify(token("forged-kid")), /oidc_invalid: unknown_key/);
+});
+
+// Parity with Cloud: a token with a bad claim is refused before any key is looked up, so an unknown kid
+// on it is oidc_invalid (401), never OidcKeysUnavailable (503), and spends no fetch.
+test("OIDC: a token with a bad claim is refused before its key is looked up", async () => {
+  const { workflowOidcVerifier, OidcInvalid } = await import("../src/delegation/oidc.js");
+  const github = issuer(GITHUB);
+  let fetches = 0;
+  const verify = workflowOidcVerifier({ issuers: [GITHUB], audience: "https://control.example.test",
+    fetchImpl: (async () => { fetches += 1; return new Response("busy", { status: 503 }); }) as typeof fetch });
+  const seconds = Math.floor(Date.now() / 1000);
+  const base = { iss: GITHUB, aud: "https://control.example.test", sub: "repo:x", repository: REPO, workflow_ref: WORKFLOW,
+    job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "push", run_id: "1", run_attempt: "1", sha: SHA,
+    iat: seconds, nbf: seconds, exp: seconds + 600 };
+  for (const extra of [{ aud: "https://other.example.test" }, { aud: undefined }, { exp: seconds - 3600 }, { exp: undefined },
+    { nbf: seconds + 3600 }, { sha: undefined }, { repository: undefined }, { run_id: "0" }]) {
+    await assert.rejects(verify(mint({ ...github, kid: "unknown-kid" }, { ...base, ...extra })), OidcInvalid, JSON.stringify(extra));
+  }
+  assert.equal(fetches, 0);
 });
 
 test("OIDC keys: one shared refresh per issuer, a keys-less JWKS keeps the last good keys, the backoff starts at the failure, every fetch has a deadline (#278 review)", async () => {
@@ -905,7 +1067,7 @@ test("gate redeem: releases only; a gate without job_workflow_ref covers its own
   const assistant = (await env.database.query<{ agent_id: string }>(
     "SELECT agent_id FROM delegation_agent_bindings LIMIT 1")).rows[0]!.agent_id;
   const grant = await env.browser("/delegates", "POST", { delegate_agent_id: assistant, scopes: [
-    { class: "release", targets: [`${REPO}:*:*:*:*`, REPO] }, { class: "deploy", targets: [`${REPO}:*`] }] });
+    { class: "release", targets: [`${REPO}:*:*:*:*`] }, { class: "deploy", targets: [`${REPO}:*`] }] });
   assert.equal(grant.status, 201, grant.raw);
   await env.gate();
   const deployTarget = `${REPO}:prod`;
