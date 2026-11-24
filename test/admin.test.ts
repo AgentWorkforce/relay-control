@@ -305,6 +305,7 @@ test("env vars: admin-only writes, write-only values, encryption at rest, runtim
   const cookiePost = await request(ctx.origin, `/cloud${base}`, {
     method: "POST",
     cookie: `agent_relay_session=${ctx.owner}`,
+    headers: { origin: ctx.origin },
     body: { name: "VIA_COOKIE", value: "cookie-value-123456" },
   });
   assert.equal(cookiePost.status, 201, "dashboard cookie path works");
@@ -1057,4 +1058,66 @@ test("authorization proof is bound atomically to the token version across same-i
   assert.equal(listed.body[0].authorizationStatus,"unknown","old credentials cannot verify a replacement");
   assert.equal(listed.body[0].authorizationReason,"connection_changed");
   assert(!listed.raw.includes("old-key") && !listed.raw.includes("replacement-key"));
+});
+
+test("cookie writes to secrets and coding agents apply the same origin check as the other cookie writes", async t => {
+  const ctx = await setup(t, {}, async () => new Response("{}", { status: 200 }));
+  const base = `/api/v1/workspaces/${ctx.workspaceId}`;
+  const cookie = `agent_relay_session=${ctx.owner}`;
+  const names = async () => (await ctx.database.query<{ name: string }>(
+    "SELECT name FROM workspace_env_vars WHERE workspace_id = $1 ORDER BY name", [ctx.workspaceId])).rows.map(row => row.name);
+  const agents = async () => (await ctx.database.query<{ id: string }>(
+    "SELECT id FROM coding_agent_credentials WHERE workspace_id = $1 ORDER BY id", [ctx.workspaceId])).rows.map(row => row.id);
+
+  const seeded = await request(ctx.origin, `${base}/secrets`, {
+    method: "POST", token: ctx.owner, body: { name: "KEEP_ME", value: "seeded-value-123456" },
+  });
+  assert.equal(seeded.status, 201);
+  const agent = await request(ctx.origin, `${base}/provider-credentials/byok`, {
+    method: "POST", token: ctx.owner, body: { modelProvider: "anthropic", key: "sk-ant-api03-origin-check-plaintext-0001" },
+  });
+  assert.equal(agent.status, 201);
+  const agentId = agent.body.id as string;
+
+  for (const headers of [{ origin: "https://elsewhere.example" }, {}] as Array<Record<string, string>>) {
+    const label = headers.origin ? "foreign Origin" : "no Origin";
+    const post = await request(ctx.origin, `/cloud${base}/secrets`, {
+      method: "POST", cookie, headers, body: { name: "REFUSED", value: "refused-value-123456" },
+    });
+    assert.equal(post.status, 403, `secret POST, ${label}`);
+    assert.equal(post.body.error, "csrf_rejected");
+    const del = await request(ctx.origin, `/cloud${base}/secrets/KEEP_ME`, { method: "DELETE", cookie, headers });
+    assert.equal(del.status, 403, `secret DELETE, ${label}`);
+    assert.equal(del.body.error, "csrf_rejected");
+    const agentDelete = await request(ctx.origin, `/cloud${base}/cloud-agents/${agentId}`, { method: "DELETE", cookie, headers });
+    assert.equal(agentDelete.status, 403, `coding agent DELETE, ${label}`);
+    assert.equal(agentDelete.body.error, "csrf_rejected");
+  }
+  assert.deepEqual(await names(), ["KEEP_ME"], "refused cookie writes change no secret");
+  assert.deepEqual(await agents(), [agentId], "refused cookie deletes keep the credential");
+
+  const allowed = { origin: ctx.origin };
+  const post = await request(ctx.origin, `/cloud${base}/secrets`, {
+    method: "POST", cookie, headers: allowed, body: { name: "VIA_COOKIE", value: "cookie-value-123456" },
+  });
+  assert.equal(post.status, 201);
+  const del = await request(ctx.origin, `/cloud${base}/secrets/VIA_COOKIE`, { method: "DELETE", cookie, headers: allowed });
+  assert.equal(del.status, 200);
+  const agentDelete = await request(ctx.origin, `/cloud${base}/cloud-agents/${agentId}`, { method: "DELETE", cookie, headers: allowed });
+  assert.equal(agentDelete.status, 200);
+  assert.deepEqual(await agents(), []);
+
+  // Bearer callers send no Origin and are unaffected.
+  const bearerPost = await request(ctx.origin, `${base}/secrets`, {
+    method: "POST", token: ctx.owner, body: { name: "VIA_BEARER", value: "bearer-value-123456" },
+  });
+  assert.equal(bearerPost.status, 201);
+  assert.equal((await request(ctx.origin, `${base}/secrets/VIA_BEARER`, { method: "DELETE", token: ctx.owner })).status, 200);
+  assert.equal((await request(ctx.origin, `${base}/secrets/KEEP_ME`, { method: "DELETE", token: ctx.owner })).status, 200);
+  assert.deepEqual(await names(), []);
+  const bearerAgent = await request(ctx.origin, `${base}/provider-credentials/byok`, {
+    method: "POST", token: ctx.owner, body: { modelProvider: "anthropic", key: "sk-ant-api03-origin-check-plaintext-0002" },
+  });
+  assert.equal(bearerAgent.status, 201);
+  assert.equal((await request(ctx.origin, `${base}/cloud-agents/${bearerAgent.body.id}`, { method: "DELETE", token: ctx.owner })).status, 200);
 });
