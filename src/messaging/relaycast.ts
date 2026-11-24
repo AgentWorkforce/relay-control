@@ -511,8 +511,9 @@ export function createRelaycastClient(input: {
     },
 
     /** Idempotent for the owner (Relaycast engine/delivery.ts ackDelivery changed:false at ac38905); 404 = absent or not owned. */
-    async acknowledgeDelivery(token: string, deliveryId: string): Promise<void> {
-      await labeled("ack_delivery", () => call("POST", `/v1/deliveries/${encodeURIComponent(deliveryId)}/ack`, token, {}));
+    async acknowledgeDelivery(token: string, deliveryId: string, signal?: AbortSignal): Promise<void> {
+      await labeled("ack_delivery", () =>
+        call("POST", `/v1/deliveries/${encodeURIComponent(deliveryId)}/ack`, token, {}, undefined, false, signal));
     },
 
     /** Workspace roster with the default metadata (ownership and declared sessions). */
