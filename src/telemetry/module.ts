@@ -52,6 +52,8 @@ export type TelemetryRouteHelpers = {
   organizationAccess(request: IncomingMessage, organizationId: string, admin: boolean): Promise<unknown>;
   requestObject(request: IncomingMessage): Promise<JsonObject>;
   bearer(request: IncomingMessage): string | null;
+  /** True when the request carries an allowed browser Origin (or same-origin fetch metadata). */
+  cookieOriginAllowed(request: IncomingMessage): boolean;
 };
 
 export type ServiceCredentialVerifier = (token: string) => Promise<{ subject: string; scopes?: string[] } | null>;
@@ -623,6 +625,9 @@ export function createTelemetryModule(input: {
       const type = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
       if (!helpers.bearer(request) && type !== "application/json") {
         throw new TelemetryHttpError(415, "unsupported_media_type", "Use application/json");
+      }
+      if (!helpers.bearer(request) && !helpers.cookieOriginAllowed(request)) {
+        throw new TelemetryHttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
       const actor = actorFor(auth);
       const organizationScoped = (input.tenancy ?? "single") === "multi" && actor.kind !== "bootstrap";

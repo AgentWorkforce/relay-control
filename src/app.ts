@@ -1417,6 +1417,8 @@ export function createApp(input: {
       store: input.flows,
       publicBaseUrl: config.publicBaseUrl,
       requireFeature: () => requireFeature("flows"),
+      csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
+      originAllowed: incoming => Boolean(bearer(incoming)) || cookieDeleteAllowed(incoming, browserOrigins),
       userAccess: async (request, admin = false) => {
         const auth = await authenticate(request);
         if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1886,6 +1888,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      // Both methods carry a JSON body, so both get the JSON + origin check.
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       const body = await requestObject(request);
       const workspaceId = stringField(body, "workspaceId")!;
       if (workspaceId !== auth.principal.workspaceId) {
@@ -2697,6 +2703,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (method === "POST") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         const workspace = await store.createWorkspace({
           organizationId,
@@ -2720,6 +2729,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // minted there. Bootstrap bearer or organization owner/admin.
       const [organizationId, workspaceId] = workspaceItem as [string, string];
       await organizationAccess(request, organizationId, true);
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       const body = await requestObject(request);
       if (body.name === undefined && body.relaycastWorkspaceId === undefined && body.relaycastApiKey === undefined) {
         throw new HttpError(400, "invalid_request", "Send name, relaycastWorkspaceId, or relaycastApiKey");
@@ -2813,6 +2825,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (method === "POST") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         const role = stringField(body, "role")!;
         if (role !== "owner" && role !== "admin" && role !== "member") {
@@ -2851,6 +2866,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (membershipItem && method === "DELETE") {
       const [organizationId, userId] = membershipItem as [string, string];
       const auth = await organizationAccess(request, organizationId, true);
+      if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       if (auth.kind === "user" && auth.principal.role !== "owner" &&
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
@@ -3296,6 +3314,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (method === "PUT") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         if (!("runtime" in body) || body.runtime === undefined) {
           throw new HttpError(400, "invalid_request", "runtime is required");
@@ -3602,6 +3623,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      cookieOriginAllowed: incoming => cookieDeleteAllowed(incoming, browserOrigins),
       agentRoster: agentIdentityRoster,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
@@ -3613,6 +3635,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      cookieOriginAllowed: incoming => cookieDeleteAllowed(incoming, browserOrigins),
     })) {
       return;
     }
