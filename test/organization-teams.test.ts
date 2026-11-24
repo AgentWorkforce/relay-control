@@ -127,7 +127,7 @@ async function setup(t: TestContext, features: SelectedFeatures = TEAMS_ON) {
       WHERE organization_id = $1 AND action LIKE 'team.%'`,
     [organizationId],
   )).rows;
-  return { database, origin, a, b, owner, addMember, tokenFor, api, createTeam, windows, age, teamAudit };
+  return { database, store, origin, a, b, owner, addMember, tokenFor, api, createTeam, windows, age, teamAudit };
 }
 
 test("teams off: every route answers 403 feature_not_enabled after the role check, and memberships keep their shape", async (t) => {
@@ -167,7 +167,28 @@ test("teams on: capabilities report it and memberships carry teamId", async (t) 
   assert.equal(byUser.get(env.a.ownerId), null);
 });
 
-test("create, list and rename: trimmed names of 1 to 80 characters, unique among live teams ignoring case", async (t) => {
+test("teams on: memberships carry teamId for owners, admins and the bootstrap bearer only, never for a member", async (t) => {
+  const env = await setup(t);
+  const memberId = await env.addMember(env.a.id, "member@acme.test");
+  const adminId = await env.addMember(env.a.id, "admin@acme.test", "admin");
+  const member = await env.tokenFor(memberId, env.a.workspaceId);
+  const admin = await env.tokenFor(adminId, env.a.workspaceId);
+  const team = await env.createTeam("Platform");
+  assert.equal((await env.api(env.owner, "PUT", `/teams/${team.id}/members/${memberId}`)).status, 200);
+  for (const token of [env.owner, admin, BOOTSTRAP]) {
+    const listed = await env.api(token, "GET", "/memberships");
+    assert.equal(listed.status, 200, listed.raw);
+    assert.equal(listed.body.memberships.find((item: { userId: string }) => item.userId === memberId).teamId, team.id);
+  }
+  const plain = await env.api(member, "GET", "/memberships");
+  assert.equal(plain.status, 200, plain.raw);
+  assert.equal(plain.body.memberships.length, 3);
+  for (const item of plain.body.memberships) {
+    assert.deepEqual(Object.keys(item).sort(), ["email", "joinedAt", "name", "role", "userId"]);
+  }
+});
+
+test("create, list and rename: trimmed names of 1 to 80 characters without control characters, unique among live teams ignoring case", async (t) => {
   const env = await setup(t);
   const created = await env.api(env.owner, "POST", "/teams", { name: "  Platform  " });
   assert.equal(created.status, 201);
@@ -176,7 +197,7 @@ test("create, list and rename: trimmed names of 1 to 80 characters, unique among
   assert.equal(created.body.archivedAt, null);
   assert.equal(typeof created.body.createdAt, "string");
   assert.equal(typeof created.body.updatedAt, "string");
-  for (const name of ["", "   ", "x".repeat(81), 7, null]) {
+  for (const name of ["", "   ", "x".repeat(81), 7, null, "a\u0000b", "a\u001fb", "a\u007fb"]) {
     const refused = await env.api(env.owner, "POST", "/teams", { name });
     assert.equal(refused.status, 400, JSON.stringify(name));
     assert.equal(refused.body.error, "invalid_request");
@@ -204,6 +225,9 @@ test("create, list and rename: trimmed names of 1 to 80 characters, unique among
   assert.equal(cased.status, 200);
   assert.equal(cased.body.name, "platform");
   assert.equal((await env.api(env.owner, "PATCH", `/teams/${id}`, { name: "" })).status, 400);
+  const control = await env.api(env.owner, "PATCH", `/teams/${id}`, { name: "a\u0000b" });
+  assert.equal(control.status, 400, control.raw);
+  assert.equal(control.body.error, "invalid_request");
   assert.equal((await env.api(env.owner, "PATCH", `/teams/${randomUUID()}`, { name: "Nope" })).body.error, "team_not_found");
   assert.equal((await env.api(env.owner, "PATCH", "/teams/not-a-uuid", { name: "Nope" })).body.error, "team_not_found");
 });
@@ -368,6 +392,48 @@ test("roles: a member is 403, an admin and the owner manage teams, another organ
   assert.equal((await env.api(env.owner, "PATCH", `/teams/${team.id}`, { name: "Platform 2" })).status, 200);
   assert.equal((await env.api(admin, "GET", "/teams")).body.teams.length, 2);
   assert.equal((await env.api(env.owner, "DELETE", `/teams/${team.id}/members/${memberId}`)).body.unassigned, true);
+});
+
+test("cookie writes: refused without an allowed Origin, and nothing changes; an allowed Origin creates", async (t) => {
+  const env = await setup(t);
+  const memberId = await env.addMember(env.a.id, "member@acme.test");
+  const other = await env.addMember(env.a.id, "other@acme.test");
+  const team = await env.createTeam("Platform");
+  assert.equal((await env.api(env.owner, "PUT", `/teams/${team.id}/members/${memberId}`)).status, 200);
+  await env.age();
+  const pair = await env.database.transaction((tx) => env.store.issueBrowserSession(tx, {
+    userId: env.a.ownerId, organizationId: env.a.id, workspaceId: env.a.workspaceId, label: "organization-teams-test",
+  }));
+  const cookie = `agent_relay_session=${pair.accessToken}`;
+  const cookiePath = (path: string) => `/cloud/api/v1/organizations/${env.a.id}${path}`;
+  const snapshot = async () => ({
+    teams: (await env.api(env.owner, "GET", "/teams?archived=true")).body.teams,
+    member: await env.windows(memberId),
+    other: await env.windows(other),
+    audit: (await env.teamAudit()).length,
+  });
+  const before = await snapshot();
+
+  for (const [method, path, body] of [
+    ["POST", "/teams", { name: "Ops" }],
+    ["PATCH", `/teams/${team.id}`, { name: "Renamed" }],
+    ["PUT", `/teams/${team.id}/members/${other}`, undefined],
+    ["DELETE", `/teams/${team.id}/members/${memberId}`, undefined],
+    ["DELETE", `/teams/${team.id}`, undefined],
+  ] as const) {
+    for (const headers of [{ origin: "https://attacker.example" }, {} as Record<string, string>]) {
+      const refused = await request(env.origin, cookiePath(path), { method, cookie, headers, body });
+      assert.equal(refused.status, 403, `${method} ${path} ${JSON.stringify(headers)}: ${refused.raw}`);
+      assert.equal(refused.body.error, "csrf_rejected");
+    }
+  }
+  assert.deepEqual(await snapshot(), before);
+
+  const created = await request(env.origin, cookiePath("/teams"), {
+    method: "POST", cookie, headers: { origin: env.origin }, body: { name: "Ops" },
+  });
+  assert.equal(created.status, 201, created.raw);
+  assert.equal(created.body.name, "Ops");
 });
 
 test("member removal closes the open assignment with the feature off, keeps the closed rows, and a re-added member has no team", async (t) => {

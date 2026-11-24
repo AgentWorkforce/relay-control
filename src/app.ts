@@ -2805,7 +2805,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const organizationId = membershipCollection[0]!;
       const auth = await organizationAccess(request, organizationId, method === "POST");
       if (method === "GET") {
-        json(response, 200, { memberships: await store.listMemberships(organizationId, { teams: features.teams }) });
+        // teamId is shown only to the operator bearer and live owners and
+        // admins, the callers the team routes admit (docs/teams.md).
+        const teams = features.teams && (auth.kind === "bootstrap" ||
+          ["owner", "admin"].includes(await store.memberRole(organizationId, auth.principal.userId) ?? ""));
+        json(response, 200, { memberships: await store.listMemberships(organizationId, { teams }) });
         return;
       }
       if (method === "POST") {

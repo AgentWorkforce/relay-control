@@ -2374,8 +2374,10 @@ paths:
         "200":
           description: >-
             Organization memberships: `{ memberships: [{ userId, email, name,
-            role, joinedAt }] }`. With the `teams` feature on, each item also
-            carries `teamId` (uuid or null), the member's current team.
+            role, joinedAt }] }`. With the `teams` feature on and an owner,
+            admin or bootstrap bearer caller, each item also carries `teamId`
+            (uuid or null), the member's current team; a member never gets
+            `teamId`.
     post:
       operationId: putMembership
       description: >-
@@ -2450,8 +2452,8 @@ paths:
       operationId: createOrganizationTeam
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       description: >-
-        Creates a team. The name is trimmed and must be 1 to 80 characters.
-        Writes a `team.create` audit row.
+        Creates a team. The name is trimmed and must be 1 to 80 characters
+        with no control characters (U+0000 to U+001F, U+007F). Writes a `team.create` audit row.
       requestBody:
         required: true
         content:

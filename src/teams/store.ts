@@ -5,9 +5,12 @@ import type { Database, SqlExecutor } from "../database.js";
 /**
  * Organization teams (docs/teams.md): flat, organization-level groups. A
  * person has at most one current team per organization; an assignment is a
- * window [starts_at, ends_at). Every write that closes or opens a window holds
- * the person's membership row lock (or removes that row), so one person's
- * windows in one organization never overlap.
+ * window [starts_at, ends_at). Assign, unassign and member removal hold the
+ * person's membership row lock (removal deletes that row), so one person's
+ * windows in one organization never overlap. Assign and unassign hold the team
+ * row lock shared; archive holds it exclusively and locks each open window row
+ * as it closes it. A window is only ever closed under its own row lock, and
+ * one that would end at or before its start is deleted instead.
  */
 
 export const TEAM_NAME_MAX = 80;
@@ -36,12 +39,18 @@ const teamNotFound = () => new TeamsError(404, "team_not_found", "Team not found
 const teamArchived = () => new TeamsError(409, "team_archived", "The team is archived");
 const nameTaken = () => new TeamsError(409, "team_name_taken", "A team with this name already exists");
 
-/** Trimmed; 1..80 characters (code points, as Postgres char_length counts). */
+/**
+ * Trimmed; 1..80 characters (code points, as Postgres char_length counts); no
+ * C0 control character or DEL left after trimming (Postgres refuses NUL).
+ */
 export function teamName(value: unknown): string {
   const name = typeof value === "string" ? value.trim() : "";
   const length = [...name].length;
   if (length < 1 || length > TEAM_NAME_MAX) {
     throw new TeamsError(400, "invalid_request", `name must be a string of 1 to ${TEAM_NAME_MAX} characters`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw new TeamsError(400, "invalid_request", "name must not contain control characters");
   }
   return name;
 }

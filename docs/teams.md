@@ -41,15 +41,16 @@ A team:
 | Route | Answer |
 |---|---|
 | `GET /teams` | 200 `{ teams }`: live teams by name ignoring case, then id. `?archived=true` adds archived teams after the live ones; any other `archived` value is 400 `invalid_request` |
-| `POST /teams` `{ name }` | 201 team. The name is trimmed and must be 1 to 80 characters (400 `invalid_request`); 409 `team_name_taken` when a live team has the same name ignoring case |
+| `POST /teams` `{ name }` | 201 team. The name is trimmed and must be 1 to 80 characters with no control characters (U+0000 to U+001F, U+007F) (400 `invalid_request`); 409 `team_name_taken` when a live team has the same name ignoring case |
 | `PATCH /teams/{teamId}` `{ name }` | 200 team. Same name rules; 404 `team_not_found` (unknown, or another organization's), 409 `team_archived`, 409 `team_name_taken`. The current name is a no-op; a change of case renames |
 | `DELETE /teams/{teamId}` | 200 `{ team, unassigned }`: archives the team and closes its open assignments. Already archived: `unassigned` 0. Archiving frees the name. 404 `team_not_found` |
 | `PUT /teams/{teamId}/members/{userId}` | 200 `{ assignment: { userId, teamId, startsAt }, previousTeamId }`. Closes the person's current assignment, if any, and opens one in this team. Already in this team: nothing is written and `previousTeamId` is the team's id. 404 `team_not_found`, 404 `membership_not_found` (not a current member), 409 `team_archived`, checked in that order |
 | `DELETE /teams/{teamId}/members/{userId}` | 200 `{ unassigned }`: true when the person's current assignment was in this team and is now closed, false (nothing written) otherwise. 404 `team_not_found` |
 
-While the feature is selected, each item of
-`GET /memberships` also carries `teamId`, the member's current team or null.
-While it is off that response is unchanged.
+While the feature is selected and the caller is an owner or admin of the
+organization or the bootstrap bearer, each item of `GET /memberships` also
+carries `teamId`, the member's current team or null. A member, or any caller
+while the feature is off, gets that response unchanged, with no `teamId`.
 
 ## Member removal
 
@@ -59,13 +60,16 @@ added back starts with no team.
 
 ## Assignment windows
 
-An assignment covers `[startsAt, endsAt)`. Every change that opens or closes
-one of a person's windows in an organization holds that person's membership
-row lock (removal deletes the row), so their windows never overlap. The
-instant used is the database clock read after the lock, and never earlier than
-the end of the person's latest closed window. A window that would close at or
-before its own start (a change within the same instant) is deleted instead of
-closed.
+An assignment covers `[startsAt, endsAt)`. Assigning, unassigning and member
+removal hold the person's membership row lock (removal deletes the row), so
+one person's windows in an organization never overlap. Assigning and
+unassigning also hold the team row lock shared; archiving holds it exclusively
+and locks each of the team's open window rows as it closes them. A window is
+only ever closed under its own row lock. For assigning, unassigning and
+removal, the instant used is the database clock read after the locks, and
+never earlier than the end of the person's latest closed window; archiving
+uses the database clock. A window that would close at or before its own start
+(a change within the same instant) is deleted instead of closed.
 
 ## Audit
 
