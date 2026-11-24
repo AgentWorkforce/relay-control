@@ -122,7 +122,7 @@ export function gateMatches(gate: GateMatchFields, claims: ClaimMatchFields): bo
 type GateMatchFields = Pick<GateRow, "issuer" | "repo" | "workflow_ref" | "job_workflow_ref" | "ref" | "ref_pattern" | "event" |
   "repository_id" | "repository_owner_id">;
 type ClaimMatchFields = Pick<WorkflowClaims, "issuer" | "repository" | "workflow_ref" | "job_workflow_ref" | "ref" | "event_name" |
-  "repository_id" | "repository_owner_id">;
+  "repository_id" | "repository_owner_id" | "sha" | "job_workflow_sha">;
 
 /**
  * GitHub's stable ids, resolved at registration, as Cloud: a repository that
@@ -148,7 +148,24 @@ function gateMatchesByName(gate: GateMatchFields, claims: ClaimMatchFields): boo
     // job_workflow_ref to that workflow) must be named on the gate explicitly (as Cloud).
     (gate.job_workflow_ref === null ?
       !claims.job_workflow_ref || claims.job_workflow_ref === claims.workflow_ref :
-      workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref));
+      workflowMatches(gate.job_workflow_ref, claims.job_workflow_ref, gate, claims.ref) && reusableReadAtRunCommit(gate, claims));
+}
+
+/**
+ * A reusable workflow a gate names by branch (allowed only in the gate's own
+ * repository at the gate's ref, D2) is mutable: GitHub reports a local
+ * `uses: ./…` call and a `uses: <repo>/…@<branch>` call the same way, and the
+ * latter reads the file wherever the branch points when the run starts, not
+ * at the caller's commit. Such a job serves only when the issuer read the
+ * reusable workflow at the run's own commit (`job_workflow_sha` equals
+ * `sha`), which the release binding ties to the approved commit. A reusable
+ * workflow pinned to a 40-hex commit, or the gate's own file, is immutable
+ * already (as Cloud).
+ */
+function reusableReadAtRunCommit(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
+  if (gate.job_workflow_ref === null || gate.job_workflow_ref === gate.workflow_ref ||
+      /@[0-9a-f]{40}$/u.test(gate.job_workflow_ref)) return true;
+  return claims.job_workflow_sha !== null && claims.job_workflow_sha === claims.sha;
 }
 
 /**

@@ -115,7 +115,7 @@ async function setup(t: TestContext) {
     const now = Math.floor(Date.now() / 1000);
     return { iss: GITHUB, aud: env.origin, sub: `repo:${REPO}:ref:refs/heads/main`, repository: REPO,
       workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "workflow_dispatch", run_id: "777000111",
-      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", sha: SHA, iat: now - 5, nbf: now - 5, exp: now + 300,
+      run_attempt: "1", repository_id: "70151234", repository_owner_id: "90122", sha: SHA, job_workflow_sha: SHA, iat: now - 5, nbf: now - 5, exp: now + 300,
       ...extra };
   };
   const redeem = (token: string | null, approvalId: string, target = STABLE, extra: Record<string, unknown> = {}) =>
@@ -584,7 +584,7 @@ test("gate consume: expiry is judged on a clock read after the gate and approval
     "SELECT expires_at, grant_id FROM delegation_approvals WHERE id = $1", [approvalId]);
   const { expires_at: expiresAt, grant_id: grantId } = row.rows[0]!;
   const claims = { issuer: GITHUB, repository: REPO, workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main",
-    event_name: "workflow_dispatch", run_id: "800", run_attempt: 1, repository_id: "70151234", repository_owner_id: "90122", sha: SHA };
+    event_name: "workflow_dispatch", run_id: "800", run_attempt: 1, repository_id: "70151234", repository_owner_id: "90122", sha: SHA, job_workflow_sha: SHA };
   const input = { workspaceId: env.workspaceId, approvalId, gateId: gate.gate_id as string, claims,
     action: { class: "release" as const, target: STABLE }, grantId };
   // The caller checked expiry earlier; by the time the locks are held the approval has expired.
@@ -675,6 +675,22 @@ test("gate redeem: a gate for a reusable workflow also requires job_workflow_ref
   const gates = (await env.bearer("/delegates/gates")).body.gates;
   assert.equal(gates[0].job_workflow_ref, reusable);
   assert.equal(gates[0].workflow_ref, WORKFLOW);
+});
+
+// Parity with Cloud: GitHub reports `uses: ./…` and `uses: <repo>/…@main` alike, and the latter reads the
+// reusable workflow wherever main points when the run starts. A branch-named one serves only when read at the run's commit.
+test("gate redeem: a reusable workflow named by branch serves only when read at the run's own commit", async (t) => {
+  const env = await setup(t);
+  const local = `${REPO}/.github/workflows/publish.yml@refs/heads/main`;
+  await env.gate({ job_workflow_ref: local });
+  const approvalId = await env.approval([STABLE]);
+  const dry = { dry_run: true };
+  for (const job_workflow_sha of ["9".repeat(40), undefined]) {
+    const moved = mint(env.github, env.workflowClaims({ job_workflow_ref: local, job_workflow_sha }));
+    assert.deepEqual((await env.redeem(moved, approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  }
+  const atRunCommit = mint(env.github, env.workflowClaims({ job_workflow_ref: local }));
+  assert.deepEqual((await env.redeem(atRunCommit, approvalId)).body, { ok: true, consumed: true });
 });
 
 test("gate redeem: single use is per action; another action of the same approval is unaffected", async (t) => {
@@ -946,6 +962,25 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   down = false;
   clock.ms += 61_000;
   await assert.rejects(verify(token("forged-kid")), /oidc_invalid: unknown_key/);
+});
+
+// Parity with Cloud: a token with a bad claim is refused before any key is looked up, so an unknown kid
+// on it is oidc_invalid (401), never OidcKeysUnavailable (503), and spends no fetch.
+test("OIDC: a token with a bad claim is refused before its key is looked up", async () => {
+  const { workflowOidcVerifier, OidcInvalid } = await import("../src/delegation/oidc.js");
+  const github = issuer(GITHUB);
+  let fetches = 0;
+  const verify = workflowOidcVerifier({ issuers: [GITHUB], audience: "https://control.example.test",
+    fetchImpl: (async () => { fetches += 1; return new Response("busy", { status: 503 }); }) as typeof fetch });
+  const seconds = Math.floor(Date.now() / 1000);
+  const base = { iss: GITHUB, aud: "https://control.example.test", sub: "repo:x", repository: REPO, workflow_ref: WORKFLOW,
+    job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "push", run_id: "1", run_attempt: "1", sha: SHA,
+    iat: seconds, nbf: seconds, exp: seconds + 600 };
+  for (const extra of [{ aud: "https://other.example.test" }, { aud: undefined }, { exp: seconds - 3600 }, { exp: undefined },
+    { nbf: seconds + 3600 }, { sha: undefined }, { repository: undefined }, { run_id: "0" }]) {
+    await assert.rejects(verify(mint({ ...github, kid: "unknown-kid" }, { ...base, ...extra })), OidcInvalid, JSON.stringify(extra));
+  }
+  assert.equal(fetches, 0);
 });
 
 test("OIDC keys: one shared refresh per issuer, a keys-less JWKS keeps the last good keys, the backoff starts at the failure, every fetch has a deadline (#278 review)", async () => {

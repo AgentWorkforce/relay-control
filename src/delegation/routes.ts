@@ -314,6 +314,9 @@ const gateBody = z.object({
       // or tag can be moved to an edited workflow). Decided 2026-11-23 (D2): a
       // reusable workflow in the gate's OWN repository at exactly the gate's
       // ref needs no pin, unless the gate opts out of the source-sha binding.
+      // GitHub reports a `uses: <repo>/…@<branch>` call like a local one, so a
+      // redeem through such a gate also needs the token's job_workflow_sha to
+      // be the run's own commit (reusableReadAtRunCommit in gates.ts).
       const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
       const sameRepoAtGateRef = jobRepo.toLowerCase() === gate.repo.toLowerCase() && gate.ref !== undefined &&
         job[1] === gate.ref && gate.allow_source_sha_mismatch !== true;

@@ -39,6 +39,12 @@ export type WorkflowClaims = {
   repository_owner_id: string | null;
   /** The commit the run is on: lower-case hex, 40 (or 64 for a SHA-256 repository). Required. */
   sha: string;
+  /**
+   * The commit the issuer read the job's workflow file at: for a reusable
+   * workflow, the commit its `@ref` resolved to when the run started. Null
+   * when absent.
+   */
+  job_workflow_sha: string | null;
 };
 
 export class OidcInvalid extends Error {
@@ -188,26 +194,11 @@ export function workflowOidcVerifier(input: {
     // The issuer is checked before any network call, so a token cannot point
     // the server at a URL of its choosing.
     if (!issuers.has(issuer)) throw new OidcInvalid("issuer");
-    // Only signing keys (`use` is "sig" or absent) are candidates (as Cloud).
-    const pick = (set: { keys: Jwk[] }) => set.keys.find(key => key.kid === header.kid && (key.use === undefined || key.use === "sig"));
-    let jwk = pick(await keys(issuer, false));
-    if (!jwk) {
-      const refreshed = await keys(issuer, true);
-      jwk = pick(refreshed);
-      // An unknown kid while the issuer cannot be reached may be a key it just
-      // rotated in: that is `unavailable` (retry), never a forged token (as Cloud).
-      // The same within the refresh cooldown, when no refetch was made (as Cloud).
-      if (!jwk && (refreshed.stale || refreshed.notRefreshed)) throw new OidcKeysUnavailable();
-    }
-    if (!jwk || (jwk.use && jwk.use !== "sig") || (jwk.alg && jwk.alg !== alg)) throw new OidcInvalid("unknown_key");
-    const key = publicKey(jwk);
-    if ((alg === "RS256") !== (jwk.kty === "RSA")) throw new OidcInvalid("unknown_key");
-    const signed = Buffer.from(`${parts[0]}.${parts[1]}`);
-    const signature = Buffer.from(parts[2]!, "base64url");
-    const ok = alg === "RS256"
-      ? verifySignature("RSA-SHA256", signed, key, signature)
-      : verifySignature("SHA256", signed, { key, dsaEncoding: "ieee-p1363" }, signature);
-    if (!ok) throw new OidcInvalid("signature");
+    // Every other claim is judged before any key is looked up (as Cloud):
+    // a token with the wrong audience, out of its window or
+    // missing a claim is refused (OidcInvalid, 401) without reading the JWKS,
+    // so an unknown kid on it never spends the refresh cooldown or answers
+    // `unavailable`. The signature below still covers these very bytes.
     const audience = claims.aud;
     const audiences = Array.isArray(audience) ? audience : [audience];
     if (!audiences.includes(input.audience)) throw new OidcInvalid("audience");
@@ -231,9 +222,12 @@ export function workflowOidcVerifier(input: {
       throw new OidcInvalid("claim_run");
     }
     // GitHub sets `sha` on every Actions token: the commit the run is on. As Cloud, it is required.
-    const sha = typeof claims.sha === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(claims.sha) ? claims.sha.toLowerCase() : null;
+    const commit = (value: unknown) => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value) ? value.toLowerCase() : null;
+    const sha = commit(claims.sha);
     if (!sha) throw new OidcInvalid("claim_sha");
-    return {
+    // The commit the job's workflow file was read at (its reusable workflow's, for a reusable job), as Cloud.
+    const jobWorkflowSha = commit(claims.job_workflow_sha);
+    const result: WorkflowClaims = {
       issuer,
       repository: text("repository"),
       workflow_ref: text("workflow_ref"),
@@ -243,9 +237,33 @@ export function workflowOidcVerifier(input: {
       run_id: runId,
       run_attempt: runAttempt,
       sha,
+      job_workflow_sha: jobWorkflowSha,
       repository_id: optionalId("repository_id"),
       repository_owner_id: optionalId("repository_owner_id"),
     };
+    // Only signing keys (`use` is "sig" or absent) are candidates (as Cloud).
+    const pick = (set: { keys: Jwk[] }) => set.keys.find(key => key.kid === header.kid && (key.use === undefined || key.use === "sig"));
+    let jwk = pick(await keys(issuer, false));
+    if (!jwk) {
+      const refreshed = await keys(issuer, true);
+      jwk = pick(refreshed);
+      // An unknown kid while the issuer cannot be reached may be a key it just
+      // rotated in: that is `unavailable` (retry), never a forged token (as Cloud).
+      // The same within the refresh cooldown, when no refetch was made (as Cloud).
+      if (!jwk && (refreshed.stale || refreshed.notRefreshed)) throw new OidcKeysUnavailable();
+    }
+    if (!jwk || (jwk.use && jwk.use !== "sig") || (jwk.alg && jwk.alg !== alg)) throw new OidcInvalid("unknown_key");
+    const key = publicKey(jwk);
+    if ((alg === "RS256") !== (jwk.kty === "RSA")) throw new OidcInvalid("unknown_key");
+    const signed = Buffer.from(`${parts[0]}.${parts[1]}`);
+    const signature = Buffer.from(parts[2]!, "base64url");
+    const ok = alg === "RS256"
+      ? verifySignature("RSA-SHA256", signed, key, signature)
+      : verifySignature("SHA256", signed, { key, dsaEncoding: "ieee-p1363" }, signature);
+    if (!ok) throw new OidcInvalid("signature");
+    // The key lookup may have waited on the issuer: the token must still be in its window now.
+    if ((claims.exp as number) + CLOCK_SKEW_SECONDS <= Math.floor(now().getTime() / 1000)) throw new OidcInvalid("expired");
+    return result;
   };
 }
 

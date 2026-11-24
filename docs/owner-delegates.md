@@ -494,7 +494,12 @@ A `job_workflow_ref` other than the gate's own `workflow_ref` must be pinned
 to a 40-hex commit SHA (400 otherwise): it is matched by name only, and a
 branch or tag can be moved to an edited workflow. The one exception (decided
 2026-11-23): a reusable workflow in the gate's own repository at exactly the
-gate's `ref`, when the gate does not set `allow_source_sha_mismatch`.
+gate's `ref`, when the gate does not set `allow_source_sha_mismatch`. GitHub
+reports a local `uses: ./…` call and a `uses: <repo>/…@<branch>` call with the
+same `job_workflow_ref`, and the second reads the workflow at the branch's head
+when the run starts, so a redeem through such a gate also needs the token's
+`job_workflow_sha` to equal its `sha` (the reusable workflow was read at the
+run's own, approved commit); otherwise it answers `gate_mismatch`.
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
