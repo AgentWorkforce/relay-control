@@ -821,7 +821,8 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
 }): Promise<string[]> {
   const ids = (await executor.query<{ id: string }>(
     `SELECT id FROM delegation_grants
-      WHERE workspace_id = $1 AND status = 'active' AND ($2::uuid IS NULL OR owner_user_id = $2) FOR UPDATE`,
+      WHERE workspace_id = $1 AND status = 'active' AND ($2::uuid IS NULL OR owner_user_id = $2)
+      ORDER BY id FOR UPDATE`,
     [input.workspaceId, input.ownerUserId],
   )).rows.map(row => row.id);
   const revoked = await revokeGrants(executor, { workspaceId: input.workspaceId, grantIds: ids,
@@ -1445,21 +1446,18 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
 }): Promise<RedeemResult> {
   const { workspace } = input;
   const now = deps.now();
-  const context: { ownerUserId?: string; grantId?: string; proven?: boolean } = {};
+  const context: { ownerUserId?: string; grantId?: string; attested?: boolean } = {};
   try {
     const policy = await loadPolicy(deps.database, workspace.id);
     if (!policy.delegation_enabled) refuse("not_enabled");
     if (deps.gateOnly) refuse("unavailable");
     await proveRecipient(deps, input);
-    context.proven = true;
     const approval = (await deps.database.query<ApprovalRow>(
       "SELECT * FROM delegation_approvals WHERE id = $1 AND workspace_id = $2",
       [input.approvalId, workspace.id],
     )).rows[0];
     if (!approval) refuse("no_approval");
-    // Only a recipient Control attested this approval to may redeem it. The
-    // approval's owner is attached to the refusal row only once that holds: a
-    // caller the approval was never attested to writes no row under its owner.
+    // Only a recipient Control attested this approval to may redeem it.
     const attested = (await deps.database.query<{ grant_id: string; accept: string }>(
       `SELECT grant_id, accept FROM delegation_attestations
         WHERE workspace_id = $1 AND approval_id = $2 AND recipient_agent_id = $3
@@ -1467,6 +1465,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       [workspace.id, input.approvalId, input.recipientAgentId],
     )).rows[0];
     if (!attested) refuse("no_approval");
+    context.attested = true;
     context.ownerUserId = approval!.owner_user_id;
     context.grantId = attested!.grant_id;
     if (approval!.invalidated_at) refuse("revoked");
@@ -1527,13 +1526,17 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       logUnavailable("redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId,
         grantId: context.grantId ?? null });
     }
-    // As at attest: only a proven recipient's refusals are written to the audit
-    // log, and an identical one (approval, recipient, action, reason) once per
-    // 10 minutes (as Cloud); repeats are still logged.
-    const repeated = context.proven && await redeemRefusedRecently(deps.database, { workspaceId: workspace.id,
+    // As Cloud (cloud#6501 8939eb6c2): a refusal is audited only once the
+    // approval is known to have been attested to this recipient. Before that
+    // (an unknown approval, or one never attested to it) it is logged only:
+    // Tier D ids derive from a message id, so another member's agent could
+    // otherwise write rows into the approval owner's audit view. An identical
+    // audited refusal (approval, recipient, action, reason) is written once per
+    // 10 minutes; repeats are still logged.
+    const repeated = context.attested && await redeemRefusedRecently(deps.database, { workspaceId: workspace.id,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, action: input.action, reason })
       .catch(() => false);
-    if (context.proven && !repeated) await recordDelegationAudit(deps.database, {
+    if (context.attested && !repeated) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,

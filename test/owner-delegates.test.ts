@@ -704,15 +704,14 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   // A recipient that never had it attested.
   const other = await env.desktopIdentity("second-coder");
   assert.deepEqual((await env.redeem(other, approvalId, prod)).body, { ok: false, reason: "no_approval" });
-  // Its refusal row is written under no owner (and no grant): the approval was
-  // never attested to that caller, so the owner's audit log does not carry it.
-  const unattested = (await env.database.query<{ owner_user_id: string | null; grant_id: string | null }>(
-    `SELECT owner_user_id, grant_id FROM delegation_audit_events
-      WHERE event = 'redeem.refused' AND approval_id = $1 AND recipient_agent_id = $2`,
+  // Logged only, never audited (as Cloud): the approval was never attested
+  // to that caller, so nothing lands in the owner's audit view.
+  const unattested = (await env.database.query(
+    `SELECT 1 FROM delegation_audit_events WHERE event = 'redeem.refused' AND approval_id = $1 AND recipient_agent_id = $2`,
     [approvalId, other.id],
   )).rows;
-  assert.deepEqual(unattested, [{ owner_user_id: null, grant_id: null }]);
-  // An attested recipient's refusal (out_of_scope above) keeps the owner.
+  assert.deepEqual(unattested, []);
+  // An attested recipient's refusal (out_of_scope above) is audited under the owner.
   const scoped = (await env.database.query<{ owner_user_id: string | null }>(
     `SELECT owner_user_id FROM delegation_audit_events
       WHERE event = 'redeem.refused' AND approval_id = $1 AND reason = 'out_of_scope'`, [approvalId],
@@ -735,7 +734,9 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   const redeemed = await env.events("approval.redeemed");
   assert.equal(redeemed.length, 1);
   const refused = new Set((await env.events("redeem.refused")).map(row => row.reason));
-  for (const code of ["out_of_scope", "no_approval", "consumed"]) assert.ok(refused.has(code), code);
+  for (const code of ["out_of_scope", "consumed"]) assert.ok(refused.has(code), code);
+  // An unknown approval, or one never attested to the caller, is never audited.
+  assert.equal(refused.has("no_approval"), false);
 });
 
 test("redeem: revocation invalidates unredeemed approvals at once", async (t) => {
