@@ -732,6 +732,31 @@ export function createRelaycastClient(input: {
       return { ...agent, channels, workspaceId: text(record(data)?.workspace_id) };
     },
 
+    /**
+     * Relaycast #543 GET /v1/deliveries/by-message/:id: proof that this exact
+     * message is still pending for the agent token, with the server-derived
+     * sender id and, where the engine stores one, the immutable
+     * `owner_approval` (relay docs/design/owner-trusted-delegates.md §16.2).
+     * Unknown, foreign, acknowledged and expired ids all answer null.
+     */
+    async pendingDeliveryForMessage(token: string, messageId: string): Promise<{
+      message_id: string; sender_agent_id: string | null; workspace_id: string; channel_id: string;
+      owner_approval: unknown; created_at: string | null;
+    } | null> {
+      const data = await labeled("delivery_by_message", () =>
+        call("GET", `/v1/deliveries/by-message/${encodeURIComponent(messageId)}`, token, undefined, undefined, true));
+      if (data === null) return null;
+      const row = record(data);
+      const id = text(row?.message_id);
+      const workspace = text(row?.workspace_id);
+      const channel = text(row?.channel_id);
+      if (!row || id !== messageId || !workspace || !channel) throw new RelaycastCallError(502, "", true);
+      return {
+        message_id: id, sender_agent_id: text(row.sender_agent_id), workspace_id: workspace, channel_id: channel,
+        owner_approval: row.owner_approval ?? null, created_at: text(row.created_at),
+      };
+    },
+
     async heartbeat(token: string): Promise<void> {
       await labeled("heartbeat", () => call("POST", "/v1/agents/heartbeat", token, {}));
     },
