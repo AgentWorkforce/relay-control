@@ -269,9 +269,12 @@ The receiving agent redeems right before **every** action (§6.3), and every
 redeem is audited (`approval.redeemed`). Single use is **per action** (§5.1):
 each action of a single-use approval redeems once, and redeeming one never
 consumes another. Single-use classes are `release`, every `deploy`,
-`secret_change`, `destructive`, `spend` and `config_change`; an owner-minted
-approval can also be single-use as a whole. A multi-use action is re-checked
-on every redeem and never consumed. Control:
+`secret_change`, `destructive`, `spend` and `config_change`: each such action
+is single use on its own, and never makes the rest of its approval single use.
+Only an owner-minted approval with an explicit `single_use: true` is single
+use as a whole, and only that choice sets the claims' `single_use` (a
+delegate's approval always has `single_use: false`). A multi-use action is
+re-checked on every redeem and never consumed. Control:
 
 - requires an earlier attestation of that approval to this recipient
   (otherwise `no_approval`), and re-checks standing under that attestation's

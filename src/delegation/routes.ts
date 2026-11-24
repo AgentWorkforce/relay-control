@@ -976,7 +976,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const expiresAt = body.expires_at ? Date.parse(body.expires_at) : from + APPROVAL_DEFAULT_MS;
       if (expiresAt <= from) fail("invalid_expiry", "expires_at must be in the future", 400);
       if (expiresAt > from + APPROVAL_MAX_MS) fail("invalid_expiry", "expires_at may be at most 24 hours away", 400);
-      const singleUse = body.single_use === true || actions.some(highRisk);
+      // The approval-wide flag is the owner's explicit choice only; high-risk
+      // actions are single use per action at redeem.
+      const singleUse = body.single_use === true;
       const id = mintId("apv");
       await input.database.transaction(async (tx) => {
         await tx.query(
