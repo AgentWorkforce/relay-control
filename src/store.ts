@@ -1227,6 +1227,19 @@ export class ControlPlaneStore {
     );
   }
 
+  /**
+   * The workspace's existing Relaycast binding, or null. Unlike
+   * relaycastBinding, it never provisions one, so routes that run before any
+   * caller is proven (delegation claims/complete, withdraw, gate redeem)
+   * cannot cause a persistent change.
+   */
+  async existingRelaycastBinding(workspaceId: string): Promise<{
+    relaycastWorkspaceId: string;
+    relaycastApiKey: string;
+  } | null> {
+    return this.relaycastBindingRow(workspaceId);
+  }
+
   private async relaycastBindingRow(workspaceId: string): Promise<{
     relaycastWorkspaceId: string;
     relaycastApiKey: string;
