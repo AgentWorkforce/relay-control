@@ -92,6 +92,9 @@ on in production, check each of these (decided 2026-11-23):
       (#289).
 - [ ] Verifier UIs label `claims.quote` as delegate-asserted text, not the
       owner's words (#312).
+- [ ] Release gates: decide who may register a gate for a repository
+      (installation coverage, code ownership or admin) before relying on
+      gates for another code owner's approvals (#313).
 
 ## Who may call what
 
@@ -419,10 +422,11 @@ may be in another repo), and the token's `job_workflow_ref` must match it
 exactly too. A gate without `job_workflow_ref` covers only the jobs defined
 in its own file: the token's `job_workflow_ref` must be absent or equal its
 `workflow_ref` (a job inside a reusable workflow must be named on the gate).
-A `job_workflow_ref` other than the gate's own `workflow_ref`, in this
-repository or another, must be pinned to a 40-hex commit SHA (400 otherwise):
-it is matched by name only, and a branch or tag can be moved to an edited
-workflow.
+A `job_workflow_ref` other than the gate's own `workflow_ref` must be pinned
+to a 40-hex commit SHA (400 otherwise): it is matched by name only, and a
+branch or tag can be moved to an edited workflow. The one exception (decided
+2026-11-23): a reusable workflow in the gate's own repository at exactly the
+gate's `ref`, when the gate does not set `allow_source_sha_mismatch`.
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when

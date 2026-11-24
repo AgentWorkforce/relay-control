@@ -946,12 +946,20 @@ test("live default branch: connection uncached, public cached 5 min per reposito
   assert.equal(calls, before + 2);
 });
 
-test("gates: any job_workflow_ref other than workflow_ref is SHA-pinned, in this repository too", async (t) => {
+test("gates: a job_workflow_ref other than workflow_ref is SHA-pinned, except in the gate's own repo at its ref (no opt-out)", async (t) => {
   const env = await setup(t);
   const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
-  const sameRepoBranch = await env.browser("/delegates/gates", "POST", { ...body,
+  // Decided 2026-11-23 (D2): the gate's own repository at exactly the gate's ref needs no pin...
+  const sameRepoAtRef = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:beta:`,
     job_workflow_ref: `${REPO}/.github/workflows/publish.yml@refs/heads/main` });
-  assert.equal(sameRepoBranch.status, 400, sameRepoBranch.raw);
+  assert.equal(sameRepoAtRef.status, 201, sameRepoAtRef.raw);
+  // ...but another ref of the same repository does, and so does an opt-out gate.
+  const sameRepoOtherRef = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:nightly:`,
+    job_workflow_ref: `${REPO}/.github/workflows/publish.yml@refs/heads/dev` });
+  assert.equal(sameRepoOtherRef.status, 400, sameRepoOtherRef.raw);
+  const optOut = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:canary:`, allow_source_sha_mismatch: true,
+    job_workflow_ref: `${REPO}/.github/workflows/publish.yml@refs/heads/main` });
+  assert.equal(optOut.status, 400, optOut.raw);
   const equal = await env.browser("/delegates/gates", "POST", { ...body, job_workflow_ref: WORKFLOW });
   assert.equal(equal.status, 201, equal.raw);
   const sameRepoSha = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable:`,

@@ -303,12 +303,16 @@ const gateBody = z.object({
     if (!job || (job[1]!.endsWith("*") && job[1] !== gate.ref_pattern)) {
       context.addIssue({ code: "custom", message: "job_workflow_ref must be <owner>/<repo>/.github/workflows/<file>@<ref or commit SHA>" });
     } else {
-      // Any job_workflow_ref other than the run's own workflow_ref, in this
-      // repository or another, is pinned to a commit SHA (as Cloud): a
-      // reusable workflow is matched by name only, and a branch or tag can be
-      // moved to an edited workflow.
-      if (gate.job_workflow_ref !== gate.workflow_ref && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
-        context.addIssue({ code: "custom", message: "a job_workflow_ref other than workflow_ref must be pinned to a 40-hex commit SHA" });
+      // A job_workflow_ref other than the run's own workflow_ref is pinned to
+      // a commit SHA (a reusable workflow is matched by name only, and a branch
+      // or tag can be moved to an edited workflow). Decided 2026-11-23 (D2): a
+      // reusable workflow in the gate's OWN repository at exactly the gate's
+      // ref needs no pin, unless the gate opts out of the source-sha binding.
+      const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
+      const sameRepoAtGateRef = jobRepo.toLowerCase() === gate.repo.toLowerCase() && gate.ref !== undefined &&
+        job[1] === gate.ref && gate.allow_source_sha_mismatch !== true;
+      if (gate.job_workflow_ref !== gate.workflow_ref && !sameRepoAtGateRef && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
+        context.addIssue({ code: "custom", message: "a job_workflow_ref other than workflow_ref must be pinned to a 40-hex commit SHA, unless it is in the gate's own repository at the gate's ref (without allow_source_sha_mismatch)" });
       }
     }
   }
