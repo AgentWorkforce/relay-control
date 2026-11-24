@@ -132,7 +132,7 @@ export async function copilotDesktopSetup(t: TestContext,
    * issued at once. Returns the one-time handoff bearer and, after the S256
    * redemption, the renewable session (the parent).
    */
-  async function desktopSignIn(options: { hostName?: string; userId?: string } = {}) {
+  async function desktopSignIn(options: { hostName?: string; userId?: string; exchange?: boolean } = {}) {
     const session = await browserSession(options.userId);
     const params = new URLSearchParams({
       redirect_uri: "http://127.0.0.1:5123/callback/STATE1", state: "STATE1", client: "desktop",
@@ -163,6 +163,8 @@ export async function copilotDesktopSetup(t: TestContext,
     }
     const handoffToken = new URL(location!).searchParams.get("access_token")!;
     assert.match(handoffToken, /^sh_at_/);
+    // Without the exchange: the redirect token alone, its PKCE proof still pending.
+    if (options.exchange === false) return { session, handoffToken, accessToken: "", refreshToken: "" };
     const exchanged = await request(origin, "/cloud/api/v1/auth/desktop/session", {
       method: "POST", token: handoffToken, body: { codeVerifier: VERIFIER },
     });

@@ -25,7 +25,7 @@ import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_IDENTITY_TOOLS, MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
 import { historyReadable, historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
 import { sessionAccessConfigured } from "../sessions/access.js";
-import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
+import { ClaudeAttestationError, claudeAttestationFor, postgresClaudeHandoffStore, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
 import { nativeContextRefusalReason, responseCorrelationId, type NativeContextStage } from "./native-context-refusal.js";
@@ -188,6 +188,7 @@ export function createMcpHandler(input: {
   const desktopCredentials = new DesktopMcpCredentials(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
+  const claudeHandoffs = postgresClaudeHandoffStore(store.database);
   // Calls made under the hosted-MCP owner lock share one time budget; all others are unchanged.
   const relayFetch = ownerLockFetch(input.fetchImpl);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: relayFetch });
@@ -443,13 +444,18 @@ export function createMcpHandler(input: {
       // that does not verify refuses the call (no unattested fallback).
       // Copilot credentials carry a Copilot proof; every other call may carry
       // a Claude Code or Cursor proof, which counts only on desktop-managed calls (as Cloud).
-      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
+      // A Claude Code proof may instead have been handed off ahead of the call
+      // (keyed by _meta claudecode/toolUseId), so the hook never rewrites input.
+      // The token family binds a handed-off proof to the Desktop session that
+      // deposited it (a provider credential shares its parent's family).
+      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider,
+        tokenFamilyId: principal.tokenFamilyId };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
       const callHeaders = oauth || staffGrant || agentToken ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
-        : await claudeAttestationFor(body, callHeaders, auth, attestations);
+        : await claudeAttestationFor(body, callHeaders, auth, attestations, undefined, { store: claudeHandoffs });
       stage = "desktop_context";
       desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {

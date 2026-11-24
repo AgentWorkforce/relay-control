@@ -74,6 +74,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "integration_oauth_apps",
   "integration_oauth_states",
   "login_attempts",
+  "mcp_attestation_handoffs",
   "mcp_attestation_tool_uses",
   "mcp_oauth_authorization_codes",
   "mcp_oauth_clients",
