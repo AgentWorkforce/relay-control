@@ -37,12 +37,12 @@ test("the committed bundle is pinned: a section change needs a new sha, version 
 test("composition filters by audience, keeps safety first, appends the overlay and versions it", () => {
   const bundle = loadAgentRules();
   const lead = composeAgentRules(bundle, "lead", null);
-  assert.deepEqual(lead.sections.map(section => section.id), ["safety", "lead-delegation", "lead-orchestration"]);
+  assert.deepEqual(lead.sections.map(section => section.id), ["safety", "lead-delegation", "lead-orchestration", "stall-watch"]);
   assert.equal(lead.version, bundle.version);
   assert.match(lead.text, /## Orchestrate; don't implement serially/);
   const procedure = grokRoutinePrompt("fake-grok", { canReply: true });
   const grok = composeAgentRules(bundle, "grok-bot", { version: 3, text: "Escalate to the owner." }, { grokRoutinePrompt: procedure });
-  assert.deepEqual(grok.sections.map(section => section.id), ["safety", "grok-inbox", "grok-delegation", "show-ui", "organization"]);
+  assert.deepEqual(grok.sections.map(section => section.id), ["safety", "grok-inbox", "grok-delegation", "show-ui", "stall-watch", "organization"]);
   assert.equal(grok.version, `${bundle.version}+org.3`);
   assert.ok(grok.text.includes(procedure), "grok-inbox is the grant's copied routine procedure");
   assert.ok(grok.text.indexOf("## Safety") < grok.text.indexOf("## Organization rules"));
@@ -130,6 +130,28 @@ test("HTTP: members read composed rules with ETag and markdown; only admins writ
   assert.equal(otherOverlay.rows.length, 0);
   assert.equal((await fetch(`${f.base}/api/v1/organizations/${other}/agent-rules/grok-bot`, { headers: headers(owner) })).status, 404);
   assert.equal((await (await put(owner, "")).json() as any).cleared, true);
+});
+
+test("Phase 3: stall watching reaches Grok bots and leads; the AgentWorkforce overlay text is lint-clean and adds the orchestration rule", () => {
+  const bundle = loadAgentRules();
+  for (const audience of ["grok-bot", "lead"] as const) {
+    const text = composeAgentRules(bundle, audience, null).text;
+    assert.match(text, /## Watch in-flight work/);
+    assert.match(text, /follow up with send_relay_message/);
+    assert.match(text, /without waiting to be asked/);
+    assert.match(text, /A run with no new messages still does this check\./);
+  }
+  assert.doesNotMatch(composeAgentRules(bundle, "worker", null).text, /Watch in-flight work/);
+  for (const file of readdirSync(resolve(directory, "overlays"))) {
+    const text = readFileSync(resolve(directory, "overlays", file), "utf8");
+    assert.equal(rulesTextProblem(text.trim()), null, `${file} fails the overlay lint`);
+  }
+  const overlay = readFileSync(resolve(directory, "overlays", "agentworkforce-grok-bot.md"), "utf8");
+  const grok = composeAgentRules(bundle, "grok-bot", { version: 1, text: overlay });
+  assert.match(grok.text, /## Organization rules\n\nYou orchestrate; you do not code or decide\./);
+  assert.match(grok.text, /Send all coding work to Claude or Codex coding agents\./);
+  assert.match(grok.text, /Surface problems to Khaliq \(khaliq-gant on Agent Relay\) directly/);
+  assert.ok(grok.text.indexOf("## Watch in-flight work") < grok.text.indexOf("## Organization rules"));
 });
 
 test("the server's wiring reads SELFHOST_GROK_DYNAMIC_PROMPT from config, so the shipped server pastes the bootstrap", () => {

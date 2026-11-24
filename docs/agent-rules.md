@@ -79,3 +79,33 @@ The `lead` audience carries the layered lead kit's delegation and
 orchestration guidance, copied as is. Having the layered lead start-up script
 fetch it (`GET /api/v1/agent-rules/lead`, falling back to a pinned snapshot)
 is a change for the layered-agents owner; this repository only serves it.
+
+## Orchestration and stall-watching rules
+
+These rules come from Phase 3 of the spec. Decision D7 split them as
+follows:
+
+- **Stall watching** is the base section `stall-watch`, for the `grok-bot`
+  and `lead` audiences, so every tenant gets it. A bot keeps a list of the
+  work it has delegated and follows up on agents that have not reported: after
+  30 minutes since the last message, or 10 minutes after a spawn with no
+  acknowledgement. It routes blockers, and it tells the person who owns the
+  work without waiting to be asked. A run with no new messages still does the
+  check. A webhook routine only runs when a message arrives, so a bot that
+  must catch stalls in quiet periods also needs a scheduled routine. That is
+  opt-in and is not created automatically (decision D6).
+- **Orchestration only** ("Grok bots do no coding or real decision-making;
+  coding goes to Claude and Codex agents; they spawn, route and relay") is
+  AgentWorkforce policy, not a default for every tenant. Its reviewed text,
+  including escalation to Khaliq, is
+  `agent-rules/overlays/agentworkforce-grok-bot.md`. It takes effect only once
+  an AgentWorkforce organization owner or admin applies it:
+
+  ```sh
+  jq -Rs '{text: .}' agent-rules/overlays/agentworkforce-grok-bot.md |
+    curl -sS -X PUT "$SELFHOST_PUBLIC_URL/api/v1/organizations/$ORG_ID/agent-rules/grok-bot" \
+      -H "Authorization: Bearer $OWNER_OR_ADMIN_TOKEN" -H 'Content-Type: application/json' --data-binary @-
+  ```
+
+  Applying it on a production deployment is a production change and needs
+  Khaliq's OK.
