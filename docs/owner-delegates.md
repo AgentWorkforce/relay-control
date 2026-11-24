@@ -74,6 +74,25 @@ To avoid even one refetch, publish the new public key first: add it to
 `SELFHOST_DELEGATION_PREVIOUS_KEYS`, wait an hour, then switch the signing
 key and move the old public key into the previous list.
 
+## Enablement checklist
+
+Delegation is off by default. Before a workspace turns `delegation_enabled`
+on in production, check each of these (decided 2026-11-23):
+
+- [ ] The real-Postgres delegation tests run in CI, not only locally (#286):
+      they prove commit-safe audit paging, serialized consumption and the
+      sweep's lock behaviour.
+- [ ] A signing key is configured and published (`GET
+      /.well-known/relay-delegation-keys.json` lists it), with a rotation plan
+      (above).
+- [ ] `RELAYCAST_INTERNAL_SECRET` is set if quotes must be redacted in
+      Relaycast too, and the redaction backlog is watched
+      (`docs/delegation-quote-redaction-runbook.md`).
+- [ ] Alerts exist for `delegation.unavailable` and `delegation.revoke_failed`
+      (#289).
+- [ ] Verifier UIs label `claims.quote` as delegate-asserted text, not the
+      owner's words (#312).
+
 ## Who may call what
 
 **Human-only routes** (`/delegates`, `/delegates/{grant_id}`, `revoke-all`,
