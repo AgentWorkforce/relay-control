@@ -391,7 +391,11 @@ can wait on a session lock) and re-checks expiry right before consuming.
 Grant creation locks the owner's active grants to the agent (by id), then the
 agent's claim rows, the order claim release and revocation use, and re-proves
 the binding under those locks; a release that waited re-reads the grants once
-it holds the claim and revokes one created meanwhile. Its `exp` is the
+it holds the claim and revokes one created meanwhile. Creation and release for
+one agent first take a per-agent advisory lock, so a second creation can never
+hold a new grant's row lock while a release re-reads the grants. A stamp left
+by the earlier spent rule on a mixed approval does not keep it from being
+revoked: revocation skips only approvals spent under the current rule. Its `exp` is the
 least of 300 seconds after issue, the approval window found earlier, and the
 grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take

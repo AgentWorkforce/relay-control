@@ -381,3 +381,79 @@ test("an approval is spent only when every action is single use and consumed: a 
       "SELECT id FROM delegation_approvals WHERE invalidated_at IS NOT NULL ORDER BY id")).rows.map(row => row.id);
     assert.deepEqual(invalidated, ["apv_mixed00000001"]);
   });
+
+test("a mixed approval stamped spent by the earlier rule is still revoked; a truly spent one is not", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  const stamped = (id: string, singleUse: boolean, actions: Array<{ class: string; target: string }>) => database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at, consumed_at)
+     VALUES ($1, $2, $3, 'O', $4::jsonb, $5, now() + interval '1 hour', now())`, [id, workspaceId, ownerId, JSON.stringify(actions), singleUse]);
+  const release = { class: "release", target: "AgentWorkforce/relay" };
+  const merge = { class: "merge", target: "AgentWorkforce/relay#9" };
+  await stamped("apv_legacymixed01", false, [merge, release]);
+  await stamped("apv_trulyspent001", false, [release]);
+  await stamped("apv_explicitspent", true, [merge]);
+  await database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
+    reason: "owner_revoke_all", authMethod: "session" }));
+  const invalidated = (await database.query<{ id: string }>(
+    "SELECT id FROM delegation_approvals WHERE invalidated_at IS NOT NULL ORDER BY id")).rows.map(row => row.id);
+  assert.deepEqual(invalidated, ["apv_legacymixed01"]);
+});
+
+test("two grant creations and a claim release for one agent serialize without deadlock", options, async (t) => {
+  const { pool, database, workspaceId, ownerId } = await fixture(t);
+  await database.query(
+    `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at, consumed_at, agent_id)
+     VALUES ('clm_twocreators01', $1, $2, 'h1', now() + interval '10 minutes', now(), 'ag_bot')`, [workspaceId, ownerId]);
+  await database.query(
+    `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+     VALUES ($1, 'rw', 'ag_bot', 'bot', $2, 'clm_twocreators01')`, [workspaceId, ownerId]);
+  const insertGrant = (executor: SqlExecutor, id: string) => executor.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, expires_at, created_auth_method)
+     SELECT $3, $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + interval '1 day', 'session'
+       FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId, id]);
+  const waiters = async (count: number) => {
+    for (let attempt = 0; ; attempt += 1) {
+      const waiting = (await database.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
+      )).rows[0]!.count;
+      if (waiting >= count) return;
+      assert.ok(attempt < 300, `expected ${count} waiting transactions`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const first = await pool.connect();
+  const second = await pool.connect();
+  try {
+    // Creation A holds its locks; a release, then creation B, queue behind it.
+    await first.query("BEGIN");
+    const a = first as unknown as SqlExecutor;
+    await lockGrantAndClaims(a, workspaceId, ownerId, "ag_bot");
+    const release = releaseClaim(database, { workspaceId, claimId: "clm_twocreators01", actorUserId: ownerId, admin: false,
+      authMethod: "session" });
+    await waiters(1);
+    await second.query("BEGIN");
+    const b = second as unknown as SqlExecutor;
+    const creationB = (async () => {
+      await lockGrantAndClaims(b, workspaceId, ownerId, "ag_bot");
+      await second.query("COMMIT");
+    })();
+    await waiters(2);
+    // Both wait on the per-agent advisory lock, before any row lock: a
+    // creation can never hold a new grant's row lock while the release holds
+    // the claim and re-reads the grants.
+    const advisory = (await database.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).rows[0]!.count;
+    assert.equal(advisory, 2);
+    await insertGrant(a, "grt_creationa0001");
+    await first.query("COMMIT");
+    const [released, created] = await Promise.allSettled([release, creationB]);
+    assert.equal(released.status, "fulfilled", JSON.stringify(released));
+    assert.equal(created.status, "fulfilled", JSON.stringify(created));
+    assert.deepEqual((released as PromiseFulfilledResult<unknown>).value,
+      { claimId: "clm_twocreators01", revokedGrants: ["grt_creationa0001"] });
+  } finally {
+    first.release();
+    second.release();
+  }
+});

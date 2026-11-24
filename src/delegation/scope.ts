@@ -331,9 +331,11 @@ export function actionsCovered(scopes: readonly Scope[], actions: readonly Pick<
 }
 
 /** §16.1: high-risk actions are always single-use. */
+/** §16.1: classes that are always single use, per action; `deploy` in every environment. */
+export const HIGH_RISK_CLASSES: readonly string[] = ["release", "deploy", "secret_change", "destructive", "spend", "config_change"];
+
 export function highRisk(action: Pick<Action, "class" | "target">): boolean {
-  // §16.1: always single use, per action; `deploy` in every environment.
-  return ["release", "deploy", "secret_change", "destructive", "spend", "config_change"].includes(action.class);
+  return HIGH_RISK_CLASSES.includes(action.class);
 }
 
 /** The classes in `actions` that need tier O under the defaults, the workspace policy and the grant. */

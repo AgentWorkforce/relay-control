@@ -19,6 +19,7 @@ import {
   CLAIM_TTL_MS,
   DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
+  HIGH_RISK_CLASSES,
   highRisk,
   ownerApprovalSchema,
   ownerDisplay,
@@ -734,6 +735,18 @@ export async function markSpentIfComplete(executor: SqlExecutor, approvalId: str
   await executor.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL", [approvalId]);
 }
 
+/**
+ * SQL: the approval row is spent under the current rule (cloud#6603): stamped,
+ * and EVERY action single use (approval-wide `single_use`, or a high-risk
+ * class; `$n` is HIGH_RISK_CLASSES). Revocation skips only these. A stamp
+ * left by the earlier rule on a mixed approval (one with a reusable action)
+ * does not keep it from being revoked.
+ */
+function spentApprovalSql(param: number): string {
+  return `(consumed_at IS NOT NULL AND (single_use OR NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(actions) AS action WHERE NOT (action->>'class' = ANY($${param}::text[])))))`;
+}
+
 export async function revokeGrants(executor: SqlExecutor, input: {
   workspaceId: string; grantIds: string[]; actorUserId: string | null; reason: string; authMethod: string | null;
 }): Promise<GrantRow[]> {
@@ -749,10 +762,10 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   const ids = revoked.map(row => row.id);
   await executor.query(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
         AND (grant_id = ANY($2::text[])
           OR id IN (SELECT approval_id FROM delegation_attestations WHERE grant_id = ANY($2::text[])))`,
-    [input.workspaceId, ids],
+    [input.workspaceId, ids, HIGH_RISK_CLASSES],
   );
   for (const row of revoked) {
     await recordDelegationAudit(executor, {
@@ -765,6 +778,16 @@ export async function revokeGrants(executor: SqlExecutor, input: {
 }
 
 /**
+ * Serializes grant creation and claim release for one delegate agent, before
+ * either takes a row lock. Release re-reads the grants after it holds the
+ * claim; without this, a second creation holding a new grant's row lock and
+ * waiting for the claim would deadlock with that re-read.
+ */
+async function lockDelegateAgent(tx: SqlExecutor, workspaceId: string, agentId: string): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`delegation-agent:${workspaceId}:${agentId}`]);
+}
+
+/**
  * Grant creation's locks, in the one order releaseClaim and revocation use
  * (cloud#6603 0592d777c): this owner's active grants to the agent (by id),
  * then the agent's claim rows (by id). expireLapsed then updates those same
@@ -772,6 +795,7 @@ export async function revokeGrants(executor: SqlExecutor, input: {
  */
 export async function lockGrantAndClaims(tx: SqlExecutor, workspaceId: string, ownerUserId: string,
   agentId: string): Promise<void> {
+  await lockDelegateAgent(tx, workspaceId, agentId);
   await tx.query(
     `SELECT id FROM delegation_grants
       WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
@@ -801,7 +825,8 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
       [input.workspaceId, input.claimId],
     )).rows[0];
     if (!seen || (seen.user_id !== input.actorUserId && !input.admin)) return null;
-    // Grants first (by id), then the claim.
+    // Serialized with grant creation for this agent, then grants (by id), then the claim.
+    if (seen.agent_id) await lockDelegateAgent(tx, input.workspaceId, seen.agent_id);
     const grantIds = seen.agent_id ? (await tx.query<{ id: string }>(
       `SELECT id FROM delegation_grants
         WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
@@ -855,10 +880,10 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
     actorUserId: input.actorUserId, reason: input.reason, authMethod: input.authMethod });
   const approvals = (await executor.query<{ id: string }>(
     `UPDATE delegation_approvals SET invalidated_at = now()
-      WHERE workspace_id = $1 AND invalidated_at IS NULL AND consumed_at IS NULL
+      WHERE workspace_id = $1 AND invalidated_at IS NULL AND NOT ${spentApprovalSql(3)}
         AND ($2::uuid IS NULL OR owner_user_id = $2)
       RETURNING id`,
-    [input.workspaceId, input.ownerUserId],
+    [input.workspaceId, input.ownerUserId, HIGH_RISK_CLASSES],
   )).rows;
   // One summary event for the approvals revoked here (tier O ones have no grant event), as Cloud.
   if (approvals.length) {
