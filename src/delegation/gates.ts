@@ -167,7 +167,9 @@ function reusableReadAtRunCommit(gate: GateMatchFields, claims: ClaimMatchFields
   if (claims.job_workflow_sha === null) return false;
   // A commit pin is judged by what the issuer read, never by the selector's
   // shape: a branch may itself be named `…@<40 hex>` (as Cloud).
-  const selector = gate.job_workflow_ref.slice(gate.job_workflow_ref.lastIndexOf("@") + 1);
+  // The selector is everything after the FIRST `@`: owner, repo and file
+  // name hold none, so a branch such as `refs/heads/a@<40 hex>` stays a branch.
+  const selector = gate.job_workflow_ref.slice(gate.job_workflow_ref.indexOf("@") + 1);
   if (/^[0-9a-f]{40}$/u.test(selector) && claims.job_workflow_sha === selector) return true;
   return claims.job_workflow_sha === claims.sha;
 }

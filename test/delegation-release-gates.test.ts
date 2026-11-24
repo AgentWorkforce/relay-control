@@ -693,6 +693,21 @@ test("gate redeem: a reusable workflow named by branch serves only when read at 
   assert.deepEqual((await env.redeem(atRunCommit, approvalId)).body, { ok: true, consumed: true });
 });
 
+// Parity with Cloud: a branch named `a@<40 hex>` is a branch, not a commit pin, even when GitHub read the
+// reusable workflow at the very commit its name ends with.
+test("gates: a branch whose name ends in @<40 hex> is never treated as a commit pin", async () => {
+  const { gateMatches } = await import("../src/delegation/gates.js");
+  const hex = "e".repeat(40);
+  const ref = `refs/heads/a@${hex}`;
+  const file = (name: string) => `${REPO}/.github/workflows/${name}.yml@${ref}`;
+  const gate = { issuer: GITHUB, repo: REPO, workflow_ref: file("caller"), job_workflow_ref: file("publish"), ref, ref_pattern: null,
+    event: "push", repository_id: "70151234", repository_owner_id: "90122" };
+  const claims = { issuer: GITHUB, repository: REPO, workflow_ref: file("caller"), job_workflow_ref: file("publish"), ref,
+    event_name: "push", repository_id: "70151234", repository_owner_id: "90122", sha: SHA };
+  assert.equal(gateMatches(gate, { ...claims, job_workflow_sha: hex }), false);
+  assert.equal(gateMatches(gate, { ...claims, job_workflow_sha: SHA }), true);
+});
+
 test("gate redeem: single use is per action; another action of the same approval is unaffected", async (t) => {
   const env = await setup(t);
   await env.gate();
