@@ -94,6 +94,7 @@ import {
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
 import { isUuid, type FlowsStore } from "./flows/store.js";
+import { OrganizationTeams, TeamsError, teamName } from "./teams/store.js";
 import {
   grantJson,
   parseMintRequest,
@@ -874,6 +875,7 @@ export function createApp(input: {
   /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
   const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
+  const organizationTeams = new OrganizationTeams(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
@@ -2803,7 +2805,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const organizationId = membershipCollection[0]!;
       const auth = await organizationAccess(request, organizationId, method === "POST");
       if (method === "GET") {
-        json(response, 200, { memberships: await store.listMemberships(organizationId) });
+        // teamId is shown only to the operator bearer and live owners and
+        // admins, the callers the team routes admit (docs/teams.md).
+        const teams = features.teams && (auth.kind === "bootstrap" ||
+          ["owner", "admin"].includes(await store.memberRole(organizationId, auth.principal.userId) ?? ""));
+        json(response, 200, { memberships: await store.listMemberships(organizationId, { teams }) });
         return;
       }
       if (method === "POST") {
@@ -2883,6 +2889,62 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       oauthTeardown?.kick();
       response.writeHead(204);
       response.end();
+      return;
+    }
+
+    // Organization teams (docs/teams.md): owners and admins, behind the teams feature.
+    const teamCollection = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams$/);
+    const teamItem = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams\/([^/]+)$/);
+    const teamMember = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
+    const teamRoute = teamCollection && (method === "GET" || method === "POST") ? teamCollection
+      : teamItem && (method === "PATCH" || method === "DELETE") ? teamItem
+      : teamMember && (method === "PUT" || method === "DELETE") ? teamMember
+      : undefined;
+    if (teamRoute) {
+      const organizationId = teamRoute[0]!;
+      const auth = await organizationAccess(request, organizationId, true);
+      requireFeature("teams");
+      // Cookie writes: JSON from an allowed origin; a bodiless PUT or DELETE
+      // needs an allowed Origin (or same-origin fetch metadata).
+      if (method !== "GET" && !bearer(request)) {
+        const allowed = method === "POST" || method === "PATCH"
+          ? cookieRequestAllowed(request, browserOrigins)
+          : cookieDeleteAllowed(request, browserOrigins);
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const actor = auth.kind === "user"
+        ? { kind: "user" as const, userId: auth.principal.userId }
+        : { kind: "bootstrap" as const };
+      if (teamCollection && method === "GET") {
+        const archived = url.searchParams.getAll("archived");
+        if (archived.length > 1 || (archived.length === 1 && archived[0] !== "true")) {
+          throw new HttpError(400, "invalid_request", "archived must be true when present");
+        }
+        json(response, 200, { teams: await organizationTeams.list(organizationId, archived.length === 1) }, true);
+        return;
+      }
+      if (teamCollection) {
+        const body = await requestObject(request);
+        json(response, 201, await organizationTeams.create({ organizationId, name: teamName(body.name), actor }), true);
+        return;
+      }
+      if (teamItem && method === "PATCH") {
+        const body = await requestObject(request);
+        json(response, 200, await organizationTeams.rename({
+          organizationId, teamId: teamItem[1]!, name: teamName(body.name), actor,
+        }), true);
+        return;
+      }
+      if (teamItem) {
+        json(response, 200, await organizationTeams.archive({ organizationId, teamId: teamItem[1]!, actor }), true);
+        return;
+      }
+      const [, teamId, userId] = teamMember as [string, string, string];
+      if (method === "PUT") {
+        json(response, 200, await organizationTeams.assign({ organizationId, teamId, userId, actor }), true);
+        return;
+      }
+      json(response, 200, { unassigned: await organizationTeams.unassign({ organizationId, teamId, userId, actor }) }, true);
       return;
     }
 
@@ -3583,6 +3645,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (error instanceof CapturePolicyError) {
+        json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
+      if (error instanceof TeamsError) {
         json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }

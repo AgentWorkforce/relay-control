@@ -2372,7 +2372,12 @@ paths:
       operationId: listMemberships
       responses:
         "200":
-          description: Organization memberships
+          description: >-
+            Organization memberships: `{ memberships: [{ userId, email, name,
+            role, joinedAt }] }`. With the `teams` feature on and an owner,
+            admin or bootstrap bearer caller, each item also carries `teamId`
+            (uuid or null), the member's current team; a member never gets
+            `teamId`.
     post:
       operationId: putMembership
       description: >-
@@ -2418,6 +2423,157 @@ paths:
           description: Membership removed and its workspace token sessions cascaded
         "409":
           description: Membership is absent or is the last owner
+  /api/v1/organizations/{organizationId}/teams:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationTeams
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Organization owner/admin or bootstrap bearer; requires the `teams`
+        feature (docs/teams.md). Live teams ordered by lower(name), then id;
+        with `archived=true`, archived teams follow the live ones.
+      parameters:
+        - { name: archived, in: query, required: false, schema: { type: string, enum: ["true"] } }
+      responses:
+        "200":
+          description: "`{ teams: [OrganizationTeam] }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [teams]
+                properties:
+                  teams: { type: array, items: { $ref: "#/components/schemas/OrganizationTeam" } }
+        "400": { description: "`invalid_request`: `archived` has a value other than `true`" }
+        "403": { description: "`forbidden` (not an owner or admin) or `feature_not_enabled`" }
+        "404": { description: "`organization_not_found`" }
+    post:
+      operationId: createOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Creates a team. The name is trimmed and must be 1 to 80 characters
+        with no control characters (U+0000 to U+001F, U+007F). Writes a `team.create` audit row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: The created team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrganizationTeam" }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found`" }
+        "409": { description: "`team_name_taken`: a live team has the same name, ignoring case" }
+  /api/v1/organizations/{organizationId}/teams/{teamId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      operationId: renameOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Renames a live team (same name rules as create). The current name is
+        a no-op. Writes a `team.rename` audit row when the name changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "200":
+          description: The team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrganizationTeam" }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
+        "409": { description: "`team_archived` or `team_name_taken`" }
+    delete:
+      operationId: archiveOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Archives the team and closes its open assignments. Already archived:
+        200 with `unassigned` 0. Writes a `team.archive` audit row when it
+        archives.
+      responses:
+        "200":
+          description: "`{ team, unassigned }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [team, unassigned]
+                properties:
+                  team: { $ref: "#/components/schemas/OrganizationTeam" }
+                  unassigned: { type: integer, minimum: 0 }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
+  /api/v1/organizations/{organizationId}/teams/{teamId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      operationId: assignOrganizationTeamMember
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Puts a current member in the team, closing their current assignment
+        first (a person has one team per organization). Already in this team:
+        nothing is written and `previousTeamId` is the team id. Writes a
+        `team.assign` audit row when it changes something.
+      responses:
+        "200":
+          description: "`{ assignment: { userId, teamId, startsAt }, previousTeamId }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignment, previousTeamId]
+                properties:
+                  assignment:
+                    type: object
+                    required: [userId, teamId, startsAt]
+                    properties:
+                      userId: { type: string, format: uuid }
+                      teamId: { type: string, format: uuid }
+                      startsAt: { type: string, format: date-time }
+                  previousTeamId: { type: [string, "null"], format: uuid }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found`, `team_not_found` or `membership_not_found`" }
+        "409": { description: "`team_archived`" }
+    delete:
+      operationId: unassignOrganizationTeamMember
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Closes the person's assignment to this team. `unassigned` is false
+        (nothing written) when they are not in it. Writes a `team.unassign`
+        audit row when it closes one.
+      responses:
+        "200":
+          description: "`{ unassigned }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unassigned]
+                properties:
+                  unassigned: { type: boolean }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
   /api/v1/organizations/{organizationId}/domains:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -11150,9 +11306,20 @@ components:
               type: integer
               minimum: 0
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
+    OrganizationTeam:
+      type: object
+      required: [id, name, memberCount, archivedAt, createdAt, updatedAt]
+      description: An organization team (docs/teams.md). memberCount counts open assignments of current members.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 80 }
+        memberCount: { type: integer, minimum: 0 }
+        archivedAt: { type: [string, "null"], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, session_access, enrollment_keys, enrollment_self_mint]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, teams, session_delete, session_access, enrollment_keys, enrollment_self_mint]
       additionalProperties: false
       description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, and session_access from session-read configuration, not SELFHOST_FEATURES.
       properties:
@@ -11163,6 +11330,7 @@ components:
         launch: { type: boolean }
         usage_people: { type: boolean }
         events_shim: { type: boolean }
+        teams: { type: boolean }
         session_delete:
           type: boolean
           description: True when the erase API URL and dedicated secret are configured and operator controls permit writes. Configuration availability only, not an upstream health or per-session storage verdict; owner/admin authorization is still required for DELETE.
