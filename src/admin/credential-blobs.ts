@@ -16,6 +16,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
+import { drainBody } from "../drain-body.js";
 import { DefaultAwsCredentialProvider, type AwsCredentialProvider } from "../aws/sigv4.js";
 
 export type CredentialEnvelope = {
@@ -166,6 +167,7 @@ export class GcsObjectBackend implements CredentialObjectBackend {
       body,
     });
     if (!response.ok) throw new CredentialBlobError("backend_failed", `GCS upload failed: ${response.status}`);
+    await drainBody(response, "credential-blobs.gcs.put");
   }
   async get(key: string): Promise<string | null> {
     const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(this.bucket)}/o/${encodeURIComponent(this.name(key))}?alt=media`;
@@ -183,6 +185,7 @@ export class GcsObjectBackend implements CredentialObjectBackend {
     if (!response.ok && response.status !== 404) {
       throw new CredentialBlobError("backend_failed", `GCS delete failed: ${response.status}`);
     }
+    await drainBody(response, "credential-blobs.gcs.delete");
   }
 }
 
