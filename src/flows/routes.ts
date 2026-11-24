@@ -168,11 +168,29 @@ function createInitializedFlowsHandler(deps: {
    * enrollment or callback credential) and before mutations or queue work.
    */
   requireFeature: () => void;
+  /** True for a bearer call, or a cookie call with JSON and an allowed Origin. */
+  csrfAllowed: (request: IncomingMessage) => boolean;
+  /** True for a bearer call, or a cookie call with an allowed Origin (bodiless writes). */
+  originAllowed: (request: IncomingMessage) => boolean;
 }): (request: IncomingMessage, response: ServerResponse, path: string, url: URL) => Promise<boolean> {
   const { store, publicBaseUrl, requireFeature } = deps;
-  const userAccess: FlowsUserAccess = async (request, admin) => {
+  /**
+   * Dashboard (membership) access. Writes get the same origin check as the
+   * other cookie writes: JSON plus an allowed Origin, or only the Origin for
+   * a write without a body (`body: "none"`, the default for DELETE).
+   */
+  const userAccess = async (
+    request: IncomingMessage,
+    admin?: boolean,
+    body: "json" | "none" = request.method === "DELETE" ? "none" : "json",
+  ): ReturnType<FlowsUserAccess> => {
     const access = await deps.userAccess(request, admin);
     requireFeature();
+    const method = request.method ?? "GET";
+    if (method !== "GET" && method !== "HEAD") {
+      const allowed = body === "none" ? deps.originAllowed(request) : deps.csrfAllowed(request);
+      if (!allowed) throw new FlowsError(403, "csrf_rejected", "Cross-origin request refused");
+    }
     return access;
   };
   const config = store.config;
@@ -710,7 +728,7 @@ function createInitializedFlowsHandler(deps: {
       return true;
     }
     if ((params = match(path, /^\/api\/v1\/workflows\/runs\/([^/]+)\/cancel$/)) && method === "POST") {
-      const access = await userAccess(request);
+      const access = await userAccess(request, false, "none");
       const run = await store.cancelRun(access.workspace.id, params[0]!, access.principal.email);
       if (!run) throw new FlowsError(404, "run_not_found", "Run not found");
       send(response, 200, { runId: run.runId, status: run.status });
@@ -902,6 +920,8 @@ export function createFlowsHandler(deps: {
   publicBaseUrl: string;
   userAccess: FlowsUserAccess;
   requireFeature: () => void;
+  csrfAllowed: (request: IncomingMessage) => boolean;
+  originAllowed: (request: IncomingMessage) => boolean;
 }): ReturnType<typeof createInitializedFlowsHandler> {
   let handler: ReturnType<typeof createInitializedFlowsHandler> | undefined;
   return async (request, response, path, url) => {
