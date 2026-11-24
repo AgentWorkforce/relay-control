@@ -308,8 +308,6 @@ export function validConfigPattern(pattern: string): boolean {
 
 /** Whether a grant pattern of `cls` covers `target` (or, with `subsumes`, another pattern). */
 export function classTargetCovered(cls: ActionClass, pattern: string, target: string, subsumes = false): boolean {
-  // Release targets are matched field by field, never as generic segments (as the hosted twin).
-  if (cls === "release") return subsumes ? releasePatternWithin(target, pattern) : releaseTargetCovered(pattern, target);
   if (cls === "config_change") {
     if (!validConfigPattern(pattern)) return false;
     if (subsumes) return pattern === "*" ? validConfigPattern(target) : target === pattern;
@@ -405,6 +403,15 @@ export function sha256Hex(value: string): string {
 const REPO_PART = "[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}";
 const SHA40 = "[0-9a-f]{40}";
 /**
+ * A land branch: letters, digits, `.`, `_`, `/` and `-`, and only a name
+ * `git check-ref-format --branch` accepts (as the hosted twin): no leading
+ * `-`, `.` or `/`, no `..`, no component starting with `.` or ending in
+ * `.lock`, no `//`, and no trailing `/` or `.`. Git refuses every name this
+ * leaves out, so no real branch is lost, and a grant pattern such as
+ * `owner/repo:land:bad..branch:*` names nothing and is refused.
+ */
+const BRANCH = String.raw`(?![-./])(?![^:]*\.\.)(?![^:]*/\.)(?![^:]*\.lock(?:/|:))(?![^:]*//)(?![^:]*[/.]:)[A-Za-z0-9._/-]{1,200}`;
+/**
  * Release targets (§11a.2), as Cloud's RELEASE_TARGETS. A `release` action
  * names exactly one release:
  * - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
@@ -414,7 +421,7 @@ const SHA40 = "[0-9a-f]{40}";
  */
 export const RELEASE_TARGETS: readonly RegExp[] = [
   new RegExp(`^${REPO_PART}:(?!land:|ios:)[a-z][a-z0-9_-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA40}:[1-9][0-9]{0,19}(?::[A-Za-z0-9_.-]{1,64})?$`, "u"),
-  new RegExp(`^${REPO_PART}:land:[A-Za-z0-9._/-]{1,200}:${SHA40}$`, "u"),
+  new RegExp(`^${REPO_PART}:land:${BRANCH}:${SHA40}$`, "u"),
   // A build number is dot-separated digit groups (`42`, `2026.11.7.3`), at most 32 characters.
   new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:(?=[0-9.]{1,32}:)[0-9]+(?:\\.[0-9]+)*:${SHA40}$`, "u"),
 ];
@@ -438,52 +445,38 @@ export function releaseTargetSha(target: string): { sha: string; form: "candidat
 }
 
 /**
- * A release target or release grant pattern as tokens: `owner`, `/`, `repo`,
- * then its `:`-separated fields. Git forbids `:` in a branch, so a land
- * target's branch is ONE field even when it holds `/` (`feature/x`), which the
- * generic tokens would split into several segments. Null without an
- * `owner/repo:` head.
+ * Release grant patterns match like every other pattern (§16.1): segments
+ * between `/`, `:` and `#`, `*` standing for exactly one non-empty segment.
+ * So `owner/repo:land:*:*` covers `main` but not `feature/x`, and
+ * `owner/repo:land:feature/*:*` covers `feature/x`: a stored grant covers
+ * exactly the targets it covered before, as the hosted twin.
  */
-function releaseTokens(value: string): string[] | null {
-  const colon = value.indexOf(":");
-  if (colon < 0) return null;
-  const repo = value.slice(0, colon).split("/");
-  if (repo.length !== 2 || repo.some(part => part.includes("#"))) return null;
-  return [repo[0]!, "/", repo[1]!, ":", ...value.slice(colon + 1).split(/(:)/u)];
-}
+
+/** Per release form, a valid value for each field after `owner/repo`, standing in for a whole-field `*`. */
+const RELEASE_FORM_SAMPLES: readonly (readonly string[])[] = [
+  ["land", "x", "0".repeat(40)],
+  ["ios", "x", "1", "0".repeat(40)],
+  ["x", "v0", "0".repeat(40), "1"],
+  ["x", "v0", "0".repeat(40), "1", "x"],
+];
 
 /**
- * Whether a release grant pattern can cover some release target (§11a.2):
- * `owner/repo:<form fields>` with whole-field wildcards and as many fields as
- * a release form has (land 3, ios 4, a candidate 4 or 5). A bare
- * `owner/repo`, `owner/*` or `*` covers no release target, so it is refused
- * rather than stored as a grant that silently covers nothing.
+ * Whether a release grant pattern can cover some release target (§11a.2), as
+ * the hosted twin. It is a valid pattern (`*` a whole segment), and its
+ * literals fit one release form: the pattern with each `*` replaced by a
+ * valid value is itself a release target within the length limit.
+ * `owner/repo`, `owner/*`, `owner/repo:land:bad..branch:*` or a candidate
+ * without a 40-character sha cover nothing, so they are refused at grant
+ * create and PATCH rather than stored as a grant that silently covers nothing.
  */
 export function validReleasePattern(pattern: string): boolean {
-  if (!pattern || pattern.length > MAX_TARGET_CHARS || /[\u0000-\u001f\u007f\s]/.test(pattern)) return false;
-  const tokens = releaseTokens(pattern);
-  if (!tokens || !tokens.every((token, index) => index % 2 === 1 ||
-    (token !== "" && (token === "*" || !token.includes("*"))))) return false;
-  const fields = (tokens.length - 3) / 2;
-  const form = tokens[4];
-  if (fields === 3) return form === "land" || form === "*";
-  if (fields === 4) return form !== "land";
-  return fields === 5 && form !== "land" && form !== "ios";
-}
-
-/** Whether a release grant pattern covers one release target, field by field. */
-function releaseTargetCovered(pattern: string, target: string): boolean {
-  if (!validReleasePattern(pattern) || !validReleaseTarget(target)) return false;
-  const want = releaseTokens(pattern)!;
-  const have = releaseTokens(target);
-  if (!have || want.length !== have.length) return false;
-  return want.every((token, index) => token === "*" ? have[index] !== "" : token === have[index]);
-}
-
-/** Whether a narrower release pattern is wholly inside a wider one (PATCH may only narrow). */
-function releasePatternWithin(narrow: string, wide: string): boolean {
-  if (!validReleasePattern(narrow) || !validReleasePattern(wide)) return false;
-  const want = releaseTokens(wide)!;
-  const have = releaseTokens(narrow)!;
-  return want.length === have.length && want.every((token, index) => token === "*" || token === have[index]);
+  if (!validTargetPattern(pattern)) return false;
+  // Git forbids `:` in a branch and the repo has none, so `:` only ever separates fields.
+  const [head, ...fields] = pattern.split(":");
+  const fill = (field: string, sample: string) =>
+    field === "*" ? sample : field.split(/([/#])/u).map(token => token === "*" ? "x" : token).join("");
+  return RELEASE_FORM_SAMPLES.some(samples => samples.length === fields.length && (() => {
+    const target = [fill(head!, "x"), ...fields.map((field, index) => fill(field, samples[index]!))].join(":");
+    return target.length <= MAX_TARGET_CHARS && validReleaseTarget(target);
+  })());
 }

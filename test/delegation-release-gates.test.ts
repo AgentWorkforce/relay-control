@@ -598,25 +598,30 @@ test("gate consume: expiry is judged on a clock read after the gate and approval
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
 });
 
-test("release grants match release fields: a land branch with `/` is one field; a pattern that covers no release is refused", async (t) => {
-  const land = `${REPO}:land:feature/x/y:${SHA}`;
+test("release grants keep segment matching; a pattern no release fits is refused (as the hosted twin)", async (t) => {
+  const land = `${REPO}:land:feature/x:${SHA}`;
   assert.ok(validReleaseTarget(land));
-  for (const pattern of [`${REPO}:land:*:*`, "AgentWorkforce/*:land:*:*", `${REPO}:land:feature/x/y:*`, `${REPO}:*:*:*`]) {
-    assert.ok(classTargetCovered("release", pattern, land), pattern);
-  }
-  assert.ok(!classTargetCovered("release", `${REPO}:land:main:*`, land));
+  // A stored grant covers exactly what it covered before: `*` is one segment, so `land:*:*` does not reach `feature/x`.
+  assert.ok(!classTargetCovered("release", `${REPO}:land:*:*`, land));
+  assert.ok(!classTargetCovered("release", "AgentWorkforce/*:land:*:*", land));
+  assert.ok(classTargetCovered("release", `${REPO}:land:*:*`, `${REPO}:land:main:${SHA}`));
+  assert.ok(classTargetCovered("release", `${REPO}:land:feature/*:*`, land));
+  assert.ok(classTargetCovered("release", `${REPO}:land:feature/x:*`, land));
   assert.ok(!classTargetCovered("release", `${REPO}:stable:*:*:*`, land));
   assert.ok(classTargetCovered("release", `${REPO}:stable:*:*:*`, STABLE));
   assert.ok(!classTargetCovered("release", REPO, STABLE));
-  assert.ok(classTargetCovered("release", `${REPO}:*:*:*:*:*`, `${STABLE}:mac`));
-  // PATCH narrowing, field by field.
-  assert.ok(classTargetCovered("release", "AgentWorkforce/*:land:*:*", `${REPO}:land:feature/x:*`, true));
-  assert.ok(!classTargetCovered("release", `${REPO}:land:*:*`, "AgentWorkforce/*:land:*:*", true));
-  for (const pattern of [`${REPO}:stable:*:*:*`, `${REPO}:stable:*:*:*:*`, `${REPO}:land:*:*`, `${REPO}:ios:testflight:*:*`]) {
+  // Git refuses these branch names, so no land target names them.
+  for (const branch of ["bad..branch", "-x", ".x", "a/.b", "a.lock", "a/b.lock/c", "a//b", "a/", "a."]) {
+    assert.ok(!validReleaseTarget(`${REPO}:land:${branch}:${SHA}`), branch);
+  }
+  for (const pattern of [`${REPO}:stable:*:*:*`, `${REPO}:stable:*:*:*:*`, `${REPO}:land:*:*`, `${REPO}:land:feature/*:*`,
+    "AgentWorkforce/*:land:*:*", `${REPO}:ios:testflight:*:*`, `${REPO}:*:*:*`]) {
     assert.ok(validReleasePattern(pattern), pattern);
   }
+  // Each `*` replaced by a valid value must give a real release target.
   for (const pattern of [REPO, "AgentWorkforce/*", "*", `${REPO}#1`, `${REPO}:stable:*`, `${REPO}:land:*:*:*`,
-    `${REPO}:stab*:*:*:*`, `${REPO}:stable::*:*`, `${REPO}/x:stable:*:*:*`]) {
+    `${REPO}:land:bad..branch:*`, `${REPO}:stable:*:main:*`, `${REPO}:stab*:*:*:*`, `${REPO}:stable::*:*`,
+    `${REPO}/x:stable:*:*:*`, `${REPO}:land:${"b".repeat(230)}:*`]) {
     assert.ok(!validReleasePattern(pattern), pattern);
   }
   // Grant creation refuses a release pattern that covers nothing.
@@ -630,6 +635,16 @@ test("release grants match release fields: a land branch with `/` is one field; 
   const granted = await env.browser("/delegates", "POST", { delegate_agent_id: assistant,
     scopes: [{ class: "release", targets: ["AgentWorkforce/*:land:*:*"] }] });
   assert.equal(granted.status, 201, granted.raw);
+  // That stored `land:*:*` grant covers a one-segment branch, and does not gain `feature/x`.
+  const recipient = env.world.agents.get("relay-coder")!;
+  const attest = async (target: string) => {
+    const messageId = env.world.sendApprovalAs("assistant", "relay-coder", "land it",
+      { v: 1, owner_id: env.ownerId, actions: [{ class: "release", target }] }).message.id;
+    return (await request(env.origin, `${env.base}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
+      body: { recipient_agent_id: recipient.id, recipient_token: recipient.token, message_id: messageId } })).body;
+  };
+  assert.equal((await attest(`${REPO}:land:main:${SHA}`)).verdict, "delegate");
+  assert.deepEqual(await attest(land), { verdict: "none", reason: "out_of_scope" });
 });
 
 test("every gate route is documented in openapi.yaml", () => {

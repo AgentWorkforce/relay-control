@@ -609,13 +609,21 @@ dry_run?}`. Control checks, in order:
    - `<repo>:ios:<distribution>:<build number>:<sha>` (the build number is
      dot-separated digit groups, at most 32 characters)
 
-   A `release` grant pattern names these fields, with `*` standing for one
-   whole field: `owner/repo:stable:*:*:*`, `owner/*:land:*:*`. Fields are
-   separated by `:` only (git forbids it in a branch), so a land branch such
-   as `feature/x` is one field and `owner/repo:land:*:*` covers it. A pattern
-   that can cover no release target (a bare `owner/repo`, `owner/*` or `*`)
-   is refused when a grant is created or patched; a grant stored with one
-   before this rule covers no release and is never widened.
+   The land `<branch>` is letters, digits, `.`, `_`, `/` and `-`, and only a
+   name `git check-ref-format --branch` accepts (no `..`, no leading `-`,
+   `.` or `/`, no component starting with `.` or ending in `.lock`, no `//`,
+   no trailing `/` or `.`).
+
+   A `release` grant pattern matches like every other pattern: `*` stands
+   for exactly one segment between `/`, `:` or `#`. So
+   `owner/repo:land:*:*` covers `main` but not `feature/x`, and
+   `owner/repo:land:feature/*:*` covers `feature/x`; a stored grant covers
+   exactly what it covered before. A pattern is accepted when a grant is
+   created or patched only if replacing each `*` with a valid value gives a
+   real release target within 256 characters, so `owner/repo`, `owner/*`,
+   `*`, `owner/repo:land:bad..branch:*` and `owner/repo:stable:*:main:*`
+   are refused (`400`). A grant stored with such a pattern before this rule
+   still covers no release.
 
    Rollout: a `release` approval minted before this grammar with a bare
    `owner/repo` (or any other non-release) target is deliberately not
