@@ -660,18 +660,22 @@ export async function recordRelaycastRedaction(executor: SqlExecutor, input: { w
  * the caller's transaction. Returns the revoked rows (inactive ones are skipped).
  */
 /**
- * Whether every single-use action of an approval has been consumed (single
- * use is per action, §5.1: a high-risk action always is, and every action of
- * an approval explicitly marked single use). False when it has none.
+ * Whether an approval is used up (cloud#6603 0592d777c): EVERY action is single
+ * use (a high-risk action always is, and every action of an approval
+ * explicitly marked single use) and every one has been consumed. An approval
+ * with a reusable action is never spent, so attest still delegates it.
  */
+function everyActionSingleUse(approval: Pick<ApprovalRow, "actions" | "single_use">): boolean {
+  return approval.actions.length > 0 && approval.actions.every(action => approval.single_use || highRisk(action));
+}
+
 async function everySingleUseActionSpent(executor: SqlExecutor,
   approval: Pick<ApprovalRow, "id" | "actions" | "single_use">): Promise<boolean> {
-  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
-  if (!singleUse.length) return false;
+  if (!everyActionSingleUse(approval)) return false;
   const spent = new Set((await executor.query<{ class: string; target: string }>(
     "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approval.id],
   )).rows.map(row => `${row.class} ${row.target}`));
-  return singleUse.every(action => spent.has(`${action.class} ${action.target}`));
+  return approval.actions.every(action => spent.has(`${action.class} ${action.target}`));
 }
 
 /** Whether one action of an approval has been consumed. */
@@ -717,22 +721,16 @@ async function consumeLocked(tx: SqlExecutor, input: { approvalId: string; works
 }
 
 /**
- * Stamps `consumed_at` once every single-use action of the approval has been
- * consumed (single use is per action, §5.1), as Cloud. A fully spent approval
- * is then no longer "unredeemed": grant revocation and revoke-all leave it
- * alone.
+ * Stamps `consumed_at` once the approval is spent: EVERY action is single use
+ * and consumed (cloud#6603 0592d777c). A spent approval is no longer
+ * "unredeemed", so grant revocation and revoke-all leave it alone; one that
+ * still has a reusable action stays live, so a revocation still reaches it.
  */
 export async function markSpentIfComplete(executor: SqlExecutor, approvalId: string): Promise<void> {
-  const approval = (await executor.query<Pick<ApprovalRow, "actions" | "single_use">>(
-    "SELECT actions, single_use FROM delegation_approvals WHERE id = $1 AND consumed_at IS NULL", [approvalId],
+  const approval = (await executor.query<Pick<ApprovalRow, "id" | "actions" | "single_use">>(
+    "SELECT id, actions, single_use FROM delegation_approvals WHERE id = $1 AND consumed_at IS NULL", [approvalId],
   )).rows[0];
-  if (!approval) return;
-  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
-  if (!singleUse.length) return;
-  const spent = new Set((await executor.query<{ class: string; target: string }>(
-    "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approvalId],
-  )).rows.map(row => `${row.class} ${row.target}`));
-  if (!singleUse.every(action => spent.has(`${action.class} ${action.target}`))) return;
+  if (!approval || !await everySingleUseActionSpent(executor, approval)) return;
   await executor.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL", [approvalId]);
 }
 
@@ -767,6 +765,26 @@ export async function revokeGrants(executor: SqlExecutor, input: {
 }
 
 /**
+ * Grant creation's locks, in the one order releaseClaim and revocation use
+ * (cloud#6603 0592d777c): this owner's active grants to the agent (by id),
+ * then the agent's claim rows (by id). expireLapsed then updates those same
+ * grant rows, so they are taken first.
+ */
+export async function lockGrantAndClaims(tx: SqlExecutor, workspaceId: string, ownerUserId: string,
+  agentId: string): Promise<void> {
+  await tx.query(
+    `SELECT id FROM delegation_grants
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
+      ORDER BY id FOR UPDATE`,
+    [workspaceId, ownerUserId, agentId],
+  );
+  await tx.query(
+    "SELECT id FROM delegation_claims WHERE workspace_id = $1 AND agent_id = $2 ORDER BY id FOR UPDATE",
+    [workspaceId, agentId],
+  );
+}
+
+/**
  * Releases a claim (DELETE /delegates/claims/{id}), as Cloud's releaseClaim:
  * its owner or an org owner/admin cancels a pending code, or ends a completed
  * claim's binding and revokes the owner's active grants to that agent
@@ -796,12 +814,20 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
       [input.workspaceId, input.claimId],
     )).rows[0];
     if (!claim) return null;
+    // A grant created while this release waited on a lock (it holds the
+    // claim lock until it commits) is read again now and revoked too, as Cloud.
+    const allGrantIds = claim.agent_id ? (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_grants
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
+        ORDER BY id FOR UPDATE`,
+      [input.workspaceId, claim.user_id, claim.agent_id],
+    )).rows.map(row => row.id) : grantIds;
     await tx.query("UPDATE delegation_claims SET released_at = now() WHERE id = $1", [claim.id]);
     let revokedGrants: string[] = [];
     if (claim.consumed_at && claim.agent_id) {
       // The binding the claim created ends, and so does any grant through it.
       await tx.query("DELETE FROM delegation_agent_bindings WHERE workspace_id = $1 AND claim_id = $2", [input.workspaceId, claim.id]);
-      revokedGrants = (await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds, actorUserId: input.actorUserId,
+      revokedGrants = (await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds: allGrantIds, actorUserId: input.actorUserId,
         reason: "delegate_released", authMethod: input.authMethod })).map(row => row.id);
     }
     await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "delegate.released", actorUserId: input.actorUserId,
@@ -1504,6 +1530,12 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       if (stale) refuse(stale);
       if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
+      // The bearer check can itself wait on a session lock (cloud#6603
+      // 0592d777c): read the clock again and re-check expiry (and the rest of
+      // the locked state) right before consuming.
+      const late = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
+        recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
+      if (late) refuse(late);
       // Single use is per action (§5.1): one atomic insert per action.
       if (singleUse && !await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
         consumedBy: input.recipientAgentId })) refuse("consumed");

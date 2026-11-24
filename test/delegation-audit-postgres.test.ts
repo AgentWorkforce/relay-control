@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
-import { PostgresDatabase } from "../src/database.js";
-import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit, redactExpiredQuotes, releaseClaim, revokeAllGrants } from "../src/delegation/service.js";
+import { PostgresDatabase, type SqlExecutor } from "../src/database.js";
+import { consumeAction, decideUnderLocks, expireLapsed, listAuditPage, lockGrantAndClaims, recordDelegationAudit, redactExpiredQuotes, releaseClaim, revokeAllGrants } from "../src/delegation/service.js";
 import { createDelegationRetention } from "../src/delegation/retention.js";
 import { migrate } from "../src/migrations.js";
 import { isolatedPostgresPool } from "./support/postgres.js";
@@ -289,3 +289,95 @@ test("the retention sweep takes the oldest due quotes across workspaces, so one 
   assert.equal(await redactExpiredQuotes(database, 2), 2);
   assert.deepEqual(await Promise.all(busyRows.map(quoted)), [null, null, "old words", "old words", "old words"]);
 });
+
+test("grant creation locks grants (by id) then the claim: replacing an expired grant while the claim is released never deadlocks", options,
+  async (t) => {
+    const { pool, database, workspaceId, ownerId } = await fixture(t);
+    await database.query(
+      `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at, consumed_at, agent_id)
+       VALUES ('clm_lockorder00001', $1, $2, 'h1', now() + interval '10 minutes', now(), 'ag_bot')`, [workspaceId, ownerId]);
+    await database.query(
+      `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+       VALUES ($1, 'rw', 'ag_bot', 'bot', $2, 'clm_lockorder00001')`, [workspaceId, ownerId]);
+    // An active grant that has lapsed: creation's expireLapsed updates it.
+    const insertGrant = (executor: { query: typeof database.query }, id: string, expires: string) => executor.query(
+      `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+         scopes, expires_at, created_auth_method)
+       SELECT $3, $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + $4::interval, 'session'
+         FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId, id, expires]);
+    await insertGrant(database, "grt_lapsed0000001", "-1 minute");
+
+    // Creation takes its locks and holds them while a release starts.
+    const creator = await pool.connect();
+    try {
+      await creator.query("BEGIN");
+      // A pg client is all these helpers use (query only).
+      const tx = creator as unknown as SqlExecutor;
+      await lockGrantAndClaims(tx, workspaceId, ownerId, "ag_bot");
+      const release = releaseClaim(database, { workspaceId, claimId: "clm_lockorder00001", actorUserId: ownerId, admin: false,
+        authMethod: "session" });
+      // Wait until the release is blocked on one of creation's locks.
+      for (let attempt = 0; ; attempt += 1) {
+        const waiting = (await database.query<{ count: number }>(
+          "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
+        )).rows[0]!.count;
+        if (waiting > 0) break;
+        assert.ok(attempt < 200, "the release never waited on creation's locks");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      // Creation expires the lapsed grant (an update of a row the release wants) and inserts the new one.
+      await expireLapsed(tx, workspaceId, ownerId, "ag_bot");
+      await insertGrant(creator, "grt_replacement001", "1 day");
+      await creator.query("COMMIT");
+      // The release then re-reads the grants under the claim lock and revokes the new one: no deadlock.
+      const released = await release;
+      assert.deepEqual(released, { claimId: "clm_lockorder00001", revokedGrants: ["grt_replacement001"] });
+    } finally {
+      creator.release();
+    }
+    const statuses = (await database.query<{ id: string; status: string }>(
+      "SELECT id, status FROM delegation_grants ORDER BY id")).rows;
+    assert.deepEqual(statuses, [{ id: "grt_lapsed0000001", status: "expired" }, { id: "grt_replacement001", status: "revoked" }]);
+  });
+
+test("an approval is spent only when every action is single use and consumed: a mixed one stays live for revocation", options,
+  async (t) => {
+    const { database, workspaceId, ownerId } = await fixture(t);
+    const approval = async (id: string, singleUse: boolean, actions: Array<{ class: string; target: string }>) => {
+      await database.query(
+        `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+         VALUES ($1, $2, $3, 'O', $4::jsonb, $5, now() + interval '1 hour')`, [id, workspaceId, ownerId, JSON.stringify(actions), singleUse]);
+      return actions;
+    };
+    const spent = async (id: string) => (await database.query<{ consumed_at: Date | null }>(
+      "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [id])).rows[0]!.consumed_at !== null;
+    const release = { class: "release" as const, target: "AgentWorkforce/relay" };
+    const comment = { class: "pr_ops" as const, target: "AgentWorkforce/relay#5:comment" };
+    // Mixed: the release is single use, the comment is reusable. Consuming the release never spends it.
+    await approval("apv_mixed00000001", false, [release, comment]);
+    assert.equal(await consumeAction(database, { approvalId: "apv_mixed00000001", workspaceId, action: release, consumedBy: "r" }), true);
+    assert.equal(await spent("apv_mixed00000001"), false);
+    // Every action single use (two high-risk ones): spent once both are consumed.
+    const deploy = { class: "deploy" as const, target: "relay:prod" };
+    await approval("apv_allsingle0001", false, [release, deploy]);
+    await consumeAction(database, { approvalId: "apv_allsingle0001", workspaceId, action: release, consumedBy: "r" });
+    assert.equal(await spent("apv_allsingle0001"), false);
+    await consumeAction(database, { approvalId: "apv_allsingle0001", workspaceId, action: deploy, consumedBy: "r" });
+    assert.equal(await spent("apv_allsingle0001"), true);
+    // An explicit approval-wide single_use makes the comment single use too.
+    await approval("apv_explicit00001", true, [release, comment]);
+    await consumeAction(database, { approvalId: "apv_explicit00001", workspaceId, action: release, consumedBy: "r" });
+    await consumeAction(database, { approvalId: "apv_explicit00001", workspaceId, action: comment, consumedBy: "r" });
+    assert.equal(await spent("apv_explicit00001"), true);
+    // Revoke-all reaches the mixed approval (it is still unredeemed), not the spent one.
+    await database.query(
+      `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+         scopes, expires_at, created_auth_method)
+       SELECT 'grt_spentrule0001', $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + interval '1 day', 'session'
+         FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId]);
+    await database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
+      reason: "owner_revoke_all", authMethod: "session" }));
+    const invalidated = (await database.query<{ id: string }>(
+      "SELECT id FROM delegation_approvals WHERE invalidated_at IS NOT NULL ORDER BY id")).rows.map(row => row.id);
+    assert.deepEqual(invalidated, ["apv_mixed00000001"]);
+  });

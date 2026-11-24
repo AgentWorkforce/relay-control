@@ -268,8 +268,10 @@ owner, otherwise `code_owner`.
 ### pr_ops (§5.1)
 
 An approval names one operation on one PR: `owner/repo#N:<op>`, where `<op>`
-is `open`, `close`, `reopen`, `label=<name>`, `unlabel=<name>`,
-`request_review=<login>`, `rerun_ci` or `comment`. A grant of `owner/repo`,
+is `close`, `reopen`, `label=<name>`, `unlabel=<name>`,
+`request_review=<login>`, `rerun_ci` or `comment`. There is no `open`, as
+Cloud: a PR's number exists only once it is opened, so such a target could
+never be redeemed; it is refused at validation. A grant of `owner/repo`,
 `owner/repo#N` or `owner/*` covers every op on a covered PR. PR conditions and
 CODEOWNERS standing use the PR part.
 
@@ -379,9 +381,17 @@ They stay best-effort; a failed write is logged
 exception (`delegation.unavailable`). See
 `docs/delegation-quote-redaction-runbook.md` for the log lines.
 
-Once every single-use action of an approval has been consumed, the approval
-is stamped `consumed_at` in the consuming transaction. A fully spent approval
-is no longer unredeemed: grant revocation and `revoke-all` leave it alone. Its `exp` is the
+An approval is spent only when EVERY action is single use and every one has
+been consumed; it is then stamped `consumed_at` in the consuming transaction.
+A spent approval is no longer unredeemed: grant revocation and `revoke-all`
+leave it alone. One that still has a reusable action (a merge next to a
+release, say) is never spent: attest still delegates it, and a revocation
+still reaches it. Redeem reads the clock again after the bearer check (which
+can wait on a session lock) and re-checks expiry right before consuming.
+Grant creation locks the owner's active grants to the agent (by id), then the
+agent's claim rows, the order claim release and revocation use, and re-proves
+the binding under those locks; a release that waited re-reads the grants once
+it holds the claim and revokes one created meanwhile. Its `exp` is the
 least of 300 seconds after issue, the approval window found earlier, and the
 grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take

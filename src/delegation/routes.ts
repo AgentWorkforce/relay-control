@@ -50,6 +50,7 @@ import {
   QUOTE_RETENTION_DAYS,
   QUOTE_RETENTION_MAX_DAYS,
   recordDelegationAudit,
+  lockGrantAndClaims,
   releaseClaim,
   flushRelaycastRedactions,
   redactExpiredQuotes,
@@ -620,6 +621,14 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           // creating transaction (403 out_of_scope otherwise).
           if (!grantFitsPolicy({ scopes, expires_at: expiresAt, created_at: now() }, current)) {
             fail("out_of_scope", "The grant does not fit the workspace policy", 403);
+          }
+          await lockGrantAndClaims(tx, workspace.id, principal.userId, binding!.agentId);
+          // Re-proved under those locks, on this transaction (as Cloud): a
+          // claim release that committed first refuses the grant; one that
+          // waits re-reads the grants once it has the claim and revokes this one.
+          const bound = await resolveBinding(tx, workspace.id, workspace.relaycastWorkspaceId, binding!.agentId, true);
+          if (!bound || bound.userId !== principal.userId) {
+            fail("not_delegate", "The agent must be bound to you; claim it first", 403);
           }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
           const existing = await tx.query(

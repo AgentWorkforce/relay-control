@@ -3,8 +3,10 @@ import { createHash, createPublicKey, generateKeyPairSync, randomBytes, randomUU
 import test, { type TestContext } from "node:test";
 import { loadDelegationSigning } from "../src/config.js";
 import { encryptSecret } from "../src/crypto.js";
+import type { SqlExecutor } from "../src/database.js";
 import { DelegationSigner, verifyDelegationJws } from "../src/delegation/jws.js";
 import {
+  actionIsValid,
   actionsCovered,
   base62,
   highRisk,
@@ -184,6 +186,9 @@ test("scope matching follows §16.1", () => {
   assert.ok(actionsCovered(prOps, [{ class: "pr_ops", target: "owner/a#7:label=bug" }]));
   assert.ok(!actionsCovered(prOps, [{ class: "pr_ops", target: "owner/b#7:close" }]));
   assert.ok(!actionsCovered(prOps, [{ class: "pr_ops", target: "owner/a:close" }]));
+  // No `open` op (as Cloud): a PR's number exists only once it is opened.
+  assert.equal(actionIsValid({ class: "pr_ops", target: "owner/a#7:open" }), false);
+  assert.equal(actionIsValid({ class: "pr_ops", target: "owner/a#7:close" }), true);
 });
 
 test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
@@ -2014,6 +2019,16 @@ test("review: single use is per action; a high-risk action never makes the whole
   const stored = (await env.database.query<{ single_use: boolean }>("SELECT single_use FROM delegation_approvals WHERE id = $1",
     [approvalId])).rows[0]!;
   assert.equal(stored.single_use, false);
+  // A mixed approval is never spent (cloud#6603): a re-attest still delegates
+  // it, and a revocation still reaches it.
+  const message = (await env.database.query<{ message_id: string }>("SELECT message_id FROM delegation_approvals WHERE id = $1",
+    [approvalId])).rows[0]!.message_id;
+  assert.equal((await env.attest(recipient, message)).body.verdict, "delegate");
+  assert.equal((await env.database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM delegation_approvals WHERE id = $1",
+    [approvalId])).rows[0]!.consumed_at, null);
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  assert.notEqual((await env.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId])).rows[0]!.invalidated_at, null);
 });
 
 test("review: policy PUT keeps omitted fields; config_change denylist is normalised; a merge names exactly one PR", async (t) => {
@@ -2088,4 +2103,34 @@ test("review: an identical redeem refusal is audited once per 10 minutes", async
   const rows = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'redeem.refused' AND approval_id = $1",
     [approvalId])).rows;
   assert.equal(rows.length, 1);
+});
+
+test("review: redeem re-reads the clock after the bearer check, so a wait past expiry consumes nothing", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const release = { class: "release", target: "AgentWorkforce/relay" };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([release])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const approvalId = attested.body.claims.approval_id as string;
+  // The bearer check inside the consuming transaction (a share lock on the
+  // session row) "waits" until the approval has expired: the clock moves
+  // two hours as that read returns.
+  const transaction = env.database.transaction.bind(env.database);
+  let moved = false;
+  env.database.transaction = (async (run: (tx: SqlExecutor) => Promise<unknown>) => transaction(tx => run({
+    ...tx,
+    query: async (sql: string, params?: unknown[]) => {
+      const result = await tx.query(sql, params);
+      if (!moved && /FROM token_sessions/u.test(sql) && /FOR SHARE/u.test(sql)) {
+        moved = true;
+        env.clock.offsetMs = 2 * 60 * 60_000;
+      }
+      return result;
+    },
+  } as SqlExecutor))) as typeof env.database.transaction;
+  const redeemed = await env.redeem(recipient, approvalId, release);
+  assert.equal(moved, true);
+  assert.deepEqual(redeemed.body, { ok: false, reason: "expired" });
+  const consumed = (await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
+    [approvalId])).rows;
+  assert.deepEqual(consumed, []);
 });
