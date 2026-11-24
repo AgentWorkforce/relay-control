@@ -89,9 +89,9 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0088_grok_routines_cloud_copy.sql","sha256":"bb64036356dadda116e0e91a14c43ab4790715bb2e0342b9a8560d265e231b0c"},
-    {"name":"0089_agent_rules_overlays.sql","sha256":"7a495bde88fced08c5bd31e466413d69371cc4e8e8f40fafbe382b653f5d290c"},
     {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
+    {"name":"0093_grok_routines_cloud_copy.sql","sha256":"bb64036356dadda116e0e91a14c43ab4790715bb2e0342b9a8560d265e231b0c"},
+    {"name":"0094_agent_rules_overlays.sql","sha256":"7a495bde88fced08c5bd31e466413d69371cc4e8e8f40fafbe382b653f5d290c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
   "required":[
@@ -2280,5 +2280,5 @@
   "optional":{
 
   },
-  "sha256":"1cf00e2dafd14429a58758b7475abbac5d90a559814cc71a95f2fd9c32945351"
+  "sha256":"5971244524898063afeef41630da62a5d0abeef66b687d07f05f6a849c99c18f"
 }

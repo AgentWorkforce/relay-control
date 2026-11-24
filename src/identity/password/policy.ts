@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { COMMON_PASSWORDS_TEXT } from "./common-passwords.js";
+import { drainBody, type DrainableResponse } from "../../drain-body.js";
 
 /**
  * Password policy (NIST SP 800-63B style): 12 to 128 characters, no
@@ -65,7 +66,7 @@ export function checkPasswordPolicy(password: string, email: string): PolicyViol
 }
 
 export type HibpFetch = (url: string, init: { signal: AbortSignal; headers: Record<string, string> }) =>
-  Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+  Promise<{ ok: boolean; status: number; text(): Promise<string> } & Partial<DrainableResponse>>;
 
 export type HibpResult = "breached" | "clean" | "unavailable";
 
@@ -87,7 +88,10 @@ export async function hibpCheck(
       signal: AbortSignal.timeout(options.timeoutMs ?? 3_000),
       headers: { "add-padding": "true", "user-agent": "relay-control" },
     });
-    if (!response.ok) return "unavailable";
+    if (!response.ok) {
+      await drainBody(response, "password-policy.hibp.unavailable");
+      return "unavailable";
+    }
     for (const line of (await response.text()).split(/\r?\n/)) {
       const [candidate, count] = line.trim().split(":");
       if (candidate?.toUpperCase() === suffix && Number(count) > 0) return "breached";

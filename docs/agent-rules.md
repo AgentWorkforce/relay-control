@@ -16,7 +16,7 @@ two layers:
    Grok Bot connection it is that grant's own routine procedure (Cloud's copied
    `grokRoutinePrompt` for its webhook or polling mode; see
    [grok-bot.md](grok-bot.md#cloud-copy-mode-selfhost_grok_routines_cloud_copy)).
-2. **An organization overlay** (`agent_rules_overlays`, migration `0089`),
+2. **An organization overlay** (`agent_rules_overlays`, migration `0094`),
    appended as "Organization rules". This is where tenant-specific policy
    goes, for example who to escalate to. An overlay can add rules but cannot
    remove a base section.
