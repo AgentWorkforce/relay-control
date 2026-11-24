@@ -3979,6 +3979,66 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/agent-rules/{audience}:
+    parameters:
+      - {name: audience, in: path, required: true, schema: {type: string, enum: [grok-bot, lead, worker]}}
+    get:
+      operationId: getAgentRules
+      description: |
+        Composed operating rules for the caller's organization: the image's base
+        bundle plus the organization overlay. Member with a cli:auth or account
+        bearer (or the /cloud session cookie); MCP OAuth bearers are refused, so use
+        the get_agent_rules MCP tool instead. Send `Accept: text/markdown` for the
+        text alone. See docs/agent-rules.md.
+      responses:
+        "200":
+          description: Composed rules; ETag is the sha256
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [audience, version, sha256, bootstrap_version_current, sections, text]
+                properties:
+                  audience: {type: string}
+                  version: {type: string, description: "Base CalVer, plus +org.<n> with an overlay"}
+                  sha256: {type: string}
+                  bootstrap_version_current: {type: integer}
+                  sections: {type: array, items: {type: object, properties: {id: {type: string}, title: {type: string}}}}
+                  text: {type: string}
+            text/markdown:
+              schema: {type: string}
+        "304": {description: Matches If-None-Match}
+        "401": {description: Authentication required}
+        "403": {description: Unexchanged handoff or missing cli:auth/account scope}
+        "404": {description: Unknown audience or no membership}
+  /api/v1/organizations/{organizationId}/agent-rules/{audience}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - {name: audience, in: path, required: true, schema: {type: string, enum: [grok-bot, lead, worker]}}
+    get:
+      operationId: getAgentRulesOverlay
+      description: Organization owner/admin or bootstrap bearer. The active overlay, or null. See docs/agent-rules.md.
+      responses:
+        "200": {description: "{audience, overlay: {version, text, updatedAt} | null, base_version}"}
+        "403": {description: Owner/admin role required}
+        "404": {description: Organization or audience not found}
+    put:
+      operationId: putAgentRulesOverlay
+      description: |
+        Organization owner/admin or bootstrap bearer. Appends a new overlay version;
+        an empty text clears it. At most 16 KiB; text that looks like a secret,
+        token, credential-bearing URL or routine webhook URL is refused. Audited as
+        agent_rules.overlay_set / agent_rules.overlay_cleared.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [text], properties: {text: {type: string, maxLength: 16384}}}
+      responses:
+        "200": {description: "{audience, version, cleared, version_string}"}
+        "400": {description: Invalid text}
+        "403": {description: Owner/admin role required or cross-origin cookie write}
+        "404": {description: Organization or audience not found}
   /api/v1/organizations/{organizationId}/workspace-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"

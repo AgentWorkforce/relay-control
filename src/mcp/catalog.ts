@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProviderStatus } from "../providers/registry.js";
 import { GROK_EVENT_TOOLS, GROK_ROUTINE_TOOLS } from "./grok-routine.js";
+import { AGENT_RULES_TOOLS } from "./agent-rules-tools.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
 /**
@@ -73,7 +74,7 @@ export const SESSION_ACCESS_TOOLS = ["get_session_access", "set_session_access",
 
 export type ToolGroupId =
   | "shared_session_reads" | "team_activity" | "relayfacts" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
-  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "grok_events" | "relay_inbox_app" | "screens" | "events_settings"
+  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "grok_events" | "agent_rules" | "relay_inbox_app" | "screens" | "events_settings"
   | "session_access" | "capability_discovery";
 
 type GroupDefinition = {
@@ -102,6 +103,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   grok_routines: { title: "Self-hosted Grok Bot webhook wake-ups", tools: GROK_ROUTINE_TOOLS },
   // SELFHOST_GROK_ROUTINES_CLOUD_COPY: the event reads Cloud's copied routine prompt calls.
   grok_events: { title: "Grok Bot routine events (Cloud copy)", tools: GROK_EVENT_TOOLS },
+  agent_rules: { title: "Agent Relay operating rules", tools: AGENT_RULES_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
@@ -112,7 +114,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; sessionAccess?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; agentRules?: boolean; sessionAccess?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -138,6 +140,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
   if (options.grokRoutines && options.grokEvents) groups.push("grok_events");
+  if (options.agentRules) groups.push("agent_rules");
   // Session access tools exist only where the read API is relaygate and the
   // connection is a person's own session (src/sessions/access.ts).
   if (options.sessionAccess) groups.push("session_access");
@@ -229,6 +232,7 @@ export function describeCapabilities(input: {
   customerSupport?: boolean;
   grokRoutines?: boolean;
   grokEvents?: boolean;
+  agentRules?: boolean;
   /** Whether this connection was given the session access tools (see planToolGroups). */
   sessionAccess?: boolean;
   /** Whether a managed native call resolves to its synced Desktop identity. */
@@ -241,7 +245,7 @@ export function describeCapabilities(input: {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents, sessionAccess: input.sessionAccess,
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents, agentRules: input.agentRules, sessionAccess: input.sessionAccess,
     staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {

@@ -158,3 +158,7 @@ migration `0093_grok_routines_cloud_copy.sql` first.
   concurrent second save gets the same refusal. This rule applies with the
   flag off as well: every save stores the URL's hash. Do not also register it in
   Agent Relay Cloud or another deployment, or it wakes twice.
+
+With `SELFHOST_GROK_DYNAMIC_PROMPT` also on, the routine prompt is a short
+bootstrap that fetches the rules, including this procedure, from
+`get_agent_rules` on every run; see [agent-rules.md](agent-rules.md).

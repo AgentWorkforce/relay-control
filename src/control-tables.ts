@@ -5,6 +5,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "admin_audit_events",
   "admin_email_grants",
   "agent_identities",
+  "agent_rules_overlays",
   "amp_bindings",
   "amp_connections",
   "amp_deliveries",
