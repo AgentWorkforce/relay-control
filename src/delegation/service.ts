@@ -14,7 +14,7 @@ import {
   canonicalAction,
   classTargetCovered,
   configTarget,
-  NEVER_DELEGABLE_SETTINGS,
+  isUndelegableSetting,
   CLAIM_TTL_MS,
   DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
@@ -594,10 +594,18 @@ export const FLUSH_BUDGET_MS = 20_000;
 export async function flushRelaycastRedactions(database: Database, deps: {
   redact: RelaycastQuoteRedactor;
   budgetMs?: number;
+  /**
+   * Only this workspace's message (as Cloud): an owner's redact request
+   * flushes the row it just queued, never other tenants'. The sweep passes none.
+   */
+  scope?: { workspaceId: string; messageId: string };
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string } | null>;
 }): Promise<{ redacted: number; absent: number; rejected: number; pending: number }> {
+  const scope = deps.scope ?? null;
   const unfinished = async () => Number((await database.query<{ count: number }>(
-    "SELECT count(*)::int AS count FROM delegation_quote_redactions WHERE relaycast_redacted_at IS NULL",
+    `SELECT count(*)::int AS count FROM delegation_quote_redactions
+      WHERE relaycast_redacted_at IS NULL AND ($1::uuid IS NULL OR (workspace_id = $1 AND message_id = $2))`,
+    [scope?.workspaceId ?? null, scope?.messageId ?? null],
   )).rows[0]?.count ?? 0);
   const counts = { redacted: 0, absent: 0, rejected: 0 };
   if (!deps.redact) return { ...counts, pending: await unfinished() };
@@ -607,7 +615,9 @@ export async function flushRelaycastRedactions(database: Database, deps: {
         AND relaycast_outcome IS DISTINCT FROM 'rejected'
         AND (last_attempt_at IS NULL OR last_attempt_at <= now() -
              make_interval(mins => least(power(2, least(attempts, 9))::int, 360)))
+        AND ($1::uuid IS NULL OR (workspace_id = $1 AND message_id = $2))
       ORDER BY requested_at LIMIT 100`,
+    [scope?.workspaceId ?? null, scope?.messageId ?? null],
   )).rows;
   const startedAt = Date.now();
   for (const row of due) {
@@ -1013,7 +1023,7 @@ function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: Deleg
     if ((action.class === "prompt_approval" || action.class === "config_change") &&
         !action.target.startsWith(`${recipientAgentId}:`)) return "out_of_scope";
     // The recipient's own delegation settings are never delegable (§5.3).
-    if (action.class === "config_change" && NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? "")) {
+    if (action.class === "config_change" && isUndelegableSetting(configTarget(action.target)?.setting ?? "")) {
       return "out_of_scope";
     }
   }

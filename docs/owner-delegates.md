@@ -164,9 +164,26 @@ the grant and create a new one.
 Grant JSON is `grant_id, owner_id, delegate_agent_id, scopes, require_tier_o,
 expires_at, status, created_at, updated_at, revoked_at, revoked_reason`.
 
-`PUT /delegates/policy` replaces the whole policy. Omitted optional fields take
-their defaults. The answer is the policy plus `revoked_grants` (the ids of
+`PUT /delegates/policy` sets the fields it names and keeps every other field at
+its stored value (the defaults when no policy exists yet), as Cloud: a PUT
+that only flips `delegation_enabled` never resets `require_tier_o` or
+`allowed_classes`. `allowed_classes: null` means every class. The answer is the policy plus `revoked_grants` (the ids of
 grants revoked because they no longer fit).
+
+`DELETE /delegates/claims/{claim_id}` releases a claimed agent, or cancels a
+pending claim code. Its owner, or an org owner or admin, may, also while
+delegation is off. A completed claim's binding ends and the owner's active
+grants to that agent are revoked (`delegate_released`); a pending code can no
+longer be completed. It is audited as `delegate.released` (reason
+`delegate_released` or `claim_cancelled`, data `{claim_id, agent_id,
+revoked_grants}`) and answers `{claim_id, released: true, revoked_grants}`; an
+unknown, already released or another person's claim is 404 `not_found`.
+
+A `merge` action names exactly one PR (`owner/repo#N`); a grant may still
+name `owner/repo` or `owner/*`. A `config_change` setting is undelegable when
+its name, trimmed, lowercased and with `-` and `.` read as `_`, is
+`delegated_approvals_from` or `spawn_delegate_approvals` (or starts with one of
+them and `_`), or mentions delegation at all.
 
 ## Attestation
 

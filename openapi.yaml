@@ -3323,6 +3323,35 @@ paths:
                   code: { type: string, pattern: "^dlg_[A-Za-z0-9_-]{32}$" }
                   expires_at: { type: string, format: date-time }
         "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims/{claimId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: claimId, in: path, required: true, schema: { type: string, pattern: "^clm_[A-Za-z0-9]{8,64}$" } }
+    delete:
+      operationId: releaseDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Human-only: the claim's owner, or an org owner or admin. Releases a
+        claimed agent (its binding ends and the owner's active grants to it
+        are revoked, `delegate_released`) or cancels a pending claim code.
+        Allowed while delegation is off: releasing only removes authority.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Released
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, released, revoked_grants]
+                properties:
+                  claim_id: { type: string }
+                  released: { const: true }
+                  revoked_grants: { type: array, items: { type: string } }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: unknown, already released, or not the caller's claim" }
   /api/v1/workspaces/{workspaceId}/delegates/claims/complete:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -3472,9 +3501,10 @@ paths:
       description: |
         Human-only, workspace owner/admin. The
         workspace switch (`delegation_enabled`, off by default) and limits.
-        A full replace: omitted optional fields take their defaults
-        (`max_expiry_days` 90, `allowed_classes` null, `require_tier_o` [],
-        `code_owner_match` any_path). Quote retention is not here: it is the
+        The fields given are set; an omitted field keeps its stored value
+        (the defaults `max_expiry_days` 90, `allowed_classes` null,
+        `require_tier_o` [], `code_owner_match` any_path when no policy exists
+        yet). `allowed_classes: null` means every class. Quote retention is not here: it is the
         org setting `/api/v1/orgs/{organizationId}/delegation-policy`, which
         no workspace overrides. Active grants that no
         longer fit (a class no longer allowed, or a lifetime above the new

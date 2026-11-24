@@ -89,7 +89,7 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0088_owner_delegates.sql","sha256":"5e882f3949a5a8348b5c018b145569a8b05839374bc67474bc661175938230df"},
+    {"name":"0088_owner_delegates.sql","sha256":"d09dfe1d4f29dcdcb10f842a5465c8e5773675ab862227198f88e8331f1b4b57"},
     {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
@@ -345,12 +345,13 @@
     {"kind":"column","name":"public.delegation_audit_events.recipient_agent_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":11,"type":"text"}},
     {"kind":"column","name":"public.delegation_audit_events.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_audit_events.xact_id","definition":{"collation":null,"default":"((pg_current_xact_id())::text)::bigint","generated":"","identity":"","not_null":true,"position":18,"type":"bigint"}},
-    {"kind":"column","name":"public.delegation_claims.agent_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"text"}},
+    {"kind":"column","name":"public.delegation_claims.agent_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
     {"kind":"column","name":"public.delegation_claims.code_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
     {"kind":"column","name":"public.delegation_claims.consumed_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"timestamp with time zone"}},
-    {"kind":"column","name":"public.delegation_claims.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":8,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.delegation_claims.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":9,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_claims.expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_claims.id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
+    {"kind":"column","name":"public.delegation_claims.released_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_claims.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_claims.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_grants.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
@@ -2418,5 +2419,5 @@
   "optional":{
 
   },
-  "sha256":"a968d2639e6640166fe73c308b89fb00c9abdaf022fbb6f08348591f05716059"
+  "sha256":"98669b86ab5e61395dd376d928e4a349d6058fb6c6932b21a84a72210e2909b5"
 }
