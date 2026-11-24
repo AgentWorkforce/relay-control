@@ -611,9 +611,11 @@ test("release grants keep segment matching; a pattern no release fits is refused
   assert.ok(classTargetCovered("release", `${REPO}:stable:*:*:*`, STABLE));
   assert.ok(!classTargetCovered("release", REPO, STABLE));
   // Git refuses these branch names, so no land target names them.
-  for (const branch of ["bad..branch", "-x", ".x", "a/.b", "a.lock", "a/b.lock/c", "a//b", "a/", "a."]) {
+  for (const branch of ["bad..branch", "-x", ".x", "a/.b", "a.lock", "a/b.lock/c", "a//b", "a/", "a.", "HEAD"]) {
     assert.ok(!validReleaseTarget(`${REPO}:land:${branch}:${SHA}`), branch);
   }
+  // Only the exact name `HEAD` is refused, as git check-ref-format --branch does.
+  for (const branch of ["main", "feature/x", "HEADS", "x/HEAD", "HEAD/x"]) assert.ok(validReleaseTarget(`${REPO}:land:${branch}:${SHA}`), branch);
   for (const pattern of [`${REPO}:stable:*:*:*`, `${REPO}:stable:*:*:*:*`, `${REPO}:land:*:*`, `${REPO}:land:feature/*:*`,
     "AgentWorkforce/*:land:*:*", `${REPO}:ios:testflight:*:*`, `${REPO}:*:*:*`]) {
     assert.ok(validReleasePattern(pattern), pattern);
@@ -621,7 +623,9 @@ test("release grants keep segment matching; a pattern no release fits is refused
   // Each `*` replaced by a valid value must give a real release target.
   for (const pattern of [REPO, "AgentWorkforce/*", "*", `${REPO}#1`, `${REPO}:stable:*`, `${REPO}:land:*:*:*`,
     `${REPO}:land:bad..branch:*`, `${REPO}:stable:*:main:*`, `${REPO}:stab*:*:*:*`, `${REPO}:stable::*:*`,
-    `${REPO}/x:stable:*:*:*`, `${REPO}:land:${"b".repeat(230)}:*`]) {
+    `${REPO}/x:stable:*:*:*`, `${REPO}:land:${"b".repeat(230)}:*`,
+    // Every literal field must fit its release form's grammar: a version ending in `/`, a `HEAD` branch.
+    `${REPO}:stable:v1/:*:*`, `${REPO}:stable:v1/x:*:*`, `${REPO}:land:HEAD:*`]) {
     assert.ok(!validReleasePattern(pattern), pattern);
   }
   // Grant creation refuses a release pattern that covers nothing.

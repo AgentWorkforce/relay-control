@@ -406,11 +406,11 @@ const SHA40 = "[0-9a-f]{40}";
  * A land branch: letters, digits, `.`, `_`, `/` and `-`, and only a name
  * `git check-ref-format --branch` accepts (as the hosted twin): no leading
  * `-`, `.` or `/`, no `..`, no component starting with `.` or ending in
- * `.lock`, no `//`, and no trailing `/` or `.`. Git refuses every name this
+ * `.lock`, no `//`, no trailing `/` or `.`, and not `HEAD`. Git refuses every name this
  * leaves out, so no real branch is lost, and a grant pattern such as
  * `owner/repo:land:bad..branch:*` names nothing and is refused.
  */
-const BRANCH = String.raw`(?![-./])(?![^:]*\.\.)(?![^:]*/\.)(?![^:]*\.lock(?:/|:))(?![^:]*//)(?![^:]*[/.]:)[A-Za-z0-9._/-]{1,200}`;
+const BRANCH = String.raw`(?!HEAD:)(?![-./])(?![^:]*\.\.)(?![^:]*/\.)(?![^:]*\.lock(?:/|:))(?![^:]*//)(?![^:]*[/.]:)[A-Za-z0-9._/-]{1,200}`;
 /**
  * Release targets (§11a.2), as Cloud's RELEASE_TARGETS. A `release` action
  * names exactly one release:
