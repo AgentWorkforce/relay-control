@@ -96,3 +96,76 @@ routes; with `usage_people` off they are 403 `feature_not_enabled`.
 The fleet view (docs/fleet.md) shows each member's `sessionsUploaded`,
 `lastSessionAt` and `topProjects` from this report next to their machines,
 for owners and admins.
+
+## Teams (`teams` and `usage_people`)
+
+Owner-only figures per team ([teams.md](teams.md)). Both `teams` and
+`usage_people` must be selected: a team of one shows one person's figures, so
+an installation that turned the People view off does not get them through
+teams. Admin, member and the bootstrap bearer are 403 `forbidden`; with either
+feature off, 403 `feature_not_enabled` (checked after the role, `teams`
+first).
+
+- `GET /api/v1/organizations/{org}/usage/teams?days=7|30|90` (any other
+  parameter is 400):
+
+```json
+{ "teams": {
+  "range": { "days": 30, "from": "2026-10-04", "to": "2026-11-02" },
+  "teamAsOf": "2026-11-02T20:00:00.000Z",
+  "rows": [
+    { "kind": "team", "teamId": "uuid", "name": "Platform", "archived": false, "members": 6, "activeUsers": 5,
+      "sessions": 212, "searches": 40, "lastSessionAt": "2026-11-02T18:00:00.000Z", "spend": null },
+    { "kind": "crossTeam", "teamIds": ["uuid", "uuid", null], "sessions": 9, "spend": null },
+    { "kind": "noTeam", "activeUsers": 2, "sessions": 14, "searches": 3, "spend": null },
+    { "kind": "unattributed", "sessions": 3, "spend": null },
+    { "kind": "notResolved", "sessions": 0, "spend": null }
+  ],
+  "total": { "sessions": 238, "searches": 43 },
+  "source": "sample",
+  "truncated": false,
+  "unavailable": ["spend"]
+} }
+```
+
+- `GET /api/v1/organizations/{org}/usage/teams/audit` (no parameters): the
+  latest 200 report views, `{ events: [{ viewerUserId, viewerName, days,
+  createdAt }] }`. Every served report, cached or not, writes an
+  organization-level `usage.teams.viewed` row (target `days:<n>`) before
+  answering. The People audit list does not include these rows.
+
+Each session read is counted in exactly one row, so the rows' `sessions` sum
+to `total.sessions`. A session whose users all resolve to one team is in that
+team's row; one whose users all have no team is in `noTeam`; one whose users
+span several teams, or a team and no team, is in the `crossTeam` row for that
+set of teams (`null` for no team, last); a session with no users is
+`unattributed`. `notResolved` is for session counts whose users are not known;
+it stays 0 until the read API can group by user set. Live teams are always
+listed; an archived team only while it has figures in the range or a
+`crossTeam` row names it.
+
+A person's team for a report is decided once, at `teamAsOf`: the end of the
+range, or now when that is earlier. It is the assignment open at that instant;
+otherwise the one that closed last inside the range (so someone removed from
+the organization, or whose team was archived, in the range still counts
+under the team they left); otherwise none. Someone who moved team in the range
+counts under the later team, and someone assigned after `teamAsOf` has no team
+in that report. An assignment in another organization never counts.
+
+Sessions come from the read API's session list (`/v1/sessions`) with the
+owner's authority, for each organization workspace the owner belongs to, under
+the People view's bounds (pages of at most 200, at most 3 calls and 2 seconds,
+cached for 5 minutes in a cache of their own); a session listed twice counts
+once. When not every session in the range was read, `truncated` is true: the
+session figures are lower bounds and `total.sessions` is the number read, not
+the total for the organization. If the read API cannot be read at all, every
+`sessions` and `lastSessionAt` and `total.sessions` and `source` are `null`
+and `unavailable` is `["sessions", "spend"]`; searches and members are still
+served. `spend` is always `null` in this version.
+
+`searches` is the sum of `usage_people_daily` searches of the people resolved
+to the row; `activeUsers` counts the people resolved to the row who were
+active or appear in a session read (for `noTeam`, only current members and
+people seen in sessions). The People report's per-person rows are not summed
+into teams: a session shared by several people is counted once for each of
+them there, so their sum would count it more than once.

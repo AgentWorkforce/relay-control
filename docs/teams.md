@@ -52,6 +52,9 @@ organization or the bootstrap bearer, each item of `GET /memberships` also
 carries `teamId`, the member's current team or null. A member, or any caller
 while the feature is off, gets that response unchanged, with no `teamId`.
 
+Usage per team (sessions and searches, owner-only, with `usage_people` also
+selected) is in [usage.md](usage.md), "Teams".
+
 ## Member removal
 
 Removing a member closes their current assignment in the same transaction,

@@ -1994,6 +1994,33 @@ paths:
       responses:
         "200": { description: "`{ events: [{ viewerUserId, viewerName, subjectUserId, subjectName, days, page, createdAt }] }`" }
         "403": { description: "`forbidden` or `feature_not_enabled`" }
+  /api/v1/organizations/{organizationId}/usage/teams:
+    get:
+      operationId: getOrganizationUsageTeams
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        Owner-only usage per team (docs/usage.md, "Teams"). Requires both
+        `teams` and `usage_people`. Rows are team, crossTeam, noTeam,
+        unattributed and notResolved; their sessions sum to the total. Every
+        served report writes a `usage.teams.viewed` audit row.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: days, in: query, required: false, schema: { type: integer, enum: [7, 30, 90], default: 30 } }
+      responses:
+        "200": { description: "`{ teams: { range, teamAsOf, rows[], total, source, truncated, unavailable } }`" }
+        "400": { description: "`days` is not 7, 30 or 90, or another query parameter was given" }
+        "403": { description: "`forbidden` (not an owner) or `feature_not_enabled` (`teams` or `usage_people`)" }
+  /api/v1/organizations/{organizationId}/usage/teams/audit:
+    get:
+      operationId: getOrganizationUsageTeamsAudit
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: Owner-only list of the latest 200 Teams usage report views.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ events: [{ viewerUserId, viewerName, days, createdAt }] }`" }
+        "400": { description: Any query parameter }
+        "403": { description: "`forbidden` or `feature_not_enabled`" }
   /api/v1/organizations/{organizationId}/fleet:
     get:
       operationId: getOrganizationFleet
