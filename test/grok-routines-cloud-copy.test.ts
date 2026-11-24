@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "../src/config.js";
-import { encryptSecret } from "../src/crypto.js";
+import { decryptSecret, encryptSecret } from "../src/crypto.js";
 import { createRelaycastClient } from "../src/messaging/relaycast.js";
 import { GrokRoutines, GROK_SETUP_PATH, grokRoutinesOptions, isDuplicateRoutine } from "../src/mcp/grok-routines.js";
 import { grokRoutinePrompt, parseGrokRoutineDetails } from "../src/mcp/grok-routine.js";
@@ -268,6 +268,76 @@ test("Cloud copy, gate-only: ingest and acknowledgement go through relaygate wit
   assert.ok(gatePaths.some(path => /^POST \/v1\/deliveries\/[^/]+\/ack$/.test(path)), "acknowledged through relaygate");
   assert.equal(f.world.pending("fake-grok").length, 0);
   assert.deepEqual(f.relayPaths.filter(path => /deliveries|\/v1\/agent$/.test(path)), [], "no direct Relaycast read or ack");
+});
+
+/**
+ * A gated participant whose rg_ token is due for renewal, read through a relaygate fake that revokes the presented
+ * token when it issues a new one. `failInbox` answers inbox reads with 500.
+ */
+async function staleGatedParticipant(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.tool("connect_grok_bot_routine");
+  assert.equal((await f.setup("POST", { webhook_url: URL, authorization: KEY })).status, 200);
+  const agent = f.world.agents.get("fake-grok")!;
+  const tokens = new Map<string, string>([["rg_current", agent.token]]);
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{grok-bot,cursor-cloud}',
+    updated_at='2000-01-01' WHERE agent_remote_id=$2`, [encryptSecret("rg_current", KEYRING.active), agent.id]);
+  const state = { renewals: 0, rejected: 0, failInbox: false };
+  const gate = createRelaycastClient({ internalOrigin: "https://gate.example.test", fetchImpl: async (input, init) => {
+    const url = new globalThis.URL(input instanceof Request ? input.url : String(input));
+    const method = init?.method ?? "GET";
+    const bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+    const upstream = tokens.get(bearer);
+    if (!upstream) { state.rejected++; return Response.json({ error: "relaygate_unauthenticated" }, { status: 401 }); }
+    if (url.pathname === "/v1/token/refresh") {
+      tokens.delete(bearer);
+      const next = `rg_renewed_${++state.renewals}`;
+      tokens.set(next, upstream);
+      return Response.json({ token: next, expires_at: new Date().toISOString() });
+    }
+    if (state.failInbox && method === "GET" && url.pathname === "/v1/deliveries") return Response.json({ ok: false }, { status: 500 });
+    const result = await f.world.handle(method, url.pathname, url.searchParams, upstream, init?.body ? JSON.parse(String(init.body)) : null, null);
+    if (url.pathname === "/v1/agent" && result?.status === 200) (result.body as any).data.workspace_id = "fake-workspace";
+    return Response.json(result?.body ?? { ok: false }, { status: result?.status ?? 404 });
+  } });
+  const participant = async () => (await f.database.query<{ token_ciphertext: string; admitted_clients: string[] }>(
+    "SELECT token_ciphertext,admitted_clients FROM hosted_relay_participants WHERE agent_remote_id=$1", [agent.id])).rows[0]!;
+  return { routines: new GrokRoutines({ ...f.routines.options, gate }), state,
+    accepted: async () => tokens.has(decryptSecret((await participant()).token_ciphertext, KEYRING)),
+    admittedClients: async () => (await participant()).admitted_clients };
+}
+
+test("Gate-only, inbox batch: a token renewed in a scan whose wake fails stays stored, so the next scan needs no recovery", async t => {
+  const f = await fixture(t, false);
+  const gated = await staleGatedParticipant(f);
+  await f.message(); f.fail(500);
+  await gated.routines.tick();
+  assert.equal(gated.state.renewals, 1);
+  assert.equal(f.calls.length, 1, "the wake was tried and failed");
+  assert.equal((await f.database.query("SELECT last_error FROM grok_bot_routines")).rows[0]!.last_error, "delivery_unavailable");
+  assert.equal(await gated.accepted(), true, "the stored token is the renewed one relaygate accepts");
+  f.fail(202); f.advance(); await gated.routines.tick();
+  assert.equal(f.calls.length, 2, "the next scan wakes the routine");
+  assert.equal(gated.state.rejected, 0, "no 401, so no recovery");
+  assert.equal(gated.state.renewals, 1);
+  assert.deepEqual(await gated.admittedClients(), ["grok-bot", "cursor-cloud"], "admitted clients are not reset by a recovery");
+});
+
+test("Gate-only, Cloud copy: a token renewed in a scan whose inbox read fails stays stored, so the next scan needs no recovery", async t => {
+  const f = await fixture(t);
+  const gated = await staleGatedParticipant(f);
+  await f.message(); gated.state.failInbox = true;
+  await gated.routines.tick();
+  assert.equal(gated.state.renewals, 1);
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.database.query("SELECT * FROM grok_bot_events")).rows.length, 0, "the rest of the scan was rolled back");
+  assert.equal((await f.database.query("SELECT last_error FROM grok_bot_routines")).rows[0]!.last_error, "delivery_unavailable");
+  assert.equal(await gated.accepted(), true, "the stored token is the renewed one relaygate accepts");
+  gated.state.failInbox = false; f.advance(); await gated.routines.tick();
+  assert.equal(f.calls.length, 1, "the next scan ingests and wakes the routine");
+  assert.equal(f.world.pending("fake-grok").length, 0, "and acknowledges through relaygate");
+  assert.equal(gated.state.rejected, 0, "no 401, so no recovery");
+  assert.equal(gated.state.renewals, 1);
+  assert.deepEqual(await gated.admittedClients(), ["grok-bot", "cursor-cloud"], "admitted clients are not reset by a recovery");
 });
 
 test("Cloud copy: trust is decided at read time from this person's own rows in this workspace", async t => {
