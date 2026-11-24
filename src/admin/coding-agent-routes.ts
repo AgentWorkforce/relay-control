@@ -65,6 +65,8 @@ export async function handleCodingAgentRoute(input: {
   logins: SubscriptionLoginStore;
   json: Json;
   requireJsonWrite: (request: IncomingMessage) => void;
+  /** Origin check for bodiless cookie writes (DELETE); bearer callers pass. */
+  requireCookieOrigin: (request: IncomingMessage) => void;
 }): Promise<boolean> {
   const { request, response, workspaceId, rest, helpers, store, json } = input;
   const method = request.method ?? "GET";
@@ -176,6 +178,7 @@ export async function handleCodingAgentRoute(input: {
   const item = /^cloud-agents\/([^/]+)$/.exec(rest);
   if (item && method === "DELETE") {
     const access = await helpers.workspaceAccess(request, workspaceId, true);
+    input.requireCookieOrigin(request);
     const deleted = await store.delete({
       workspaceId: access.workspace.id,
       organizationId: access.workspace.organizationId,

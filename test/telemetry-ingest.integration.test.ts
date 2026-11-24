@@ -77,6 +77,7 @@ test("relaycontrol -> hosted ingest: digest, error burst, issue report, and an a
           return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
         },
         bearer: (req) => /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? null,
+        cookieOriginAllowed: () => false,
       });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

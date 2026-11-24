@@ -686,3 +686,48 @@ test("assignment payloads carry the workspace runtime environment at delivery ti
   assert.equal(await cp.flows.verifyRuntimeCredential("sh_wrk_enr_x"), null);
   assert.equal(await cp.flows.verifyRuntimeCredential(tenant.memberToken), null);
 });
+
+test("cookie writes to Relayflows routes apply the same origin check as the other cookie writes", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(api);
+  const allowedOrigin = new URL(cp.config.publicBaseUrl).origin;
+  const cookie = `agent_relay_session=${tenant.ownerToken}`;
+  const tokens = async () => (await cp.database.query<{ id: string; revoked: boolean }>(
+    "SELECT id, revoked_at IS NOT NULL AS revoked FROM worker_enrollment_tokens ORDER BY id",
+  )).rows;
+
+  const seeded = await api("/api/v1/workers/enrollment-tokens", {
+    method: "POST", token: tenant.ownerToken, body: { name: "seeded" },
+  });
+  assert.equal(seeded.status, 200);
+  const before = await tokens();
+  assert.deepEqual(before, [{ id: seeded.body.id, revoked: false }]);
+
+  for (const origin of ["https://elsewhere.example", undefined]) {
+    const label = origin ? "foreign Origin" : "no Origin";
+    const headers: Record<string, string> = { cookie, ...(origin ? { origin } : {}) };
+    const created = await api("/cloud/api/v1/workers/enrollment-tokens", { method: "POST", headers, body: { name: "refused" } });
+    assert.equal(created.status, 403, `POST, ${label}`);
+    assert.equal(created.body.code, "csrf_rejected");
+    const revoked = await api(`/cloud/api/v1/workers/enrollment-tokens/${seeded.body.id}`, { method: "DELETE", headers });
+    assert.equal(revoked.status, 403, `DELETE, ${label}`);
+    assert.equal(revoked.body.code, "csrf_rejected");
+  }
+  assert.deepEqual(await tokens(), before, "refused cookie writes change nothing");
+
+  const allowed = { cookie, origin: allowedOrigin };
+  const created = await api("/cloud/api/v1/workers/enrollment-tokens", { method: "POST", headers: allowed, body: { name: "via-cookie" } });
+  assert.equal(created.status, 200);
+  const revoked = await api(`/cloud/api/v1/workers/enrollment-tokens/${created.body.id}`, { method: "DELETE", headers: allowed });
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.body.status, "revoked");
+
+  // Bearer callers send no Origin and are unaffected.
+  const bearerCreated = await api("/api/v1/workers/enrollment-tokens", { method: "POST", token: tenant.ownerToken, body: { name: "via-bearer" } });
+  assert.equal(bearerCreated.status, 200);
+  const bearerRevoked = await api(`/api/v1/workers/enrollment-tokens/${seeded.body.id}`, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal(bearerRevoked.status, 200);
+  assert.equal(bearerRevoked.body.status, "revoked");
+});
