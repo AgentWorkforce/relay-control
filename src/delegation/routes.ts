@@ -27,6 +27,7 @@ import {
   sha256Hex,
   validConfigPattern,
   validPromptPattern,
+  validReleasePattern,
   validRfc3339,
   validTargetPattern,
   type ActionClass,
@@ -167,8 +168,10 @@ const scopeSchema = z.object({
   targets: z.array(z.string().max(256)).min(1).max(50),
 }).strict().refine(scope => scope.targets.every(target =>
   scope.class === "prompt_approval" ? validPromptPattern(target)
-    : scope.class === "config_change" ? validConfigPattern(target) : validTargetPattern(target)),
-"`*` may only stand for a whole segment; prompt_approval and config_change targets are `<agent id>:*` or `*`");
+    : scope.class === "config_change" ? validConfigPattern(target)
+    : scope.class === "release" ? validReleasePattern(target) : validTargetPattern(target)),
+"`*` may only stand for a whole segment; prompt_approval and config_change targets are `<agent id>:*` or `*`; " +
+  "release targets name release fields, such as `owner/repo:stable:*:*:*` or `owner/*:land:*:*`");
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 

@@ -398,7 +398,9 @@ exception (`delegation.unavailable`). See
 An approval is spent only when EVERY action is single use and every one has
 been consumed; it is then stamped `consumed_at` in the consuming transaction.
 A spent approval is no longer unredeemed: grant revocation and `revoke-all`
-leave it alone. One that still has a reusable action (a merge next to a
+leave it alone, unless a release gate redeemed it. The run that consumed a
+gate-redeemed action may redeem it again (`same_run`), so revocation reaches
+such an approval too. One that still has a reusable action (a merge next to a
 release, say) is never spent: attest still delegates it, and a revocation
 still reaches it. Redeem reads the clock again after the bearer check (which
 can wait on a session lock) and re-checks expiry right before consuming.
@@ -607,6 +609,14 @@ dry_run?}`. Control checks, in order:
    - `<repo>:ios:<distribution>:<build number>:<sha>` (the build number is
      dot-separated digit groups, at most 32 characters)
 
+   A `release` grant pattern names these fields, with `*` standing for one
+   whole field: `owner/repo:stable:*:*:*`, `owner/*:land:*:*`. Fields are
+   separated by `:` only (git forbids it in a branch), so a land branch such
+   as `feature/x` is one field and `owner/repo:land:*:*` covers it. A pattern
+   that can cover no release target (a bare `owner/repo`, `owner/*` or `*`)
+   is refused when a grant is created or patched; a grant stored with one
+   before this rule covers no release and is never widened.
+
    Rollout: a `release` approval minted before this grammar with a bare
    `owner/repo` (or any other non-release) target is deliberately not
    migrated and has no legacy exception. It is never redeemable: it answers
@@ -620,7 +630,10 @@ dry_run?}`. Control checks, in order:
 7. **Single use per run, per action** (§5.1), decided under locks as at
    redeem (`decideUnderLocks`: the gate owner's and, for tier O, the approval
    owner's membership, the policy, the tier D grant, the approval, then the
-   gate row). A departed gate owner is `recipient_policy` for tier D and a
+   gate row). Expiry of the approval and of a tier D grant is judged on a
+   clock read once the gate and approval locks are held, so waiting on a
+   concurrent gate delete that rolls back cannot consume an approval that
+   expired during the wait (`expired`). A departed gate owner is `recipient_policy` for tier D and a
    departed approval owner `revoked` for tier O.
    - The first redeem of an action consumes that action and binds it to the
      token's `run_id`, GitHub repository id (so a rename changes nothing)

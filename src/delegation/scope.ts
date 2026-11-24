@@ -308,6 +308,8 @@ export function validConfigPattern(pattern: string): boolean {
 
 /** Whether a grant pattern of `cls` covers `target` (or, with `subsumes`, another pattern). */
 export function classTargetCovered(cls: ActionClass, pattern: string, target: string, subsumes = false): boolean {
+  // Release targets are matched field by field, never as generic segments (as the hosted twin).
+  if (cls === "release") return subsumes ? releasePatternWithin(target, pattern) : releaseTargetCovered(pattern, target);
   if (cls === "config_change") {
     if (!validConfigPattern(pattern)) return false;
     if (subsumes) return pattern === "*" ? validConfigPattern(target) : target === pattern;
@@ -433,4 +435,55 @@ export function releaseTargetSha(target: string): { sha: string; form: "candidat
   const segments = target.slice(target.indexOf(":") + 1).split(":");
   if (segments[0] === "land" || segments[0] === "ios") return { sha: segments.at(-1)!, form: segments[0] };
   return { sha: segments[2]!, form: "candidate" };
+}
+
+/**
+ * A release target or release grant pattern as tokens: `owner`, `/`, `repo`,
+ * then its `:`-separated fields. Git forbids `:` in a branch, so a land
+ * target's branch is ONE field even when it holds `/` (`feature/x`), which the
+ * generic tokens would split into several segments. Null without an
+ * `owner/repo:` head.
+ */
+function releaseTokens(value: string): string[] | null {
+  const colon = value.indexOf(":");
+  if (colon < 0) return null;
+  const repo = value.slice(0, colon).split("/");
+  if (repo.length !== 2 || repo.some(part => part.includes("#"))) return null;
+  return [repo[0]!, "/", repo[1]!, ":", ...value.slice(colon + 1).split(/(:)/u)];
+}
+
+/**
+ * Whether a release grant pattern can cover some release target (§11a.2):
+ * `owner/repo:<form fields>` with whole-field wildcards and as many fields as
+ * a release form has (land 3, ios 4, a candidate 4 or 5). A bare
+ * `owner/repo`, `owner/*` or `*` covers no release target, so it is refused
+ * rather than stored as a grant that silently covers nothing.
+ */
+export function validReleasePattern(pattern: string): boolean {
+  if (!pattern || pattern.length > MAX_TARGET_CHARS || /[\u0000-\u001f\u007f\s]/.test(pattern)) return false;
+  const tokens = releaseTokens(pattern);
+  if (!tokens || !tokens.every((token, index) => index % 2 === 1 ||
+    (token !== "" && (token === "*" || !token.includes("*"))))) return false;
+  const fields = (tokens.length - 3) / 2;
+  const form = tokens[4];
+  if (fields === 3) return form === "land" || form === "*";
+  if (fields === 4) return form !== "land";
+  return fields === 5 && form !== "land" && form !== "ios";
+}
+
+/** Whether a release grant pattern covers one release target, field by field. */
+function releaseTargetCovered(pattern: string, target: string): boolean {
+  if (!validReleasePattern(pattern) || !validReleaseTarget(target)) return false;
+  const want = releaseTokens(pattern)!;
+  const have = releaseTokens(target);
+  if (!have || want.length !== have.length) return false;
+  return want.every((token, index) => token === "*" ? have[index] !== "" : token === have[index]);
+}
+
+/** Whether a narrower release pattern is wholly inside a wider one (PATCH may only narrow). */
+function releasePatternWithin(narrow: string, wide: string): boolean {
+  if (!validReleasePattern(narrow) || !validReleasePattern(wide)) return false;
+  const want = releaseTokens(wide)!;
+  const have = releaseTokens(narrow)!;
+  return want.length === have.length && want.every((token, index) => token === "*" || token === have[index]);
 }
