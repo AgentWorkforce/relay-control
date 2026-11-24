@@ -1454,8 +1454,9 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       [input.approvalId, workspace.id],
     )).rows[0];
     if (!approval) refuse("no_approval");
-    context.ownerUserId = approval!.owner_user_id;
-    // Only a recipient Control attested this approval to may redeem it.
+    // Only a recipient Control attested this approval to may redeem it. The
+    // approval's owner is attached to the refusal row only once that holds: a
+    // caller the approval was never attested to writes no row under its owner.
     const attested = (await deps.database.query<{ grant_id: string; accept: string }>(
       `SELECT grant_id, accept FROM delegation_attestations
         WHERE workspace_id = $1 AND approval_id = $2 AND recipient_agent_id = $3
@@ -1463,6 +1464,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       [workspace.id, input.approvalId, input.recipientAgentId],
     )).rows[0];
     if (!attested) refuse("no_approval");
+    context.ownerUserId = approval!.owner_user_id;
     context.grantId = attested!.grant_id;
     if (approval!.invalidated_at) refuse("revoked");
     const grant = (await deps.database.query<GrantRow>(

@@ -369,6 +369,9 @@ consumption rolls back and the answer is `unavailable`: no use goes
 unrecorded. Refusal events (`approval.refused`, `redeem.refused`) are
 written only once the recipient is proven; a refusal before that (delegation
 off, no key, a bad token) is logged as `delegation.refused`, never audited.
+A `redeem.refused` row carries the approval's owner only once the approval
+was attested to that caller; a redeem by anyone else is audited with no owner
+and no grant, so it never lands in that owner's view.
 An identical `approval.refused` (message, recipient, reason), or
 `redeem.refused` (approval, recipient, action, reason), is written once per 10
 minutes; repeats are still logged. A refusal row keeps the sender's quote and its
