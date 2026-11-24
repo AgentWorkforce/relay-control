@@ -13,6 +13,7 @@
 import { randomUUID } from "node:crypto";
 import { decryptSecret, EncryptedSecretError, encryptSecret, type EncryptionKeyring } from "./crypto.js";
 import type { Database, SqlExecutor } from "./database.js";
+import { drainBody } from "./drain-body.js";
 import { loadDatabaseUrl, loadEncryptionKeyring, readSecret, serviceUrl, type Env } from "./config.js";
 import { lockRelaycastWorkspace } from "./relaycast-workspace-lock.js";
 
@@ -192,6 +193,7 @@ async function pushWorkspaceKey(
     { api_key: apiKey, key_generation: generation, grace_ms: graceMs },
   );
   if (status !== 200 && status !== 201) throw new RekeyFailure(await relaycastError(response));
+  await drainBody(response, "relaycast-rekey.push-workspace-key");
 }
 
 type Upgrade = { credential: string } | { alreadyAr: true };
@@ -705,7 +707,9 @@ async function relaycastReady(deps: RekeyDeps): Promise<string | null> {
       headers: { authorization: `Bearer ${deps.internalSecret}`, accept: "application/json" },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    return response.ok ? null : await relaycastError(response);
+    if (!response.ok) return await relaycastError(response);
+    await drainBody(response, "relaycast-rekey.ready");
+    return null;
   } catch {
     return "relaycast_unreachable";
   }
