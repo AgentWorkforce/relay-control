@@ -16,13 +16,14 @@
  *   delegation.refused            one refusal, by `op` and `reason` (info level)
  *   delegation.redaction_backlog  the Relaycast redaction queue after a sweep (warn when it needs an operator)
  *   delegation.audit_fenced       a paged audit read held events back behind a running transaction (info)
+ *   delegation.repository_mismatch a gate redeem token matched a gate by name but carried other repository ids (warn)
  *
  * relay-control writes each line synchronously to the console, so a line is
  * never lost when the request ends (Cloud registers its async delivery with
  * the Worker's waitUntil for the same reason).
  */
 export type DelegationOp = "attest" | "redeem" | "gate_redeem" | "prompt_delegates" | "conditions" | "standing" |
-  "github_oidc_jwks" | "retention" | "audit";
+  "github_oidc_jwks" | "retention" | "audit" | "gate_registry";
 
 export type SafeContext = {
   workspaceId?: string | null;
@@ -99,4 +100,8 @@ export function logRedactionBacklog(level: "info" | "warn", ctx: SafeContext): v
 
 export function logAuditFenced(ctx: SafeContext): void {
   emit("info", "delegation.audit_fenced", fields("audit", ctx));
+}
+
+export function logRepositoryMismatch(ctx: SafeContext): void {
+  emit("warn", "delegation.repository_mismatch", fields("gate_redeem", ctx));
 }

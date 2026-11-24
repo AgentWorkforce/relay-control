@@ -66,6 +66,13 @@ export type SelfhostConfig = {
    */
   delegationQuoteKey?: string | null;
   /**
+   * SELFHOST_DELEGATION_OIDC_ISSUERS: comma-separated OIDC issuers (https)
+   * whose workflow tokens may redeem through a release gate, in addition to
+   * GitHub Actions (https://token.actions.githubusercontent.com), which is
+   * always accepted. For example a GitHub Enterprise Server issuer.
+   */
+  delegationOidcIssuers?: string[];
+  /**
    * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
    * a workspace queues the same delete for relayfile-control's Flows data.
    * Unset: nothing is queued (the legacy local Flows rows still cascade).
@@ -616,6 +623,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     chiefRelaySecret: loadChiefRelaySecret(env),
     delegationSigning: loadDelegationSigning(env),
     delegationQuoteKey: loadDelegationQuoteKey(env),
+    delegationOidcIssuers: loadDelegationOidcIssuers(env),
     flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
@@ -723,6 +731,30 @@ export function loadDelegationQuoteKey(env: Env): string | null {
  */
 export function delegationQuoteSecret(config: Pick<SelfhostConfig, "delegationQuoteKey" | "encryptionKeyring">): Buffer {
   return config.delegationQuoteKey ? Buffer.from(config.delegationQuoteKey, "utf8") : config.encryptionKeyring.active.key;
+}
+
+/** SELFHOST_DELEGATION_OIDC_ISSUERS: extra release-gate OIDC issuers, https origins with an optional path. */
+export function loadDelegationOidcIssuers(env: Env): string[] {
+  const raw = env.SELFHOST_DELEGATION_OIDC_ISSUERS?.trim();
+  if (!raw) return [];
+  const issuers = raw.split(",").map(value => value.trim()).filter(Boolean);
+  if (issuers.length > 8) throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS takes at most 8 issuers");
+  return [...new Set(issuers.map((value) => {
+    // A bare "?" or "#" leaves url.search and url.hash empty: refuse the raw delimiters too.
+    if (/[?#]/.test(value)) {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs without query, fragment or credentials");
+    }
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs");
+    }
+    if (url.protocol !== "https:" || url.search || url.hash || url.username || url.password) {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs without query, fragment or credentials");
+    }
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  }))];
 }
 
 const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;

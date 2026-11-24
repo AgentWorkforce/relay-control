@@ -3600,6 +3600,202 @@ paths:
                   approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
         "400": { description: "`invalid_request` or `invalid_expiry`" }
         "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationGates
+      tags: [Owner delegates]
+      description: |
+        Release gates (relay design §11a.3). Human-only (browser session or
+        verified Desktop bearer). The caller's gates; workspace owner/admin may
+        pass `all=1`. Allowed while delegation is off.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: all, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Gates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gates]
+                properties:
+                  gates: { type: array, items: { $ref: "#/components/schemas/DelegationGate" } }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`" }
+    post:
+      operationId: registerDelegationGate
+      tags: [Owner delegates]
+      description: |
+        Register exactly which workflow may redeem: `repo`, `workflow_ref`
+        (the workflow the run starts from, in that repo, pinned to a ref),
+        optionally `job_workflow_ref` (when the publishing job runs inside a
+        reusable workflow, which may live in another repo), `event`,
+        and either an exact `ref` (`refs/heads/...` or `refs/tags/...`) or a
+        `ref_pattern` of the form `refs/tags/<literal prefix>*` (one trailing
+        `*`). `target_prefix` must start with `<repo>:` and contain no
+        whitespace or `*`. `event` is one of push, workflow_dispatch, release
+        and schedule. Human-only (browser session or verified Desktop
+        bearer, of a current member), delegation on. The same live gate
+        (owner, repo, workflow_ref, job_workflow_ref, event, target_prefix)
+        cannot be registered twice. Audited `gate.registered`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationGateInput" }
+      responses:
+        "201":
+          description: Registered gate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationGate" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`, `not_enabled`, `csrf_rejected`, or `gate_owner_unqualified` (only an org owner or admin may own a gate, D5)" }
+        "409": { description: "`gate_exists`: you already registered this gate; `gate_limit`: 10 live gates already share this repository and workflow file (workflow_ref without its @ref)" }
+        "422": { description: "`repository_unresolved`: GitHub knows no repository by that name that this workspace can see (the gate is pinned to its ids at registration)" }
+        "503": { description: "`unavailable`: GitHub could not be reached to resolve the repository" }
+    delete:
+      operationId: deleteDelegationGate
+      tags: [Owner delegates]
+      description: |
+        Remove a gate named by `?gate_id=` or `{"gate_id": ...}`: its owner, or
+        a workspace owner/admin. Allowed while delegation is off. Audited
+        `gate.deleted`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: gate_id, in: query, required: false, schema: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gate_id: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gate_id, deleted]
+                properties:
+                  gate_id: { type: string }
+                  deleted: { const: true }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates/redeem:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redeemThroughDelegationGate
+      tags: [Owner delegates]
+      description: |
+        The publishing job redeems the approval itself (§11a.3), with
+        `Authorization: Bearer <workflow OIDC token>`. The token is verified
+        against its issuer's JWKS (GitHub Actions, plus
+        SELFHOST_DELEGATION_OIDC_ISSUERS), its issuer, its audience (this
+        deployment's origin) and its validity window. `repository`,
+        `workflow_ref`, `ref` (or the gate's `ref_pattern`) and
+        `event_name` must match a registered gate exactly, plus
+        `job_workflow_ref` when the gate sets it (`gate_unknown` when
+        the repository has no gate, `gate_mismatch` when no gate's workflow
+        identity matches). The gate's repository ids were resolved and
+        pinned at registration, before its 201, and redeem never pins: a
+        token that matches a gate by name but does not carry those
+        `repository_id` and `repository_owner_id` is `repository_mismatch`,
+        not `gate_mismatch`.
+        and the action's target must start with that gate's `target_prefix`
+        (`target_prefix`). Until a gate matches, nothing is written to the
+        workspace's audit log; a key outage with no cached keys is
+        `unavailable`. Then the normal redeem checks run (approval, grant,
+        delegate binding, scope, policy, tier O, revocation, expiry, the gate
+        owner's standing, conditions). A `release` target must name exactly
+        one release (§11a.2); any other approval is malformed.
+
+        Single use is per action, `(approval_id, class, target)`, not per
+        approval: the first redeem of an action consumes that action and
+        binds it to the token's `run_id`. A later redeem of the same action
+        in the same run (another job, or a later attempt) answers
+        `{ok:true, consumed:true, same_run:true}`; any other run gets
+        `consumed`. Another action of the same approval is redeemed on its
+        own, with its own checks, and is never `same_run` because a sibling
+        was. `dry_run: true` runs every check, never consumes, and answers
+        `{ok:true, consumed:false, dry_run:true}` or
+        `{ok:false, reason, dry_run:true}`; it takes no lock, so a change
+        committing after its last read is not reflected. Audited `gate.redeemed`,
+        `gate.checked` (a passing dry run) or `gate.refused` (with
+        `dry_run: true` in the event data for a dry run), auth method
+        `github_oidc`. A gate serves only while its owner is still an org
+        owner or admin (D5), re-checked under the consuming transaction's
+        locks: an owner demoted to `member` no longer serves, and with no
+        other qualified gate the answer is `gate_owner_unqualified`.
+        Repository names match case-insensitively.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [approval_id, action]
+              properties:
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                action:
+                  type: object
+                  additionalProperties: false
+                  required: [class, target]
+                  properties:
+                    class: { $ref: "#/components/schemas/DelegationActionClass" }
+                    target: { type: string, maxLength: 256 }
+                dry_run: { type: boolean }
+      responses:
+        "200":
+          description: >-
+            A redeem (`ok: true`), or any dry run (report-only), with its verdict. Status codes fail closed for a
+            plain `curl -f` step, as Cloud: a refusal is 401 (`oidc_invalid`), 503 (`unavailable`,
+            `condition_unavailable`: retry) or 403 (every other reason: final), with the same body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, consumed]
+                    properties:
+                      ok: { const: true }
+                      consumed: { const: true }
+                      same_run: { const: true }
+                  - type: object
+                    required: [ok, consumed, dry_run]
+                    properties:
+                      ok: { const: true }
+                      consumed: { const: false }
+                      dry_run: { const: true }
+                  - type: object
+                    required: [ok, reason]
+                    properties:
+                      ok: { const: false }
+                      reason: { $ref: "#/components/schemas/DelegationReason" }
+                      unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
+                      dry_run: { const: true }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`: no bearer; or a refusal `{ok:false, reason:\"oidc_invalid\"}`" }
+        "403": { description: "A final refusal `{ok:false, reason}` (not a dry run)" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`, or a retryable refusal `{ok:false, reason}` (`unavailable`, `condition_unavailable`)" }
   /api/v1/workspaces/{workspaceId}/delegates/audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10336,7 +10532,8 @@ components:
     DelegationReason:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
-        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant]
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant, gate_unknown, oidc_invalid,
+        gate_mismatch, target_prefix, sha_mismatch, repository_mismatch, gate_owner_unqualified]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
@@ -10360,6 +10557,49 @@ components:
       properties:
         error: { type: string, description: Human-readable message }
         code: { type: string, description: Stable machine-readable code }
+    DelegationGate:
+      type: object
+      required: [gate_id, owner_id, repo, workflow_ref, event, target_prefix, created_at]
+      description: Exactly one of `ref` and `ref_pattern` is present.
+      properties:
+        gate_id: { type: string }
+        repo: { type: string }
+        issuer: { type: string, description: Present only for a gate on a self-host issuer (relay-control) }
+        workflow_ref: { type: string }
+        job_workflow_ref: { type: string, description: Present only for a gate on a reusable workflow }
+        ref: { type: string }
+        ref_pattern: { type: string }
+        event: { type: string }
+        target_prefix: { type: string }
+        repository_id: { type: string, description: "GitHub's repository id, resolved and pinned at registration (before the 201); redeem never pins" }
+        repository_owner_id: { type: string, description: "GitHub's repository owner id, pinned with repository_id at registration" }
+        allow_source_sha_mismatch: { const: true, description: "Present only when true: candidate-run release targets may name a source commit other than the run's sha" }
+        default_branch: { type: string, description: "The repository's default branch, as GitHub reported it at registration" }
+        owner_id: { type: string }
+        created_at: { type: string, format: date-time }
+    DelegationGateInput:
+      type: object
+      additionalProperties: false
+      required: [repo, workflow_ref, event, target_prefix]
+      description: Exactly one of `ref` and `ref_pattern`.
+      oneOf:
+        - required: [ref]
+          not: { required: [ref_pattern] }
+        - required: [ref_pattern]
+          not: { required: [ref] }
+      properties:
+        repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
+        issuer: { type: string, description: "relay-control only: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. A same-named repository on another issuer is another repository." }
+        workflow_ref: { type: string, maxLength: 512, description: "<repo>/.github/workflows/<file>@<the gate's ref, or its ref_pattern for a tag gate>", example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
+        job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in: <owner>/<repo>/.github/workflows/<file>@<full ref, the gate's ref_pattern, or a 40-hex lowercase commit SHA>", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@0123456789abcdef0123456789abcdef01234567" }
+        ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
+        ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
+        event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
+        target_prefix: { type: string, maxLength: 256, description: "Starts with <repo>: and ends with : (a segment boundary); no wildcard", example: "AgentWorkforce/relay-app:" }
+        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false. Only on a gate whose ref is refs/heads/<the repository's default branch> (400 otherwise)." }
+        repository_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "relay-control only, for a gate on a self-host issuer (required there, refused for GitHub Actions): the repository's id, pinned as given. A GitHub Actions gate is resolved on GitHub." }
+        repository_owner_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "With repository_id." }
+        default_branch: { type: string, maxLength: 250, description: "relay-control only, with repository_id for a self-host issuer: the repository's default branch." }
     DelegationAction:
       type: object
       description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.
