@@ -59,6 +59,8 @@ export const REASON_CODES = [
   "not_enabled", "not_delegate", "no_approval", "out_of_scope", "expired", "revoked",
   "recipient_policy", "tier_o_required", "consumed", "not_pending", "unavailable",
   "condition_unmet", "condition_unavailable", "predates_grant",
+  // Release-gate redeem (§11a.3).
+  "gate_unknown", "oidc_invalid", "gate_mismatch", "target_prefix", "sha_mismatch", "repository_mismatch", "gate_owner_unqualified",
 ] as const;
 export type ReasonCode = typeof REASON_CODES[number];
 
@@ -152,6 +154,7 @@ export function actionIsValid(action: Pick<Action, "class" | "target" | "conditi
   if (action.class === "prompt_approval" && !PROMPT_TARGET.test(action.target)) return false;
   if (action.class === "config_change" && !configTarget(action.target)) return false;
   if (action.class === "pr_ops" && !prOpsTarget(action.target)) return false;
+  if (action.class === "release" && !validReleaseTarget(action.target)) return false;
   // A merge names exactly one PR (`owner/repo#N`), as Cloud: a bare repo or a
   // branch target would be ambiguous and unpinned to any head. Grants may
   // still name `owner/repo` or `owner/*`, which cover that repo's `#N`.
@@ -393,4 +396,41 @@ export function ownerDisplay(name: string | null | undefined): string {
 
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+// Release targets (§11a.2) --------------------------------------------------
+
+const REPO_PART = "[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}";
+const SHA40 = "[0-9a-f]{40}";
+/**
+ * Release targets (§11a.2), as Cloud's RELEASE_TARGETS. A `release` action
+ * names exactly one release:
+ * - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
+ * - landing a branch: `<repo>:land:<branch>:<head sha>`
+ * - TestFlight and App Store: `<repo>:ios:<distribution>:<build number>:<sha>`
+ * "Ship everything" names nothing, so it matches none of these.
+ */
+export const RELEASE_TARGETS: readonly RegExp[] = [
+  new RegExp(`^${REPO_PART}:(?!land:|ios:)[a-z][a-z0-9_-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA40}:[1-9][0-9]{0,19}(?::[A-Za-z0-9_.-]{1,64})?$`, "u"),
+  new RegExp(`^${REPO_PART}:land:[A-Za-z0-9._/-]{1,200}:${SHA40}$`, "u"),
+  // A build number is dot-separated digit groups (`42`, `2026.11.7.3`), at most 32 characters.
+  new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:(?=[0-9.]{1,32}:)[0-9]+(?:\\.[0-9]+)*:${SHA40}$`, "u"),
+];
+
+export function validReleaseTarget(target: string): boolean {
+  return RELEASE_TARGETS.some(pattern => pattern.test(target));
+}
+
+/**
+ * The commit a release target names, and its form, as Cloud's
+ * releaseTargetSha: `candidate` for `<repo>:<channel>:v<version>:<source
+ * sha>:<run id>[:<profile>]` (the third segment after the repo), `land` and
+ * `ios` for the others (the last segment). Null for anything that is not a
+ * release target.
+ */
+export function releaseTargetSha(target: string): { sha: string; form: "candidate" | "land" | "ios" } | null {
+  if (!validReleaseTarget(target)) return null;
+  const segments = target.slice(target.indexOf(":") + 1).split(":");
+  if (segments[0] === "land" || segments[0] === "ios") return { sha: segments.at(-1)!, form: segments[0] };
+  return { sha: segments[2]!, form: "candidate" };
 }

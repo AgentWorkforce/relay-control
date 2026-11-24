@@ -130,7 +130,7 @@ async function ready(t: TestContext, options: { relaycastInternal?: boolean } = 
   const created = await env.grant(bot.id, [
     { class: "merge", targets: ["AgentWorkforce/*"] },
     { class: "deploy", targets: ["*:staging", "relay:prod"] },
-    { class: "release", targets: ["AgentWorkforce/relay"] },
+    { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] },
   ]);
   return { env, recipient, bot, grantId: created.grant_id as string };
 }
@@ -746,7 +746,7 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
 
 test("redeem: revocation invalidates unredeemed approvals at once", async (t) => {
   const { env, recipient, bot, grantId } = await ready(t);
-  const release = { class: "release", target: "AgentWorkforce/relay" };
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v2026.11.7:${"3f2a1c9e".padEnd(40, "0")}:123456789` };
   const messageId = send(env, bot, recipient, env.approval([release]));
   const attested = await env.attest(recipient, messageId);
   assert.equal(attested.body.verdict, "delegate", attested.raw);
@@ -948,12 +948,12 @@ test("prompt_approval: grant patterns, this session only, machine owner only, pr
 test("conditions: not_before is checked at redeem without consuming; GitHub conditions are unavailable", async (t) => {
   const { env, recipient, bot } = await ready(t);
   const future = new Date(Date.now() + 20 * 60_000).toISOString();
-  const release = { class: "release", target: "AgentWorkforce/relay", conditions: [{ type: "not_before", at: future }] };
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v2026.11.7:${"3f2a1c9e".padEnd(40, "0")}:123456789`, conditions: [{ type: "not_before", at: future }] };
   const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([release])));
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   assert.deepEqual(attested.body.claims.actions, [release]);
   const approvalId = attested.body.claims.approval_id as string;
-  const action = { class: "release", target: "AgentWorkforce/relay" };
+  const action = { class: "release", target: release.target };
   const unmet = await env.redeem(recipient, approvalId, action);
   assert.deepEqual(unmet.body, { ok: false, reason: "condition_unmet", unmet: [{ type: "not_before", at: future }] });
   // Not consumed: once the time has come (the clock moves, the approval is
@@ -975,7 +975,7 @@ test("conditions: not_before is checked at redeem without consuming; GitHub cond
   // Tier O: minted conditions must equal the message's.
   const minted = await env.browser("/delegates/approvals", "POST", { actions: [release] });
   assert.equal(minted.status, 201, minted.raw);
-  const differs = send(env, bot, recipient, env.approval([{ class: "release", target: "AgentWorkforce/relay" }],
+  const differs = send(env, bot, recipient, env.approval([{ class: "release", target: release.target }],
     { approval_ref: minted.body.approval_id }));
   assert.equal((await env.attest(recipient, differs)).body.reason, "out_of_scope");
 });

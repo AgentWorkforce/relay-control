@@ -8,6 +8,9 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims } from "./oidc.js";
+import { gateAuditData, gateRedeemStatus, gateView, gateWorkflowFile, MAX_GATES_PER_WORKFLOW, qualifiedGateOwner, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
+import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
   actionClass,
@@ -29,7 +32,7 @@ import {
   type ActionClass,
   type Scope,
 } from "./scope.js";
-import { logAuditFenced } from "./observe.js";
+import { logAuditFenced, logUnavailable } from "./observe.js";
 import {
   anyBinding,
   attestDelegation,
@@ -106,7 +109,16 @@ export type DelegationRoutesInput = {
     id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; role: Principal["role"];
   } | null>;
   json: JsonWriter;
-  /** A workspace's Relaycast binding, without a person (claims/complete, withdraw). */
+  /** Release gates (§11a.3): the workflow OIDC verifier for gate redeem. */
+  workflowOidc: WorkflowOidcVerifier;
+  /** GitHub's REST API (gate repository resolution at registration). */
+  githubFetch?: typeof fetch;
+  /** The workspace's GitHub connection token for this person, or null when it has none. */
+  githubToken?: (workspaceId: string, userId: string | null) => Promise<string | null>;
+  /* null: the workspace has no GitHub connection (the public API may be asked); throws GithubUnavailable on an outage. */
+  /** The issuers that verifier accepts (GitHub Actions first); a gate names one of them. */
+  oidcIssuers: readonly string[];
+  /** A workspace's organization and Relaycast binding, without a person. */
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
   /** Redacts a quote in Relaycast's stored owner_approval; null: redactions stay queued. */
   relaycastRedact?: RelaycastQuoteRedactor;
@@ -227,6 +239,99 @@ const withdrawBody = z.object({
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
 const CLAIM_ID = /^clm_[A-Za-z0-9]{8,64}$/u;
 const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
+const GATE_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
+/** As Cloud: a workflow file under `.github/workflows/` at a full ref (a tag gate: its `ref_pattern`). */
+const WORKFLOW_FILE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[A-Za-z0-9_.-]{1,200}\.ya?ml@(refs\/(?:heads|tags)\/[^\s*]{1,250}\*?)$/u;
+/** A reusable workflow may also be pinned by commit SHA (`…@<40 hex>`), as GitHub reports `uses: …@<sha>`. */
+const JOB_WORKFLOW_FILE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}\/\.github\/workflows\/[A-Za-z0-9_.-]{1,200}\.ya?ml@(refs\/(?:heads|tags)\/[^\s*]{1,250}\*?|[0-9a-f]{40})$/u;
+/**
+ * `POST /delegates/gates` (§11a.3). Every field is matched exactly against
+ * the job's OIDC token: `workflow_ref` (the workflow the run started from,
+ * in the gate's repo), and `job_workflow_ref` too when the publishing job runs
+ * inside a reusable workflow (which may live in another repo).
+ */
+const gateBody = z.object({
+  /** Optional: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. */
+  issuer: z.string().max(512).optional(),
+  repo: z.string().regex(GATE_REPO),
+  workflow_ref: z.string().min(1).max(512),
+  job_workflow_ref: z.string().min(1).max(512).optional(),
+  ref: z.string().regex(/^refs\/(?:heads|tags)\/[^\s*]{1,250}$/u).optional(),
+  /** Tag-triggered workflows: `refs/tags/<literal prefix>*`, a single trailing `*` and nothing else. */
+  ref_pattern: z.string().regex(/^refs\/tags\/[^\s*]{1,200}\*$/u).optional(),
+  // As Cloud: only events that run the gated ref's own, trusted workflow code
+  // (never pull_request* or workflow_run).
+  event: z.enum(["push", "workflow_dispatch", "release", "schedule"]),
+  target_prefix: z.string().min(1).max(256),
+  /**
+   * Candidate-run release targets name the candidate's source commit, which a
+   * promote workflow may legitimately not be running on. Only then, opt out
+   * of requiring the target's sha to be the run's `sha` claim. Land and iOS
+   * targets are always bound. As Cloud.
+   */
+  allow_source_sha_mismatch: z.boolean().optional(),
+  /**
+   * relay-control only, for a gate on a self-host issuer (whose repositories
+   * Control cannot look up on GitHub): the repository's numeric ids, pinned as
+   * given. Refused for a GitHub Actions gate, which is resolved on GitHub.
+   */
+  repository_id: z.string().regex(/^[1-9][0-9]{0,19}$/u).optional(),
+  repository_owner_id: z.string().regex(/^[1-9][0-9]{0,19}$/u).optional(),
+  /** relay-control only, with repository_id for a self-host issuer: the repository's default branch. */
+  default_branch: z.string().regex(/^[^\s*~^:?\[\\]{1,250}$/u).optional(),
+}).strict().superRefine((gate, context) => {
+  // A tag gate trusts whatever commit a tag is pushed at; only binding the run
+  // to the approved commit keeps an unreviewed workflow out. It cannot opt out (as Cloud).
+  // An exact tag can be moved too: the opt-out needs an exact branch ref (as Cloud).
+  if (gate.allow_source_sha_mismatch === true && (gate.ref_pattern !== undefined || !gate.ref?.startsWith("refs/heads/"))) {
+    context.addIssue({ code: "custom", message: "allow_source_sha_mismatch needs an exact branch ref (refs/heads/…)" });
+  }
+  if ((gate.repository_id === undefined) !== (gate.repository_owner_id === undefined)) {
+    context.addIssue({ code: "custom", message: "set repository_id and repository_owner_id together" });
+  }
+  if (Boolean(gate.ref) === Boolean(gate.ref_pattern)) {
+    context.addIssue({ code: "custom", message: "set exactly one of ref and ref_pattern" });
+  }
+  // The run's own workflow lives in the gate's repository, at the gate's ref
+  // (or ref pattern): a file edited on another branch never matches.
+  const gateRef = gate.ref ?? gate.ref_pattern;
+  const workflow = WORKFLOW_FILE.exec(gate.workflow_ref);
+  if (!workflow || !gate.workflow_ref.startsWith(`${gate.repo}/.github/workflows/`) || workflow[1] !== gateRef) {
+    context.addIssue({ code: "custom", message: "workflow_ref must be <repo>/.github/workflows/<file>@<the gate's ref or ref_pattern>" });
+  }
+  // A reusable workflow may live in another repository; its ref must be a full
+  // ref, the gate's ref pattern, or (preferred across repositories) a commit SHA.
+  if (gate.job_workflow_ref !== undefined) {
+    const job = JOB_WORKFLOW_FILE.exec(gate.job_workflow_ref);
+    if (!job || (job[1]!.endsWith("*") && job[1] !== gate.ref_pattern)) {
+      context.addIssue({ code: "custom", message: "job_workflow_ref must be <owner>/<repo>/.github/workflows/<file>@<ref or commit SHA>" });
+    } else {
+      // A job_workflow_ref other than the run's own workflow_ref is pinned to
+      // a commit SHA (a reusable workflow is matched by name only, and a branch
+      // or tag can be moved to an edited workflow). Decided 2026-11-23 (D2): a
+      // reusable workflow in the gate's OWN repository at exactly the gate's
+      // ref needs no pin, unless the gate opts out of the source-sha binding.
+      const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
+      const sameRepoAtGateRef = jobRepo.toLowerCase() === gate.repo.toLowerCase() && gate.ref !== undefined &&
+        job[1] === gate.ref && gate.allow_source_sha_mismatch !== true;
+      if (gate.job_workflow_ref !== gate.workflow_ref && !sameRepoAtGateRef && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
+        context.addIssue({ code: "custom", message: "a job_workflow_ref other than workflow_ref must be pinned to a 40-hex commit SHA, unless it is in the gate's own repository at the gate's ref (without allow_source_sha_mismatch)" });
+      }
+    }
+  }
+  // A prefix not anchored to this repository would let one gate redeem another repo's releases.
+  // It ends at a segment boundary (`:`), so `repo:stable:` never covers `repo:stable-canary:…`.
+  if (!gate.target_prefix.startsWith(`${gate.repo}:`) || !gate.target_prefix.endsWith(":") || /\s|\*/u.test(gate.target_prefix)) {
+    context.addIssue({ code: "custom", message: "target_prefix must start with <repo>:, end with : and contain no wildcard" });
+  }
+});
+const gateRedeemBody = z.object({
+  approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
+  action: z.object({ class: actionClass, target: z.string().min(1).max(256) }).strict(),
+  dry_run: z.boolean().optional(),
+}).strict();
+const GATE_ID = /^gate_[A-Za-z0-9]{8,64}$/u;
+const GATE_REDEEM_RATE = { limit: 60, windowMs: 60_000 };
 const promptDelegatesBody = z.object({
   session_agent_id: z.string().min(1).max(200),
   session_token: z.string().min(12).max(512),
@@ -507,6 +612,52 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return true;
     }
 
+    if (sub === "gates/redeem") {
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      input.rateLimit(response, `delegation-gate:${input.clientKey(request)}`, GATE_REDEEM_RATE);
+      const token = bearer(request);
+      if (!token) return fail("unauthorized", "A GitHub Actions OIDC token is required", 401);
+      const body = parse(gateRedeemBody, await readJson(request), "Invalid request");
+      const dryRun = body.dry_run === true;
+      // Authenticate before anything about the workspace: whether it exists,
+      // has delegation on or a messaging binding is never answered to a caller
+      // no trusted issuer signed for (#278 review). The verified claims are
+      // handed on, so a valid token is verified once.
+      let claims: WorkflowClaims;
+      try {
+        claims = await input.workflowOidc(token);
+      } catch (error) {
+        // The issuer's keys could not be read: an outage, not a forged token.
+        const keysDown = error instanceof OidcKeysUnavailable;
+        if (keysDown) logUnavailable("gate_redeem", error, {});
+        const refused = { ok: false as const, reason: keysDown ? "unavailable" as const : "oidc_invalid" as const,
+          ...(dryRun ? { dry_run: true as const } : {}) };
+        json(gateRedeemStatus(refused), refused);
+        return true;
+      }
+      const verified = claims;
+      const row = (await input.database.query<{ id: string; organization_id: string }>(
+        "SELECT id, organization_id FROM workspaces WHERE id::text = $1", [workspaceId],
+      )).rows[0];
+      if (!row) {
+        // As Cloud: a workspace that does not exist has no gate for the token.
+        const refused = { ok: false as const, reason: "gate_unknown" as const, ...(dryRun ? { dry_run: true as const } : {}) };
+        json(gateRedeemStatus(refused), refused);
+        return true;
+      }
+      const binding = await input.relaycastBinding(row.id);
+      const workspace: DelegationWorkspace = { id: row.id, organizationId: row.organization_id,
+        relaycastWorkspaceId: binding?.relaycastWorkspaceId ?? "", relaycastApiKey: binding?.relaycastApiKey ?? "" };
+      // Status codes fail closed for a plain `curl -f` step (gateRedeemStatus); the body is unchanged.
+      const result = await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
+        workspace, verifyOidc: async () => verified, oidcToken: token, approvalId: body.approval_id, action: body.action,
+        dryRun,
+        liveDefaultBranch: liveDefaultBranchFor(row.id),
+      });
+      json(gateRedeemStatus(result), result);
+      return true;
+    }
+
     if (sub === "claims/complete") {
       if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
       input.rateLimit(response, `delegation-claim:${input.clientKey(request)}`, CLAIM_COMPLETE_RATE);
@@ -661,6 +812,144 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       json(201, grantView(row, now()));
       return true;
+    }
+
+    if (sub === "gates") {
+      return await gateRegistry().catch((error: unknown) => {
+        // A refusal is answered as is; anything else is an outage, logged (op gate_registry), as Cloud.
+        const known = error as { status?: unknown; code?: unknown };
+        if (!(error instanceof DelegationHttpError) && !(typeof known?.status === "number" && typeof known.code === "string")) {
+          logUnavailable("gate_registry", error, { workspaceId: workspace.id });
+        }
+        throw error;
+      });
+    }
+    async function gateRegistry(): Promise<boolean> {
+      if (method === "GET") {
+        const all = new URL(request.url ?? "/", "http://localhost").searchParams.get("all") === "1";
+        if (all && !caller.admin) fail("forbidden", "Only org owners and admins can list every gate", 403);
+        const rows = (await input.database.query<GateRow>(
+          `SELECT * FROM delegation_gates WHERE workspace_id = $1 AND deleted_at IS NULL
+             AND ($2::boolean OR owner_user_id = $3) ORDER BY created_at`,
+          [workspace.id, all, principal.userId],
+        )).rows;
+        json(200, { gates: rows.map(gateView) });
+        return true;
+      }
+      if (method === "POST") {
+        const body = parse(gateBody, await readJson(request), "Invalid gate");
+        const issuer = (body.issuer ?? input.oidcIssuers[0]!).replace(/\/+$/, "");
+        if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
+        await requireEnabled(workspace.id);
+        // D5 (#owner-decisions 250887862744305664): only an org owner or admin may own a gate.
+        if (!caller.admin) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
+        // As Cloud: the gate is pinned to the repository's GitHub ids at
+        // registration (the workspace's GitHub connection, else the public
+        // API; the canonical name must match). Redeem never pins.
+        let repository: { repositoryId: string; repositoryOwnerId: string; defaultBranch: string };
+        if (issuer === GITHUB_ACTIONS_OIDC_ISSUER) {
+          if (body.repository_id !== undefined || body.default_branch !== undefined) {
+            fail("invalid_request", "repository_id and default_branch are resolved on GitHub for a GitHub Actions gate", 400);
+          }
+          let resolved;
+          try {
+            resolved = await resolveGateRepository({ repo: body.repo, fetchImpl: input.githubFetch ?? globalThis.fetch,
+              token: input.githubToken ? await input.githubToken(workspace.id, principal.userId) : null });
+          } catch (error) {
+            if (!(error instanceof GithubUnavailable)) throw error;
+            logUnavailable("gate_registry", error, { workspaceId: workspace.id });
+            return fail("unavailable", "GitHub could not be reached to resolve the repository", 503);
+          }
+          if (!resolved) {
+            return fail("repository_unresolved", "GitHub knows no repository by that name that this workspace can see", 422);
+          }
+          repository = resolved;
+        } else {
+          // A self-host issuer's repositories are not on github.com: the owner
+          // names the ids and the default branch (relay-control only).
+          if (body.repository_id === undefined || body.default_branch === undefined) {
+            fail("invalid_request", "A gate on a self-host issuer needs repository_id, repository_owner_id and default_branch", 400);
+          }
+          repository = { repositoryId: body.repository_id!, repositoryOwnerId: body.repository_owner_id!,
+            defaultBranch: body.default_branch! };
+        }
+        // As Cloud: the source-sha opt-out is only for a gate on the repository's default branch.
+        if (body.allow_source_sha_mismatch === true && body.ref !== `refs/heads/${repository.defaultBranch}`) {
+          fail("invalid_request", "allow_source_sha_mismatch needs ref to be the repository's default branch", 400);
+        }
+        const row = await input.database.transaction(async (tx) => {
+          // Held until commit, as Cloud: a departure cannot finish between the
+          // caller's membership check and this insert and leave a live gate.
+          const role = await memberRole(tx, workspace.id, principal.userId, true);
+          if (!role) fail("forbidden", "Forbidden", 403);
+          if (!qualifiedGateOwner(role)) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
+          // As every delegation write: delegation turned off after the check
+          // above refuses the gate (the policy row is share-locked until
+          // commit, after the membership row, as decideUnderLocks takes them).
+          if (!(await loadPolicy(tx, workspace.id, true)).delegation_enabled) NOT_ENABLED();
+          // At most MAX_GATES_PER_WORKFLOW live gates per (workspace, repository,
+          // workflow file without its @ref, so all tag patterns share one cap),
+          // counted under an advisory lock so concurrent registrations cannot
+          // both slip under the limit.
+          const workflowFile = gateWorkflowFile(body.workflow_ref);
+          await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            [`delegation-gates:${workspace.id}:${body.repo.toLowerCase()}:${workflowFile}`]);
+          const live = (await tx.query<{ workflow_ref: string }>(
+            `SELECT workflow_ref FROM delegation_gates
+              WHERE workspace_id = $1 AND lower(repo) = lower($2) AND deleted_at IS NULL`,
+            [workspace.id, body.repo])).rows.filter(item => gateWorkflowFile(item.workflow_ref) === workflowFile).length;
+          if (live >= MAX_GATES_PER_WORKFLOW) {
+            fail("gate_limit", `At most ${MAX_GATES_PER_WORKFLOW} live gates per repository and workflow`, 409);
+          }
+          const created = (await tx.query<GateRow>(
+            `INSERT INTO delegation_gates
+               (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
+                target_prefix, allow_source_sha_mismatch, repository_id, repository_owner_id, default_branch,
+                created_auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
+            [mintId("gate"), workspace.id, principal.userId, issuer, body.repo, body.workflow_ref, body.job_workflow_ref ?? null,
+              body.ref ?? null, body.ref_pattern ?? null, body.event, body.target_prefix, body.allow_source_sha_mismatch === true,
+              repository.repositoryId, repository.repositoryOwnerId, repository.defaultBranch, caller.authMethod],
+          )).rows[0]!;
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.registered", ...actor,
+            ownerUserId: principal.userId, data: gateView(created) });
+          // The pin is visible to the owner: which repository this gate trusts, and from when.
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.pinned", ...actor,
+            ownerUserId: principal.userId, data: { gate_id: created.id, repo: created.repo,
+              repository_id: created.repository_id, repository_owner_id: created.repository_owner_id, source: "registration" } });
+          return created;
+        }).catch((error: unknown) => {
+          if ((error as { code?: string })?.code === "23505") fail("gate_exists", "You already registered this gate", 409);
+          throw error;
+        });
+        json(201, gateView(row));
+        return true;
+      }
+      if (method === "DELETE") {
+        // `?gate_id=` or `{gate_id}`, as Cloud.
+        const raw = await readJson(request) as { gate_id?: unknown } | null | undefined;
+        const gateId = new URL(request.url ?? "/", "http://localhost").searchParams.get("gate_id")
+          ?? (typeof raw?.gate_id === "string" ? raw.gate_id : "");
+        if (!GATE_ID.test(gateId)) fail("not_found", "Gate not found", 404);
+        const gate = (await input.database.query<GateRow>(
+          "SELECT * FROM delegation_gates WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL", [gateId, workspace.id],
+        )).rows[0];
+        if (!gate || (gate.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Gate not found", 404);
+        const deleted = await input.database.transaction(async (tx) => {
+          const updated = (await tx.query<{ id: string }>(
+            "UPDATE delegation_gates SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id", [gateId],
+          )).rows[0];
+          if (!updated) return false;
+          // The full gate, so the log alone shows what stopped serving (as Cloud).
+          await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.deleted", ...actor,
+            ownerUserId: gate!.owner_user_id, reason: "deleted", data: gateAuditData(gate!) });
+          return true;
+        });
+        if (!deleted) fail("not_found", "Gate not found", 404);
+        json(200, { gate_id: gateId, deleted: true });
+        return true;
+      }
+      return fail("method_not_allowed", "Method not allowed", 405);
     }
 
     if (sub === "revoke-all") {
@@ -1039,6 +1328,19 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
    * Every route answers a refusal as Cloud does: `{error: <message>, code}`
    * with no-store, and an unexpected failure as 503 `unavailable`.
    */
+  // One reader per workspace: the public-API answers are cached per repository id.
+  const branchReaders = new Map<string, ReturnType<typeof liveDefaultBranchReader>>();
+  function liveDefaultBranchFor(workspaceId: string) {
+    let reader = branchReaders.get(workspaceId);
+    if (!reader) {
+      if (branchReaders.size >= 1000) branchReaders.clear();
+      reader = liveDefaultBranchReader({ fetchImpl: input.githubFetch ?? globalThis.fetch, now,
+        connectionToken: async () => input.githubToken ? input.githubToken(workspaceId, null) : null });
+      branchReaders.set(workspaceId, reader);
+    }
+    return reader;
+  }
+
   return async function handleDelegation(request: IncomingMessage, response: ServerResponse,
     path: string, publicPath: string, method: string): Promise<boolean> {
     if (!isDelegationPath(path)) return false;
