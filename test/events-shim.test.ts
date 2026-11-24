@@ -930,6 +930,18 @@ test("the wake link keeps the agent name it was linked with: linked_agent, repla
     assert.equal((await p.database.query<{ wake_agent: string | null }>("SELECT wake_agent FROM events_shims")).rows[0]!.wake_agent, "claude-one", agent);
   }
 
+  // Package and Control share the 128-character limit (18.15.0): the longest name links and shows,
+  // one more character is refused and the link stays.
+  const longest = `a${"b".repeat(127)}`;
+  const long = await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET, agent: longest });
+  assert.notEqual(long.isError, true, JSON.stringify(long.content));
+  assert.equal(long.structuredContent!.linked_agent, longest);
+  assert.equal((await call("watch_webhooks")).structuredContent!.linked_agent, longest);
+  const tooLong = await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET, agent: `${longest}c` });
+  assert.equal(tooLong.isError, true);
+  assert.equal((await p.database.query<{ wake_agent: string | null }>("SELECT wake_agent FROM events_shims")).rows[0]!.wake_agent, longest);
+  await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET, agent: "claude-one" });
+
   // Control's own check still keeps a bad name out if one reaches the store some other way.
   const store = new PostgresEventsShimStore(p.database, KEYRING, () => undefined);
   const [{ id }] = (await p.database.query<{ id: string }>("SELECT id FROM events_shims")).rows as [{ id: string }];
