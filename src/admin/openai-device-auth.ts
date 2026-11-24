@@ -2,6 +2,7 @@
 // Server-side Codex device login: no hosted callback; the operator approves a
 // one-time code at auth.openai.com and this control plane exchanges it.
 import crypto from "node:crypto";
+import { drainBody } from "../drain-body.js";
 
 export const OPENAI_DEVICE_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const OPENAI_DEVICE_VERIFICATION_URI = "https://auth.openai.com/codex/device";
@@ -180,6 +181,7 @@ export async function pollOpenAIDeviceAuthorization(
   }
 
   if (response.status === 403 || response.status === 404) {
+    await drainBody(response, "openai-device-auth.poll.pending");
     return { status: "pending" };
   }
   if (!response.ok) {

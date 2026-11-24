@@ -2,6 +2,7 @@ import { createHmac, hkdfSync, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import type { DelegationSigner } from "./jws.js";
+import { drainBody } from "../drain-body.js";
 import { messageSentAt } from "./relaycast-ids.js";
 import { logAuditWriteFailed, logRefused, logRevokeFailed, logUnavailable } from "./observe.js";
 import {
@@ -1622,11 +1623,13 @@ export function relaycastQuoteRedactor(input: { relaycastUrl: string; internalSe
         redirect: "manual", signal: AbortSignal.timeout(10_000),
       });
       const status = response.status;
-      if (status >= 200 && status < 300) return { outcome: "redacted", status };
       if (status === 404) {
         const body = await response.json().catch(() => null) as { error?: { code?: unknown } } | null;
         return { outcome: body?.error?.code === "owner_approval_not_found" ? "absent" : "retry", status };
       }
+      // Only the status matters on every other answer: release the body.
+      await drainBody(response, "delegation.relaycast_redact_quote");
+      if (status >= 200 && status < 300) return { outcome: "redacted", status };
       if (status === 429 || status >= 500) return { outcome: "retry", status };
       return { outcome: "rejected", status };
     } catch {
