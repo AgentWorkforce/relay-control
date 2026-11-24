@@ -393,6 +393,10 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
               token = await via.refreshGateToken(token, requestSignal);
               await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
                 [participant.id, encryptSecret(token, this.options.keyring.active)]);
+              // relaygate revoked the old token when it issued this one, so a later failure in this scan must not roll
+              // the stored token back: move the rollback target to after the write.
+              await tx.query("RELEASE SAVEPOINT grok_routine_scan");
+              await tx.query("SAVEPOINT grok_routine_scan");
             }
             remote = await via.authenticatedAgent(token, requestSignal);
           } catch (error) {
@@ -439,11 +443,14 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
       if (recovery) await this.recover(owner, candidate.grant_id, recovery);
     }
     // Cloud copy: acknowledge only deliveries whose events have committed. A failed acknowledgement is retried on the
-    // next scan; the event id is stable per delivery, so the re-read inserts nothing new.
+    // next scan; the event id is stable per delivery, so the re-read inserts nothing new. Each routine's acknowledgements
+    // share one budget, and stop() aborts them, so one hung connection cannot hold the scan.
     for (const { via, token, ids } of acknowledgements) {
+      const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
+      const ackSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       for (const id of ids) {
         if (signal?.aborted) return;
-        try { await via.acknowledgeDelivery(token, id); } catch { break; }
+        try { await via.acknowledgeDelivery(token, id, ackSignal); } catch { break; }
       }
     }
   }
