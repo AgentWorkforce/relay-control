@@ -412,9 +412,34 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     return workspace;
   }
 
+  /**
+   * As memberWorkspace, for a read that needs only the workspace's id: the
+   * same membership, read without workspaceForUser, which provisions a
+   * Relaycast binding for an unbound workspace. A read has no side effect.
+   */
+  async function memberWorkspaceId(principal: Principal, workspaceId: string): Promise<string> {
+    if (principal.workspaceId !== workspaceId) return fail("forbidden", "Forbidden", 403);
+    const row = (await input.database.query<{ organization_id: string }>(
+      `SELECT w.organization_id FROM workspaces w
+         JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $2
+        WHERE w.id = $1`,
+      [workspaceId, principal.userId],
+    )).rows[0];
+    if (!row || row.organization_id !== principal.organizationId) return fail("forbidden", "Forbidden", 403);
+    return workspaceId;
+  }
+
   /** Human-only routes: browser account session or Desktop-verified bearer, never an agent or plain CLI token. */
   async function human(request: IncomingMessage, publicPath: string, workspaceId: string,
     options: { write: boolean }): Promise<Human> {
+    const { principal, authMethod } = await humanPrincipal(request, publicPath, options);
+    const workspace = await memberWorkspace(principal, workspaceId);
+    return { principal, workspace, authMethod, admin: workspace.role === "owner" || workspace.role === "admin" };
+  }
+
+  /** The credential half of human(): who the caller is, before any workspace lookup. */
+  async function humanPrincipal(request: IncomingMessage, publicPath: string,
+    options: { write: boolean }): Promise<{ principal: Principal; authMethod: AuthMethod }> {
     const headerToken = bearer(request);
     let principal: Principal | null;
     let authMethod: AuthMethod;
@@ -435,8 +460,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       authMethod = "session";
     }
-    const workspace = await memberWorkspace(principal, workspaceId);
-    return { principal, workspace, authMethod, admin: workspace.role === "owner" || workspace.role === "admin" };
+    return { principal, authMethod };
   }
 
   /** Attest, redeem, prompt-delegates: the recipient owner's Desktop-verified bearer (Cloud's desktopBearer). */
@@ -726,6 +750,15 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     }
 
     // Human-only routes ------------------------------------------------
+    // GET /delegates/policy: read-only, for any member of the workspace (the
+    // same credentials as the other human routes). The stored policy, or the
+    // defaults when none is stored. Membership is read without provisioning a
+    // Relaycast binding, so an unbound workspace answers too.
+    if (sub === "policy" && method === "GET") {
+      const { principal } = await humanPrincipal(request, publicPath, { write: false });
+      json(200, await loadPolicy(input.database, await memberWorkspaceId(principal, workspaceId)));
+      return true;
+    }
     const caller = await human(request, publicPath, workspaceId, { write: method !== "GET" });
     const { principal, workspace } = caller;
     const actor = { actorUserId: principal.userId, authMethod: caller.authMethod };
@@ -1102,6 +1135,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     }
 
     if (sub === "policy") {
+      // GET is answered above, before human().
       if (method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
       if (!caller.admin) fail("forbidden", "Only org owners and admins can set delegation policy", 403);
       const body = parse(policyBody, await readJson(request), "Invalid policy");
