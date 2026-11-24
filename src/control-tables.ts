@@ -84,6 +84,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "organization_domains",
   "organization_invitations",
   "organization_memberships",
+  "organization_team_assignments",
+  "organization_teams",
   "organizations",
   "password_credentials",
   "password_registrations",

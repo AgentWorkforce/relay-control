@@ -1,7 +1,7 @@
 # Optional features
 
 `SELFHOST_FEATURES` selects which optional components an installation serves.
-It is a comma list of `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people` and `events_shim`, read once at startup.
+It is a comma list of `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`, `events_shim` and `teams`, read once at startup.
 Unset selects `usage` and `usage_people` (the owner-only usage pages); an explicit list, including an empty one, is exact. An unknown name stops startup. Everything
 else is core and always on.
 
@@ -14,11 +14,12 @@ else is core and always on.
 | `usage_people` | The owner-only per-member People drill-down serves, with an audit row per view ([usage.md](usage.md#people-usage_people)). Selected by default |
 | `launch` | The shared-sessions MCP endpoint serves the agent launch tools ([agent-launch.md](agent-launch.md)) |
 | `events_shim` | Webhook inboxes that wake an agent serve under `/api/v1/events-shim` ([events-shim.md](events-shim.md)). While off every such path answers 404 before authentication, not 403 |
+| `teams` | Organization teams routes serve under `/api/v1/organizations/{organizationId}/teams`, and `GET .../memberships` items carry `teamId` ([teams.md](teams.md)). Off by default. Member removal closes the member's team assignment whether or not it is selected |
 
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool, "session_access": bool, "enrollment_keys": true, "enrollment_self_mint": bool } }` (`enrollment_keys` is always true; `enrollment_self_mint` is false only when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`; see [identity.md](identity.md#desktop-enrollment-keys)).
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "teams": bool, "session_delete": bool, "session_access": bool, "enrollment_keys": true, "enrollment_self_mint": bool } }` (`enrollment_keys` is always true; `enrollment_self_mint` is false only when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`; see [identity.md](identity.md#desktop-enrollment-keys)).
 - `/readyz` includes the same `capabilities` object.
 
 `session_delete` is derived from configuration, not selected by `SELFHOST_FEATURES`:
