@@ -895,15 +895,66 @@ test("gate redeem: the opt-out re-reads the default branch live; a cross-repo re
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ run_id: "961" })), approvalId, STABLE, dry)).body,
     { ok: true, consumed: false, dry_run: true });
   assert.equal(env.githubApi.calls.length, onCommit);
-  // The default branch moved: the gate's branch is no longer the reviewed one.
-  env.githubApi.repos.set(REPO.toLowerCase(), { id: 70151234, owner: 90122, full_name: REPO, default_branch: "trunk" });
-  assert.deepEqual((await env.redeem(token("962"), approvalId, STABLE, dry)).body, { ok: false, reason: "sha_mismatch", dry_run: true });
-  // GitHub no longer resolves the repository: no opt-out either.
-  env.githubApi.repos.delete(REPO.toLowerCase());
-  assert.deepEqual((await env.redeem(token("963"), approvalId, STABLE, dry)).body, { ok: false, reason: "sha_mismatch", dry_run: true });
-  // An outage: unavailable (503).
-  env.githubApi.repos.set(REPO.toLowerCase(), "down");
-  const outage = await env.redeem(token("964"), approvalId);
-  assert.equal(outage.status, 503, outage.raw);
-  assert.deepEqual(outage.body, { ok: false, reason: "unavailable" });
+  // The public-API answer is cached per repository id: a second off-commit redeem asks nothing.
+  const cachedCalls = env.githubApi.calls.length;
+  assert.deepEqual((await env.redeem(token("962"), approvalId, STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
+  assert.equal(env.githubApi.calls.length, cachedCalls);
+
+});
+
+test("live default branch: connection uncached, public cached 5 min per repository id, id and name checked, rate limits unavailable", async () => {
+  const { liveDefaultBranchReader, GithubRateLimited, GithubUnavailable } = await import("../src/delegation/gates.js");
+  let answer: { status: number; body?: unknown } = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: REPO, default_branch: "main" } };
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls += 1;
+    return answer.body === undefined ? new Response(null, { status: answer.status }) : Response.json(answer.body, { status: answer.status });
+  }) as typeof fetch;
+  const clock = { ms: Date.now() };
+  let token: string | null = null;
+  const read = liveDefaultBranchReader({ fetchImpl, now: () => new Date(clock.ms), connectionToken: async () => token });
+  // Public API: cached for 5 minutes per repository id, branch and null alike.
+  assert.equal(await read(REPO, "70151234"), "main");
+  assert.equal(await read(REPO, "70151234"), "main");
+  assert.equal(calls, 1);
+  answer = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: REPO, default_branch: "trunk" } };
+  clock.ms += 301_000;
+  assert.equal(await read(REPO, "70151234"), "trunk");
+  // Another repository id (a recreated repo) or another name: null, also cached.
+  assert.equal(await read(REPO, "99999999"), null);
+  answer = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: "Other/name", default_branch: "main" } };
+  clock.ms += 301_000;
+  assert.equal(await read(REPO, "70151234"), null);
+  // Moved (a redirect) or gone (404): null.
+  answer = { status: 301 };
+  clock.ms += 301_000;
+  assert.equal(await read(REPO, "70151234"), null);
+  // Rate limits are unavailable, never cached; other failures too.
+  answer = { status: 429 };
+  clock.ms += 301_000;
+  await assert.rejects(read(REPO, "70151234"), GithubRateLimited);
+  answer = { status: 403, body: { message: "API rate limit exceeded" } };
+  await assert.rejects(read(REPO, "70151234"), GithubRateLimited);
+  answer = { status: 502 };
+  await assert.rejects(read(REPO, "70151234"), GithubUnavailable);
+  // Through the workspace's connection: never cached.
+  token = "ghs_x";
+  answer = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: REPO, default_branch: "main" } };
+  const before = calls;
+  assert.equal(await read(REPO, "70151234"), "main");
+  assert.equal(await read(REPO, "70151234"), "main");
+  assert.equal(calls, before + 2);
+});
+
+test("gates: any job_workflow_ref other than workflow_ref is SHA-pinned, in this repository too", async (t) => {
+  const env = await setup(t);
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  const sameRepoBranch = await env.browser("/delegates/gates", "POST", { ...body,
+    job_workflow_ref: `${REPO}/.github/workflows/publish.yml@refs/heads/main` });
+  assert.equal(sameRepoBranch.status, 400, sameRepoBranch.raw);
+  const equal = await env.browser("/delegates/gates", "POST", { ...body, job_workflow_ref: WORKFLOW });
+  assert.equal(equal.status, 201, equal.raw);
+  const sameRepoSha = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable:`,
+    job_workflow_ref: `${REPO}/.github/workflows/publish.yml@${SHA}` });
+  assert.equal(sameRepoSha.status, 201, sameRepoSha.raw);
 });

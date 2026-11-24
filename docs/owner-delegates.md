@@ -400,9 +400,10 @@ may be in another repo), and the token's `job_workflow_ref` must match it
 exactly too. A gate without `job_workflow_ref` covers only the jobs defined
 in its own file: the token's `job_workflow_ref` must be absent or equal its
 `workflow_ref` (a job inside a reusable workflow must be named on the gate).
-A `job_workflow_ref` in another repository must be pinned to a 40-hex commit
-SHA (400 otherwise): it is matched by name only, and a branch or tag there can
-be moved by that repository's writers.
+A `job_workflow_ref` other than the gate's own `workflow_ref`, in this
+repository or another, must be pinned to a 40-hex commit SHA (400 otherwise):
+it is matched by name only, and a branch or tag can be moved to an edited
+workflow.
 `target_prefix` must start with `<repo>:`, end with `:` (a segment
 boundary, so `repo:stable:` never covers `repo:stable-canary:…`) and contain
 no `*`. `allow_source_sha_mismatch` (default false, shown on the gate only when
@@ -498,9 +499,13 @@ dry_run?}`. Control checks, in order:
    `allow_source_sha_mismatch` keep serving a candidate target, land and
    iOS targets keep none, and with none left the answer is `sha_mismatch`.
    For a GitHub Actions gate the default branch is then read live from
-   GitHub (the workspace's connection, else the public API; never on an
-   on-commit redeem): if it moved, or GitHub no longer resolves the
-   repository, the opt-out does not apply; a GitHub outage is `unavailable`.
+   GitHub (never on an on-commit redeem): through the workspace's connection
+   when it has one (not cached), else the public API, whose answers are cached
+   per repository id for 5 minutes. GitHub's id must equal the gate's
+   repository id and its `full_name` the repo. If the branch moved, or GitHub
+   no longer resolves the repository (404 or redirect), the opt-out does not
+   apply; a rate limit (403/429) or any other failure is `unavailable`, never
+   cached.
    A self-host issuer gate keeps the default branch its owner named.
    Other classes are not sha-bound. Every gate event carries the run's `sha`.
 

@@ -173,7 +173,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
    * it; throws GithubUnavailable on an outage. Only asked for an off-commit
    * candidate redeem through an opt-out gate.
    */
-  liveDefaultBranch?: (repo: string) => Promise<string | null>;
+  liveDefaultBranch?: (repo: string, repositoryId: string) => Promise<string | null>;
 }): Promise<GateRedeemResult> {
   const { workspace } = input;
   const dryRun = input.dryRun === true;
@@ -285,7 +285,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       // and the opt-out does not apply; an outage answers unavailable. A gate
       // on a self-host issuer keeps the branch its owner named at registration.
       if (candidates.length && claims.issuer === GITHUB_ACTIONS_OIDC_ISSUER && input.liveDefaultBranch) {
-        const live = await input.liveDefaultBranch(claims.repository);
+        const live = await input.liveDefaultBranch(claims.repository, claims.repository_id!);
         candidates = live === null ? [] : candidates.filter(item => item.ref === `refs/heads/${live}`);
       }
       if (!candidates.length) return await refuse("sha_mismatch");
@@ -483,6 +483,9 @@ export class GithubUnavailable extends Error {
   }
 }
 
+/** GitHub answered 403 or 429 (a rate limit): unavailable, never "unresolved", never cached (as Cloud). */
+export class GithubRateLimited extends GithubUnavailable {}
+
 /**
  * GitHub's ids for the repository a gate is registered for, resolved before
  * the gate exists, as Cloud's resolveGateRepository: through the workspace's
@@ -510,6 +513,7 @@ export async function resolveGateRepository(input: { repo: string; token: string
   if (response.status === 404 || (response.status >= 300 && response.status < 400) || response.type === "opaqueredirect") {
     return null;
   }
+  if (response.status === 403 || response.status === 429) throw new GithubRateLimited();
   if (!response.ok) throw new GithubUnavailable();
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   const id = body?.id, ownerId = (body?.owner as Record<string, unknown> | undefined)?.id, fullName = body?.full_name;
@@ -529,4 +533,35 @@ export async function resolveGateRepository(input: { repo: string; token: string
 export function mayOptOutOfSourceSha(gate: Pick<GateRow, "allow_source_sha_mismatch" | "ref" | "ref_pattern" | "default_branch">): boolean {
   return gate.allow_source_sha_mismatch === true && gate.ref_pattern === null && Boolean(gate.default_branch) &&
     gate.ref === `refs/heads/${gate.default_branch}`;
+}
+
+/** How long a public-API default-branch answer is reused, per repository id (as Cloud). */
+export const DEFAULT_BRANCH_CACHE_MS = 300_000;
+
+/**
+ * The live default-branch read for an off-commit opt-out redeem (Cloud's
+ * liveDefaultBranch). Through the workspace's GitHub connection when it has
+ * one (not cached), else GitHub's public API, whose answers (a branch, or
+ * null) are cached in memory per repository id for 5 minutes; errors are
+ * never cached. A branch is returned only when GitHub's id equals the gate's
+ * repository id and its full_name equals the repo (case-insensitive), else
+ * null; a moved repository (redirect) or 404 is null. 403/429 throw
+ * GithubRateLimited, any other failure GithubUnavailable: both answer
+ * unavailable.
+ */
+export function liveDefaultBranchReader(input: { fetchImpl: typeof fetch; now: () => Date;
+  connectionToken: (() => Promise<string | null>) }) {
+  const cache = new Map<string, { at: number; branch: string | null }>();
+  return async (repo: string, repositoryId: string): Promise<string | null> => {
+    const token = await input.connectionToken();
+    const check = (ids: RepositoryIds | null) => ids && ids.repositoryId === repositoryId ? ids.defaultBranch : null;
+    if (token) return check(await resolveGateRepository({ repo, token, fetchImpl: input.fetchImpl }));
+    const at = input.now().getTime();
+    const cached = cache.get(repositoryId);
+    if (cached && at - cached.at < DEFAULT_BRANCH_CACHE_MS) return cached.branch;
+    const branch = check(await resolveGateRepository({ repo, token: null, fetchImpl: input.fetchImpl }));
+    if (cache.size >= 1000) cache.clear();
+    cache.set(repositoryId, { at, branch });
+    return branch;
+  };
 }

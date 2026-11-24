@@ -9,7 +9,7 @@ import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
-import { gateRedeemStatus, gateView, GithubUnavailable, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
+import { gateRedeemStatus, gateView, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -303,12 +303,12 @@ const gateBody = z.object({
     if (!job || (job[1]!.endsWith("*") && job[1] !== gate.ref_pattern)) {
       context.addIssue({ code: "custom", message: "job_workflow_ref must be <owner>/<repo>/.github/workflows/<file>@<ref or commit SHA>" });
     } else {
-      // A reusable workflow in ANOTHER repository is matched by name only (no
-      // repository id), and a branch or tag there can be moved by that repo's
-      // writers: it must be pinned to a commit SHA (as Cloud).
-      const jobRepo = gate.job_workflow_ref.slice(0, gate.job_workflow_ref.indexOf("/.github/workflows/"));
-      if (jobRepo.toLowerCase() !== gate.repo.toLowerCase() && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
-        context.addIssue({ code: "custom", message: "a job_workflow_ref in another repository must be pinned to a 40-hex commit SHA" });
+      // Any job_workflow_ref other than the run's own workflow_ref, in this
+      // repository or another, is pinned to a commit SHA (as Cloud): a
+      // reusable workflow is matched by name only, and a branch or tag can be
+      // moved to an edited workflow.
+      if (gate.job_workflow_ref !== gate.workflow_ref && !/^[0-9a-f]{40}$/u.test(job[1]!)) {
+        context.addIssue({ code: "custom", message: "a job_workflow_ref other than workflow_ref must be pinned to a 40-hex commit SHA" });
       }
     }
   }
@@ -625,8 +625,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const result = await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
         workspace, verifyOidc: input.workflowOidc, oidcToken: token, approvalId: body.approval_id, action: body.action,
         dryRun: body.dry_run === true,
-        liveDefaultBranch: async (repo) => (await resolveGateRepository({ repo, fetchImpl: input.githubFetch ?? globalThis.fetch,
-          token: input.githubToken ? await input.githubToken(row.id, null) : null }))?.defaultBranch ?? null,
+        liveDefaultBranch: liveDefaultBranchFor(row.id),
       });
       json(gateRedeemStatus(result), result);
       return true;
@@ -1246,6 +1245,19 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
    * Every route answers a refusal as Cloud does: `{error: <message>, code}`
    * with no-store, and an unexpected failure as 503 `unavailable`.
    */
+  // One reader per workspace: the public-API answers are cached per repository id.
+  const branchReaders = new Map<string, ReturnType<typeof liveDefaultBranchReader>>();
+  function liveDefaultBranchFor(workspaceId: string) {
+    let reader = branchReaders.get(workspaceId);
+    if (!reader) {
+      if (branchReaders.size >= 1000) branchReaders.clear();
+      reader = liveDefaultBranchReader({ fetchImpl: input.githubFetch ?? globalThis.fetch, now,
+        connectionToken: async () => input.githubToken ? input.githubToken(workspaceId, null) : null });
+      branchReaders.set(workspaceId, reader);
+    }
+    return reader;
+  }
+
   return async function handleDelegation(request: IncomingMessage, response: ServerResponse,
     path: string, publicPath: string, method: string): Promise<boolean> {
     if (!isDelegationPath(path)) return false;
