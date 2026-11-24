@@ -50,6 +50,7 @@ import {
   QUOTE_RETENTION_DAYS,
   QUOTE_RETENTION_MAX_DAYS,
   recordDelegationAudit,
+  releaseClaim,
   flushRelaycastRedactions,
   redactExpiredQuotes,
   redactMessageQuotes,
@@ -688,32 +689,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (method !== "DELETE") fail("method_not_allowed", "Method not allowed", 405);
       const claimId = sub.slice(7);
       if (!CLAIM_ID.test(claimId)) fail("not_found", "Claim not found", 404);
-      const released = await input.database.transaction(async (tx) => {
-        const claim = (await tx.query<{ id: string; user_id: string; agent_id: string | null; consumed_at: Date | null }>(
-          `SELECT id, user_id, agent_id, consumed_at FROM delegation_claims
-            WHERE workspace_id = $1 AND id = $2 AND released_at IS NULL FOR UPDATE`,
-          [workspace.id, claimId],
-        )).rows[0];
-        if (!claim || (claim.user_id !== principal.userId && !caller.admin)) return null;
-        await tx.query("UPDATE delegation_claims SET released_at = now() WHERE id = $1", [claim.id]);
-        let revokedGrants: string[] = [];
-        if (claim.consumed_at && claim.agent_id) {
-          // The binding the claim created ends, and so does any grant through it.
-          await tx.query("DELETE FROM delegation_agent_bindings WHERE workspace_id = $1 AND claim_id = $2", [workspace.id, claim.id]);
-          const grantIds = (await tx.query<{ id: string }>(
-            `SELECT id FROM delegation_grants
-              WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active' FOR UPDATE`,
-            [workspace.id, claim.user_id, claim.agent_id],
-          )).rows.map(row => row.id);
-          revokedGrants = (await revokeGrants(tx, { workspaceId: workspace.id, grantIds, actorUserId: principal.userId,
-            reason: "delegate_released", authMethod: caller.authMethod })).map(row => row.id);
-        }
-        await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "delegate.released", ...actor,
-          ownerUserId: claim.user_id, actorAgentId: claim.agent_id,
-          reason: claim.consumed_at ? "delegate_released" : "claim_cancelled",
-          data: { claim_id: claim.id, agent_id: claim.agent_id, revoked_grants: revokedGrants } });
-        return { claimId: claim.id, revokedGrants };
-      });
+      const released = await releaseClaim(input.database, { workspaceId: workspace.id, claimId,
+        actorUserId: principal.userId, admin: caller.admin, authMethod: caller.authMethod });
       if (!released) fail("not_found", "Claim not found", 404);
       json(200, { claim_id: released!.claimId, released: true, revoked_grants: released!.revokedGrants });
       return true;

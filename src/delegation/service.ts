@@ -764,6 +764,52 @@ export async function revokeGrants(executor: SqlExecutor, input: {
 }
 
 /**
+ * Releases a claim (DELETE /delegates/claims/{id}), as Cloud's releaseClaim:
+ * its owner or an org owner/admin cancels a pending code, or ends a completed
+ * claim's binding and revokes the owner's active grants to that agent
+ * (`delegate_released`). Lock order, as every path that locks both: the
+ * grant rows (by id) first, then the claim row, so it cannot deadlock with
+ * revocation or another release. Null when the claim is unknown, already
+ * released, or not the caller's.
+ */
+export async function releaseClaim(database: Database, input: { workspaceId: string; claimId: string; actorUserId: string;
+  admin: boolean; authMethod: string }): Promise<{ claimId: string; revokedGrants: string[] } | null> {
+  return database.transaction(async (tx) => {
+    const seen = (await tx.query<{ user_id: string; agent_id: string | null }>(
+      "SELECT user_id, agent_id FROM delegation_claims WHERE workspace_id = $1 AND id = $2 AND released_at IS NULL",
+      [input.workspaceId, input.claimId],
+    )).rows[0];
+    if (!seen || (seen.user_id !== input.actorUserId && !input.admin)) return null;
+    // Grants first (by id), then the claim.
+    const grantIds = seen.agent_id ? (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_grants
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'
+        ORDER BY id FOR UPDATE`,
+      [input.workspaceId, seen.user_id, seen.agent_id],
+    )).rows.map(row => row.id) : [];
+    const claim = (await tx.query<{ id: string; user_id: string; agent_id: string | null; consumed_at: Date | null }>(
+      `SELECT id, user_id, agent_id, consumed_at FROM delegation_claims
+        WHERE workspace_id = $1 AND id = $2 AND released_at IS NULL FOR UPDATE`,
+      [input.workspaceId, input.claimId],
+    )).rows[0];
+    if (!claim) return null;
+    await tx.query("UPDATE delegation_claims SET released_at = now() WHERE id = $1", [claim.id]);
+    let revokedGrants: string[] = [];
+    if (claim.consumed_at && claim.agent_id) {
+      // The binding the claim created ends, and so does any grant through it.
+      await tx.query("DELETE FROM delegation_agent_bindings WHERE workspace_id = $1 AND claim_id = $2", [input.workspaceId, claim.id]);
+      revokedGrants = (await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds, actorUserId: input.actorUserId,
+        reason: "delegate_released", authMethod: input.authMethod })).map(row => row.id);
+    }
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "delegate.released", actorUserId: input.actorUserId,
+      authMethod: input.authMethod, ownerUserId: claim.user_id, actorAgentId: claim.agent_id,
+      reason: claim.consumed_at ? "delegate_released" : "claim_cancelled",
+      data: { claim_id: claim.id, agent_id: claim.agent_id, revoked_grants: revokedGrants } });
+    return { claimId: claim.id, revokedGrants };
+  });
+}
+
+/**
  * The panic button (§7): every active grant of one owner (or, with null, the
  * whole workspace), plus that owner's unredeemed tier O approvals, as Cloud.
  */
