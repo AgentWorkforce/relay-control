@@ -11,9 +11,9 @@ const ALLOWLIST: AllowlistEntry[] = [
   {
     file: "src/flows/objects.ts",
     binding: "response",
-    count: 1,
+    count: 2,
     reason:
-      "Legacy src/flows run-object upload (GcsRunObjectStore.put). Flows belong to relayfile-control and AGENTS.md says not to change legacy src/flows by default; drain it there or delete it with the legacy module.",
+      "Legacy src/flows run-object store: the GcsRunObjectStore.put upload (unread) and the 404 -> null branch of GcsRunObjectStore.get (branch-exit). Flows belong to relayfile-control and AGENTS.md says not to change legacy src/flows by default; drain them there or delete them with the legacy module.",
   },
 ];
 
@@ -199,4 +199,169 @@ test("non-fetch calls and inline browser scripts in strings are ignored", () => 
     scan("const page = `<script>async function poll(){const r=await fetch('/poll');}</script>`;"),
     [],
   );
+});
+
+// Fixtures for the shapes the reviewer's findings on #310 listed as missed. Each pair is a leak the
+// scan must report and the fixed form it must accept.
+function kinds(body: string): string[] {
+  return scan(body).map((finding) => `${finding.kind} ${finding.binding}`);
+}
+
+test("a read only under any failure check on ok or status does not count", () => {
+  const failureChecks = [
+    "if (!response.ok && response.status !== 404) { await response.text(); throw new Error(); }",
+    "if (response.status >= 400) { await response.text(); throw new Error(); }",
+    "if (response.ok === false) { await response.text(); throw new Error(); }",
+    "if (response.ok) { log('fine'); } else { await response.text(); throw new Error(); }",
+    "return response.ok ? null : await response.text();",
+    "const status = response.status; if (status !== 200) { await response.text(); throw new Error(); }",
+  ];
+  for (const check of failureChecks) {
+    assert.deepEqual(
+      kinds(`async function f(url: string) { const response = await fetch(url); ${check} }`),
+      ["unread response"],
+      check,
+    );
+  }
+  const covered = [
+    "if (response.ok) return response.json(); throw new Error(String(response.status));",
+    "if (response.ok) { return response.json(); } else { throw new Error(); }",
+    "return response.ok ? await response.json() : await response.text();",
+    "if (!response.ok) return await response.text(); await drainBody(response, 'x'); return null;",
+  ];
+  for (const check of covered) {
+    assert.deepEqual(kinds(`async function f(url: string) { const response = await fetch(url); ${check} }`), [], check);
+  }
+});
+
+test("a status branch that returns or continues without reading is a branch-exit finding", () => {
+  const get = (missing: string) => `
+    async function get(url: string) {
+      const response = await fetch(url);
+      if (response.status === 404) ${missing}
+      if (!response.ok) throw new Error(String(response.status));
+      return response.text();
+    }`;
+  assert.deepEqual(kinds(get("return null;")), ["branch-exit response"]);
+  assert.deepEqual(kinds(get("{ await drainBody(response, 'x'); return null; }")), []);
+  assert.deepEqual(
+    kinds(`
+      async function poll(url: string) {
+        for (;;) {
+          const response = await fetch(url);
+          if (response.status === 429) continue;
+          return response.json();
+        }
+      }`),
+    ["branch-exit response"],
+  );
+  // Already read before the test: nothing is left to release.
+  assert.deepEqual(
+    kinds("async function f(url: string) { const response = await fetch(url); const t = await response.text(); if (response.status === 404) return null; return t; }"),
+    [],
+  );
+});
+
+test("wrappers declared to return Promise<Response>, fetch factories and parenthesised callees are fetch-like", () => {
+  const leaks = [
+    `class S3 {
+      private async request(key: string): Promise<Response> { return this.fetchImpl(key); }
+      async put(key: string) { const response = await this.request(key); if (!response.ok) throw new Error(); }
+    }`,
+    `class Api {
+      private api(path: string): Promise<Response> { return fetch(path); }
+      async metadata(path: string): Promise<Response> { return fetch(path); }
+      async go() { const a = await this.api("/a"); const b = await this.metadata("/b"); if (!a.ok || !b.ok) throw new Error(); }
+    }`,
+    `function call(deps: { fetchImpl?: typeof fetch }): typeof fetch { return (input, init) => fetch(input, init); }
+     async function remove(deps: { fetchImpl?: typeof fetch }) { await call(deps)("/x", { method: "DELETE" }).catch(() => undefined); }`,
+    `async function f(options: { fetchImpl?: typeof fetch }) { const response = await (options.fetchImpl ?? fetch)("/x"); if (!response.ok) throw new Error(); }`,
+    `type Deps = { http: typeof fetch };
+     async function f(deps: Deps) { const response = await deps.http("/x"); if (!response.ok) throw new Error(); }`,
+  ];
+  for (const leak of leaks) assert.ok(scan(leak).length > 0, leak);
+  assert.deepEqual(
+    kinds(`class S3 {
+      private async request(key: string): Promise<Response> { return this.fetchImpl(key); }
+      async put(key: string) { const response = await this.request(key); if (!response.ok) throw new Error(); await drainBody(response, "s3.put"); }
+    }`),
+    [],
+  );
+});
+
+test("catch, then, destructuring, Promise.all and ternary await are followed", () => {
+  assert.deepEqual(kinds("async function f(u: string) { await fetch(u).catch(() => undefined); }"), ["discarded <discarded>"]);
+  assert.deepEqual(kinds("function f(u: string) { fetch(u).catch(() => undefined); }"), ["discarded <discarded>"]);
+  assert.deepEqual(
+    kinds("async function f(u: string) { const r = await fetch(u).catch(() => null); if (!r?.ok) throw new Error(); }"),
+    ["unread r"],
+  );
+  assert.deepEqual(
+    kinds("async function f(u: string) { const r = await fetch(u).catch(() => null); if (r) await drainBody(r, 'x'); }"),
+    [],
+  );
+  assert.deepEqual(kinds("function f(u: string) { return fetch(u).then((r) => r.ok); }"), ["unread r"]);
+  assert.deepEqual(kinds("function f(u: string) { return fetch(u).then((r) => r.json()); }"), []);
+  assert.deepEqual(kinds("async function f(u: string) { const { ok } = await fetch(u); return ok; }"), ["unread <{ok}>"]);
+  assert.deepEqual(kinds("async function f(u: string) { const [r] = await Promise.all([fetch(u)]); return r.ok; }"), ["unread r"]);
+  assert.deepEqual(kinds("async function f(u: string) { const [r] = await Promise.all([fetch(u)]); return r.json(); }"), []);
+  assert.deepEqual(kinds("async function f(a: string, b: string) { const [x] = await Promise.all([fetch(a), fetch(b)]); return x.json(); }"), ["unread <[1]>"]);
+  assert.deepEqual(kinds("async function f(c: boolean, u: string) { const r = c ? await fetch(u) : null; return r?.status; }"), ["unread r"]);
+});
+
+test("a body test, a logger, or a same-file helper that ignores the response is not consumption", () => {
+  const notConsumed = [
+    "if (response.body) return 1;",
+    "console.log(response);",
+    "log('fetched', { response });",
+    "deps.log?.('fetched', { status: response.status, response });",
+    "ignore(response);",
+  ];
+  for (const use of notConsumed) {
+    assert.deepEqual(
+      kinds(`function ignore(r: Response) { return r.status; }
+        async function f(url: string) { const response = await fetch(url); if (!response.ok) throw new Error(); ${use} }`),
+      ["unread response"],
+      use,
+    );
+  }
+  assert.deepEqual(
+    kinds(`async function readError(r: Response) { return (await r.json()).code; }
+      async function f(url: string) { const response = await fetch(url); return readError(response); }`),
+    [],
+  );
+});
+
+test("a same-named binding in a nested function or block does not satisfy the outer one", () => {
+  assert.deepEqual(
+    kinds(`async function f(url: string) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error();
+      const parse = async (response: Response) => response.json();
+      return parse;
+    }`),
+    ["unread response"],
+  );
+  assert.deepEqual(
+    kinds(`async function f(a: string, b: string) {
+      { const response = await fetch(a); if (!response.ok) throw new Error(); }
+      { const response = await fetch(b); return response.json(); }
+    }`),
+    ["unread response"],
+  );
+});
+
+test("a carrier that returns { status, response } is tracked through destructuring", () => {
+  const post = `async function post(path: string): Promise<{ status: number; response: Response }> {
+    const response = await fetch(path); return { status: response.status, response };
+  }`;
+  assert.deepEqual(
+    kinds(`${post} async function push() { const { status, response } = await post("/k"); if (status !== 200) throw new Error(await response.text()); }`),
+    ["unread response"],
+  );
+  assert.deepEqual(
+    kinds(`${post} async function push() { const { status, response } = await post("/k"); if (status !== 200) throw new Error(await response.text()); await drainBody(response, "x"); }`),
+    [],
+  );
+  assert.deepEqual(kinds(`${post} async function push() { const { status } = await post("/k"); return status; }`), ["unread <{response} dropped>"]);
 });
