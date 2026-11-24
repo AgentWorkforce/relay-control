@@ -101,7 +101,7 @@ Off by default. With it off, everything above applies unchanged. With it on,
 new Grok Bot routines get Agent Relay Cloud's routine behaviour: Cloud's
 routine prompt, sender check and reply policy, copied as is. Cloud itself is
 not changed. See [the spec](specs/grok-bot-dynamic-prompt.md), Phase 1. Apply
-migration `0088_grok_routines_cloud_copy.sql` first.
+migration `0093_grok_routines_cloud_copy.sql` first.
 
 - **Per routine, not per server.** A routine uses the copy only if it was
   saved on the setup page, or connected for polling, while the flag was on
