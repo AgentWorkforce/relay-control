@@ -119,6 +119,8 @@ export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thre
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
+/** A managed join never changes the desktop identity's card, so its description is not applied. */
+export const MANAGED_JOIN_DESCRIPTION_IGNORED = "The description was not applied: joining does not change this desktop identity's card. Use set_relay_agent_card to change it.";
 /** Cloud's DESKTOP_RELAY_GUIDANCE without the web-session sentence: self-host has no web sessions. */
 export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; DMs and subscribed channel posts are then injected.";
 export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session is not linked to Agent Relay Desktop, so channel posts would not reach your local session. Call join_relay with desktop_address (from GET /whoami on the relay socket, or an injected Agent Relay message), then retry. To use this MCP session's hosted inbox instead (posts arrive in check_relay_inbox; poll it), pass hosted: true.";
@@ -1105,7 +1107,8 @@ function createRelayService(context: McpContext) {
         throw new RelayToolError(MANAGED_JOIN_REFUSED);
       }
       return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
-        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE };
+        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE,
+        ...(input.description ? { note: MANAGED_JOIN_DESCRIPTION_IGNORED } : {}) };
     }
     if (input.desktop_address) return joinDesktop(input.desktop_address.trim(), input);
     if (oauth && !oauth.access.agentRemoteId) oauth.assertActor(input.name);

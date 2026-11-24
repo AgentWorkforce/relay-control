@@ -882,7 +882,10 @@ paths:
         signature are checked here; the tool and tool use are bound, and the
         tool use spent, only when the desktop-managed `tools/call` whose
         `_meta["claudecode/toolUseId"]` equals `tuid` takes it. The same proof
-        again is 204; another proof for a stored tool use is 409 `conflict`.
+        again is 204; another proof for a stored tool use, or a proof whose
+        tool use a call already spent, is 409 `conflict`. The Desktop
+        sign-in's redirect token is refused (403 `handoff_not_exchanged`
+        before its exchange, `forbidden` after).
         A malformed body or proof, or one that is not `kind: "claude"`, is 400
         `invalid_attestation`; an unknown key, bad signature, expired proof or
         one issued in the future is 403 `attestation_rejected`. Neither the
@@ -13525,8 +13528,8 @@ components:
       description: |
         `{error, message}` with a stable code: invalid_request or
         invalid_attestation (400), unauthorized (401), desktop_login_required,
-        workspace_access_changed, forbidden, csrf_rejected or
-        attestation_rejected (403), workspace_not_found or token_not_found
+        workspace_access_changed, forbidden, csrf_rejected,
+        handoff_not_exchanged or attestation_rejected (403), workspace_not_found or token_not_found
         (404), method_not_allowed (405, with Allow), credential_conflict,
         too_many_credentials or conflict (409), rate_limited (429),
         upstream_unavailable (502).

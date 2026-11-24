@@ -452,7 +452,7 @@ export function createMcpHandler(input: {
       const callHeaders = oauth || staffGrant || agentToken ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
-        : await claudeAttestationFor(body, callHeaders, auth, attestations, undefined, claudeHandoffs);
+        : await claudeAttestationFor(body, callHeaders, auth, attestations, undefined, { store: claudeHandoffs });
       stage = "desktop_context";
       desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {

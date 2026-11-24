@@ -83,8 +83,13 @@ expired rows are pruned on later handoffs. Answers: 204 (also for the same
 proof again); 400 `invalid_attestation` for a malformed body or proof or
 another kind; 403 `attestation_rejected` for an unknown key, a bad signature,
 an expired proof or one issued in the future; 409 `conflict` when another
-proof is stored for that tool use; otherwise the identity sync's 401, 403 and
-404. Neither the proof nor key material is echoed or logged.
+proof is stored for that tool use or a call already spent it; otherwise the
+identity sync's 401, 403 and 404. The Desktop sign-in's redirect token is
+refused here and at identity sync (403 `handoff_not_exchanged` before its PKCE
+exchange, 403 `forbidden` after), as at the MCP route. Neither the proof nor
+key material is echoed or logged. Each handoff logs `claude attestation
+handoff` with `outcome` (`stored`, `repeat`, `conflict`, `invalid`,
+`rejected`) and a fixed `reason`, plus workspace and user ids.
 
 On a single desktop-managed `tools/call` with no proof in its arguments, on
 the app bearer with the marker or a credential bound to `claude` (never
@@ -92,11 +97,26 @@ the app bearer with the marker or a credential bound to `claude` (never
 the proof handed off for `_meta["claudecode/toolUseId"]` and verifies it
 exactly as an in-argument proof, spend included; any failure is the same
 `-32602 Invalid native chat context.` With nothing handed off the call has no
-verified chat, as a call without a proof always had. An in-argument proof
-still works and is checked first.
+verified chat, as a call without a proof always had. A store failure while
+taking the proof is logged and treated the same way (the call fails closed,
+never a 500); a store failure while verifying a proof, handed off or not,
+still fails the request as before. Each take logs `claude attestation
+handoff take` with `outcome` `hit`, `miss`, `error` or `verify_failed` (with a
+fixed `reason`), never the proof, the tool-use id or key material. An
+in-argument proof still works and is checked first.
+
+What a pending handoff proves: it can be consumed by any client that holds
+its tool-use id and a desktop-managed credential of the same user in the same
+workspace (the app bearer with the Desktop marker, or a `claude` provider
+credential). The proof's tool name is still bound to `params.name`, it lives
+at most 60 seconds, and it is spent once. Tool-use ids are not secrets: they
+appear in Claude Code's transcripts and hook input, so the handoff's security
+rests on the signature, the owner's credential and the tool binding, not on
+the id being unguessable.
 
 Because Desktop no longer strips them, a desktop-managed `join_relay` may
 carry `name` when it is the verified identity's own name (trimmed, any letter
-case); `description` is ignored, since the join never changes the card. Any
+case); `description` is ignored, since the join never changes the card, and
+the result then carries a `note` saying it was not applied. Any
 other `name`, or a `desktop_address` that is not the identity's, is refused
 with "This chat can only use its verified desktop identity."

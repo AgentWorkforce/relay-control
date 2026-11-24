@@ -2,6 +2,7 @@ import { webcrypto } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { SqlExecutor } from "../database.js";
 import { normalizeDesktopSourceId } from "../desktop-source-id.js";
+import { nativeContextRefusalReason } from "./native-context-refusal.js";
 import {
   ATTESTATION_ARGUMENT, ATTESTATION_TYPE, attestationKeyId, decodeBase64Url, type AttestationStore,
 } from "./copilot-attestation.js";
@@ -232,9 +233,13 @@ export async function verifyClaudeHandoff(input: {
  * Claude's tool-use id (table mcp_attestation_handoffs, migration 0097).
  */
 export type ClaudeHandoffStore = {
-  /** Stores a proof; "exists" when this exact proof is already stored, "conflict" when another one is. */
+  /**
+   * Stores a proof; "exists" when this exact proof is already stored,
+   * "conflict" when another one is, "spent" when its tool use was already
+   * spent by a call (nothing is stored then).
+   */
   put(input: { workspaceId: string; userId: string; toolUseId: string; proof: string; expiresAt: Date }):
-    Promise<"stored" | "exists" | "conflict">;
+    Promise<"stored" | "exists" | "conflict" | "spent">;
   /** Reads and deletes the unexpired proof stored for this tool use, atomically; null when there is none. */
   take(input: { workspaceId: string; userId: string; toolUseId: string }): Promise<string | null>;
 };
@@ -249,6 +254,13 @@ export function postgresClaudeHandoffStore(database: SqlExecutor): ClaudeHandoff
           WHERE expires_at <= now() AND workspace_id = $1 AND user_id = $2`,
         [input.workspaceId, input.userId],
       );
+      // A proof for a tool use a call already spent can never verify again.
+      const spent = await database.query(
+        `SELECT 1 FROM mcp_attestation_tool_uses
+          WHERE workspace_id = $1 AND user_id = $2 AND tool_use_id = $3 AND expires_at > now()`,
+        [input.workspaceId, input.userId, input.toolUseId],
+      );
+      if (spent.rows.length > 0) return "spent";
       // A row taken between the insert and the read is inserted again.
       for (let attempt = 0; attempt < 2; attempt++) {
         const inserted = await database.query<{ tool_use_id: string }>(
@@ -293,6 +305,14 @@ function takeProof(message: unknown): { present: boolean; proof?: unknown } {
 }
 
 /**
+ * Operator log for the handoff take: outcome and a fixed reason code only,
+ * never the proof, the tool-use id or key material.
+ */
+export type ClaudeHandoffLog = (message: string, fields: Record<string, unknown>) => void;
+export const CLAUDE_HANDOFF_TAKE_LOG = "claude attestation handoff take";
+const defaultHandoffLog: ClaudeHandoffLog = (message, fields) => console.warn(`[selfhost-mcp] ${message}`, fields);
+
+/**
  * Removes the proof from the parsed request in place, so no tool ever sees or
  * echoes it, then verifies it when this is a desktop-managed Claude Code or
  * Cursor call.
@@ -305,13 +325,16 @@ function takeProof(message: unknown): { present: boolean; proof?: unknown } {
  * unbound or Claude credential (never Cursor or Copilot) that carries Claude
  * Code's `_meta["claudecode/toolUseId"]` takes the proof Desktop handed off
  * for that tool use, if any, and verifies it exactly as an in-argument proof
- * (tool, tool use, lifetime, spend). Nothing handed off is no attestation.
+ * (tool, tool use, lifetime, spend). Nothing handed off is no attestation,
+ * and neither is a store failure while taking it (logged; the call fails
+ * closed). A store failure while verifying a proof still throws.
  */
 export async function claudeAttestationFor(body: unknown, headers: Headers, auth: {
   workspaceId: string;
   userId: string;
   desktopMcpProvider?: string;
-}, store: AttestationStore, nowMs?: number, handoffs?: ClaudeHandoffStore): Promise<ClaudeAttestation | undefined> {
+}, store: AttestationStore, nowMs?: number,
+handoff?: { store: ClaudeHandoffStore; log?: ClaudeHandoffLog }): Promise<ClaudeAttestation | undefined> {
   if (Array.isArray(body)) {
     const present = body.map(takeProof).some(result => result.present);
     if (present) return fail("batched proof");
@@ -322,18 +345,40 @@ export async function claudeAttestationFor(body: unknown, headers: Headers, auth
   if (!managed) return undefined;
   const provider = auth.desktopMcpProvider;
   if (!taken.present) {
-    if (!handoffs || (provider !== undefined && provider !== "claude")) return undefined;
+    if (!handoff || (provider !== undefined && provider !== "claude")) return undefined;
     const request = body as ToolCallRequest | null;
     if (!object(request) || request.method !== "tools/call") return undefined;
     const params = request.params;
     const toolUseId = object(params) && object(params._meta) ? params._meta[CLAUDE_TOOL_USE_META] : undefined;
     if (typeof toolUseId !== "string" || !TOOL_USE_ID.test(toolUseId)) return undefined;
-    const proof = await handoffs.take({ workspaceId: auth.workspaceId, userId: auth.userId, toolUseId });
-    if (proof === null) return undefined;
-    return verifyClaudeAttestation({
-      proof, workspaceId: auth.workspaceId, userId: auth.userId,
-      toolUseId, toolName: params?.name, args: params?.arguments, provider: "claude", nowMs,
-    }, store);
+    const log = handoff.log ?? defaultHandoffLog;
+    const owner = { workspace_id: auth.workspaceId, user_id: auth.userId, tool: typeof params?.name === "string" ? params.name : null };
+    let proof: string | null;
+    try {
+      proof = await handoff.store.take({ workspaceId: auth.workspaceId, userId: auth.userId, toolUseId });
+    } catch (error) {
+      // A store failure here never fails the call: it proceeds with no
+      // attestation, so actor tools fail closed with today's guidance.
+      log(CLAUDE_HANDOFF_TAKE_LOG, { ...owner, outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+      return undefined;
+    }
+    if (proof === null) {
+      log(CLAUDE_HANDOFF_TAKE_LOG, { ...owner, outcome: "miss" });
+      return undefined;
+    }
+    try {
+      const attested = await verifyClaudeAttestation({
+        proof, workspaceId: auth.workspaceId, userId: auth.userId,
+        toolUseId, toolName: params?.name, args: params?.arguments, provider: "claude", nowMs,
+      }, store);
+      log(CLAUDE_HANDOFF_TAKE_LOG, { ...owner, outcome: "hit" });
+      return attested;
+    } catch (error) {
+      if (error instanceof ClaudeAttestationError) {
+        log(CLAUDE_HANDOFF_TAKE_LOG, { ...owner, outcome: "verify_failed", reason: nativeContextRefusalReason("claude_attestation", error) });
+      }
+      throw error;
+    }
   }
   if (provider !== undefined && provider !== "claude" && provider !== "cursor") return fail("provider mismatch");
   const params = (body as ToolCallRequest).params;

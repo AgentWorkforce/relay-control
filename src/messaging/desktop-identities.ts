@@ -7,6 +7,7 @@ import { normalizeDesktopSourceId } from "../desktop-source-id.js";
 import {
   CLAUDE_ATTESTATION_MAX_PROOF_BYTES, ClaudeAttestationError, postgresClaudeHandoffStore, verifyClaudeHandoff,
 } from "../mcp/claude-attestation.js";
+import { nativeContextRefusalReason } from "../mcp/native-context-refusal.js";
 import {
   attestationKeyId, COPILOT_ATTESTATION_CAPABILITY, decodeBase64Url, postgresAttestationStore,
 } from "../mcp/copilot-attestation.js";
@@ -110,6 +111,9 @@ const handoffBody = z.object({
   attestation: z.string().min(1).max(CLAUDE_ATTESTATION_MAX_PROOF_BYTES),
 }).strict();
 
+/** Operator log line for each handoff, by outcome: stored, repeat, conflict, invalid or rejected. */
+export const CLAUDE_HANDOFF_LOG = "claude attestation handoff";
+
 /** Verifier reasons that mean a well-formed proof was refused (403), not a malformed one (400). */
 const HANDOFF_REJECTED = new Set(["unknown key", "bad signature", "expired", "issued in the future"]);
 
@@ -117,7 +121,7 @@ type Identity = z.infer<typeof identity>;
 type AttestationKey = z.infer<typeof attestationKey>;
 
 type Access = {
-  principal: { userId: string; scopes: string[] };
+  principal: { userId: string; scopes: string[]; pendingHandoff?: boolean; handoff?: boolean };
   workspace: { id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string };
 };
 
@@ -418,6 +422,7 @@ export async function handleDesktopIdentityRoutes(
   if (!match) return false;
   const handoff = match[2] !== undefined;
   if (handoff ? method !== "POST" : method !== "GET" && method !== "PUT") {
+    response.setHeader("allow", handoff ? "POST" : "GET, PUT");
     throw new MessagingHttpError(405, "method_not_allowed", "Method not allowed");
   }
   let workspaceId: string;
@@ -430,9 +435,17 @@ export async function handleDesktopIdentityRoutes(
   if (!access.principal.scopes.includes("cli:auth")) {
     throw new MessagingHttpError(403, "forbidden", "Desktop identities require a browser session or cli:auth");
   }
+  // The Desktop sign-in's redirect token is never a capability bearer, before
+  // or after its PKCE exchange (as the MCP route and the other cli:auth gates).
+  if (access.principal.pendingHandoff) {
+    throw new MessagingHttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+  }
+  if (access.principal.handoff) {
+    throw new MessagingHttpError(403, "forbidden", "Desktop identities require the exchanged Desktop session");
+  }
 
   if (handoff) {
-    await handOffClaudeAttestation(request, response, access, deps);
+    await handOffClaudeAttestation(request, response, access, { ...deps, log: deps.log ?? defaultLog });
     return true;
   }
 
@@ -496,7 +509,8 @@ export async function handleDesktopIdentityRoutes(
  * format, lifetime, key and signature are checked here; its tool and tool use
  * are bound, and the tool use spent, only when the MCP call with that
  * `claudecode/toolUseId` takes it. Same auth as identity sync. 204 on success,
- * also for the same proof again; another proof for a stored tool use is 409.
+ * also for the same proof again; another proof for a stored tool use, or a
+ * proof whose tool use a call already spent, is 409.
  * Neither the proof nor key material is ever echoed or logged.
  */
 async function handOffClaudeAttestation(
@@ -507,38 +521,52 @@ async function handOffClaudeAttestation(
     requestObject: (request: IncomingMessage) => Promise<Record<string, unknown>>;
     database: Database;
     csrfAllowed: (request: IncomingMessage) => boolean;
+    log: DesktopIdentityLog;
   },
 ): Promise<void> {
   if (!deps.csrfAllowed(request)) {
     throw new MessagingHttpError(403, "csrf_rejected", "Cross-origin attestation handoff refused");
   }
-  const invalid = () => new MessagingHttpError(400, "invalid_attestation", "Invalid attestation handoff");
+  const owner = { workspaceId: access.workspace.id, userId: access.principal.userId };
+  // Outcome and a fixed reason only: never the proof, the tool-use id or key material.
+  const log = (outcome: string, reason?: string) => deps.log(CLAUDE_HANDOFF_LOG, {
+    outcome, ...(reason ? { reason } : {}), workspace_id: owner.workspaceId, user_id: owner.userId,
+  });
+  const invalid = (reason: string) => {
+    log("invalid", reason);
+    return new MessagingHttpError(400, "invalid_attestation", "Invalid attestation handoff");
+  };
   let body: Record<string, unknown>;
   try {
     body = await deps.requestObject(request);
   } catch {
-    throw invalid();
+    throw invalid("malformed_body");
   }
   const parsed = handoffBody.safeParse(body);
-  if (!parsed.success) throw invalid();
-  const owner = { workspaceId: access.workspace.id, userId: access.principal.userId };
+  if (!parsed.success) throw invalid("malformed_body");
   let verified: { toolUseId: string; expiresAt: Date };
   try {
     verified = await verifyClaudeHandoff({ proof: parsed.data.attestation, ...owner },
       postgresAttestationStore(deps.database));
   } catch (error) {
     if (!(error instanceof ClaudeAttestationError)) throw error;
+    const reason = nativeContextRefusalReason("claude_attestation", error);
     if (HANDOFF_REJECTED.has(error.reason)) {
+      log("rejected", reason);
       throw new MessagingHttpError(403, "attestation_rejected", "The attestation was not accepted");
     }
-    throw invalid();
+    throw invalid(reason);
   }
   const stored = await postgresClaudeHandoffStore(deps.database).put({
     ...owner, toolUseId: verified.toolUseId, proof: parsed.data.attestation, expiresAt: verified.expiresAt,
   });
-  if (stored === "conflict") {
-    throw new MessagingHttpError(409, "conflict", "Another attestation is already handed off for this tool use");
+  if (stored === "conflict" || stored === "spent") {
+    log("conflict", stored === "spent" ? "spent" : "other_proof");
+    throw new MessagingHttpError(409, "conflict", stored === "spent"
+      ? "This tool use was already used by a call"
+      : "Another attestation is already handed off for this tool use");
   }
+  log(stored === "exists" ? "repeat" : "stored");
   response.writeHead(204, { "cache-control": "no-store" });
   response.end();
 }
