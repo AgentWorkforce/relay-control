@@ -9,7 +9,7 @@ import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
-import { gateAuditData, gateRedeemStatus, gateView, MAX_GATES_PER_WORKFLOW, qualifiedGateOwner, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
+import { gateAuditData, gateRedeemStatus, gateView, gateWorkflowFile, MAX_GATES_PER_WORKFLOW, qualifiedGateOwner, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -855,14 +855,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           if (!role) fail("forbidden", "Forbidden", 403);
           if (!qualifiedGateOwner(role)) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
           // At most MAX_GATES_PER_WORKFLOW live gates per (workspace, repository,
-          // workflow_ref), counted under an advisory lock so concurrent
-          // registrations cannot both slip under the limit.
+          // workflow file without its @ref, so all tag patterns share one cap),
+          // counted under an advisory lock so concurrent registrations cannot
+          // both slip under the limit.
+          const workflowFile = gateWorkflowFile(body.workflow_ref);
           await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            [`delegation-gates:${workspace.id}:${body.repo.toLowerCase()}:${body.workflow_ref}`]);
-          const live = Number((await tx.query<{ count: number }>(
-            `SELECT count(*)::int AS count FROM delegation_gates
-              WHERE workspace_id = $1 AND lower(repo) = lower($2) AND workflow_ref = $3 AND deleted_at IS NULL`,
-            [workspace.id, body.repo, body.workflow_ref])).rows[0]?.count ?? 0);
+            [`delegation-gates:${workspace.id}:${body.repo.toLowerCase()}:${workflowFile}`]);
+          const live = (await tx.query<{ workflow_ref: string }>(
+            `SELECT workflow_ref FROM delegation_gates
+              WHERE workspace_id = $1 AND lower(repo) = lower($2) AND deleted_at IS NULL`,
+            [workspace.id, body.repo])).rows.filter(item => gateWorkflowFile(item.workflow_ref) === workflowFile).length;
           if (live >= MAX_GATES_PER_WORKFLOW) {
             fail("gate_limit", `At most ${MAX_GATES_PER_WORKFLOW} live gates per repository and workflow`, 409);
           }

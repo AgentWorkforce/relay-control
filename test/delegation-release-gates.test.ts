@@ -997,9 +997,45 @@ test("gates: only an org owner or admin's gate serves (pending D5); at most 10 l
   const refused = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "990" })), approvalId);
   assert.equal(refused.status, 403, refused.raw);
   assert.deepEqual(refused.body, { ok: false, reason: "gate_owner_unqualified" });
-  // At most 10 live gates per (repository, workflow_ref), Bob's included: the 11th is 409 gate_limit.
+  // At most 10 live gates per (repository, workflow file without its @ref), Bob's included:
+  // the 11th is 409 gate_limit, on any ref or tag pattern of that file and any repo casing.
   for (let index = 0; index < 9; index += 1) await env.gate({ target_prefix: `${REPO}:c${index}:` });
   const eleventh = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:c10:` });
   assert.equal(eleventh.status, 409, eleventh.raw);
   assert.equal(eleventh.body.code, "gate_limit");
+  const file = WORKFLOW.slice(0, WORKFLOW.indexOf("@"));
+  const tagPattern = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: `${file}@refs/tags/v*`,
+    ref_pattern: "refs/tags/v*", event: "push", target_prefix: `${REPO}:` });
+  assert.equal(tagPattern.status, 409, tagPattern.raw);
+  assert.equal(tagPattern.body.code, "gate_limit");
+  const otherBranch = await env.browser("/delegates/gates", "POST", { ...body, workflow_ref: `${file}@refs/heads/dev`,
+    ref: "refs/heads/dev", target_prefix: `${REPO}:dev:` });
+  assert.equal(otherBranch.status, 409, otherBranch.raw);
+  // Another workflow file of the same repository has its own cap.
+  const otherFile = `${REPO}/.github/workflows/release.yml`;
+  const own = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: `${otherFile}@refs/tags/v*`,
+    ref_pattern: "refs/tags/v*", event: "push", target_prefix: `${REPO}:` });
+  assert.equal(own.status, 201, own.raw);
+});
+
+test("gates: one redeem evaluates at most 10 candidate gates, oldest first", async (t) => {
+  const env = await setup(t);
+  // Ten gates whose prefix the action misses, then (as if registered past the
+  // cap before it existed) an eleventh that would serve: it is never reached.
+  for (let index = 0; index < 10; index += 1) await env.gate({ target_prefix: `${REPO}:c${index}:` });
+  const [first] = (await env.database.query<{ id: string }>(
+    "SELECT id FROM delegation_gates ORDER BY created_at, id LIMIT 1")).rows;
+  await env.database.query(
+    `INSERT INTO delegation_gates
+       SELECT (jsonb_populate_record(g, jsonb_build_object('id', 'gate_late11', 'target_prefix', $2::text,
+         'created_at', now() + interval '1 minute'))).* FROM delegation_gates g WHERE g.id = $1`,
+    [first!.id, `${REPO}:`]);
+  const approvalId = await env.approval([STABLE]);
+  const claims = () => mint(env.github, env.workflowClaims({ run_id: `${Math.floor(Math.random() * 1e9) + 1}` }));
+  assert.deepEqual((await env.redeem(claims(), approvalId, STABLE, { dry_run: true })).body,
+    { ok: false, reason: "target_prefix", dry_run: true });
+  // Delete one of the ten: the late gate is now within the first ten and serves.
+  await env.database.query("UPDATE delegation_gates SET deleted_at = now() WHERE id = $1", [first!.id]);
+  assert.deepEqual((await env.redeem(claims(), approvalId, STABLE, { dry_run: true })).body,
+    { ok: true, consumed: false, dry_run: true });
 });

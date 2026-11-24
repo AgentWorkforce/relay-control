@@ -422,8 +422,10 @@ qualification is pending Khaliq's decision D5 (option b):** only an org owner
 or admin may register a gate (403 `gate_owner_unqualified` otherwise), and a
 gate serves only while its owner still is one. relay-control reads no
 CODEOWNERS, so this is stricter than Cloud's code-owner-or-admin rule. At
-most 10 live gates may share a repository and `workflow_ref` in a workspace
-(409 `gate_limit`). `DELETE` names the gate
+most 10 live gates may share a repository and workflow file (the
+`workflow_ref` path without its `@ref`, so every ref and tag pattern of one
+file shares the cap) in a workspace (409 `gate_limit`), and one redeem
+evaluates at most 10 candidate gates, oldest first. `DELETE` names the gate
 with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, workflow_ref, job_workflow_ref?, ref,
 ref_pattern, event, target_prefix}`. For example:
 

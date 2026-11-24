@@ -231,7 +231,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (!registered.length) return await refuse("gate_unknown");
     // Matching the repository alone is not enough: a workflow edited on
     // another branch also gets a token for the same repository.
-    const byName = registered.filter(item => gateMatchesByName(item, claims!));
+    // At most MAX_GATES_PER_WORKFLOW candidates are evaluated, oldest first
+    // (registration caps a workflow file at that many).
+    const byName = registered.filter(item => gateMatchesByName(item, claims!)).slice(0, MAX_GATES_PER_WORKFLOW);
     if (!byName.length) return await refuse("gate_mismatch");
     // Every gate holds the repository ids GitHub reported at registration;
     // redeem never pins. A token that matches a gate by name but carries
@@ -598,5 +600,18 @@ export function qualifiedGateOwner(role: string | null): boolean {
   return role === "owner" || role === "admin";
 }
 
-/** At most this many live gates per (workspace, repository, workflow_ref). */
+/**
+ * At most this many live gates per (workspace, lower(repo), workflow file),
+ * as Cloud: the file path without its `@ref`, so every tag pattern of one
+ * workflow shares one cap. One redeem also evaluates at most this many
+ * candidate gates.
+ */
 export const MAX_GATES_PER_WORKFLOW = 10;
+
+/** A gate's workflow file, `/.github/workflows/<file>`, without the repository or `@ref`. */
+export function gateWorkflowFile(workflowRef: string): string {
+  const at = workflowRef.indexOf("/.github/workflows/");
+  const path = at < 0 ? workflowRef : workflowRef.slice(at);
+  const ref = path.indexOf("@");
+  return ref < 0 ? path : path.slice(0, ref);
+}

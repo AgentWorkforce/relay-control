@@ -3500,7 +3500,7 @@ paths:
         "400": { description: "`invalid_request`" }
         "401": { description: "`unauthorized`" }
         "403": { description: "`forbidden`, `not_enabled`, `csrf_rejected`, or `gate_owner_unqualified` (only an org owner or admin may own a gate; pending D5)" }
-        "409": { description: "`gate_exists`: you already registered this gate; `gate_limit`: 10 live gates already share this repository and workflow_ref" }
+        "409": { description: "`gate_exists`: you already registered this gate; `gate_limit`: 10 live gates already share this repository and workflow file (workflow_ref without its @ref)" }
         "422": { description: "`repository_unresolved`: GitHub knows no repository by that name that this workspace can see (the gate is pinned to its ids at registration)" }
         "503": { description: "`unavailable`: GitHub could not be reached to resolve the repository" }
     delete:
