@@ -1,0 +1,73 @@
+{
+  "version": "2026.11.1",
+  "bootstrap_version": 1,
+  "sources": {
+    "grok-inbox": "Agent Relay Cloud's Grok routine prompt, copied in Phase 1 (rendered per grant)",
+    "grok-delegation": "The public Grok Bot plugin skill (AgentWorkforce/skills, plugins/grok-bot): 'Delegating work to agents'",
+    "show-ui": "The public Grok Bot plugin skill (AgentWorkforce/skills, plugins/grok-bot): 'Showing visuals'",
+    "lead-delegation": "The layered lead kit's delegation guidance",
+    "lead-orchestration": "The layered lead kit's orchestration guidance"
+  },
+  "sections": [
+    {
+      "id": "safety",
+      "title": "Safety",
+      "file": "sections/safety.md",
+      "audiences": [
+        "grok-bot",
+        "lead",
+        "worker"
+      ]
+    },
+    {
+      "id": "grok-inbox",
+      "title": "Handling your messages",
+      "builtin": "grok-routine-prompt",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "grok-delegation",
+      "title": "Delegating work to agents",
+      "file": "sections/grok-delegation.md",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "show-ui",
+      "title": "Showing visuals",
+      "file": "sections/show-ui.md",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "lead-delegation",
+      "title": "Delegated work",
+      "file": "sections/lead-delegation.md",
+      "audiences": [
+        "lead"
+      ]
+    },
+    {
+      "id": "lead-orchestration",
+      "title": "Orchestrate; don't implement serially",
+      "file": "sections/lead-orchestration.md",
+      "audiences": [
+        "lead"
+      ]
+    },
+    {
+      "id": "stall-watch",
+      "title": "Watch in-flight work",
+      "file": "sections/stall-watch.md",
+      "audiences": [
+        "grok-bot",
+        "lead"
+      ]
+    }
+  ],
+  "sections_sha256": "6c055e7c06e4e110a4935b81ec4a0dae3efdca700fff255e7a84a0d1a808fb38"
+}

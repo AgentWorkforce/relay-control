@@ -142,7 +142,7 @@ export const CHANNEL_CREATE_LIMIT_PER_HOUR = 5;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const CHANNEL_DELIVERY_REASONS: ReadonlySet<string> = new Set(["message", "mention", "thread-reply"]);
-const isChannelDelivery = (delivery: { reason?: string | null }) =>
+export const isChannelDelivery = (delivery: { reason?: string | null }) =>
   Boolean(delivery.reason && CHANNEL_DELIVERY_REASONS.has(delivery.reason));
 
 export function normalizeChannelName(channel: string): string {

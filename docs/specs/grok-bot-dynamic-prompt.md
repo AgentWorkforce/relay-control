@@ -7,7 +7,7 @@ There are three phases, all in relay-control:
 
 1. **Copy** Cloud's Grok Bot webhook handling into relay-control as it is:
    `grokRoutinePrompt`, `connect_grok_bot_routine` and what they directly need.
-   **This is a copy, not a migration.** Cloud (`AgentWorkforce/cloud`) is not
+   **This is a copy, not a migration.** Agent Relay Cloud is not
    changed and keeps serving every bot connected to it. There is no cutover, no
    move of existing routines and no Cloud rollback plan.
 2. Make the Grok Bot initial prompt **dynamic**: a versioned rules source in
@@ -19,17 +19,17 @@ There are three phases, all in relay-control:
 
 ## 0. Current state
 
-### 0.1 Cloud (source of the copy; read only)
+### 0.1 Agent Relay Cloud (source of the copy)
 
-| Piece | Location in `cloud` | What it does |
+| Piece | Where it lives in Cloud | What it does |
 |---|---|---|
-| Routine contract | `packages/web/lib/mcp-events/grok-routine.ts` | `parseGrokRoutineUrl`, `parseGrokRoutineKey`, `parseGrokRoutineDetails` (one-paste), `parseGrokRoutineAgentName`, `perBotConnectionRequired`, `grokRoutineHeaders` (Bearer `crsr_` key + `X-MCP-Subscription-Id` + `webhook-id`), `SHOW_UI_GUIDANCE`, and **`grokRoutinePrompt()`**: a hardcoded template for webhook or polling mode, with or without reply rights |
-| Sender-check strings | `lib/mcp-events/sender-check.ts` | `SENDER_CHECK` / `REPLY_SETTING` labels, quoted by both the prompt and `get_event`'s app block |
-| MCP tools | `lib/mcp-events/server.ts` (~390–475) | `connect_grok_bot_routine` (webhook or polling; returns `routine_prompt`, `inbox_address`, `setup_url` or `suggested_interval_minutes`, `next_steps`), `disconnect_grok_bot_routine`; the prompt depends on `get_event` / `get_recent_events` |
-| Delivery | `lib/mcp-events/service.ts` (`post` / `postRoutine`, ~513–529) | Events pump; POSTs a thin `relay.message` / `relay.channel_message` event to the routine URL. Row in `mcp_event_subscriptions`, `delivery_mode='routine'` (`secrets[0]` is the `crsr_` key) or `'polling'` |
-| Setup context | `lib/mcp-events/grok-setup-context.ts`, `grok-setup.ts` | Setup-page query keys; `hasGrokRoutine(principal)` |
-| UI | `app/connect/grok/*`, `app/dashboard/relay/grok-routine-*`, `app/oauth/connect/grok/*` | Next.js browser flows |
-| Plugin | `integrations/grok-bot/` (v0.1.4): `mcp.json` → `https://agentrelay.com/cloud/api/v1/mcp/relay-events`; `skills/agent-relay-grok-bot/SKILL.md` | Static skill: connect, wake-up setup, wake handling, delegation, `show_ui` |
+| Routine contract | Cloud's Grok routine module | `parseGrokRoutineUrl`, `parseGrokRoutineKey`, `parseGrokRoutineDetails` (one-paste), `parseGrokRoutineAgentName`, `perBotConnectionRequired`, `grokRoutineHeaders` (Bearer `crsr_` key + `X-MCP-Subscription-Id` + `webhook-id`), `SHOW_UI_GUIDANCE`, and **`grokRoutinePrompt()`**: a hardcoded template for webhook or polling mode, with or without reply rights |
+| Sender-check strings | Cloud's sender-check module | `SENDER_CHECK` / `REPLY_SETTING` labels, quoted by both the prompt and `get_event`'s app block |
+| MCP tools | Cloud's MCP Events server | `connect_grok_bot_routine` (webhook or polling; returns `routine_prompt`, `inbox_address`, `setup_url` or `suggested_interval_minutes`, `next_steps`), `disconnect_grok_bot_routine`; the prompt depends on `get_event` / `get_recent_events` |
+| Delivery | Cloud's MCP Events service (`post` / `postRoutine`) | Events pump; POSTs a thin `relay.message` / `relay.channel_message` event to the routine URL. Row in `mcp_event_subscriptions`, `delivery_mode='routine'` (`secrets[0]` is the `crsr_` key) or `'polling'` |
+| Setup context | Cloud's Grok setup helpers | Setup-page query keys; `hasGrokRoutine(principal)` |
+| UI | Cloud's connect, dashboard and consent pages for Grok | Next.js browser flows |
+| Plugin | The Grok Bot plugin: `mcp.json` → `https://agentrelay.com/cloud/api/v1/mcp/relay-events`; `skills/agent-relay-grok-bot/SKILL.md` | Static skill: connect, wake-up setup, wake handling, delegation, `show_ui` |
 
 ### 0.2 relay-control today (self-hosted port, merged in #136)
 
@@ -89,9 +89,8 @@ and data exist in relay-control:
 
 **Not copied:** Cloud's MCP Events pump and `mcp_event_subscriptions`. The
 existing worker delivers instead. Also not copied:
-`grok-setup-context.ts` / `grok-setup.ts`, because relay-control keys setup by
-grant id behind the browser session. Cloud's Next.js `app/connect/grok/*` and
-`app/dashboard/relay/grok-routine-*` are not copied either; relay-control's
+Cloud's Grok setup helpers, because relay-control keys setup by
+grant id behind the browser session. Cloud's Next.js connect and dashboard pages for Grok are not copied either; relay-control's
 server-rendered setup page gains the same fields (one-paste box, reply mode,
 sender filter). Porting the dashboard UI to relay-web is separate (D3).
 
@@ -192,7 +191,7 @@ The text is returned as the application's own instructions, in a content block
 labelled `Agent Relay app: operating rules (version …)`. It is not placed in the
 untrusted-content wrapper that relay messages use. Cloud learned that chats
 refuse instructions found inside untrusted blocks (see the comment on
-`answer_reply_question` in Cloud `server.ts`).
+`answer_reply_question` in Cloud).
 
 **HTTP** (for non-MCP consumers such as `lead-run.sh`):
 `GET /api/v1/agent-rules/{audience}` (and the `/cloud` alias). The response has
