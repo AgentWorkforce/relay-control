@@ -1,6 +1,7 @@
 import { sha256Hex } from "@agent-relay/events-shim";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
+import { drainBody } from "../drain-body.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -183,11 +184,12 @@ async function setExpiry(deps: TempWorkspaceDeps, workspaceId: string, seconds: 
 }
 
 async function removeWorkspace(deps: TempWorkspaceDeps, workspaceId: string): Promise<void> {
-  await call(deps)(`${deps.relaycastUrl.replace(/\/+$/, "")}/internal/workspaces/${encodeURIComponent(workspaceId)}`, {
+  const response = await call(deps)(`${deps.relaycastUrl.replace(/\/+$/, "")}/internal/workspaces/${encodeURIComponent(workspaceId)}`, {
     method: "DELETE",
     headers: admin(deps),
     signal: AbortSignal.timeout(30_000),
   }).catch(() => undefined);
+  if (response) await drainBody(response, "temp-workspace.remove");
 }
 
 function admin(deps: TempWorkspaceDeps): Record<string, string> {

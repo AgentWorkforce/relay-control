@@ -6,7 +6,8 @@
 // name only, never the body or any header.
 export type DrainableResponse = { readonly body: { cancel(reason?: unknown): Promise<void> } | null; readonly bodyUsed: boolean };
 
-export async function drainBody(response: DrainableResponse, label: string): Promise<void> {
+// A test double or minimal fetch type may carry neither field; there is then nothing to release.
+export async function drainBody(response: Partial<DrainableResponse>, label: string): Promise<void> {
   const body = response.body;
   if (!body || response.bodyUsed) return;
   try {
