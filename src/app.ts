@@ -51,6 +51,7 @@ import { confirmsAccessAdministrator, sessionAccessConfigured } from "./sessions
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
+import { recordTeamsView, teamsAudit, teamsReport } from "./usage/teams.js";
 import { mcpReaderMarker, readerKindOf, readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { bearer } from "./auth/bearer.js";
 import { z } from "zod";
@@ -2484,6 +2485,42 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         if (error instanceof PeopleInputError) throw new HttpError(400, "invalid_request", error.message);
         throw error;
       }
+      return;
+    }
+
+    // Usage page Teams (docs/usage.md, "Teams"): owner-only, per team. Needs
+    // usage_people too: a team of one shows one person's figures.
+    const teamsUsageRoute = /^\/api\/v1\/organizations\/([^/]+)\/usage\/teams(?:\/(audit))?$/.exec(path);
+    if (teamsUsageRoute && method === "GET") {
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(teamsUsageRoute[1]!);
+      } catch {
+        throw new HttpError(400, "invalid_request", "Invalid organization id");
+      }
+      const auth = await organizationAccess(request, organizationId);
+      if (auth.kind !== "user" || await store.memberRole(organizationId, auth.principal.userId) !== "owner") {
+        throw new HttpError(403, "forbidden", "Organization owner role required");
+      }
+      requireFeature("teams");
+      requireFeature("usage_people");
+      if (teamsUsageRoute[2] === "audit") {
+        if ([...url.searchParams.keys()].length > 0) throw new HttpError(400, "invalid_request", "No parameters are accepted");
+        json(response, 200, { events: await teamsAudit(store.database, store, organizationId) }, true);
+        return;
+      }
+      let days: number;
+      try {
+        days = usageDays(url);
+      } catch (error) {
+        if (error instanceof UsageRangeError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      const owner = { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) };
+      const teams = await teamsReport({ config, store, people, organizationId, owner, days, now: input.now?.() ?? new Date() });
+      // Every served report is audited, cached or not, before it leaves Control.
+      await recordTeamsView(store.database, { organizationId, viewerUserId: owner.userId, days });
+      json(response, 200, { teams }, true);
       return;
     }
 

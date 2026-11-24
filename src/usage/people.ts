@@ -74,9 +74,9 @@ export class UsagePeopleStore {
 export class PeopleInputError extends Error {}
 export class PersonNotFoundError extends Error {}
 
-type Range = { days: number; from: string; to: string; lastTsAfter: string; lastTsBefore: string };
+export type Range = { days: number; from: string; to: string; lastTsAfter: string; lastTsBefore: string };
 
-function rangeOf(days: number, now: Date): Range {
+export function rangeOf(days: number, now: Date): Range {
   const dates = usageDates(days, now);
   return {
     days,
@@ -87,7 +87,7 @@ function rangeOf(days: number, now: Date): Range {
   };
 }
 
-type Session = {
+export type Session = {
   sessionId: string;
   source: string;
   workspaceId: string;
@@ -115,7 +115,7 @@ function sessionOf(value: unknown, workspaceId: string): Session | null {
   };
 }
 
-async function ownerIdentities(store: ControlPlaneStore, organizationId: string, owner: { userId: string; token: string; readerKind: ReaderKind }) {
+export async function ownerIdentities(store: ControlPlaneStore, organizationId: string, owner: { userId: string; token: string; readerKind: ReaderKind }) {
   const identities: HistoryIdentity[] = [];
   for (const workspace of await store.listWorkspaces(organizationId)) {
     const workspaceId = String(workspace.id);
@@ -127,7 +127,7 @@ async function ownerIdentities(store: ControlPlaneStore, organizationId: string,
   return identities;
 }
 
-async function sessionPage(
+export async function sessionPage(
   config: SelfhostConfig,
   identity: HistoryIdentity,
   range: Range,
@@ -162,7 +162,7 @@ function topProjects(sessions: Session[], limit: number) {
     .map(([name, sessions]) => ({ name, sessions }));
 }
 
-function newest(a: string | null, b: string | null): string | null {
+export function newest(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
   return Date.parse(a) >= Date.parse(b) ? a : b;
@@ -188,7 +188,7 @@ export function forgetPeopleCache(config: SelfhostConfig): void {
   aggregateAbsent.delete(config);
 }
 
-class BudgetExhausted extends Error {}
+export class BudgetExhausted extends Error {}
 
 function addTotals(byUser: Map<string, UserTotals>, userId: string, count: number, lastSessionAt: string | null, projects: Array<[string, number]>) {
   const totals = byUser.get(userId) ?? { sessions: 0, lastSessionAt: null, projects: new Map<string, number>() };
