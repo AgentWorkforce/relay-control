@@ -19,7 +19,7 @@ import { registerSharedSessionReads } from "./shared-session-reads.js";
 import { registerTeamActivity } from "./team-activity.js";
 import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
-import { registerGrokRoutineTools } from "./grok-routine-tools.js";
+import { registerGrokEventTools, registerGrokRoutineTools } from "./grok-routine-tools.js";
 import { registerSessionAccessTools } from "./session-access.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
@@ -82,7 +82,7 @@ export function buildMcpServer(context: McpContext): McpServer {
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
   const sessionAccess = context.sessionAccess;
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokRoutines?.cloudCopy),
     sessionAccess: Boolean(sessionAccess), staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
@@ -91,6 +91,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     customer_support: () => registerCustomerSupportTool(server, context),
     capability_discovery: () => registerCapabilityDiscovery(server, context),
     grok_routines: () => registerGrokRoutineTools(server, context),
+    grok_events: () => registerGrokEventTools(server, context),
     ...(launch ? { hosted_launch: () => registerRelaySpawnTools(server, context) } : {}),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
