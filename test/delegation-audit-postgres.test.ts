@@ -457,3 +457,35 @@ test("two grant creations and a claim release for one agent serialize without de
     second.release();
   }
 });
+
+test("concurrent revoke-alls audit each approval exactly once (only rows the guarded update changed)", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  const approval = (id: string, actions: Array<{ class: string; target: string }>, stamped: boolean) => database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at, consumed_at)
+     VALUES ($1, $2, $3, 'O', $4::jsonb, false, now() + interval '1 hour', CASE WHEN $5 THEN now() END)`,
+    [id, workspaceId, ownerId, JSON.stringify(actions), stamped]);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#11" };
+  const release = { class: "release", target: "AgentWorkforce/relay" };
+  for (let round = 0; round < 5; round += 1) {
+    // The audit log is append-only: each round reads only the events after its start.
+    const startId = (await database.query<{ id: string | null }>(
+      "SELECT max(id)::text AS id FROM delegation_audit_events")).rows[0]!.id ?? "0";
+    // Live ones, and a mixed one carrying a legacy spent stamp (not spent now): all revocable.
+    const expected = [];
+    for (let index = 0; index < 6; index += 1) {
+      const id = `apv_concurrent${round}${index}`;
+      await approval(id, index % 2 ? [merge] : [merge, release], index === 5);
+      expected.push(id);
+    }
+    // Truly spent under the current rule: never revoked, never audited.
+    await approval(`apv_spentnow0${round}`, [release], true);
+    const runs = await Promise.allSettled([1, 2, 3].map(() => database.transaction(tx => revokeAllGrants(tx, {
+      workspaceId, ownerUserId: ownerId, actorUserId: ownerId, reason: "owner_revoke_all", authMethod: "session" }))));
+    for (const run of runs) assert.equal(run.status, "fulfilled", JSON.stringify(run));
+    const audits = (await database.query<{ data: { count: number; approval_ids: string[] } }>(
+      "SELECT data FROM delegation_audit_events WHERE event = 'approval.revoked' AND id > $1::bigint", [startId])).rows;
+    const audited = audits.flatMap(row => row.data.approval_ids);
+    assert.deepEqual([...audited].sort(), [...expected].sort(), `round ${round}`);
+    assert.equal(audits.reduce((sum, row) => sum + row.data.count, 0), expected.length);
+  }
+});
