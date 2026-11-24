@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
 import { PostgresDatabase } from "../src/database.js";
-import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit, redactExpiredQuotes } from "../src/delegation/service.js";
+import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit, redactExpiredQuotes, releaseClaim, revokeAllGrants } from "../src/delegation/service.js";
 import { createDelegationRetention } from "../src/delegation/retention.js";
 import { migrate } from "../src/migrations.js";
 import { isolatedPostgresPool } from "./support/postgres.js";
@@ -234,4 +234,34 @@ test("standalone consumers of one approval serialize: 4 over 2 actions, exactly 
   assert.equal(results.filter(Boolean).length, 2);
   const row = (await database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM delegation_approvals WHERE id = $1", [id])).rows[0]!;
   assert.ok(row.consumed_at);
+});
+
+test("releasing a claim and revoking grants concurrently never deadlock (grants, then the claim)", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  await database.query(
+    `INSERT INTO delegation_claims (id, workspace_id, user_id, code_hash, expires_at, consumed_at, agent_id)
+     VALUES ('clm_concurrent0001', $1, $2, 'h1', now() + interval '10 minutes', now(), 'ag_bot')`, [workspaceId, ownerId]);
+  await database.query(
+    `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+     VALUES ($1, 'rw', 'ag_bot', 'bot', $2, 'clm_concurrent0001')`, [workspaceId, ownerId]);
+  await database.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, expires_at, created_auth_method)
+     SELECT 'grt_concurrent00001', $1, w.organization_id, $2, 'ag_bot', 'bot', '[]'::jsonb, now() + interval '1 day', 'session'
+       FROM workspaces w WHERE w.id = $1`, [workspaceId, ownerId]);
+  for (let round = 0; round < 5; round += 1) {
+    await database.query("UPDATE delegation_claims SET released_at = NULL WHERE id = 'clm_concurrent0001'");
+    await database.query("UPDATE delegation_grants SET status = 'active', revoked_at = NULL WHERE id = 'grt_concurrent00001'");
+    const results = await Promise.allSettled([
+      releaseClaim(database, { workspaceId, claimId: "clm_concurrent0001", actorUserId: ownerId, admin: true, authMethod: "session" }),
+      database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId, reason: "owner_revoked",
+        authMethod: "session" })),
+      releaseClaim(database, { workspaceId, claimId: "clm_concurrent0001", actorUserId: ownerId, admin: true, authMethod: "session" }),
+    ]);
+    for (const result of results) assert.equal(result.status, "fulfilled", JSON.stringify(result));
+    const winners = results.slice(0, 1).concat(results.slice(2)).filter(result => result.status === "fulfilled" && result.value);
+    assert.equal(winners.length, 1);
+    const grant = (await database.query<{ status: string }>("SELECT status FROM delegation_grants WHERE id = 'grt_concurrent00001'")).rows[0]!;
+    assert.equal(grant.status, "revoked");
+  }
 });

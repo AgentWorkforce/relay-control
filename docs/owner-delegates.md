@@ -251,7 +251,11 @@ stripped. The cut is at 80 characters on a code point boundary, so an emoji is n
   - **Repo targets** (`owner/repo`, `owner/repo#N`) need CODEOWNERS from
     GitHub, read through a verified, linked GitHub account. relay-control has
     no verified person-to-GitHub link, so these **fail closed** with
-    `recipient_policy`.
+    `recipient_policy`. When they are supported, the rules are Cloud's: a
+    PR's author never has code-owner standing on their own PR (checked
+    against every linked login), and for a high-risk class on a repo-level
+    target only the owners of the last whole-repo rule (`*`, `**` or `/**`;
+    `/*` matches root files only) count.
   - **Other targets** use the admin table `GET/PUT /delegates/target-owners`
     (`[{pattern, repo?, owner_ids?}]`). An entry that names the person by
     member id grants standing. An entry that points at a repo needs CODEOWNERS
@@ -323,7 +327,9 @@ re-checked on every redeem and never consumed. Control:
   - `not_before` is checked here.
   - `ci_green`, `head_sha`, `reviews_approved` and `mergeable` need the PR's
     GitHub state, which relay-control does not read, so they **fail closed**
-    with `condition_unavailable`.
+    with `condition_unavailable`. (Cloud's `ci_green`, for reference: each
+    required check name needs at least one result, and every check run and
+    commit status under that name must pass.)
   - An unmet condition answers `condition_unmet` with `unmet` and does not
     consume the approval.
 
