@@ -813,7 +813,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     }
 
     if (sub === "policy") {
-      if (method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
+      if (method !== "GET" && method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
+      // Read-only, for any member of the workspace (human() above proved it):
+      // the stored policy, or the defaults when none is stored yet.
+      if (method === "GET") {
+        json(200, await loadPolicy(input.database, workspace.id));
+        return true;
+      }
       if (!caller.admin) fail("forbidden", "Only org owners and admins can set delegation policy", 403);
       const body = parse(policyBody, await readJson(request), "Invalid policy");
       // As Cloud: the PUT sets the fields given and keeps every other field at

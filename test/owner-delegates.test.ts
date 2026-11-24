@@ -425,6 +425,50 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
   assert.ok(lines.every(line => line.grant_id === created.grant_id));
 });
 
+test("policy GET: any member reads the stored policy or the defaults; others are refused; PUT is unchanged", async (t) => {
+  const env = await setup(t);
+  const defaults = { delegation_enabled: false, max_expiry_days: 90, allowed_classes: null, require_tier_o: [],
+    code_owner_match: "any_path" };
+  // Unset: the defaults, by bearer and by browser session.
+  const unset = await env.bearer("/delegates/policy");
+  assert.equal(unset.status, 200, unset.raw);
+  assert.deepEqual(unset.body, defaults);
+  const sessionGet = (cookie: string) => request(env.origin, `/cloud${env.base}/delegates/policy`, { cookie });
+  assert.deepEqual((await sessionGet(env.desktop.session)).body, defaults);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_policies")).rows.length, 0);
+
+  // PUT is unchanged: admin only, and it answers the stored policy with revoked_grants.
+  const memberId = await env.addMember("reader@acme.test");
+  const member = await env.desktopSignIn({ hostName: "reader-box", userId: memberId });
+  const memberPut = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true }, member.session);
+  assert.equal(memberPut.status, 403, memberPut.raw);
+  const stored = { delegation_enabled: true, max_expiry_days: 30, allowed_classes: ["merge", "release"],
+    require_tier_o: ["release"], code_owner_match: "all_paths" };
+  const put = await env.browser("/delegates/policy", "PUT", stored);
+  assert.equal(put.status, 200, put.raw);
+  assert.deepEqual(put.body, { ...stored, revoked_grants: [] });
+
+  // A member who is not an admin reads it (bearer and session); nothing is audited.
+  const audited = (await env.database.query("SELECT 1 FROM delegation_audit_events")).rows.length;
+  const byBearer = await env.bearer("/delegates/policy", "GET", undefined, member.accessToken);
+  assert.equal(byBearer.status, 200, byBearer.raw);
+  assert.deepEqual(byBearer.body, stored);
+  const bySession = await sessionGet(member.session);
+  assert.equal(bySession.status, 200, bySession.raw);
+  assert.deepEqual(bySession.body, stored);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events")).rows.length, audited);
+
+  // No credential: 401. A caller of another workspace: 403.
+  assert.equal((await request(env.origin, `${env.base}/delegates/policy`)).status, 401);
+  const other = await request(env.origin, `/api/v1/workspaces/${env.otherWorkspaceId}/delegates/policy`,
+    { token: env.desktop.accessToken });
+  assert.equal(other.status, 403, other.raw);
+  assert.equal(other.body.code, "forbidden");
+  // Other methods stay 405.
+  const post = await env.browser("/delegates/policy", "POST", { delegation_enabled: false });
+  assert.equal(post.status, 405, post.raw);
+});
+
 test("policy change revokes grants that no longer fit", async (t) => {
   const env = await setup(t);
   await env.enable();
