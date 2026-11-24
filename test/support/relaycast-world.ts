@@ -456,8 +456,8 @@ export function createRelaycastWorld(roster: unknown[]) {
       }
       return sent;
     },
-    /** A peer agent creates or joins a channel and optionally posts to it. */
-    channelAs(from: string, name: string, text?: string) {
+    /** A peer agent creates or joins a channel and optionally posts to it; `mention` gets the post as a mention delivery. */
+    channelAs(from: string, name: string, text?: string, options: { mention?: string } = {}) {
       let channel = channels.get(name);
       if (!channel) {
         channel = { id: `ch_${next()}`, name, topic: null, members: new Set<string>(), archived: false };
@@ -466,7 +466,7 @@ export function createRelaycastWorld(roster: unknown[]) {
       channel.members.add(from);
       if (text === undefined) return null;
       const created = message(agents.get(from)!, text, { channel_id: channel.id });
-      for (const member of channel.members) if (member !== from) deliver(member, created, "message");
+      for (const member of channel.members) if (member !== from) deliver(member, created, member === options.mention ? "mention" : "message");
       return created;
     },
   };
