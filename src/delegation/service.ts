@@ -14,7 +14,7 @@ import {
   canonicalAction,
   classTargetCovered,
   configTarget,
-  NEVER_DELEGABLE_SETTINGS,
+  isUndelegableSetting,
   CLAIM_TTL_MS,
   DEFAULT_TIER_O_CLASSES,
   GITHUB_CONDITIONS,
@@ -594,10 +594,18 @@ export const FLUSH_BUDGET_MS = 20_000;
 export async function flushRelaycastRedactions(database: Database, deps: {
   redact: RelaycastQuoteRedactor;
   budgetMs?: number;
+  /**
+   * Only this workspace's message (as Cloud): an owner's redact request
+   * flushes the row it just queued, never other tenants'. The sweep passes none.
+   */
+  scope?: { workspaceId: string; messageId: string };
   relaycastBinding: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string } | null>;
 }): Promise<{ redacted: number; absent: number; rejected: number; pending: number }> {
+  const scope = deps.scope ?? null;
   const unfinished = async () => Number((await database.query<{ count: number }>(
-    "SELECT count(*)::int AS count FROM delegation_quote_redactions WHERE relaycast_redacted_at IS NULL",
+    `SELECT count(*)::int AS count FROM delegation_quote_redactions
+      WHERE relaycast_redacted_at IS NULL AND ($1::uuid IS NULL OR (workspace_id = $1 AND message_id = $2))`,
+    [scope?.workspaceId ?? null, scope?.messageId ?? null],
   )).rows[0]?.count ?? 0);
   const counts = { redacted: 0, absent: 0, rejected: 0 };
   if (!deps.redact) return { ...counts, pending: await unfinished() };
@@ -607,7 +615,9 @@ export async function flushRelaycastRedactions(database: Database, deps: {
         AND relaycast_outcome IS DISTINCT FROM 'rejected'
         AND (last_attempt_at IS NULL OR last_attempt_at <= now() -
              make_interval(mins => least(power(2, least(attempts, 9))::int, 360)))
+        AND ($1::uuid IS NULL OR (workspace_id = $1 AND message_id = $2))
       ORDER BY requested_at LIMIT 100`,
+    [scope?.workspaceId ?? null, scope?.messageId ?? null],
   )).rows;
   const startedAt = Date.now();
   for (const row of due) {
@@ -908,6 +918,20 @@ export async function refusedRecently(executor: SqlExecutor, input: { workspaceI
   )).rows.length > 0;
 }
 
+/** Whether the same redeem refusal (approval, recipient, action, reason) was audited within REFUSAL_DEDUP_MS (as Cloud). */
+export async function redeemRefusedRecently(executor: SqlExecutor, input: { workspaceId: string; approvalId: string;
+  recipientAgentId: string; action: { class: string; target: string }; reason: string }): Promise<boolean> {
+  return (await executor.query(
+    `SELECT 1 FROM delegation_audit_events
+      WHERE workspace_id = $1 AND approval_id = $2 AND event = 'redeem.refused' AND recipient_agent_id = $3
+        AND reason = $4 AND data->'action'->>'class' = $5 AND data->'action'->>'target' = $6
+        AND created_at > now() - make_interval(secs => $7)
+      LIMIT 1`,
+    [input.workspaceId, input.approvalId, input.recipientAgentId, input.reason, input.action.class, input.action.target,
+      REFUSAL_DEDUP_MS / 1000],
+  )).rows.length > 0;
+}
+
 export type DelegationVerdict =
   | { verdict: "delegate"; attestation: string; claims: AttestationClaims }
   | { verdict: "none"; reason: ReasonCode };
@@ -1013,7 +1037,7 @@ export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy
     if ((action.class === "prompt_approval" || action.class === "config_change") &&
         !action.target.startsWith(`${recipientAgentId}:`)) return "out_of_scope";
     // The recipient's own delegation settings are never delegable (§5.3).
-    if (action.class === "config_change" && NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? "")) {
+    if (action.class === "config_change" && isUndelegableSetting(configTarget(action.target)?.setting ?? "")) {
       return "out_of_scope";
     }
   }
@@ -1452,8 +1476,13 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       logUnavailable("redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId,
         grantId: context.grantId ?? null });
     }
-    // As at attest: only a proven recipient's refusals are written to the audit log.
-    if (context.proven) await recordDelegationAudit(deps.database, {
+    // As at attest: only a proven recipient's refusals are written to the audit
+    // log, and an identical one (approval, recipient, action, reason) once per
+    // 10 minutes (as Cloud); repeats are still logged.
+    const repeated = context.proven && await redeemRefusedRecently(deps.database, { workspaceId: workspace.id,
+      approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, action: input.action, reason })
+      .catch(() => false);
+    if (context.proven && !repeated) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,

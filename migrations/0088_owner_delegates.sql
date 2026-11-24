@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS delegation_claims (
   code_hash text NOT NULL UNIQUE,
   expires_at timestamptz NOT NULL,
   consumed_at timestamptz,
+  -- Released by its owner or an admin (DELETE /delegates/claims/{id}): a
+  -- pending code is cancelled, a completed claim's binding is removed.
+  released_at timestamptz,
   agent_id text,
   created_at timestamptz NOT NULL DEFAULT now()
 );

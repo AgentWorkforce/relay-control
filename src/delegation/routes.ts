@@ -19,7 +19,7 @@ import {
   canonicalAction,
   classTargetCovered,
   configTarget,
-  NEVER_DELEGABLE_SETTINGS,
+  isUndelegableSetting,
   GRANT_DEFAULT_DAYS,
   GRANT_MAX_DAYS,
   highRisk,
@@ -235,6 +235,7 @@ const withdrawBody = z.object({
   approval_id: z.string().regex(/^apv_[A-Za-z0-9]{8,64}$/u),
 }).strict();
 const APPROVAL_ID = /^apv_[A-Za-z0-9]{8,64}$/u;
+const CLAIM_ID = /^clm_[A-Za-z0-9]{8,64}$/u;
 const redactBody = z.object({ message_id: z.string().min(1).max(200) }).strict();
 const GATE_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/u;
 /** As Cloud: a workflow file under `.github/workflows/` at a full ref (a tag gate: its `ref_pattern`). */
@@ -647,7 +648,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       // Unknown, used and expired codes look the same.
       const claim = (await input.database.query<{ id: string; user_id: string }>(
         `SELECT id, user_id FROM delegation_claims
-          WHERE workspace_id = $1 AND code_hash = $2 AND consumed_at IS NULL AND expires_at > now()`,
+          WHERE workspace_id = $1 AND code_hash = $2 AND consumed_at IS NULL AND released_at IS NULL AND expires_at > now()`,
         [workspace.id, sha256Hex(body.code)],
       )).rows[0];
       if (!claim) return fail("invalid_code", "Claim code is invalid or expired", 404);
@@ -683,7 +684,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         if (await anyBinding(tx, workspace.id, relaycastWorkspaceId, proven.id)) return false;
         const consumed = (await tx.query(
           `UPDATE delegation_claims SET consumed_at = now(), agent_id = $2
-            WHERE id = $1 AND consumed_at IS NULL AND expires_at > now() RETURNING id`,
+            WHERE id = $1 AND consumed_at IS NULL AND released_at IS NULL AND expires_at > now() RETURNING id`,
           [claim.id, proven.id],
         )).rows[0];
         if (!consumed) return false;
@@ -925,6 +926,45 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return true;
     }
 
+    // DELETE /delegates/claims/{claim_id}, as Cloud: release a claimed agent,
+    // or cancel a pending claim code (§4.1). Its owner, or any org owner or
+    // admin, may. The owner's active grants to that agent are revoked with it.
+    // Allowed while delegation is off: releasing only removes authority.
+    if (sub?.startsWith("claims/") && sub !== "claims/complete" && !sub.slice(7).includes("/")) {
+      if (method !== "DELETE") fail("method_not_allowed", "Method not allowed", 405);
+      const claimId = sub.slice(7);
+      if (!CLAIM_ID.test(claimId)) fail("not_found", "Claim not found", 404);
+      const released = await input.database.transaction(async (tx) => {
+        const claim = (await tx.query<{ id: string; user_id: string; agent_id: string | null; consumed_at: Date | null }>(
+          `SELECT id, user_id, agent_id, consumed_at FROM delegation_claims
+            WHERE workspace_id = $1 AND id = $2 AND released_at IS NULL FOR UPDATE`,
+          [workspace.id, claimId],
+        )).rows[0];
+        if (!claim || (claim.user_id !== principal.userId && !caller.admin)) return null;
+        await tx.query("UPDATE delegation_claims SET released_at = now() WHERE id = $1", [claim.id]);
+        let revokedGrants: string[] = [];
+        if (claim.consumed_at && claim.agent_id) {
+          // The binding the claim created ends, and so does any grant through it.
+          await tx.query("DELETE FROM delegation_agent_bindings WHERE workspace_id = $1 AND claim_id = $2", [workspace.id, claim.id]);
+          const grantIds = (await tx.query<{ id: string }>(
+            `SELECT id FROM delegation_grants
+              WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active' FOR UPDATE`,
+            [workspace.id, claim.user_id, claim.agent_id],
+          )).rows.map(row => row.id);
+          revokedGrants = (await revokeGrants(tx, { workspaceId: workspace.id, grantIds, actorUserId: principal.userId,
+            reason: "delegate_released", authMethod: caller.authMethod })).map(row => row.id);
+        }
+        await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "delegate.released", ...actor,
+          ownerUserId: claim.user_id, actorAgentId: claim.agent_id,
+          reason: claim.consumed_at ? "delegate_released" : "claim_cancelled",
+          data: { claim_id: claim.id, agent_id: claim.agent_id, revoked_grants: revokedGrants } });
+        return { claimId: claim.id, revokedGrants };
+      });
+      if (!released) fail("not_found", "Claim not found", 404);
+      json(200, { claim_id: released!.claimId, released: true, revoked_grants: released!.revokedGrants });
+      return true;
+    }
+
     if (sub?.startsWith("approvals/") && !sub.slice(10).includes("/")) {
       if (method !== "DELETE") fail("method_not_allowed", "Method not allowed", 405);
       const approvalId = sub.slice(10);
@@ -957,8 +997,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const redacted = await redactMessageQuotes(input.database, { workspaceId: workspace.id, messageId: body.message_id,
         actorUserId: principal.userId, authMethod: caller.authMethod, asAdmin: caller.admin });
       if (!redacted) fail("not_found", "No quote of yours for that message", 404);
+      // Only this message's row in this workspace (as Cloud): an owner's request
+      // never drives other tenants' Relaycast redactions (the sweep does those).
       const relaycast = await flushRelaycastRedactions(input.database, { redact: input.relaycastRedact ?? null,
-        relaycastBinding: input.relaycastBinding }).catch(() => ({ redacted: 0, pending: 1 }));
+        relaycastBinding: input.relaycastBinding, scope: { workspaceId: workspace.id, messageId: body.message_id } })
+        .catch(() => ({ redacted: 0, pending: 1 }));
       json(200, { message_id: body.message_id, redacted_events: redacted,
         relaycast: relaycast.pending === 0 ? "redacted" : "queued" });
       return true;
@@ -971,7 +1014,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const actions = body.actions.map(canonicalAction);
       // The recipient's own delegation settings are never delegable (§5.3); checked first, as Cloud.
       if (actions.some(action => action.class === "config_change" &&
-          NEVER_DELEGABLE_SETTINGS.includes(configTarget(action.target)?.setting ?? ""))) {
+          isUndelegableSetting(configTarget(action.target)?.setting ?? ""))) {
         fail("out_of_scope", "Delegation settings themselves are never delegable", 403);
       }
       policyRefusal(actions.map(action => action.class), policy);
@@ -1042,14 +1085,20 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (method !== "PUT") fail("method_not_allowed", "Method not allowed", 405);
       if (!caller.admin) fail("forbidden", "Only org owners and admins can set delegation policy", 403);
       const body = parse(policyBody, await readJson(request), "Invalid policy");
-      // Cloud's PUT replaces the policy: omitted optional fields take their defaults.
-      const next: DelegationPolicy = {
+      // As Cloud: the PUT sets the fields given and keeps every other field at
+      // its stored value (the default when no policy row exists yet), so a PUT
+      // that only flips delegation_enabled never resets require_tier_o or
+      // allowed_classes to the permissive defaults. `allowed_classes: null`
+      // still means every class.
+      const given: Partial<DelegationPolicy> = {
         delegation_enabled: body.delegation_enabled,
-        max_expiry_days: body.max_expiry_days ?? GRANT_MAX_DAYS,
-        allowed_classes: body.allowed_classes ? uniqueClasses(body.allowed_classes) : null,
-        require_tier_o: uniqueClasses(body.require_tier_o),
-        code_owner_match: body.code_owner_match ?? "any_path",
+        ...(body.max_expiry_days !== undefined ? { max_expiry_days: body.max_expiry_days } : {}),
+        ...(body.allowed_classes !== undefined
+          ? { allowed_classes: body.allowed_classes === null ? null : uniqueClasses(body.allowed_classes) } : {}),
+        ...(body.require_tier_o !== undefined ? { require_tier_o: uniqueClasses(body.require_tier_o) } : {}),
+        ...(body.code_owner_match !== undefined ? { code_owner_match: body.code_owner_match } : {}),
       };
+      let next!: DelegationPolicy;
       const revoked = await input.database.transaction(async (tx) => {
         // Serialize policy writers and grant creation on the workspace row
         // (this also covers the first insert of the policy row).
@@ -1059,6 +1108,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         await tx.query("SELECT 1 FROM workspaces WHERE id = $1 FOR NO KEY UPDATE", [workspace.id]);
         await tx.query("SELECT 1 FROM delegation_policies WHERE workspace_id = $1 FOR UPDATE", [workspace.id]);
         const before = await loadPolicy(tx, workspace.id);
+        next = { ...before, ...given };
         await tx.query(
           `INSERT INTO delegation_policies
              (workspace_id, delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match,

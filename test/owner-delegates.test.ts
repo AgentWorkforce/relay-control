@@ -281,7 +281,7 @@ test("human-only routes refuse agent, CLI and enrollment credentials; off by def
   assert.equal(refusedOff.status, 403, refusedOff.raw);
   assert.equal(refusedOff.body.code, "not_enabled");
   assert.equal((await env.browser("/delegates/claims", "POST")).body.code, "not_enabled");
-  assert.equal((await env.browser("/delegates/approvals", "POST", { actions: [{ class: "merge", target: "a/b" }] })).body.code, "not_enabled");
+  assert.equal((await env.browser("/delegates/approvals", "POST", { actions: [{ class: "merge", target: "a/b#1" }] })).body.code, "not_enabled");
 
   // A plain device-flow CLI login is not a human session for this surface.
   const cli = await env.deviceLogin();
@@ -1518,8 +1518,10 @@ test("review: the policy, Tier O classes and approval are rechecked at the commi
   const { env, recipient, bot, grantId } = await ready(t);
   const during = duringRosterLookup(env, t);
   const attestations = async () => (await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length;
+  // A PUT keeps omitted fields: each call names the fields it resets.
   const put = async (body: Record<string, unknown>) => {
-    const response = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, ...body });
+    const response = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, require_tier_o: [],
+      allowed_classes: null, ...body });
     assert.equal(response.status, 200, response.raw);
   };
 
@@ -1997,4 +1999,78 @@ test("review: single use is per action; a high-risk action never makes the whole
   const stored = (await env.database.query<{ single_use: boolean }>("SELECT single_use FROM delegation_approvals WHERE id = $1",
     [approvalId])).rows[0]!;
   assert.equal(stored.single_use, false);
+});
+
+test("review: policy PUT keeps omitted fields; config_change denylist is normalised; a merge names exactly one PR", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  assert.equal((await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, require_tier_o: ["secret_change"],
+    allowed_classes: ["merge", "deploy", "release", "secret_change"], max_expiry_days: 30 })).status, 200);
+  // Flipping only delegation_enabled keeps the rest.
+  const flipped = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true });
+  assert.equal(flipped.status, 200, flipped.raw);
+  assert.deepEqual(flipped.body.require_tier_o, ["secret_change"]);
+  assert.deepEqual(flipped.body.allowed_classes, ["merge", "deploy", "release", "secret_change"]);
+  assert.equal(flipped.body.max_expiry_days, 30);
+  // allowed_classes: null still means every class.
+  const every = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, allowed_classes: null });
+  assert.equal(every.body.allowed_classes, null);
+  assert.deepEqual(every.body.require_tier_o, ["secret_change"]);
+  // A merge of a bare repo or branch is malformed.
+  for (const target of ["AgentWorkforce/relay", "AgentWorkforce/relay:main"]) {
+    const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target }])));
+    assert.equal(attested.body.verdict, "none", target);
+  }
+  // config_change: any spelling of a delegation setting is undelegable.
+  const { isUndelegableSetting } = await import("../src/delegation/scope.js");
+  for (const name of ["delegated_approvals_from", " Delegated-Approvals-From ", "delegated_approvals_from.0", "spawn.delegate.approvals",
+    "my_delegation_toggle"]) assert.ok(isUndelegableSetting(name), name);
+  assert.ok(!isUndelegableSetting("sandbox"));
+});
+
+test("review: DELETE /delegates/claims/{id} releases a claimed agent (revoking grants) or cancels a pending code", async (t) => {
+  const { env, bot, grantId } = await ready(t);
+  const claimId = (await env.database.query<{ id: string }>(
+    "SELECT claim_id AS id FROM delegation_agent_bindings WHERE agent_id = $1", [bot.id])).rows[0]!.id;
+  // Another member cannot release it; an unknown id is 404.
+  const memberId = await env.addMember("not-owner@acme.test");
+  const member = await env.desktopSignIn({ hostName: "not-owner-box", userId: memberId });
+  assert.equal((await env.bearer(`/delegates/claims/${claimId}`, "DELETE", undefined, member.accessToken)).status, 404);
+  assert.equal((await env.bearer("/delegates/claims/clm_unknownclaim1", "DELETE")).status, 404);
+  // The owner releases it (allowed while delegation is off): the binding ends and the grant is revoked.
+  await env.enable({ delegation_enabled: false });
+  const released = await env.bearer(`/delegates/claims/${claimId}`, "DELETE");
+  assert.equal(released.status, 200, released.raw);
+  assert.deepEqual(released.body, { claim_id: claimId, released: true, revoked_grants: [grantId] });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_agent_bindings WHERE claim_id = $1", [claimId])).rows.length, 0);
+  const grant = (await env.database.query<{ status: string; revoked_reason: string }>(
+    "SELECT status, revoked_reason FROM delegation_grants WHERE id = $1", [grantId])).rows[0]!;
+  assert.deepEqual(grant, { status: "revoked", revoked_reason: "delegate_released" });
+  const event = (await env.database.query<{ reason: string; data: Record<string, unknown> }>(
+    "SELECT reason, data FROM delegation_audit_events WHERE event = 'delegate.released'")).rows[0]!;
+  assert.equal(event.reason, "delegate_released");
+  assert.deepEqual(event.data.revoked_grants, [grantId]);
+  // Releasing again is 404.
+  assert.equal((await env.bearer(`/delegates/claims/${claimId}`, "DELETE")).status, 404);
+  // A pending code is cancelled and can no longer be completed.
+  await env.enable();
+  const started = await env.browser("/delegates/claims", "POST");
+  const cancelled = await env.bearer(`/delegates/claims/${started.body.claim_id}`, "DELETE");
+  assert.deepEqual(cancelled.body, { claim_id: started.body.claim_id, released: true, revoked_grants: [] });
+  const agent = env.world.addAgent("late-bot");
+  const done = await request(env.origin, `${env.base}/delegates/claims/complete`, {
+    method: "POST", body: { code: started.body.code, agent_id: agent.id, agent_token: agent.token } });
+  assert.equal(done.status, 404, done.raw);
+  assert.equal(done.body.code, "invalid_code");
+});
+
+test("review: an identical redeem refusal is audited once per 10 minutes", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#300" }])));
+  const approvalId = attested.body.claims.approval_id as string;
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal((await env.redeem(recipient, approvalId, { class: "merge", target: "AgentWorkforce/relay#301" })).body.reason, "out_of_scope");
+  }
+  const rows = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'redeem.refused' AND approval_id = $1",
+    [approvalId])).rows;
+  assert.equal(rows.length, 1);
 });

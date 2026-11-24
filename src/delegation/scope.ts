@@ -26,6 +26,20 @@ export const DEFAULT_TIER_O_CLASSES: readonly ActionClass[] = [];
  */
 export const NEVER_DELEGABLE_SETTINGS: readonly string[] = ["delegated_approvals_from", "spawn_delegate_approvals"];
 
+/**
+ * Whether a `config_change` setting is one a delegate may never set (§5.3),
+ * as Cloud's isUndelegableSetting: the name is trimmed, lowercased, and `-`
+ * and `.` are read as `_` before matching, so `Delegated-Approvals-From` or
+ * `delegated_approvals_from.0` is the same setting. Any setting whose name
+ * mentions delegation is refused too, so a future delegation setting is
+ * undelegable by default.
+ */
+export function isUndelegableSetting(setting: string): boolean {
+  const name = setting.trim().toLowerCase().replace(/[-.]/gu, "_");
+  return name.includes("delegat") ||
+    NEVER_DELEGABLE_SETTINGS.some(denied => name === denied || name.startsWith(`${denied}_`));
+}
+
 export const MAX_TARGET_CHARS = 256;
 export const MAX_NOTE_CHARS = 280;
 export const MAX_QUOTE_CHARS = 2000;
@@ -139,6 +153,10 @@ export function actionIsValid(action: Pick<Action, "class" | "target" | "conditi
   if (action.class === "config_change" && !configTarget(action.target)) return false;
   if (action.class === "pr_ops" && !prOpsTarget(action.target)) return false;
   if (action.class === "release" && !validReleaseTarget(action.target)) return false;
+  // A merge names exactly one PR (`owner/repo#N`), as Cloud: a bare repo or a
+  // branch target would be ambiguous and unpinned to any head. Grants may
+  // still name `owner/repo` or `owner/*`, which cover that repo's `#N`.
+  if (action.class === "merge" && !PR_TARGET.test(action.target)) return false;
   const conditions = action.conditions ?? [];
   if (conditions.length > MAX_CONDITIONS) return false;
   if (new Set(conditions.map(condition => condition.type)).size !== conditions.length) return false;
