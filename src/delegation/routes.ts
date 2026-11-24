@@ -9,7 +9,7 @@ import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
-import { gateRedeemStatus, gateView, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
+import { gateAuditData, gateRedeemStatus, gateView, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -888,8 +888,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
             "UPDATE delegation_gates SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id", [gateId],
           )).rows[0];
           if (!updated) return false;
+          // The full gate, so the log alone shows what stopped serving (as Cloud).
           await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "gate.deleted", ...actor,
-            ownerUserId: gate!.owner_user_id, data: { gate_id: gateId } });
+            ownerUserId: gate!.owner_user_id, reason: "deleted", data: gateAuditData(gate!) });
           return true;
         });
         if (!deleted) fail("not_found", "Gate not found", 404);

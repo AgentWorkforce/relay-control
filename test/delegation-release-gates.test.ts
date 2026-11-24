@@ -203,6 +203,11 @@ test("gate registry: owner session or verified Desktop sign-in, validated, liste
   const audited = (await env.database.query<{ event: string }>(
     "SELECT event FROM delegation_audit_events WHERE event LIKE 'gate.%' ORDER BY id")).rows.map(row => row.event);
   assert.deepEqual(audited, ["gate.registered", "gate.pinned", "gate.deleted"]);
+  // The deletion audits the whole gate, so the log alone shows what stopped serving.
+  const deletedEvent = (await env.database.query<{ reason: string; data: Record<string, unknown> }>(
+    "SELECT reason, data FROM delegation_audit_events WHERE event = 'gate.deleted'")).rows[0]!;
+  assert.equal(deletedEvent.reason, "deleted");
+  assert.deepEqual(Object.keys(deletedEvent.data).sort(), ["event", "gate_id", "ref", "repo", "repository_id", "target_prefix", "workflow_ref"]);
 });
 
 test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer are oidc_invalid)", async (t) => {
@@ -691,6 +696,10 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   clock.ms += 31_000;
   down = false;
   assert.equal((await verify(token())).repository, REPO);
+  // An unknown kid within the 60 s refresh cooldown is not refetched: unavailable, not oidc_invalid.
+  const coolFetches = fetches;
+  await assert.rejects(verify(token("too-soon")), OidcKeysUnavailable);
+  assert.equal(fetches, coolFetches);
   // The issuer goes down again: an unknown kid refetches (after the cooldown), fails, and the last good keys still serve.
   down = true;
   clock.ms += 61_000;
@@ -902,7 +911,7 @@ test("gate redeem: the opt-out re-reads the default branch live; a cross-repo re
 
 });
 
-test("live default branch: connection uncached, public cached 5 min per repository id, id and name checked, rate limits unavailable", async () => {
+test("live default branch: connection uncached, public branch answers cached 5 min per repository id, id and name checked, rate limits unavailable", async () => {
   const { liveDefaultBranchReader, GithubRateLimited, GithubUnavailable } = await import("../src/delegation/gates.js");
   let answer: { status: number; body?: unknown } = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: REPO, default_branch: "main" } };
   let calls = 0;
@@ -920,8 +929,11 @@ test("live default branch: connection uncached, public cached 5 min per reposito
   answer = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: REPO, default_branch: "trunk" } };
   clock.ms += 301_000;
   assert.equal(await read(REPO, "70151234"), "trunk");
-  // Another repository id (a recreated repo) or another name: null, also cached.
+  // Another repository id (a recreated repo) or another name: null, never cached.
+  const beforeNull = calls;
   assert.equal(await read(REPO, "99999999"), null);
+  assert.equal(await read(REPO, "99999999"), null);
+  assert.equal(calls, beforeNull + 2);
   answer = { status: 200, body: { id: 70151234, owner: { id: 90122 }, full_name: "Other/name", default_branch: "main" } };
   clock.ms += 301_000;
   assert.equal(await read(REPO, "70151234"), null);

@@ -541,9 +541,9 @@ export const DEFAULT_BRANCH_CACHE_MS = 300_000;
 /**
  * The live default-branch read for an off-commit opt-out redeem (Cloud's
  * liveDefaultBranch). Through the workspace's GitHub connection when it has
- * one (not cached), else GitHub's public API, whose answers (a branch, or
- * null) are cached in memory per repository id for 5 minutes; errors are
- * never cached. A branch is returned only when GitHub's id equals the gate's
+ * one (not cached), else GitHub's public API, whose branch answers are
+ * cached in memory per repository id for 5 minutes; a null answer and errors
+ * are never cached. A branch is returned only when GitHub's id equals the gate's
  * repository id and its full_name equals the repo (case-insensitive), else
  * null; a moved repository (redirect) or 404 is null. 403/429 throw
  * GithubRateLimited, any other failure GithubUnavailable: both answer
@@ -560,8 +560,21 @@ export function liveDefaultBranchReader(input: { fetchImpl: typeof fetch; now: (
     const cached = cache.get(repositoryId);
     if (cached && at - cached.at < DEFAULT_BRANCH_CACHE_MS) return cached.branch;
     const branch = check(await resolveGateRepository({ repo, token: null, fetchImpl: input.fetchImpl }));
-    if (cache.size >= 1000) cache.clear();
-    cache.set(repositoryId, { at, branch });
+    // Only a branch is cached, never a negative answer (as Cloud): a repository
+    // GitHub briefly failed to show must not keep the opt-out off for 5 minutes.
+    if (branch) {
+      if (cache.size >= 1000) cache.clear();
+      cache.set(repositoryId, { at, branch });
+    }
     return branch;
   };
+}
+
+/** A gate as audited when it is deleted or removed (as Cloud's gateAuditData). */
+export function gateAuditData(row: Pick<GateRow, "id" | "repo" | "repository_id" | "workflow_ref" | "job_workflow_ref" | "ref" |
+  "ref_pattern" | "event" | "target_prefix">): Record<string, unknown> {
+  return { gate_id: row.id, repo: row.repo, repository_id: row.repository_id, workflow_ref: row.workflow_ref,
+    ...(row.job_workflow_ref ? { job_workflow_ref: row.job_workflow_ref } : {}),
+    ...(row.ref ? { ref: row.ref } : {}), ...(row.ref_pattern ? { ref_pattern: row.ref_pattern } : {}),
+    event: row.event, target_prefix: row.target_prefix };
 }

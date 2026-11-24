@@ -91,11 +91,13 @@ export function workflowOidcVerifier(input: {
    * (`delegation.dependency_failed`, op github_oidc_jwks).
    */
   /** `stale`: the issuer could not be reached and these are the last good keys (as Cloud). */
-  async function keys(issuer: string, refresh: boolean): Promise<{ keys: Jwk[]; stale: boolean }> {
+  async function keys(issuer: string, refresh: boolean): Promise<{ keys: Jwk[]; stale: boolean; notRefreshed?: boolean }> {
     const cached = cache.get(issuer);
     const at = now().getTime();
     const age = cached ? at - cached.at : Number.POSITIVE_INFINITY;
-    if (cached && (refresh ? age < REFRESH_COOLDOWN_MS : age < JWKS_TTL_MS)) return { keys: cached.keys, stale: false };
+    if (cached && !refresh && age < JWKS_TTL_MS) return { keys: cached.keys, stale: false };
+    // A refresh asked within the cooldown is not made: those keys may predate a rotation (as Cloud).
+    if (cached && refresh && age < REFRESH_COOLDOWN_MS) return { keys: cached.keys, stale: false, notRefreshed: true };
     if (at - (failedAt.get(issuer) ?? Number.NEGATIVE_INFINITY) < FAILURE_BACKOFF_MS) {
       if (cached) return { keys: cached.keys, stale: true };
       throw new OidcKeysUnavailable();
@@ -177,7 +179,8 @@ export function workflowOidcVerifier(input: {
       jwk = pick(refreshed);
       // An unknown kid while the issuer cannot be reached may be a key it just
       // rotated in: that is `unavailable` (retry), never a forged token (as Cloud).
-      if (!jwk && refreshed.stale) throw new OidcKeysUnavailable();
+      // The same within the refresh cooldown, when no refetch was made (as Cloud).
+      if (!jwk && (refreshed.stale || refreshed.notRefreshed)) throw new OidcKeysUnavailable();
     }
     if (!jwk || (jwk.use && jwk.use !== "sig") || (jwk.alg && jwk.alg !== alg)) throw new OidcInvalid("unknown_key");
     const key = publicKey(jwk);

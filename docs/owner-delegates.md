@@ -475,7 +475,8 @@ held until the insert commits). The same live gate (owner, repo,
 `workflow_ref`, `job_workflow_ref`, event, `target_prefix`) cannot be
 registered twice (the repository in any letter case): 409 `gate_exists`. A registry outage is
 logged as `delegation.unavailable` (op `gate_registry`). Each change is audited
-(`gate.registered`, `gate.deleted`).
+(`gate.registered`, `gate.pinned`, and `gate.deleted` with the whole gate and
+reason `deleted`).
 
 **Redeeming.** The job calls `POST /delegates/gates/redeem` with
 `Authorization: Bearer <workflow OIDC token>` and `{approval_id, action,
@@ -494,8 +495,9 @@ dry_run?}`. Control checks, in order:
    - Failing any of these is `oidc_invalid`. When the issuer's keys cannot be
      read and none are cached, the answer is `unavailable` (an outage, not a
      forged token), and so is a `kid` the cached keys don't know while the
-     issuer can't be reached (it may be a key just rotated in); on a fresh
-     answer an unknown `kid` is `oidc_invalid`. After a failed key fetch no
+     issuer can't be reached, or within the 60-second refresh cooldown (it
+     may be a key just rotated in); on a fresh answer an unknown `kid` is
+     `oidc_invalid`. After a failed key fetch no
      refetch starts for 30 seconds; meanwhile the last good keys serve, or
      the call fails fast.
      Each failure is logged (`delegation.dependency_failed`, op
@@ -541,8 +543,8 @@ dry_run?}`. Control checks, in order:
    iOS targets keep none, and with none left the answer is `sha_mismatch`.
    For a GitHub Actions gate the default branch is then read live from
    GitHub (never on an on-commit redeem): through the workspace's connection
-   when it has one (not cached), else the public API, whose answers are cached
-   per repository id for 5 minutes. GitHub's id must equal the gate's
+   when it has one (not cached), else the public API, whose branch answers are
+   cached per repository id for 5 minutes (a null answer never is). GitHub's id must equal the gate's
    repository id and its `full_name` the repo. If the branch moved, or GitHub
    no longer resolves the repository (404 or redirect), the opt-out does not
    apply; a rate limit (403/429) or any other failure is `unavailable`, never
