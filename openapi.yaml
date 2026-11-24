@@ -3851,6 +3851,27 @@ paths:
   /api/v1/workspaces/{workspaceId}/delegates/policy:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Human-only, any member of the workspace (a browser session or a
+        Desktop-verified bearer, as the other workspace delegation reads).
+        Read-only: the stored workspace policy, or the defaults when none is
+        stored yet (`delegation_enabled` false, `max_expiry_days` 90,
+        `allowed_classes` null, `require_tier_o` [], `code_owner_match`
+        any_path). Not audited.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The workspace delegation policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationPolicy" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`: not a member of this workspace, or not a human caller" }
     put:
       operationId: putDelegationPolicy
       tags: [Owner delegates]
