@@ -164,6 +164,9 @@ export function groupTeamRows(input: {
  * Each user's team for a report, in one query (docs/usage.md, "Teams"): the
  * window open at `teamAsOf`, else the one that closed last inside
  * [rangeStart, teamAsOf], else none. Users absent from the map have no team.
+ * `teamAsOf` comes from the application clock while assignment windows are
+ * stamped by the database clock, so a change made within the difference
+ * between the two clocks just before a request counts from the next request.
  */
 export async function resolveTeams(database: Database, organizationId: string, rangeStart: string, teamAsOf: string): Promise<Map<string, string>> {
   const result = await database.query<{ user_id: string; team_id: string }>(
@@ -206,8 +209,9 @@ export function forgetTeamsCache(config: SelfhostConfig): void {
 
 /**
  * Reads session list pages under the People view's bounds. A session listed
- * twice (a moved cursor, or one session in two readable workspaces) counts
- * once. Throws when a read fails, as the People view does.
+ * twice for one workspace (a moved cursor) counts once; the same session id in
+ * two workspaces counts in each, as in the People view. Throws when a read
+ * fails, as the People view does.
  */
 async function sampleSessions(config: SelfhostConfig, identities: HistoryIdentity[], range: Range): Promise<Sample> {
   const seen = new Set<string>();
@@ -235,7 +239,7 @@ async function sampleSessions(config: SelfhostConfig, identities: HistoryIdentit
       for (;;) {
         const page = await call(() => sessionPage(config, identity, range, { limit: READ_API_MAX_LIMIT, cursor }));
         for (const session of page.sessions) {
-          const key = JSON.stringify([session.source, session.sessionId]);
+          const key = JSON.stringify([session.workspaceId, session.source, session.sessionId]);
           if (seen.has(key)) continue;
           seen.add(key);
           const userIds = [...new Set(session.userIds)];

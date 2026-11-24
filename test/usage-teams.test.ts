@@ -281,8 +281,10 @@ test("usage teams: every session lands in exactly one row and the rows sum to th
   await env.assign(m3!, infra, "2026-10-01T00:00:00Z");
   env.readApi.rows.push(
     session("s1", env.alpha, [m1!], "2026-11-02T10:00:00.000Z"),
-    // The same session listed by a second workspace counts once.
+    // The same session id in a second workspace counts in that workspace too.
     session("s1", env.beta, [m1!], "2026-11-02T10:00:00.000Z"),
+    session("s2", env.alpha, [m3!], "2026-11-01T10:00:00.000Z"),
+    // Listed twice for one workspace: counts once.
     session("s2", env.alpha, [m3!], "2026-11-01T10:00:00.000Z"),
     session("s3", env.alpha, [m1!, m2!], "2026-10-31T10:00:00.000Z"),
     session("s4", env.beta, [m2!, m3!], "2026-10-30T10:00:00.000Z"),
@@ -303,7 +305,7 @@ test("usage teams: every session lands in exactly one row and the rows sum to th
   const rows = rowsOf(result.body);
   assert.deepEqual(rows[0], {
     kind: "team", teamId: platform, name: "Platform", archived: false, members: 2, activeUsers: 2,
-    sessions: 2, searches: 0, lastSessionAt: "2026-11-02T10:00:00.000Z", spend: null,
+    sessions: 3, searches: 0, lastSessionAt: "2026-11-02T10:00:00.000Z", spend: null,
   });
   assert.deepEqual(rows[1], {
     kind: "team", teamId: infra, name: "Infra", archived: false, members: 1, activeUsers: 1,
@@ -321,7 +323,7 @@ test("usage teams: every session lands in exactly one row and the rows sum to th
     { kind: "notResolved", sessions: 0, spend: null },
   ]);
   assert.equal(rows.length, 7);
-  assert.deepEqual(teams.total, { sessions: 7, searches: 0 });
+  assert.deepEqual(teams.total, { sessions: 8, searches: 0 });
   assertSums(result.body);
 });
 
@@ -359,6 +361,28 @@ test("usage teams: shared-count and other buckets are not resolved, and the rows
   assert.deepEqual(unread.total, { sessions: null, searches: 2 });
 });
 
+test("usage teams: an archived team named only by a cross-team row stays listed (pure)", () => {
+  const teams = [
+    { teamId: "t-live", name: "Platform", archived: false, members: 1 },
+    { teamId: "t-old", name: "Old Ops", archived: true, members: 0 },
+    { teamId: "t-quiet", name: "Quiet", archived: true, members: 0 },
+  ];
+  const grouped = groupTeamRows({
+    buckets: [{ kind: "users", userIds: ["u-live", "u-old"], sessions: 2, lastSessionAt: "2026-11-01T00:00:00.000Z" }],
+    teamOf: new Map([["u-live", "t-live"], ["u-old", "t-old"]]),
+    teams,
+  });
+  const old = grouped.rows.find((row) => row.kind === "team" && row.teamId === "t-old");
+  assert.ok(old && old.kind === "team", "the archived team named by a cross row is listed");
+  assert.equal(old.sessions, 0);
+  assert.deepEqual(grouped.rows.filter((row) => row.kind === "crossTeam"), [
+    { kind: "crossTeam", teamIds: ["t-live", "t-old"], sessions: 2, spend: null },
+  ]);
+  assert.ok(!grouped.rows.some((row) => row.kind === "team" && row.teamId === "t-quiet"),
+    "an archived team with no figures and no cross row is absent");
+  assert.deepEqual(grouped.total, { sessions: 2, searches: 0 });
+});
+
 test("usage teams: moves, removals and later assignments resolve at teamAsOf", async (t) => {
   const env = await setup(t);
   const mover = await env.addMember(env.a.id, "mover@acme.test");
@@ -366,6 +390,7 @@ test("usage teams: moves, removals and later assignments resolve at teamAsOf", a
   const edge = await env.addMember(env.a.id, "edge@acme.test");
   const late = await env.addMember(env.a.id, "late@acme.test");
   const gone = await env.addMember(env.a.id, "gone@acme.test");
+  const twice = await env.addMember(env.a.id, "twice@acme.test");
   const platform = await env.team("Platform");
   const infra = await env.team("Infra");
   // Moved inside the range: the later team.
@@ -380,7 +405,11 @@ test("usage teams: moves, removals and later assignments resolve at teamAsOf", a
   await env.assign(late, infra, "2026-11-02T21:00:00Z");
   // Left before the range: no team.
   await env.assign(gone, infra, "2026-09-01T00:00:00Z", "2026-10-20T00:00:00Z");
+  // Two closed windows in the range and none open: the one that closed last.
+  await env.assign(twice, platform, "2026-10-28T00:00:00Z", "2026-10-30T00:00:00Z");
+  await env.assign(twice, infra, "2026-10-30T00:00:00Z", "2026-10-31T00:00:00Z");
   env.readApi.rows.push(
+    session("twice", env.alpha, [twice], "2026-10-31T10:00:00.000Z"),
     session("mover", env.alpha, [mover], "2026-10-28T10:00:00.000Z"),
     session("leaver", env.alpha, [leaver], "2026-10-29T10:00:00.000Z"),
     session("edge", env.alpha, [edge], "2026-10-30T10:00:00.000Z"),
@@ -393,11 +422,11 @@ test("usage teams: moves, removals and later assignments resolve at teamAsOf", a
   const rows = rowsOf(result.body);
   assert.equal(teamRow(rows, platform)?.sessions, 2);
   assert.equal(teamRow(rows, platform)?.activeUsers, 2);
-  assert.equal(teamRow(rows, infra)?.sessions, 1);
-  assert.equal(teamRow(rows, infra)?.activeUsers, 1);
+  assert.equal(teamRow(rows, infra)?.sessions, 2);
+  assert.equal(teamRow(rows, infra)?.activeUsers, 2);
   assert.equal(only(rows, "noTeam").sessions, 2);
   assert.equal(rows.filter((row) => row.kind === "crossTeam").length, 0);
-  assert.equal(result.body.teams.total.sessions, 5);
+  assert.equal(result.body.teams.total.sessions, 6);
   assertSums(result.body);
 });
 

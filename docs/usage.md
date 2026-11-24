@@ -155,13 +155,15 @@ in that report. An assignment in another organization never counts.
 Sessions come from the read API's session list (`/v1/sessions`) with the
 owner's authority, for each organization workspace the owner belongs to, under
 the People view's bounds (pages of at most 200, at most 3 calls and 2 seconds,
-cached for 5 minutes in a cache of their own); a session listed twice counts
-once. When not every session in the range was read, `truncated` is true: the
-session figures are lower bounds and `total.sessions` is the number read, not
-the total for the organization. If the read API cannot be read at all, every
-`sessions` and `lastSessionAt` and `total.sessions` and `source` are `null`
-and `unavailable` is `["sessions", "spend"]`; searches and members are still
-served. `spend` is always `null` in this version.
+cached for 5 minutes in a cache of their own); a session the read API lists
+twice for one workspace counts once, and the same session id in two workspaces
+counts in each, as in the People view. When not every session in the range was
+read, `truncated` is true: the session figures are lower bounds and
+`total.sessions` is the number read, not the total for the organization. If
+the read API cannot be read at all, every `sessions` and `lastSessionAt` and
+`total.sessions` and `source` are `null` and `unavailable` is
+`["sessions", "spend"]`; searches and members are still served. `spend` is
+always `null` in this version.
 
 `searches` is the sum of `usage_people_daily` searches of the people resolved
 to the row; `activeUsers` counts the people resolved to the row who were
