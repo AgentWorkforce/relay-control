@@ -265,3 +265,27 @@ test("releasing a claim and revoking grants concurrently never deadlock (grants,
     assert.equal(grant.status, "revoked");
   }
 });
+
+test("the retention sweep takes the oldest due quotes across workspaces, so one backlog cannot starve the rest", options, async (t) => {
+  const { database, workspaceId: busy, ownerId } = await fixture(t);
+  // A second workspace, created after the busy one, holding the oldest due quote.
+  const quiet = randomUUID();
+  await database.query(`INSERT INTO workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+    SELECT $1, organization_id, 'Quiet', $2, 'envelope' FROM workspaces WHERE id = $3`, [quiet, `rw-${quiet}`, busy]);
+  const quoteRow = async (workspaceId: string, messageId: string, days: number) => (await database.query<{ id: string }>(
+    `INSERT INTO delegation_audit_events (workspace_id, event, owner_user_id, message_id, quote, quote_hash, created_at)
+     VALUES ($1, 'approval.attested', $2, $3, 'old words', 'h', now() - make_interval(days => $4)) RETURNING id::text`,
+    [workspaceId, ownerId, messageId, days])).rows[0]!.id;
+  const busyRows = [];
+  for (let index = 0; index < 5; index += 1) busyRows.push(await quoteRow(busy, `m-busy-${index}`, 100 - index));
+  const oldest = await quoteRow(quiet, "m-quiet", 200);
+  const quoted = async (id: string) => (await database.query<{ quote: string | null }>(
+    "SELECT quote FROM delegation_audit_events WHERE id = $1", [id])).rows[0]!.quote;
+  // A batch of one takes the quiet workspace's older quote, not the busy one's.
+  assert.equal(await redactExpiredQuotes(database, 1), 1);
+  assert.equal(await quoted(oldest), null);
+  for (const id of busyRows) assert.equal(await quoted(id), "old words");
+  // The next batch of two takes the busy workspace's two oldest (100 and 99 days).
+  assert.equal(await redactExpiredQuotes(database, 2), 2);
+  assert.deepEqual(await Promise.all(busyRows.map(quoted)), [null, null, "old words", "old words", "old words"]);
+});

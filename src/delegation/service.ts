@@ -386,15 +386,17 @@ export async function redactExpiredQuotes(executor: SqlExecutor, limit?: number)
        -- As Cloud: each workspace's cutoff is computed once, then its due
        -- quotes are read as one (workspace_id, created_at) index range, so the
        -- cost follows the due rows, not every quote an org with a long window
-       -- keeps.
+       -- keeps. The batch is the oldest due quotes across every workspace
+       -- (cloud#6501 9d70f481b), so one workspace's backlog cannot take the
+       -- whole budget on every run while others' quotes stay past due.
        (SELECT d.id FROM workspaces w
           LEFT JOIN delegation_org_policies p ON p.organization_id = w.organization_id
           CROSS JOIN LATERAL (
-            SELECT e.id FROM delegation_audit_events e
+            SELECT e.id, e.created_at FROM delegation_audit_events e
              WHERE e.workspace_id = w.id AND e.quote IS NOT NULL
                AND e.created_at <= now() - make_interval(days => COALESCE(p.quote_retention_days, $1))
-             ORDER BY e.created_at LIMIT $2) d
-         LIMIT $2)
+             ORDER BY e.created_at, e.id LIMIT $2) d
+         ORDER BY d.created_at, d.id LIMIT $2)
        UNION
        -- Any row still quoting a message whose redaction was requested
        -- (relay-control also catches a write that raced the request).
