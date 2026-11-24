@@ -2062,3 +2062,15 @@ test("review: DELETE /delegates/claims/{id} releases a claimed agent (revoking g
   assert.equal(done.status, 404, done.raw);
   assert.equal(done.body.code, "invalid_code");
 });
+
+test("review: an identical redeem refusal is audited once per 10 minutes", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#300" }])));
+  const approvalId = attested.body.claims.approval_id as string;
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal((await env.redeem(recipient, approvalId, { class: "merge", target: "AgentWorkforce/relay#301" })).body.reason, "out_of_scope");
+  }
+  const rows = (await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'redeem.refused' AND approval_id = $1",
+    [approvalId])).rows;
+  assert.equal(rows.length, 1);
+});

@@ -918,6 +918,20 @@ export async function refusedRecently(executor: SqlExecutor, input: { workspaceI
   )).rows.length > 0;
 }
 
+/** Whether the same redeem refusal (approval, recipient, action, reason) was audited within REFUSAL_DEDUP_MS (as Cloud). */
+export async function redeemRefusedRecently(executor: SqlExecutor, input: { workspaceId: string; approvalId: string;
+  recipientAgentId: string; action: { class: string; target: string }; reason: string }): Promise<boolean> {
+  return (await executor.query(
+    `SELECT 1 FROM delegation_audit_events
+      WHERE workspace_id = $1 AND approval_id = $2 AND event = 'redeem.refused' AND recipient_agent_id = $3
+        AND reason = $4 AND data->'action'->>'class' = $5 AND data->'action'->>'target' = $6
+        AND created_at > now() - make_interval(secs => $7)
+      LIMIT 1`,
+    [input.workspaceId, input.approvalId, input.recipientAgentId, input.reason, input.action.class, input.action.target,
+      REFUSAL_DEDUP_MS / 1000],
+  )).rows.length > 0;
+}
+
 export type DelegationVerdict =
   | { verdict: "delegate"; attestation: string; claims: AttestationClaims }
   | { verdict: "none"; reason: ReasonCode };
@@ -1462,8 +1476,13 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       logUnavailable("redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId,
         grantId: context.grantId ?? null });
     }
-    // As at attest: only a proven recipient's refusals are written to the audit log.
-    if (context.proven) await recordDelegationAudit(deps.database, {
+    // As at attest: only a proven recipient's refusals are written to the audit
+    // log, and an identical one (approval, recipient, action, reason) once per
+    // 10 minutes (as Cloud); repeats are still logged.
+    const repeated = context.proven && await redeemRefusedRecently(deps.database, { workspaceId: workspace.id,
+      approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, action: input.action, reason })
+      .catch(() => false);
+    if (context.proven && !repeated) await recordDelegationAudit(deps.database, {
       workspaceId: workspace.id, event: "redeem.refused", actorUserId: input.callerUserId,
       authMethod: input.authMethod, ownerUserId: context.ownerUserId ?? null, grantId: context.grantId ?? null,
       approvalId: input.approvalId, recipientAgentId: input.recipientAgentId, reason,
