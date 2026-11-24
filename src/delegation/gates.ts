@@ -318,15 +318,23 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // standing serves.
     const targetOwners = await loadTargetOwners(deps.database, workspace.id);
     let standingGate: GateRow | null = null;
+    // Pending Khaliq D5 (option b): a gate serves only while its owner is an
+    // org owner or admin (relay-control reads no CODEOWNERS, so that is the
+    // whole rule here, stricter than Cloud's code-owner-or-admin).
+    let unqualified = 0;
     for (const candidate of candidates) {
-      if (!await memberRole(deps.database, workspace.id, candidate.owner_user_id)) continue;
+      const role = await memberRole(deps.database, workspace.id, candidate.owner_user_id);
+      if (!role) continue;
+      if (!qualifiedGateOwner(role)) { unqualified += 1; continue; }
       if (resolveStanding({ approvalOwnerId: approval.owner_user_id, recipientOwnerId: candidate.owner_user_id,
         accept: "code_owners", actions: [action], targetOwners })) {
         standingGate = candidate;
         break;
       }
     }
-    if (!standingGate) return await refuse("recipient_policy");
+    if (!standingGate) {
+      return await refuse(unqualified && unqualified === candidates.length ? "gate_owner_unqualified" : "recipient_policy");
+    }
     gate = standingGate;
     const conditions = evaluateConditions(action.conditions ?? [], now);
     if (conditions.kind === "unavailable") return await refuse("condition_unavailable");
@@ -457,7 +465,9 @@ async function currentGateAuthority(executor: SqlExecutor, workspaceId: string, 
     if (!await memberRole(executor, workspaceId, approval.owner_user_id)) return "revoked";
     if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return "out_of_scope";
   }
-  if (!await memberRole(executor, workspaceId, gateOwnerId)) return "recipient_policy";
+  const role = await memberRole(executor, workspaceId, gateOwnerId);
+  if (!role) return "recipient_policy";
+  if (!qualifiedGateOwner(role)) return "gate_owner_unqualified";
   return null;
 }
 
@@ -578,3 +588,15 @@ export function gateAuditData(row: Pick<GateRow, "id" | "repo" | "repository_id"
     ...(row.ref ? { ref: row.ref } : {}), ...(row.ref_pattern ? { ref_pattern: row.ref_pattern } : {}),
     event: row.event, target_prefix: row.target_prefix };
 }
+
+/**
+ * Pending Khaliq D5 (option b): who may own a release gate. relay-control has
+ * no CODEOWNERS reads, so only an org owner or admin qualifies, at
+ * registration and at every redeem.
+ */
+export function qualifiedGateOwner(role: string | null): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** At most this many live gates per (workspace, repository, workflow_ref). */
+export const MAX_GATES_PER_WORKFLOW = 10;

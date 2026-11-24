@@ -474,6 +474,11 @@ test("gate redeem: another member's matching gate never blocks the approval owne
   const bobId = await env.addMember("bob@acme.test");
   const bob = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
   const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  // A plain member may not own a gate (pending D5, option b): org owners and admins only.
+  const refused = await env.bearer("/delegates/gates", "POST", body, bob.accessToken);
+  assert.equal(refused.status, 403, refused.raw);
+  assert.equal(refused.body.code, "gate_owner_unqualified");
+  await env.database.query("UPDATE organization_memberships SET role = 'admin' WHERE user_id = $1", [bobId]);
   assert.equal((await env.bearer("/delegates/gates", "POST", body, bob.accessToken)).status, 201);
   const own = await env.gate();
   const approvalId = await env.approval([STABLE]);
@@ -977,4 +982,24 @@ test("gates: a job_workflow_ref other than workflow_ref is SHA-pinned, except in
   const sameRepoSha = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:stable:`,
     job_workflow_ref: `${REPO}/.github/workflows/publish.yml@${SHA}` });
   assert.equal(sameRepoSha.status, 201, sameRepoSha.raw);
+});
+
+test("gates: only an org owner or admin's gate serves (pending D5); at most 10 live gates per repository and workflow", async (t) => {
+  const env = await setup(t);
+  const bobId = await env.addMember("admin-bob@acme.test");
+  await env.database.query("UPDATE organization_memberships SET role = 'admin' WHERE user_id = $1", [bobId]);
+  const bob = await env.desktopSignIn({ hostName: "admin-bob-box", userId: bobId });
+  const body = { repo: REPO, workflow_ref: WORKFLOW, ref: "refs/heads/main", event: "workflow_dispatch", target_prefix: `${REPO}:` };
+  assert.equal((await env.bearer("/delegates/gates", "POST", body, bob.accessToken)).status, 201);
+  // Bob is demoted: his gate no longer serves, and with no qualified gate the answer is gate_owner_unqualified.
+  await env.database.query("UPDATE organization_memberships SET role = 'member' WHERE user_id = $1", [bobId]);
+  const approvalId = await env.approval([STABLE]);
+  const refused = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "990" })), approvalId);
+  assert.equal(refused.status, 403, refused.raw);
+  assert.deepEqual(refused.body, { ok: false, reason: "gate_owner_unqualified" });
+  // At most 10 live gates per (repository, workflow_ref), Bob's included: the 11th is 409 gate_limit.
+  for (let index = 0; index < 9; index += 1) await env.gate({ target_prefix: `${REPO}:c${index}:` });
+  const eleventh = await env.browser("/delegates/gates", "POST", { ...body, target_prefix: `${REPO}:c10:` });
+  assert.equal(eleventh.status, 409, eleventh.raw);
+  assert.equal(eleventh.body.code, "gate_limit");
 });

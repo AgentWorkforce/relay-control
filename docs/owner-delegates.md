@@ -94,7 +94,8 @@ on in production, check each of these (decided 2026-11-23):
       owner's words (#312).
 - [ ] Release gates: decide who may register a gate for a repository
       (installation coverage, code ownership or admin) before relying on
-      gates for another code owner's approvals (#313).
+      gates for another code owner's approvals (#313). Until D5 is recorded,
+      relay-control lets only org owners and admins own gates.
 
 ## Who may call what
 
@@ -416,7 +417,13 @@ workflow OIDC token, right before its first publish step. Whatever starts the
 job therefore cannot skip the check. No stored secret is involved.
 
 **Registering a gate.** `GET`/`POST`/`DELETE /delegates/gates` are for the
-owner, by browser session or verified Desktop bearer. `DELETE` names the gate
+owner, by browser session or verified Desktop bearer. **Gate-owner
+qualification is pending Khaliq's decision D5 (option b):** only an org owner
+or admin may register a gate (403 `gate_owner_unqualified` otherwise), and a
+gate serves only while its owner still is one. relay-control reads no
+CODEOWNERS, so this is stricter than Cloud's code-owner-or-admin rule. At
+most 10 live gates may share a repository and `workflow_ref` in a workspace
+(409 `gate_limit`). `DELETE` names the gate
 with `?gate_id=` or `{gate_id}` and answers `{gate_id, deleted:true}`. A gate is `{gate_id, repo, workflow_ref, job_workflow_ref?, ref,
 ref_pattern, event, target_prefix}`. For example:
 

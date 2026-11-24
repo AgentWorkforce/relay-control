@@ -9,7 +9,7 @@ import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
-import { gateAuditData, gateRedeemStatus, gateView, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
+import { gateAuditData, gateRedeemStatus, gateView, MAX_GATES_PER_WORKFLOW, qualifiedGateOwner, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
   ACTION_CLASSES,
@@ -812,6 +812,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const issuer = (body.issuer ?? input.oidcIssuers[0]!).replace(/\/+$/, "");
         if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
         await requireEnabled(workspace.id);
+        // Pending Khaliq D5 (option b): only an org owner or admin may own a gate.
+        if (!caller.admin) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
         // As Cloud: the gate is pinned to the repository's GitHub ids at
         // registration (the workspace's GitHub connection, else the public
         // API; the canonical name must match). Redeem never pins.
@@ -849,7 +851,21 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const row = await input.database.transaction(async (tx) => {
           // Held until commit, as Cloud: a departure cannot finish between the
           // caller's membership check and this insert and leave a live gate.
-          if (!await memberRole(tx, workspace.id, principal.userId, true)) fail("forbidden", "Forbidden", 403);
+          const role = await memberRole(tx, workspace.id, principal.userId, true);
+          if (!role) fail("forbidden", "Forbidden", 403);
+          if (!qualifiedGateOwner(role)) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
+          // At most MAX_GATES_PER_WORKFLOW live gates per (workspace, repository,
+          // workflow_ref), counted under an advisory lock so concurrent
+          // registrations cannot both slip under the limit.
+          await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            [`delegation-gates:${workspace.id}:${body.repo.toLowerCase()}:${body.workflow_ref}`]);
+          const live = Number((await tx.query<{ count: number }>(
+            `SELECT count(*)::int AS count FROM delegation_gates
+              WHERE workspace_id = $1 AND lower(repo) = lower($2) AND workflow_ref = $3 AND deleted_at IS NULL`,
+            [workspace.id, body.repo, body.workflow_ref])).rows[0]?.count ?? 0);
+          if (live >= MAX_GATES_PER_WORKFLOW) {
+            fail("gate_limit", `At most ${MAX_GATES_PER_WORKFLOW} live gates per repository and workflow`, 409);
+          }
           const created = (await tx.query<GateRow>(
             `INSERT INTO delegation_gates
                (id, workspace_id, owner_user_id, issuer, repo, workflow_ref, job_workflow_ref, ref, ref_pattern, event,
