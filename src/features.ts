@@ -4,12 +4,12 @@
  * usage pages); an explicit list, including an empty one, is exact. Read once
  * at startup. Everything else is core and always on.
  */
-export const FEATURES = ["flows", "relayfile", "chief", "usage", "launch", "usage_people", "events_shim"] as const;
+export const FEATURES = ["flows", "relayfile", "chief", "usage", "launch", "usage_people", "events_shim", "teams"] as const;
 export type Feature = (typeof FEATURES)[number];
 export type SelectedFeatures = Record<Feature, boolean>;
 
 export const NO_FEATURES: SelectedFeatures = {
-  flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false, events_shim: false,
+  flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false, events_shim: false, teams: false,
 };
 
 /** Selected when SELFHOST_FEATURES is unset. Set it (to "" for none) to choose otherwise. */
@@ -29,7 +29,7 @@ export function loadSelectedFeatures(env: Record<string, string | undefined> = p
 }
 
 const DISPLAY: Record<Feature, string> = {
-  flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage", launch: "Agent launch", usage_people: "Usage people", events_shim: "Events shim",
+  flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage", launch: "Agent launch", usage_people: "Usage people", events_shim: "Events shim", teams: "Teams",
 };
 
 /** A 403 refusal for a feature route: `{ error, message, feature }`. */
