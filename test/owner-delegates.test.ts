@@ -467,6 +467,16 @@ test("policy GET: any member reads the stored policy or the defaults; others are
   // Other methods stay 405.
   const post = await env.browser("/delegates/policy", "POST", { delegation_enabled: false });
   assert.equal(post.status, 405, post.raw);
+
+  // An unbound workspace (no Relaycast binding yet) answers too, and the read provisions nothing.
+  await env.database.query(
+    "UPDATE workspaces SET relaycast_workspace_id = NULL, relaycast_api_key_ciphertext = NULL WHERE id = $1", [env.workspaceId]);
+  const unbound = await env.bearer("/delegates/policy", "GET", undefined, member.accessToken);
+  assert.equal(unbound.status, 200, unbound.raw);
+  assert.deepEqual(unbound.body, stored);
+  const binding = (await env.database.query<{ relaycast_workspace_id: string | null }>(
+    "SELECT relaycast_workspace_id FROM workspaces WHERE id = $1", [env.workspaceId])).rows[0]!;
+  assert.equal(binding.relaycast_workspace_id, null);
 });
 
 test("policy change revokes grants that no longer fit", async (t) => {

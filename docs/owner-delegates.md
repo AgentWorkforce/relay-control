@@ -175,8 +175,9 @@ grants revoked because they no longer fit).
 reads): it answers the stored policy, or the defaults when none is stored yet
 (`delegation_enabled` false, `max_expiry_days` 90, `allowed_classes` null,
 `require_tier_o` [], `code_owner_match` any_path). A caller of another
-workspace gets 403 `forbidden`. It works while delegation is off and is not
-audited.
+workspace gets 403 `forbidden`. It works while delegation is off, is not
+audited, and reads membership without provisioning a Relaycast binding, so a
+workspace that has none yet answers too and stays unbound.
 
 `DELETE /delegates/claims/{claim_id}` releases a claimed agent, or cancels a
 pending claim code. Its owner, or an org owner or admin, may, also while
