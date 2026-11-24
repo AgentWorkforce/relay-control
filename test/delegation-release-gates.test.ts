@@ -230,6 +230,17 @@ test("gate redeem: OIDC must verify (forged, expired, wrong audience or issuer a
     assert.equal(refused.status, 401, `${name} ${refused.raw}`);
     assert.deepEqual(refused.body, { ok: false, reason: "oidc_invalid" }, name);
   }
+  // The token is verified before the workspace is read (#278 review): a
+  // workspace that does not exist answers a bad token oidc_invalid, and a
+  // valid one gate_unknown (as Cloud), never not_enabled.
+  const elsewhere = (token: string) => request(env.origin, `/api/v1/workspaces/${randomUUID()}/delegates/gates/redeem`, {
+    method: "POST", token, body: { approval_id: approvalId, action: { class: "release", target: STABLE } } });
+  const forgedElsewhere = await elsewhere(mint(env.github, env.workflowClaims(), forger));
+  assert.equal(forgedElsewhere.status, 401, forgedElsewhere.raw);
+  assert.deepEqual(forgedElsewhere.body, { ok: false, reason: "oidc_invalid" });
+  const validElsewhere = await elsewhere(mint(env.github, env.workflowClaims()));
+  assert.equal(validElsewhere.status, 403, validElsewhere.raw);
+  assert.deepEqual(validElsewhere.body, { ok: false, reason: "gate_unknown" });
   // No bearer at all is 401, before anything is read.
   const missing = await env.redeem(null, approvalId);
   assert.equal(missing.status, 401, missing.raw);
@@ -301,11 +312,46 @@ test("gate redeem: single use bound to run_id; any later redeem in the same run 
   const fresh = await env.approval([BETA]);
   const results = await Promise.all(["31", "32", "33", "34"].map(id => env.redeem(run(id, "1"), fresh, BETA)));
   assert.equal(results.filter(result => result.body.ok === true).length, 1);
+  // Every losing run is refused, never answered as a consumption (#278 review).
+  for (const result of results.filter(result => result.body.ok !== true)) {
+    assert.deepEqual(result.body, { ok: false, reason: "consumed" });
+  }
   const bound = await env.database.query<{ run_id: string }>(
     "SELECT run_id FROM delegation_gate_redemptions WHERE approval_id = $1", [approvalId]);
   assert.deepEqual(bound.rows.map(row => row.run_id), ["900"]);
   const redeemed = await env.events("gate.redeemed");
   assert.deepEqual(redeemed.map(row => row.data.same_run), [false, true, true, true, false]);
+});
+
+test("gate redeem: a run that loses the consume race is refused consumed, never answered as consumed (#278 review)", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  const run = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId, run_attempt: "1" }));
+  // Both runs pass the plain read; the winner commits just before the
+  // loser's consuming transaction starts, so the loser's consume finds the
+  // action taken by another run.
+  const database = env.database as { transaction: typeof env.database.transaction };
+  const original = database.transaction.bind(env.database);
+  let raced = false;
+  let winner: Awaited<ReturnType<typeof env.redeem>> | null = null;
+  database.transaction = (async (fn: Parameters<typeof original>[0]) => {
+    if (!raced) {
+      raced = true;
+      winner = await env.redeem(run("51"), approvalId);
+    }
+    return original(fn);
+  }) as typeof original;
+  t.after(() => { database.transaction = original; });
+  const loser = await env.redeem(run("52"), approvalId);
+  assert.deepEqual(winner!.body, { ok: true, consumed: true });
+  assert.equal(loser.status, 403, loser.raw);
+  assert.deepEqual(loser.body, { ok: false, reason: "consumed" });
+  const bound = await env.database.query<{ run_id: string }>(
+    "SELECT run_id FROM delegation_gate_redemptions WHERE approval_id = $1", [approvalId]);
+  assert.deepEqual(bound.rows.map(row => row.run_id), ["51"]);
+  // Only the winner's consumption is audited as redeemed.
+  assert.equal((await env.events("gate.redeemed")).length, 1);
 });
 
 test("gate redeem: dry_run runs every check, never consumes, and is audited as dry_run", async (t) => {

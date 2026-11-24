@@ -8,7 +8,7 @@ import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { ACCOUNT_SCOPE, type Principal } from "../store.js";
 import { DELEGATION_JWKS_PATH, type DelegationSigner } from "./jws.js";
-import { GITHUB_ACTIONS_OIDC_ISSUER } from "./oidc.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims } from "./oidc.js";
 import { gateAuditData, gateRedeemStatus, gateView, gateWorkflowFile, MAX_GATES_PER_WORKFLOW, qualifiedGateOwner, GithubUnavailable, liveDefaultBranchReader, redeemThroughGate, resolveGateRepository, type GateRow } from "./gates.js";
 import type { WorkflowOidcVerifier } from "./oidc.js";
 import {
@@ -617,11 +617,31 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const token = bearer(request);
       if (!token) return fail("unauthorized", "A GitHub Actions OIDC token is required", 401);
       const body = parse(gateRedeemBody, await readJson(request), "Invalid request");
+      const dryRun = body.dry_run === true;
+      // Authenticate before anything about the workspace: whether it exists,
+      // has delegation on or a messaging binding is never answered to a caller
+      // no trusted issuer signed for (#278 review). The verified claims are
+      // handed on, so a valid token is verified once.
+      let claims: WorkflowClaims;
+      try {
+        claims = await input.workflowOidc(token);
+      } catch (error) {
+        // The issuer's keys could not be read: an outage, not a forged token.
+        const keysDown = error instanceof OidcKeysUnavailable;
+        if (keysDown) logUnavailable("gate_redeem", error, {});
+        const refused = { ok: false as const, reason: keysDown ? "unavailable" as const : "oidc_invalid" as const,
+          ...(dryRun ? { dry_run: true as const } : {}) };
+        json(gateRedeemStatus(refused), refused);
+        return true;
+      }
+      const verified = claims;
       const row = (await input.database.query<{ id: string; organization_id: string }>(
         "SELECT id, organization_id FROM workspaces WHERE id::text = $1", [workspaceId],
       )).rows[0];
       if (!row) {
-        json(body.dry_run ? 200 : 403, { ok: false, reason: "not_enabled", ...(body.dry_run ? { dry_run: true } : {}) });
+        // As Cloud: a workspace that does not exist has no gate for the token.
+        const refused = { ok: false as const, reason: "gate_unknown" as const, ...(dryRun ? { dry_run: true as const } : {}) };
+        json(gateRedeemStatus(refused), refused);
         return true;
       }
       const binding = await input.relaycastBinding(row.id);
@@ -629,8 +649,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         relaycastWorkspaceId: binding?.relaycastWorkspaceId ?? "", relaycastApiKey: binding?.relaycastApiKey ?? "" };
       // Status codes fail closed for a plain `curl -f` step (gateRedeemStatus); the body is unchanged.
       const result = await redeemThroughGate({ ...deps, gateOnly: deps.gateOnly || !binding }, {
-        workspace, verifyOidc: input.workflowOidc, oidcToken: token, approvalId: body.approval_id, action: body.action,
-        dryRun: body.dry_run === true,
+        workspace, verifyOidc: async () => verified, oidcToken: token, approvalId: body.approval_id, action: body.action,
+        dryRun,
         liveDefaultBranch: liveDefaultBranchFor(row.id),
       });
       json(gateRedeemStatus(result), result);

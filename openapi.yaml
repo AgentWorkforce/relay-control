@@ -3609,7 +3609,7 @@ paths:
                     required: [ok, consumed]
                     properties:
                       ok: { const: true }
-                      consumed: { type: boolean }
+                      consumed: { const: true }
                       same_run: { const: true }
                   - type: object
                     required: [ok, consumed, dry_run]

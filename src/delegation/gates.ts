@@ -364,30 +364,33 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // `gate.redeemed` in that transaction: a failure rolls the consumption back.
     const servingGate = standingGate;
     const oidc = claims;
-    const outcome = await decideUnderLocks(deps.database, { workspaceId: workspace.id,
+    const outcome = await decideUnderLocks<{ refused: ReasonCode } | { consumed: "consumed" | "same_run" }>(deps.database, { workspaceId: workspace.id,
       memberUserIds: approval.tier === "O" ? [servingGate.owner_user_id, approval.owner_user_id] : [servingGate.owner_user_id],
       grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true },
       async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action], tier: approval.tier, policy, recipientAgentId: "",
         nowMs: deps.now().getTime(), memberGone: approval.tier === "O" ? "revoked" : "recipient_policy",
         noGrant: approval.tier === "O" });
-      if (stale) return stale;
+      // Refusals and consumptions are kept apart: a refusal reason (even
+      // "consumed") can never read as a successful first consumption.
+      if (stale) return { refused: stale };
       // Standing against the target owners as committed now (read locally).
       if (!resolveStanding({ approvalOwnerId: approval.owner_user_id, recipientOwnerId: servingGate.owner_user_id,
         accept: "code_owners", actions: [action],
         targetOwners: servingGate.owner_user_id === approval.owner_user_id ? [] : await loadTargetOwners(tx, workspace.id) })) {
-        return "recipient_policy" as const;
+        return { refused: "recipient_policy" as const };
       }
       const result = await consumeForGateRun(tx, { workspaceId: workspace.id, approvalId: approval.id, gateId: servingGate.id,
         claims: oidc, action });
-      if (result === "gate_gone") return "gate_unknown" as const;
-      if (result === "revoked") return "revoked" as const;
-      if (result === "taken") return "consumed" as const;
+      if (result === "gate_gone") return { refused: "gate_unknown" as const };
+      if (result === "revoked") return { refused: "revoked" as const };
+      // Another run consumed the action first: this run is refused (#278 review).
+      if (result === "taken") return { refused: "consumed" as const };
       await audit("gate.redeemed", null, { same_run: result === "same_run" }, tx);
-      return result;
+      return { consumed: result } as const;
     });
-    if (outcome !== "consumed" && outcome !== "same_run") return await refuse(outcome);
-    return outcome === "same_run" ? { ok: true, consumed: true, same_run: true } : { ok: true, consumed: true };
+    if ("refused" in outcome) return await refuse(outcome.refused);
+    return outcome.consumed === "same_run" ? { ok: true, consumed: true, same_run: true } : { ok: true, consumed: true };
   } catch (error) {
     // Class and SQLSTATE only: never the token or the error's message.
     logUnavailable("gate_redeem", error, { workspaceId: workspace.id, approvalId: input.approvalId, gateId: gate?.id ?? null });
