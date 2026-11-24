@@ -16,6 +16,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
+import { drainBody } from "../drain-body.js";
 import { DefaultAwsCredentialProvider, type AwsCredentialProvider } from "../aws/sigv4.js";
 
 export type CredentialEnvelope = {
@@ -166,11 +167,15 @@ export class GcsObjectBackend implements CredentialObjectBackend {
       body,
     });
     if (!response.ok) throw new CredentialBlobError("backend_failed", `GCS upload failed: ${response.status}`);
+    await drainBody(response, "credential-blobs.gcs.put");
   }
   async get(key: string): Promise<string | null> {
     const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(this.bucket)}/o/${encodeURIComponent(this.name(key))}?alt=media`;
     const response = await this.fetchImpl(url, { headers: { authorization: `Bearer ${await this.accessToken()}` } });
-    if (response.status === 404) return null;
+    if (response.status === 404) {
+      await drainBody(response, "credential-blobs.gcs.get.missing");
+      return null;
+    }
     if (!response.ok) throw new CredentialBlobError("backend_failed", `GCS download failed: ${response.status}`);
     return response.text();
   }
@@ -183,6 +188,7 @@ export class GcsObjectBackend implements CredentialObjectBackend {
     if (!response.ok && response.status !== 404) {
       throw new CredentialBlobError("backend_failed", `GCS delete failed: ${response.status}`);
     }
+    await drainBody(response, "credential-blobs.gcs.delete");
   }
 }
 
@@ -246,10 +252,14 @@ export class S3ObjectBackend implements CredentialObjectBackend {
   async put(key: string, body: string): Promise<void> {
     const response = await this.request("PUT", key, body);
     if (!response.ok) throw new CredentialBlobError("backend_failed", `S3 upload failed: ${response.status}`);
+    await drainBody(response, "credential-blobs.s3.put");
   }
   async get(key: string): Promise<string | null> {
     const response = await this.request("GET", key);
-    if (response.status === 404) return null;
+    if (response.status === 404) {
+      await drainBody(response, "credential-blobs.s3.get.missing");
+      return null;
+    }
     if (!response.ok) throw new CredentialBlobError("backend_failed", `S3 download failed: ${response.status}`);
     return response.text();
   }
@@ -258,6 +268,7 @@ export class S3ObjectBackend implements CredentialObjectBackend {
     if (!response.ok && response.status !== 404) {
       throw new CredentialBlobError("backend_failed", `S3 delete failed: ${response.status}`);
     }
+    await drainBody(response, "credential-blobs.s3.delete");
   }
 }
 

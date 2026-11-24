@@ -29,7 +29,7 @@
     "relaycast-rekey": "node dist/relaycast-rekey-cli.js"
   },
   "dependencies": {
-    "@agent-relay/events-shim": "18.13.0",
+    "@agent-relay/events-shim": "18.14.0",
     "@agent-relay/spawn-placement": "18.11.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@node-rs/argon2": "^2.2.2",
