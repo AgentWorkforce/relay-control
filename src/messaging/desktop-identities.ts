@@ -121,7 +121,7 @@ type Identity = z.infer<typeof identity>;
 type AttestationKey = z.infer<typeof attestationKey>;
 
 type Access = {
-  principal: { userId: string; scopes: string[]; pendingHandoff?: boolean; handoff?: boolean };
+  principal: { userId: string; scopes: string[]; pendingHandoff?: boolean; handoff?: boolean; tokenFamilyId?: string };
   workspace: { id: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string };
 };
 
@@ -559,6 +559,8 @@ async function handOffClaudeAttestation(
   }
   const stored = await postgresClaudeHandoffStore(deps.database).put({
     ...owner, toolUseId: verified.toolUseId, proof: parsed.data.attestation, expiresAt: verified.expiresAt,
+    // Only a call on this session's token family can take it.
+    tokenFamilyId: access.principal.tokenFamilyId ?? null,
   });
   if (stored === "conflict" || stored === "spent") {
     log("conflict", stored === "spent" ? "spent" : "other_proof");

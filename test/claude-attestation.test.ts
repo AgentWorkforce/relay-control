@@ -28,7 +28,7 @@ function memoryStore(keys: Record<string, string>): AttestationStore & { spent: 
   };
 }
 
-const auth = { workspaceId: "w1", userId: "u1" };
+const auth = { workspaceId: "w1", userId: "u1", tokenFamilyId: "f1" };
 const desktopHeaders = new Headers({ "x-agent-relay-desktop": "1" });
 
 async function fixture() {
@@ -176,8 +176,8 @@ type MemoryHandoffs = ClaudeHandoffStore & {
 function memoryHandoffs(): MemoryHandoffs {
   const rows = new Map<string, string>();
   const logs: Record<string, unknown>[] = [];
-  const key = (input: { workspaceId: string; userId: string; toolUseId: string }) =>
-    `${input.workspaceId}/${input.userId}/${input.toolUseId}`;
+  const key = (input: { workspaceId: string; userId: string; toolUseId: string; tokenFamilyId: string | null }) =>
+    `${input.workspaceId}/${input.userId}/${input.toolUseId}/${input.tokenFamilyId}`;
   const self: MemoryHandoffs = {
     rows,
     logs,
@@ -189,6 +189,7 @@ function memoryHandoffs(): MemoryHandoffs {
       return "stored";
     },
     async take(input) {
+      // As the Postgres store: a row deposited with no token family never matches.
       const stored = rows.get(key(input)) ?? null;
       rows.delete(key(input));
       return stored;
@@ -227,6 +228,24 @@ test("a handed-off proof verifies the call with the matching claudecode/toolUseI
   // A child credential bound to provider "claude" takes a handoff too.
   const child = await handedOff(value, handoffs);
   assert.ok(await claudeAttestationFor(child, new Headers(), { ...auth, desktopMcpProvider: "claude" }, value.store, undefined, handoffs.use));
+});
+
+test("a handed-off proof is taken only by a call on the depositing token family", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const body = await handedOff(value, handoffs);
+  // Same person and workspace, another session family holding the tool-use id: nothing taken.
+  assert.equal(await claudeAttestationFor(structuredClone(body), desktopHeaders, { ...auth, tokenFamilyId: "f2" },
+    value.store, undefined, handoffs.use), undefined);
+  assert.equal(handoffs.rows.size, 1, "still waiting for its own family");
+  // A call with no token family never takes one, and is logged as unbound.
+  const { tokenFamilyId: _family, ...unbound } = auth;
+  assert.equal(await claudeAttestationFor(structuredClone(body), desktopHeaders, unbound, value.store, undefined, handoffs.use), undefined);
+  assert.equal(handoffs.logs.at(-1)!.outcome, "unbound");
+  assert.equal(handoffs.rows.size, 1);
+  // The depositing family takes it.
+  assert.ok(await claudeAttestationFor(structuredClone(body), desktopHeaders, auth, value.store, undefined, handoffs.use));
+  assert.equal(handoffs.rows.size, 0);
 });
 
 test("a handed-off proof is used once: a repeat call has no attestation, a re-handed-off spent proof is refused", async () => {

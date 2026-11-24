@@ -397,11 +397,53 @@ test("the handoff store's take is atomic: of two parallel takes exactly one gets
   const { env, sign, hand } = await handoffDesktop(t);
   const tuid = toolUseId();
   assert.equal((await hand({ attestation: await sign("relay_status", tuid) })).status, 204);
-  const owner = await env.database.query<{ workspace_id: string; user_id: string }>("SELECT workspace_id, user_id FROM mcp_attestation_handoffs");
+  const owner = await env.database.query<{ workspace_id: string; user_id: string; token_family_id: string }>(
+    "SELECT workspace_id, user_id, token_family_id FROM mcp_attestation_handoffs");
   const store = postgresClaudeHandoffStore(env.database);
-  const key = { workspaceId: owner.rows[0]!.workspace_id, userId: owner.rows[0]!.user_id, toolUseId: tuid };
+  const key = { workspaceId: owner.rows[0]!.workspace_id, userId: owner.rows[0]!.user_id, toolUseId: tuid,
+    tokenFamilyId: owner.rows[0]!.token_family_id };
   const taken = await Promise.all([store.take(key), store.take(key)]);
   assert.equal(taken.filter((proof) => proof !== null).length, 1);
+});
+
+test("a handoff belongs to the Desktop sign-in that deposited it: another sign-in cannot take it, a refreshed token can", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("send_relay_message", tuid) })).status, 204);
+  const family = await env.database.query<{ token_family_id: string | null }>("SELECT token_family_id FROM mcp_attestation_handoffs");
+  assert.ok(family.rows[0]!.token_family_id, "stored with the depositing session's token family");
+  // The same person's second Desktop sign-in holding the tool-use id: the call runs unattested.
+  const other = await env.desktopSignIn({ hostName: "other-mac" });
+  const stolen = await rpc(env.origin, other.accessToken, plain("send_relay_message", { to: "peer", text: "x" }, tuid));
+  assert.equal(stolen.status, 200);
+  assert.equal(stolen.body.result.isError, true);
+  assert.match(stolen.body.result.content[0].text, /cannot verify this chat's desktop identity/);
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 1, "not taken");
+  assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
+  // The depositing sign-in after an access-token refresh keeps its family and takes it.
+  const refreshed = await request(env.origin, "/cloud/api/v1/auth/token/refresh", {
+    method: "POST", body: { refreshToken: parent.refreshToken },
+  });
+  assert.equal(refreshed.status, 200, refreshed.raw);
+  const fresh = refreshed.body.accessToken as string;
+  assert.notEqual(fresh, parent.accessToken);
+  const sent = await rpc(env.origin, fresh, plain("send_relay_message", { to: "peer", text: "mine" }, tuid));
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.notEqual(sent.body.result.isError, true, JSON.stringify(sent.body.result));
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0, "taken");
+});
+
+test("a handoff stored with no token family is never taken", async (t) => {
+  const { env, sign, hand } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("relay_status", tuid) })).status, 204);
+  const row = await env.database.query<{ workspace_id: string; user_id: string; token_family_id: string }>(
+    "SELECT workspace_id, user_id, token_family_id FROM mcp_attestation_handoffs");
+  await env.database.query("UPDATE mcp_attestation_handoffs SET token_family_id = NULL");
+  const store = postgresClaudeHandoffStore(env.database);
+  assert.equal(await store.take({ workspaceId: row.rows[0]!.workspace_id, userId: row.rows[0]!.user_id, toolUseId: tuid,
+    tokenFamilyId: row.rows[0]!.token_family_id }), null);
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 1);
 });
 
 test("the sign-in redirect token is refused by the handoff and identity sync, exchanged or not", async (t) => {

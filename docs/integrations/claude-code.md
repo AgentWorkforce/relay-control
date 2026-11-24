@@ -77,13 +77,15 @@ Auth is the identity sync's (`cli:auth`; cookie requests pass the origin
 check, also under `/cloud`). The body has exactly that member. The proof's
 format, `kind: "claude"`, lifetime, key and signature are checked as above
 (not its tool or tool use: there is no call yet, and nothing is spent), then
-it is stored for the authenticated workspace and user under its `tuid` in
-`mcp_attestation_handoffs` (migration 0097) until two minutes past `exp`;
+it is stored for the authenticated workspace and user under its `tuid`, with
+the depositing session's token family, in `mcp_attestation_handoffs`
+(migration 0097) until two minutes past `exp`;
 expired rows are pruned on later handoffs. Answers: 204 (also for the same
 proof again); 400 `invalid_attestation` for a malformed body or proof or
 another kind; 403 `attestation_rejected` for an unknown key, a bad signature,
 an expired proof or one issued in the future; 409 `conflict` when another
-proof is stored for that tool use or a call already spent it; otherwise the
+proof (or the same proof from another session family) is stored for that tool
+use, or a call already spent it; otherwise the
 identity sync's 401, 403 and 404. The Desktop sign-in's redirect token is
 refused here and at identity sync (403 `handoff_not_exchanged` before its PKCE
 exchange, 403 `forbidden` after), as at the MCP route. Neither the proof nor
@@ -94,25 +96,30 @@ handoff` with `outcome` (`stored`, `repeat`, `conflict`, `invalid`,
 On a single desktop-managed `tools/call` with no proof in its arguments, on
 the app bearer with the marker or a credential bound to `claude` (never
 `cursor` or `copilot`), the route takes (reads and deletes, in one statement)
-the proof handed off for `_meta["claudecode/toolUseId"]` and verifies it
+the proof handed off for `_meta["claudecode/toolUseId"]` by the same session
+token family as the call, and verifies it
 exactly as an in-argument proof, spend included; any failure is the same
 `-32602 Invalid native chat context.` With nothing handed off the call has no
 verified chat, as a call without a proof always had. A store failure while
 taking the proof is logged and treated the same way (the call fails closed,
 never a 500); a store failure while verifying a proof, handed off or not,
 still fails the request as before. Each take logs `claude attestation
-handoff take` with `outcome` `hit`, `miss`, `error` or `verify_failed` (with a
+handoff take` with `outcome` `hit`, `miss`, `unbound` (a call with no token
+family), `error` or `verify_failed` (with a
 fixed `reason`), never the proof, the tool-use id or key material. An
 in-argument proof still works and is checked first.
 
-What a pending handoff proves: it can be consumed by any client that holds
-its tool-use id and a desktop-managed credential of the same user in the same
-workspace (the app bearer with the Desktop marker, or a `claude` provider
-credential). The proof's tool name is still bound to `params.name`, it lives
-at most 60 seconds, and it is spent once. Tool-use ids are not secrets: they
-appear in Claude Code's transcripts and hook input, so the handoff's security
-rests on the signature, the owner's credential and the tool binding, not on
-the id being unguessable.
+What a pending handoff proves: it is bound to the Desktop sign-in that
+deposited it. The row keeps the depositing session's token family, which
+survives access-token refresh and which a desktop provider credential shares
+with its parent sign-in; a call takes the row only when its own session is in
+the same family, for the same user and workspace. Tool-use ids are not
+secrets: they appear in Claude Code's transcripts and hook input. But the id
+alone is useless without that Desktop sign-in's own token: another sign-in of
+the same person, an MCP OAuth connector or any other credential holding the id
+takes nothing, and a row without a family never matches. The proof's tool
+name is still bound to `params.name`, it lives at most 60 seconds, and it is
+spent once.
 
 Because Desktop no longer strips them, a desktop-managed `join_relay` may
 carry `name` when it is the verified identity's own name (trimmed, any letter

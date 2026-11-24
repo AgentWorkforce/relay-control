@@ -878,11 +878,14 @@ paths:
         unchanged. Advertised as `capabilities.claude_attestation_handoff`.
         Same auth as identity sync (`cli:auth`; cookie requests must pass the
         origin check); the proof is stored for the authenticated workspace and
-        user, keyed by its `tuid`. Format, `kind: "claude"`, lifetime, key and
+        user, keyed by its `tuid` and bound to the calling session's token
+        family. Format, `kind: "claude"`, lifetime, key and
         signature are checked here; the tool and tool use are bound, and the
         tool use spent, only when the desktop-managed `tools/call` whose
-        `_meta["claudecode/toolUseId"]` equals `tuid` takes it. The same proof
-        again is 204; another proof for a stored tool use, or a proof whose
+        `_meta["claudecode/toolUseId"]` equals `tuid`, on a session of the same
+        token family, takes it. The same proof again from the same session
+        family is 204; another proof (or the same one from another session
+        family) for a stored tool use, or a proof whose
         tool use a call already spent, is 409 `conflict`. The Desktop
         sign-in's redirect token is refused (403 `handoff_not_exchanged`
         before its exchange, `forbidden` after).

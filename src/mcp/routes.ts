@@ -446,7 +446,10 @@ export function createMcpHandler(input: {
       // a Claude Code or Cursor proof, which counts only on desktop-managed calls (as Cloud).
       // A Claude Code proof may instead have been handed off ahead of the call
       // (keyed by _meta claudecode/toolUseId), so the hook never rewrites input.
-      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
+      // The token family binds a handed-off proof to the Desktop session that
+      // deposited it (a provider credential shares its parent's family).
+      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider,
+        tokenFamilyId: principal.tokenFamilyId };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
       const callHeaders = oauth || staffGrant || agentToken ? withoutDesktopMarker(headers) : headers;

@@ -238,10 +238,15 @@ export type ClaudeHandoffStore = {
    * "conflict" when another one is, "spent" when its tool use was already
    * spent by a call (nothing is stored then).
    */
-  put(input: { workspaceId: string; userId: string; toolUseId: string; proof: string; expiresAt: Date }):
+  put(input: { workspaceId: string; userId: string; toolUseId: string; proof: string; expiresAt: Date;
+    /** The depositing session's token family; null is stored but never matches a call. */
+    tokenFamilyId: string | null }):
     Promise<"stored" | "exists" | "conflict" | "spent">;
-  /** Reads and deletes the unexpired proof stored for this tool use, atomically; null when there is none. */
-  take(input: { workspaceId: string; userId: string; toolUseId: string }): Promise<string | null>;
+  /**
+   * Reads and deletes, atomically, the unexpired proof stored for this tool
+   * use by the same token family as the call; null when there is none.
+   */
+  take(input: { workspaceId: string; userId: string; toolUseId: string; tokenFamilyId: string }): Promise<string | null>;
 };
 
 /** The handoff store on the primary database: a row the handoff wrote is visible to the call that follows it. */
@@ -264,28 +269,33 @@ export function postgresClaudeHandoffStore(database: SqlExecutor): ClaudeHandoff
       // A row taken between the insert and the read is inserted again.
       for (let attempt = 0; attempt < 2; attempt++) {
         const inserted = await database.query<{ tool_use_id: string }>(
-          `INSERT INTO mcp_attestation_handoffs (workspace_id, user_id, tool_use_id, proof, expires_at)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO mcp_attestation_handoffs (workspace_id, user_id, tool_use_id, proof, expires_at, token_family_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (workspace_id, user_id, tool_use_id) DO NOTHING
            RETURNING tool_use_id`,
-          [input.workspaceId, input.userId, input.toolUseId, input.proof, input.expiresAt],
+          [input.workspaceId, input.userId, input.toolUseId, input.proof, input.expiresAt, input.tokenFamilyId],
         );
         if (inserted.rows.length === 1) return "stored";
-        const existing = await database.query<{ proof: string }>(
-          `SELECT proof FROM mcp_attestation_handoffs WHERE workspace_id = $1 AND user_id = $2 AND tool_use_id = $3`,
+        const existing = await database.query<{ proof: string; token_family_id: string | null }>(
+          `SELECT proof, token_family_id FROM mcp_attestation_handoffs
+            WHERE workspace_id = $1 AND user_id = $2 AND tool_use_id = $3`,
           [input.workspaceId, input.userId, input.toolUseId],
         );
-        const stored = existing.rows[0]?.proof;
-        if (stored !== undefined) return stored === input.proof ? "exists" : "conflict";
+        const stored = existing.rows[0];
+        // The same proof from another session family is not a retry of this deposit.
+        if (stored !== undefined) {
+          return stored.proof === input.proof && stored.token_family_id === input.tokenFamilyId ? "exists" : "conflict";
+        }
       }
       return "conflict";
     },
     async take(input) {
       const result = await database.query<{ proof: string }>(
         `DELETE FROM mcp_attestation_handoffs
-          WHERE workspace_id = $1 AND user_id = $2 AND tool_use_id = $3 AND expires_at > now()
+          WHERE workspace_id = $1 AND user_id = $2 AND tool_use_id = $3 AND token_family_id = $4
+            AND expires_at > now()
           RETURNING proof`,
-        [input.workspaceId, input.userId, input.toolUseId],
+        [input.workspaceId, input.userId, input.toolUseId, input.tokenFamilyId],
       );
       return result.rows[0]?.proof ?? null;
     },
@@ -324,7 +334,7 @@ const defaultHandoffLog: ClaudeHandoffLog = (message, fields) => console.warn(`[
  * With no proof in the arguments, a single desktop-managed `tools/call` on an
  * unbound or Claude credential (never Cursor or Copilot) that carries Claude
  * Code's `_meta["claudecode/toolUseId"]` takes the proof Desktop handed off
- * for that tool use, if any, and verifies it exactly as an in-argument proof
+ * for that tool use by the same session token family, if any, and verifies it exactly as an in-argument proof
  * (tool, tool use, lifetime, spend). Nothing handed off is no attestation,
  * and neither is a store failure while taking it (logged; the call fails
  * closed). A store failure while verifying a proof still throws.
@@ -333,6 +343,8 @@ export async function claudeAttestationFor(body: unknown, headers: Headers, auth
   workspaceId: string;
   userId: string;
   desktopMcpProvider?: string;
+  /** The calling session's token family; a handoff is taken only by the family that deposited it. */
+  tokenFamilyId?: string;
 }, store: AttestationStore, nowMs?: number,
 handoff?: { store: ClaudeHandoffStore; log?: ClaudeHandoffLog }): Promise<ClaudeAttestation | undefined> {
   if (Array.isArray(body)) {
@@ -353,9 +365,16 @@ handoff?: { store: ClaudeHandoffStore; log?: ClaudeHandoffLog }): Promise<Claude
     if (typeof toolUseId !== "string" || !TOOL_USE_ID.test(toolUseId)) return undefined;
     const log = handoff.log ?? defaultHandoffLog;
     const owner = { workspace_id: auth.workspaceId, user_id: auth.userId, tool: typeof params?.name === "string" ? params.name : null };
+    // The tool-use id is not a secret: only the session family that deposited
+    // the proof may take it, and a call with no family takes nothing.
+    if (!auth.tokenFamilyId) {
+      log(CLAUDE_HANDOFF_TAKE_LOG, { ...owner, outcome: "unbound" });
+      return undefined;
+    }
     let proof: string | null;
     try {
-      proof = await handoff.store.take({ workspaceId: auth.workspaceId, userId: auth.userId, toolUseId });
+      proof = await handoff.store.take({ workspaceId: auth.workspaceId, userId: auth.userId, toolUseId,
+        tokenFamilyId: auth.tokenFamilyId });
     } catch (error) {
       // A store failure here never fails the call: it proceeds with no
       // attestation, so actor tools fail closed with today's guidance.

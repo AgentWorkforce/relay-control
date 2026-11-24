@@ -96,7 +96,7 @@
     {"name":"0094_agent_rules_overlays.sql","sha256":"7a495bde88fced08c5bd31e466413d69371cc4e8e8f40fafbe382b653f5d290c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"},
     {"name":"0096_organization_teams.sql","sha256":"b32bbd68c8522504be230286bc2c347e236f617e06e2f9fda6707e9452066883"},
-    {"name":"0097_mcp_attestation_handoffs.sql","sha256":"cf774210025bb953b2a14290f104a04c8f99e1c1c8dab8d16ed48a6348099231"}
+    {"name":"0097_mcp_attestation_handoffs.sql","sha256":"54a58b53ed36773cce771e77d0397daed530cbdfba3fb2dc1ad9725e2fc28ff3"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -850,9 +850,10 @@
     {"kind":"column","name":"public.login_attempts.last_failure_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":4,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.login_attempts.locked_until","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":5,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.login_attempts.subject","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
-    {"kind":"column","name":"public.mcp_attestation_handoffs.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":6,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.mcp_attestation_handoffs.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":7,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_attestation_handoffs.expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_attestation_handoffs.proof","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
+    {"kind":"column","name":"public.mcp_attestation_handoffs.token_family_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_attestation_handoffs.tool_use_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
     {"kind":"column","name":"public.mcp_attestation_handoffs.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_attestation_handoffs.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
@@ -2561,5 +2562,5 @@
   "optional":{
 
   },
-  "sha256":"810f5c58fbaa4624a2d6674866b8c84941f51fb207aa9ef87aacbe30a26aac6f"
+  "sha256":"d3615343a26a48a0a75384c7795c91615f8b679efb24e3c6afdbd6985a0b4713"
 }
