@@ -1,3 +1,4 @@
+import { drainBody } from "../drain-body.js";
 import type { SqlExecutor } from "../database.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims, type WorkflowOidcVerifier } from "./oidc.js";
 import { logAuditWriteFailed, logRefused, logRepositoryMismatch, logUnavailable } from "./observe.js";
@@ -521,12 +522,16 @@ export async function resolveGateRepository(input: { repo: string; token: string
   } catch {
     throw new GithubUnavailable();
   }
-  // A redirect means the name moved; it is never followed.
+  // A redirect means the name moved; it is never followed. Only a 2xx body is
+  // read: every other answer's body is released.
   if (response.status === 404 || (response.status >= 300 && response.status < 400) || response.type === "opaqueredirect") {
+    await drainBody(response, "delegation.github_repository");
     return null;
   }
-  if (response.status === 403 || response.status === 429) throw new GithubRateLimited();
-  if (!response.ok) throw new GithubUnavailable();
+  if (!response.ok) {
+    await drainBody(response, "delegation.github_repository");
+    throw response.status === 403 || response.status === 429 ? new GithubRateLimited() : new GithubUnavailable();
+  }
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   const id = body?.id, ownerId = (body?.owner as Record<string, unknown> | undefined)?.id, fullName = body?.full_name;
   const defaultBranch = body?.default_branch;
