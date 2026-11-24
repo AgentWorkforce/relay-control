@@ -704,6 +704,20 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   // A recipient that never had it attested.
   const other = await env.desktopIdentity("second-coder");
   assert.deepEqual((await env.redeem(other, approvalId, prod)).body, { ok: false, reason: "no_approval" });
+  // Its refusal row is written under no owner (and no grant): the approval was
+  // never attested to that caller, so the owner's audit log does not carry it.
+  const unattested = (await env.database.query<{ owner_user_id: string | null; grant_id: string | null }>(
+    `SELECT owner_user_id, grant_id FROM delegation_audit_events
+      WHERE event = 'redeem.refused' AND approval_id = $1 AND recipient_agent_id = $2`,
+    [approvalId, other.id],
+  )).rows;
+  assert.deepEqual(unattested, [{ owner_user_id: null, grant_id: null }]);
+  // An attested recipient's refusal (out_of_scope above) keeps the owner.
+  const scoped = (await env.database.query<{ owner_user_id: string | null }>(
+    `SELECT owner_user_id FROM delegation_audit_events
+      WHERE event = 'redeem.refused' AND approval_id = $1 AND reason = 'out_of_scope'`, [approvalId],
+  )).rows;
+  assert.deepEqual(scoped, [{ owner_user_id: env.ownerId }]);
   // Unknown approval.
   assert.deepEqual((await env.redeem(recipient, "apv_unknown123", prod)).body, { ok: false, reason: "no_approval" });
 
