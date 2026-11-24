@@ -124,6 +124,7 @@ exactly one bucket**:
 | one team, for every user | that team |
 | no team, for every user | `noTeam` |
 | anything else: two or more teams, or a mix of a team and no team | `crossTeam`, keyed by the sorted set of teams involved (`null` standing for no team) |
+| not known: the session is in the read API's `other` remainder (section 5.1) | `notResolved` |
 
 A cross-team session is never split between its teams and never added to each of them. It is reported on its own
 row ("shared by Platform and Payments"), with its session count.
@@ -131,7 +132,7 @@ row ("shared by Platform and Payments"), with its session count.
 **Invariant.** For every additive measure and every scope:
 
 ```
-sum(team rows) + sum(crossTeam rows) + noTeam + unattributed = the scope's total
+sum(team rows) + sum(crossTeam rows) + noTeam + unattributed + notResolved = the scope's total
 ```
 
 The same holds for each denominator (`sessions`, `observedSessions`, `knownCostSessions`). A report that cannot
@@ -184,10 +185,19 @@ team report does the same and groups the answer itself:
 
 What this needs from the pipeline, and nothing more:
 
-- on each shared bucket, the list of user ids (they are the ids the reader already scopes by; no names or e-mail
-  addresses);
-- for team by project, the same buckets keyed by user set and project;
-- a stated cap on the number of rows, with the remainder in one `other` row so totals still hold (section 5.3).
+- on each shared bucket, the sorted list of user ids (they are the ids the reader already scopes by; no names or
+  e-mail addresses);
+- a stated cap on the number of rows, with the remainder in one `other` row so totals still hold;
+- the person join done at read time in the read API, scoped by the caller's read token.
+
+The spend proposal's current draft states all three: one bucket per sorted user set, at most 200 user-set buckets
+per scope (largest first by session count) and an `other` remainder. relay-control cannot resolve the `other` row to
+teams, so it is carried through as `notResolved` and shown as such. An organization whose sessions spread over more
+than 200 distinct user sets in one scope therefore sees part of its usage outside the team rows; the report gives
+that share, and it is the first thing to revisit if it is large in practice.
+
+Still open on the pipeline side: the same user-set grouping on the per-user session aggregate (section 6), which
+is a different route from the spend block.
 
 Team data never leaves relay-control, the pipeline learns nothing about teams, and no service credential or
 service route is added.
@@ -195,8 +205,8 @@ service route is added.
 ### 5.2 Until the pipeline carries user sets
 
 If the spend block has per-person rows and shared buckets with only a user count, the report still works without
-double counting: sessions with one user are grouped by team, and every shared session goes to a single row
-`shared (teams not resolved)`. The invariant holds. The row disappears when the user sets arrive.
+double counting: sessions with one user are grouped by team, and every shared session goes to the
+`notResolved` row. The invariant holds. The row shrinks to the `other` remainder when the user sets arrive.
 
 ### 5.3 Bounds
 
@@ -256,7 +266,8 @@ The report, in outline:
                  "knownCostSessions": 120, "costUSD": 0 } },
     { "kind": "crossTeam", "teamIds": ["<id>", "<id>"], "sessions": 9, "spend": null },
     { "kind": "noTeam", "sessions": 14, "spend": null },
-    { "kind": "unattributed", "sessions": 3, "spend": null }
+    { "kind": "unattributed", "sessions": 3, "spend": null },
+    { "kind": "notResolved", "sessions": 0, "spend": null }
   ],
   "total": { "sessions": 238 },
   "source": "aggregate",
@@ -315,7 +326,7 @@ Tests that must exist before step 3 ships:
   shared across two teams, one shared between a team and a person without a team, and one with no users;
 - a shared session's cost appears once in the whole report;
 - a person who moves teams inside the window, one who leaves the organization inside it, and one assigned after it;
-- the fallback of section 5.2, with the invariant;
+- the fallback of section 5.2 and an `other` remainder from the read API, each with the invariant;
 - a truncated read is labelled and never presented as a total;
 - a second organization's teams never resolve a session of the first, for a user who belongs to both;
 - removing a member, deleting a user and archiving a team leave the tables as section 3.2 says.
@@ -332,5 +343,6 @@ Tests that must exist before step 3 ships:
    (proposed), or a fixed number of days.
 6. **Who sees the team report.** Owners only (proposed, as for People), or admins too.
 7. **The hosted product.** Same model there, or self-hosted installations only for now.
-8. **The pipeline contract in section 5.1** (user ids on shared buckets, an `other` row under a cap). This is the
-   pipeline owner's call; section 5.2 is what happens without it.
+8. **The pipeline contract in section 5.1.** The spend proposal's draft now carries it (user ids on shared buckets,
+   a cap of 200 with an `other` row, the join at read time). It is a draft on that side too, and the per-user
+   session aggregate has no user-set grouping yet. Section 5.2 is what happens without either.
