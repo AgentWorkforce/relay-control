@@ -868,6 +868,50 @@ paths:
         "403": { $ref: "#/components/responses/DesktopMcpError" }
         "404": { $ref: "#/components/responses/DesktopMcpError" }
         "502": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/messaging/desktop-identities/attestations:
+    post:
+      operationId: handOffClaudeAttestation
+      summary: Hand a Claude Code call proof over ahead of its call.
+      description: |
+        Claude Code's auto mode refuses a call whose input a hook rewrote, so
+        Desktop posts the PreToolUse hook's proof here and sends the call
+        unchanged. Advertised as `capabilities.claude_attestation_handoff`.
+        Same auth as identity sync (`cli:auth`; cookie requests must pass the
+        origin check); the proof is stored for the authenticated workspace and
+        user, keyed by its `tuid`. Format, `kind: "claude"`, lifetime, key and
+        signature are checked here; the tool and tool use are bound, and the
+        tool use spent, only when the desktop-managed `tools/call` whose
+        `_meta["claudecode/toolUseId"]` equals `tuid` takes it. The same proof
+        again is 204; another proof for a stored tool use is 409 `conflict`.
+        A malformed body or proof, or one that is not `kind: "claude"`, is 400
+        `invalid_attestation`; an unknown key, bad signature, expired proof or
+        one issued in the future is 403 `attestation_rejected`. Neither the
+        proof nor key material is echoed. Also served at
+        `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attestation]
+              properties:
+                attestation: { type: string, minLength: 1, maxLength: 4096, description: Compact JWS, the Claude Code call proof. }
+      responses:
+        "204":
+          description: Stored (or already stored)
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "405": { $ref: "#/components/responses/DesktopMcpError" }
+        "409": { $ref: "#/components/responses/DesktopMcpError" }
   /api/v1/workspaces/{workspaceId}/messaging/people:
     get:
       operationId: listMessagingPeople
@@ -12833,6 +12877,10 @@ components:
           type: integer
           const: 1
           description: Cursor chats may sync native_session kind cursor (the Cursor conversation_id) and send kind cursor call proofs.
+        claude_attestation_handoff:
+          type: integer
+          const: 1
+          description: POST .../desktop-identities/attestations takes a Claude Code proof ahead of its call, matched by _meta claudecode/toolUseId.
     DesktopIdentitySync:
       type: object
       additionalProperties: false
@@ -13475,11 +13523,12 @@ components:
           schema: { $ref: "#/components/schemas/FactoryError" }
     DesktopMcpError:
       description: |
-        `{error, message}` with a stable code: invalid_request (400),
-        unauthorized (401), desktop_login_required, workspace_access_changed,
-        forbidden or csrf_rejected (403), workspace_not_found or
-        token_not_found (404), method_not_allowed (405, with Allow),
-        credential_conflict or too_many_credentials (409), rate_limited (429),
+        `{error, message}` with a stable code: invalid_request or
+        invalid_attestation (400), unauthorized (401), desktop_login_required,
+        workspace_access_changed, forbidden, csrf_rejected or
+        attestation_rejected (403), workspace_not_found or token_not_found
+        (404), method_not_allowed (405, with Allow), credential_conflict,
+        too_many_credentials or conflict (409), rate_limited (429),
         upstream_unavailable (502).
       content:
         application/json:

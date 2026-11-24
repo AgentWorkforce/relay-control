@@ -4,7 +4,12 @@ import { z } from "zod";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import { normalizeDesktopSourceId } from "../desktop-source-id.js";
-import { attestationKeyId, COPILOT_ATTESTATION_CAPABILITY, decodeBase64Url } from "../mcp/copilot-attestation.js";
+import {
+  CLAUDE_ATTESTATION_MAX_PROOF_BYTES, ClaudeAttestationError, postgresClaudeHandoffStore, verifyClaudeHandoff,
+} from "../mcp/claude-attestation.js";
+import {
+  attestationKeyId, COPILOT_ATTESTATION_CAPABILITY, decodeBase64Url, postgresAttestationStore,
+} from "../mcp/copilot-attestation.js";
 import { MessagingHttpError } from "./http.js";
 import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from "./relaycast.js";
 
@@ -50,6 +55,7 @@ export const NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION = 1;
 export const CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 export const COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 export const CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
+export const CLAUDE_ATTESTATION_HANDOFF_CAPABILITY_VERSION = 1;
 
 /**
  * What GET advertises. Each attestation flag exists because MCP verifies and
@@ -60,6 +66,8 @@ export const DESKTOP_IDENTITY_CAPABILITIES = {
   claude_session_attestation: CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION,
   copilot_session_attestation: COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION,
   cursor_session_attestation: CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION,
+  // POST .../desktop-identities/attestations takes a Claude Code proof ahead of its call.
+  claude_attestation_handoff: CLAUDE_ATTESTATION_HANDOFF_CAPABILITY_VERSION,
 } as const;
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -97,6 +105,13 @@ const syncBody = z.object({
   // Omitted: the registered key is unchanged. null: removed. A key: replaced.
   attestation_key: attestationKey.nullable().optional(),
 }).strict();
+
+const handoffBody = z.object({
+  attestation: z.string().min(1).max(CLAUDE_ATTESTATION_MAX_PROOF_BYTES),
+}).strict();
+
+/** Verifier reasons that mean a well-formed proof was refused (403), not a malformed one (400). */
+const HANDOFF_REJECTED = new Set(["unknown key", "bad signature", "expired", "issued in the future"]);
 
 type Identity = z.infer<typeof identity>;
 type AttestationKey = z.infer<typeof attestationKey>;
@@ -399,9 +414,10 @@ export async function handleDesktopIdentityRoutes(
     log?: DesktopIdentityLog;
   },
 ): Promise<boolean> {
-  const match = /^\/api\/v1\/workspaces\/([^/]+)\/messaging\/desktop-identities$/.exec(path);
+  const match = /^\/api\/v1\/workspaces\/([^/]+)\/messaging\/desktop-identities(\/attestations)?$/.exec(path);
   if (!match) return false;
-  if (method !== "GET" && method !== "PUT") {
+  const handoff = match[2] !== undefined;
+  if (handoff ? method !== "POST" : method !== "GET" && method !== "PUT") {
     throw new MessagingHttpError(405, "method_not_allowed", "Method not allowed");
   }
   let workspaceId: string;
@@ -413,6 +429,11 @@ export async function handleDesktopIdentityRoutes(
   const access = await deps.workspaceAccess(request, workspaceId);
   if (!access.principal.scopes.includes("cli:auth")) {
     throw new MessagingHttpError(403, "forbidden", "Desktop identities require a browser session or cli:auth");
+  }
+
+  if (handoff) {
+    await handOffClaudeAttestation(request, response, access, deps);
+    return true;
   }
 
   if (method === "GET") {
@@ -466,6 +487,60 @@ export async function handleDesktopIdentityRoutes(
     throw new MessagingHttpError(502, "upstream_unavailable", "Desktop identity sync failed");
   }
   return true;
+}
+
+/**
+ * POST .../messaging/desktop-identities/attestations: Desktop hands a Claude
+ * Code hook proof over ahead of its call, so the hook never rewrites the
+ * call's input (Claude Code's auto mode refuses rewritten input). The proof's
+ * format, lifetime, key and signature are checked here; its tool and tool use
+ * are bound, and the tool use spent, only when the MCP call with that
+ * `claudecode/toolUseId` takes it. Same auth as identity sync. 204 on success,
+ * also for the same proof again; another proof for a stored tool use is 409.
+ * Neither the proof nor key material is ever echoed or logged.
+ */
+async function handOffClaudeAttestation(
+  request: IncomingMessage,
+  response: ServerResponse,
+  access: Access,
+  deps: {
+    requestObject: (request: IncomingMessage) => Promise<Record<string, unknown>>;
+    database: Database;
+    csrfAllowed: (request: IncomingMessage) => boolean;
+  },
+): Promise<void> {
+  if (!deps.csrfAllowed(request)) {
+    throw new MessagingHttpError(403, "csrf_rejected", "Cross-origin attestation handoff refused");
+  }
+  const invalid = () => new MessagingHttpError(400, "invalid_attestation", "Invalid attestation handoff");
+  let body: Record<string, unknown>;
+  try {
+    body = await deps.requestObject(request);
+  } catch {
+    throw invalid();
+  }
+  const parsed = handoffBody.safeParse(body);
+  if (!parsed.success) throw invalid();
+  const owner = { workspaceId: access.workspace.id, userId: access.principal.userId };
+  let verified: { toolUseId: string; expiresAt: Date };
+  try {
+    verified = await verifyClaudeHandoff({ proof: parsed.data.attestation, ...owner },
+      postgresAttestationStore(deps.database));
+  } catch (error) {
+    if (!(error instanceof ClaudeAttestationError)) throw error;
+    if (HANDOFF_REJECTED.has(error.reason)) {
+      throw new MessagingHttpError(403, "attestation_rejected", "The attestation was not accepted");
+    }
+    throw invalid();
+  }
+  const stored = await postgresClaudeHandoffStore(deps.database).put({
+    ...owner, toolUseId: verified.toolUseId, proof: parsed.data.attestation, expiresAt: verified.expiresAt,
+  });
+  if (stored === "conflict") {
+    throw new MessagingHttpError(409, "conflict", "Another attestation is already handed off for this tool use");
+  }
+  response.writeHead(204, { "cache-control": "no-store" });
+  response.end();
 }
 
 export class DesktopIdentityUnavailable extends Error {

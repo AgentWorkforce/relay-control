@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
-  claudeAttestationFor, ClaudeAttestationError, CLAUDE_TOOL_USE_META, verifyClaudeAttestation,
+  claudeAttestationFor, ClaudeAttestationError, CLAUDE_TOOL_USE_META, verifyClaudeAttestation, verifyClaudeHandoff,
+  type ClaudeHandoffStore,
 } from "../src/mcp/claude-attestation.js";
 import { ATTESTATION_ARGUMENT, type AttestationStore } from "../src/mcp/copilot-attestation.js";
 import { claudeSigner, toolUseId } from "./support/claude-signer.js";
@@ -161,4 +162,121 @@ test("Cursor replay keys cannot collide across source/ticket pairs that share a 
     assert.deepEqual(result, { nativeSession: { kind: "cursor", id: sid }, sourceId: src });
   }
   assert.equal(store.spent.size, 2);
+});
+
+// The handoff: Desktop posts the hook's proof ahead of the call (so the hook
+// never rewrites input) and the route takes it by _meta claudecode/toolUseId.
+
+function memoryHandoffs(): ClaudeHandoffStore & { rows: Map<string, string> } {
+  const rows = new Map<string, string>();
+  const key = (input: { workspaceId: string; userId: string; toolUseId: string }) =>
+    `${input.workspaceId}/${input.userId}/${input.toolUseId}`;
+  return {
+    rows,
+    async put(input) {
+      const stored = rows.get(key(input));
+      if (stored !== undefined) return stored === input.proof ? "exists" : "conflict";
+      rows.set(key(input), input.proof);
+      return "stored";
+    },
+    async take(input) {
+      const stored = rows.get(key(input)) ?? null;
+      rows.delete(key(input));
+      return stored;
+    },
+  };
+}
+
+/** Hands a proof off for `tuid` and returns the unchanged call Claude Code then sends. */
+async function handedOff(fixtureValue: Awaited<ReturnType<typeof fixture>>, handoffs: ClaudeHandoffStore,
+  overrides: { tuid?: string; tool?: string; callTool?: string } = {}) {
+  const { signer, src, sid, store } = fixtureValue;
+  const tuid = overrides.tuid ?? toolUseId();
+  const tool = overrides.tool ?? "send_relay_message";
+  const proof = await signer.sign({ tool, src, sid, tuid });
+  const verified = await verifyClaudeHandoff({ proof, ...auth }, store);
+  assert.equal(verified.toolUseId, tuid);
+  await handoffs.put({ ...auth, toolUseId: tuid, proof, expiresAt: verified.expiresAt });
+  return {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: overrides.callTool ?? tool, arguments: { to: "peer", text: "hi" }, _meta: { [CLAUDE_TOOL_USE_META]: tuid } },
+  };
+}
+
+test("a handed-off proof verifies the call with the matching claudecode/toolUseId; the call is unchanged", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const body = await handedOff(value, handoffs);
+  const result = await claudeAttestationFor(body, desktopHeaders, auth, value.store, undefined, handoffs);
+  assert.deepEqual(result, { nativeSession: { kind: "claude", id: value.sid }, sourceId: value.src });
+  assert.deepEqual(body.params.arguments, { to: "peer", text: "hi" });
+  assert.equal(handoffs.rows.size, 0, "the handoff was taken");
+  assert.equal(value.store.spent.size, 1, "the tool use was spent");
+  // A child credential bound to provider "claude" takes a handoff too.
+  const child = await handedOff(value, handoffs);
+  assert.ok(await claudeAttestationFor(child, new Headers(), { ...auth, desktopMcpProvider: "claude" }, value.store, undefined, handoffs));
+});
+
+test("a handed-off proof is used once: a repeat call has no attestation, a re-handed-off spent proof is refused", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const tuid = toolUseId();
+  const body = await handedOff(value, handoffs, { tuid });
+  assert.ok(await claudeAttestationFor(structuredClone(body), desktopHeaders, auth, value.store, undefined, handoffs));
+  assert.equal(await claudeAttestationFor(structuredClone(body), desktopHeaders, auth, value.store, undefined, handoffs), undefined);
+  await handedOff(value, handoffs, { tuid });
+  await refused(claudeAttestationFor(body, desktopHeaders, auth, value.store, undefined, handoffs), "replayed tool use");
+});
+
+test("a handed-off proof for another tool is refused at the call", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const body = await handedOff(value, handoffs, { tool: "relay_status", callTool: "send_relay_message" });
+  await refused(claudeAttestationFor(body, desktopHeaders, auth, value.store, undefined, handoffs), "tool mismatch");
+});
+
+test("Cursor and Copilot credentials, unmanaged calls, batches and malformed tool use ids never take a handoff", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const body = await handedOff(value, handoffs);
+  for (const provider of ["cursor", "copilot"]) {
+    assert.equal(await claudeAttestationFor(structuredClone(body), new Headers(), { ...auth, desktopMcpProvider: provider },
+      value.store, undefined, handoffs), undefined, provider);
+  }
+  assert.equal(await claudeAttestationFor(structuredClone(body), new Headers(), auth, value.store, undefined, handoffs), undefined);
+  assert.equal(await claudeAttestationFor([structuredClone(body)], desktopHeaders, auth, value.store, undefined, handoffs), undefined);
+  const odd = structuredClone(body);
+  (odd.params._meta as Record<string, unknown>)[CLAUDE_TOOL_USE_META] = "has:colon";
+  assert.equal(await claudeAttestationFor(odd, desktopHeaders, auth, value.store, undefined, handoffs), undefined);
+  for (const other of [null, "x", { method: "tools/list" }, { method: "tools/call" }, { method: "tools/call", params: { _meta: null } }]) {
+    assert.equal(await claudeAttestationFor(other, desktopHeaders, auth, value.store, undefined, handoffs), undefined);
+  }
+  assert.equal(handoffs.rows.size, 1, "the handoff is still there");
+  assert.equal(value.store.spent.size, 0);
+});
+
+test("an in-argument proof still wins when handoffs are available", async () => {
+  const value = await fixture();
+  const handoffs = memoryHandoffs();
+  const body = await value.call();
+  assert.ok(await claudeAttestationFor(body, desktopHeaders, auth, value.store, undefined, handoffs));
+  assert.deepEqual(body.params.arguments, { to: "peer", text: "hi" });
+});
+
+test("a handoff is checked for format, kind, key, signature and lifetime, but not bound or spent", async () => {
+  const { signer, src, sid, store } = await fixture();
+  const tuid = toolUseId();
+  const proof = await signer.sign({ tool: "send_relay_message", src, sid, tuid });
+  const verified = await verifyClaudeHandoff({ proof, ...auth }, store);
+  assert.equal(verified.toolUseId, tuid);
+  assert.equal(store.spent.size, 0);
+  await refused(verifyClaudeHandoff({ proof: await (await claudeSigner()).sign({ tool: "t", src, sid, tuid }), ...auth }, store), "unknown key");
+  const [head, payload] = proof.split(".");
+  await refused(verifyClaudeHandoff({ proof: `${head}.${payload}.${Buffer.alloc(64, 1).toString("base64url")}`, ...auth }, store), "bad signature");
+  await refused(verifyClaudeHandoff({ proof: "not-a-proof", ...auth }, store), "proof is not a compact JWS");
+  await refused(verifyClaudeHandoff({ proof: await signer.sign({ kind: "cursor", tool: "t", src, sid, tuid, extra: { args: {} } }), ...auth }, store),
+    "provider mismatch");
+  const now = Math.floor(Date.now() / 1000);
+  await refused(verifyClaudeHandoff({ proof: await signer.sign({ tool: "t", src, sid, tuid, iat: now - 120, exp: now - 60 }), ...auth }, store), "expired");
+  await refused(verifyClaudeHandoff({ proof, ...auth, userId: "u2" }, store), "unknown key");
 });

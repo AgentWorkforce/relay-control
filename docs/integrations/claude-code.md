@@ -61,3 +61,42 @@ with `as`, `hosted` or `as_person`. A managed call with no verified chat (no
 proof, an unsynced chat, a duplicate mapping) fails closed; it never falls
 back to a hosted participant. Outside desktop management a proof is stripped
 and ignored.
+
+## Handing the proof off ahead of the call
+
+Claude Code's auto mode refuses any call whose input a hook rewrote, so a hook
+that adds `_agent_relay_attestation` (or strips `name` from a `join_relay`)
+breaks every hosted call in auto mode. Identity sync therefore also advertises
+`capabilities.claude_attestation_handoff: 1`, and Desktop, when it sees it,
+hands the same proof over first and sends the call unchanged:
+
+    POST /api/v1/workspaces/{ws}/messaging/desktop-identities/attestations
+    {"attestation": "<compact JWS>"}
+
+Auth is the identity sync's (`cli:auth`; cookie requests pass the origin
+check, also under `/cloud`). The body has exactly that member. The proof's
+format, `kind: "claude"`, lifetime, key and signature are checked as above
+(not its tool or tool use: there is no call yet, and nothing is spent), then
+it is stored for the authenticated workspace and user under its `tuid` in
+`mcp_attestation_handoffs` (migration 0097) until two minutes past `exp`;
+expired rows are pruned on later handoffs. Answers: 204 (also for the same
+proof again); 400 `invalid_attestation` for a malformed body or proof or
+another kind; 403 `attestation_rejected` for an unknown key, a bad signature,
+an expired proof or one issued in the future; 409 `conflict` when another
+proof is stored for that tool use; otherwise the identity sync's 401, 403 and
+404. Neither the proof nor key material is echoed or logged.
+
+On a single desktop-managed `tools/call` with no proof in its arguments, on
+the app bearer with the marker or a credential bound to `claude` (never
+`cursor` or `copilot`), the route takes (reads and deletes, in one statement)
+the proof handed off for `_meta["claudecode/toolUseId"]` and verifies it
+exactly as an in-argument proof, spend included; any failure is the same
+`-32602 Invalid native chat context.` With nothing handed off the call has no
+verified chat, as a call without a proof always had. An in-argument proof
+still works and is checked first.
+
+Because Desktop no longer strips them, a desktop-managed `join_relay` may
+carry `name` when it is the verified identity's own name (trimmed, any letter
+case); `description` is ignored, since the join never changes the card. Any
+other `name`, or a `desktop_address` that is not the identity's, is refused
+with "This chat can only use its verified desktop identity."

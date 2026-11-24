@@ -1096,7 +1096,12 @@ function createRelayService(context: McpContext) {
     }
     if (managed) {
       const identity = await desktop();
-      if (input.name || input.description || (input.desktop_address && input.desktop_address !== identity.address)) {
+      // Desktop no longer strips name/description (a hook that rewrites input
+      // breaks Claude Code's auto mode): the verified identity's own name is
+      // accepted (trimmed, any letter case) and description is ignored, since
+      // this join never changes the card. Another name or address is refused.
+      const otherName = Boolean(input.name) && input.name!.trim().toLowerCase() !== identity.name.toLowerCase();
+      if (otherName || (input.desktop_address && input.desktop_address !== identity.address)) {
         throw new RelayToolError(MANAGED_JOIN_REFUSED);
       }
       return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
