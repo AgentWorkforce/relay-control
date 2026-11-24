@@ -740,6 +740,10 @@ export function loadDelegationOidcIssuers(env: Env): string[] {
   const issuers = raw.split(",").map(value => value.trim()).filter(Boolean);
   if (issuers.length > 8) throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS takes at most 8 issuers");
   return [...new Set(issuers.map((value) => {
+    // A bare "?" or "#" leaves url.search and url.hash empty: refuse the raw delimiters too.
+    if (/[?#]/.test(value)) {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs without query, fragment or credentials");
+    }
     let url: URL;
     try {
       url = new URL(value);

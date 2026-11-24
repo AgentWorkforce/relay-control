@@ -409,7 +409,8 @@ const SHA40 = "[0-9a-f]{40}";
 export const RELEASE_TARGETS: readonly RegExp[] = [
   new RegExp(`^${REPO_PART}:(?!land:|ios:)[a-z][a-z0-9_-]{0,31}:v[0-9][0-9A-Za-z.+-]{0,63}:${SHA40}:[1-9][0-9]{0,19}(?::[A-Za-z0-9_.-]{1,64})?$`, "u"),
   new RegExp(`^${REPO_PART}:land:[A-Za-z0-9._/-]{1,200}:${SHA40}$`, "u"),
-  new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:[0-9][0-9.]{0,31}:${SHA40}$`, "u"),
+  // A build number is dot-separated digit groups (`42`, `2026.11.7.3`), at most 32 characters.
+  new RegExp(`^${REPO_PART}:ios:[a-z][a-z0-9_-]{0,31}:(?=[0-9.]{1,32}:)[0-9]+(?:\\.[0-9]+)*:${SHA40}$`, "u"),
 ];
 
 export function validReleaseTarget(target: string): boolean {

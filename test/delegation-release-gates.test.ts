@@ -146,6 +146,11 @@ test("release target grammar (§11a.2)", () => {
     `${REPO}:stable:v1:${SHA.toUpperCase()}:1`, `${REPO}:stable:v1:${SHA}:0`, `${REPO}:stable:v1:${SHA}`,
     `${REPO}:land:main`, `${REPO}:ios:testflight:12`, `${REPO}:land:v1:${SHA}:12`, "everything", `${REPO}:stable:v1:${SHA}:1:a:b`,
   ]) assert.equal(validReleaseTarget(bad), false, bad);
+  // iOS build numbers are dot-separated digit groups, never with an empty group (#278 review).
+  assert.ok(validReleaseTarget(`${REPO}:ios:testflight:42:${SHA}`));
+  for (const build of ["1.", "1..2", ".1", "1.2.", "9".repeat(33)]) {
+    assert.equal(validReleaseTarget(`${REPO}:ios:testflight:${build}:${SHA}`), false, build);
+  }
 });
 
 test("OIDC issuer config: https only, at most 8, GitHub is built in", () => {
@@ -153,6 +158,11 @@ test("OIDC issuer config: https only, at most 8, GitHub is built in", () => {
   assert.deepEqual(loadDelegationOidcIssuers({ SELFHOST_DELEGATION_OIDC_ISSUERS: `${GHES}/, ${GHES}` }), [GHES]);
   assert.throws(() => loadDelegationOidcIssuers({ SELFHOST_DELEGATION_OIDC_ISSUERS: "http://ghe.example" }), /https/);
   assert.throws(() => loadDelegationOidcIssuers({ SELFHOST_DELEGATION_OIDC_ISSUERS: "https://x.example/?q=1" }), /https/);
+  // Empty delimiters too: URL parsing leaves search and hash empty for a bare "?" or "#" (#278 review).
+  for (const bare of ["https://x.example/?", "https://x.example/#", "https://x.example/path?#"]) {
+    assert.throws(() => loadDelegationOidcIssuers({ SELFHOST_DELEGATION_OIDC_ISSUERS: bare }), /query, fragment/, bare);
+  }
+  assert.deepEqual(loadDelegationOidcIssuers({ SELFHOST_DELEGATION_OIDC_ISSUERS: "https://x.example/a%20b" }), ["https://x.example/a%20b"]);
   assert.throws(() => loadDelegationOidcIssuers({
     SELFHOST_DELEGATION_OIDC_ISSUERS: Array.from({ length: 9 }, (_, i) => `https://i${i}.example`).join(","),
   }), /at most 8/);
@@ -352,6 +362,77 @@ test("gate redeem: a run that loses the consume race is refused consumed, never 
   assert.deepEqual(bound.rows.map(row => row.run_id), ["51"]);
   // Only the winner's consumption is audited as redeemed.
   assert.equal((await env.events("gate.redeemed")).length, 1);
+});
+
+test("gate redeem and registration re-check under the locks: a demotion or delegation off after the plain read decides (#278 review)", async (t) => {
+  const env = await setup(t);
+  const created = await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  const database = env.database as { transaction: typeof env.database.transaction };
+  const original = database.transaction.bind(env.database);
+  t.after(() => { database.transaction = original; });
+  // Just before the next transaction starts, run `change` (it commits first).
+  const beforeNextTransaction = (change: () => Promise<unknown>) => {
+    let done = false;
+    database.transaction = (async (fn: Parameters<typeof original>[0]) => {
+      if (!done) { done = true; await change(); }
+      return original(fn);
+    }) as typeof original;
+  };
+  // The owner passes the plain read as owner, and is demoted before the lock.
+  beforeNextTransaction(() => env.database.query("UPDATE organization_memberships SET role = 'member' WHERE user_id = $1",
+    [env.ownerId]));
+  const refused = await env.redeem(mint(env.github, env.workflowClaims()), approvalId);
+  assert.equal(refused.status, 403, refused.raw);
+  assert.deepEqual(refused.body, { ok: false, reason: "gate_owner_unqualified" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_gate_redemptions WHERE approval_id = $1",
+    [approvalId])).rows.length, 0);
+  await env.database.query("UPDATE organization_memberships SET role = 'owner' WHERE user_id = $1", [env.ownerId]);
+  // Delegation is turned off between the route's check and the registering transaction.
+  beforeNextTransaction(() => env.database.query(
+    "UPDATE delegation_policies SET delegation_enabled = false WHERE workspace_id = $1", [env.workspaceId]));
+  const registered = await env.browser("/delegates/gates", "POST", { repo: REPO, workflow_ref: WORKFLOW,
+    ref: "refs/heads/main", event: "push", target_prefix: `${REPO}:` });
+  assert.equal(registered.status, 403, registered.raw);
+  assert.equal(registered.body.code, "not_enabled");
+  const gates = await env.database.query("SELECT id FROM delegation_gates WHERE workspace_id = $1 AND deleted_at IS NULL",
+    [env.workspaceId]);
+  assert.deepEqual(gates.rows.map(row => row.id), [created.gate_id]);
+});
+
+test("gate redeem: a dry run answers from the state at its end, never passing a gate deleted or an action consumed meanwhile (#278 review)", async (t) => {
+  const env = await setup(t);
+  const created = await env.gate();
+  const approvalId = await env.approval([STABLE]);
+  const dry = { dry_run: true };
+  const database = env.database as { query: typeof env.database.query };
+  const original = database.query.bind(env.database);
+  t.after(() => { database.query = original; });
+  // Runs `change` once, right before the dry run's final gate re-read.
+  const beforeFinalRead = (change: () => Promise<unknown>) => {
+    let done = false;
+    database.query = (async (text: string, params?: unknown[]) => {
+      if (!done && /SELECT 1 FROM delegation_gates WHERE workspace_id = \$1 AND id = \$2 AND deleted_at IS NULL$/.test(text.trim())) {
+        done = true;
+        await change();
+      }
+      return original(text, params as never);
+    }) as typeof original;
+  };
+  beforeFinalRead(() => original("UPDATE delegation_gates SET deleted_at = now() WHERE id = $1", [created.gate_id]));
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims()), approvalId, STABLE, dry)).body,
+    { ok: false, reason: "gate_unknown", dry_run: true });
+  database.query = original;
+  await original("UPDATE delegation_gates SET deleted_at = NULL WHERE id = $1", [created.gate_id]);
+  // Another run consumes the action while the dry run is checking.
+  let winner: Awaited<ReturnType<typeof env.redeem>> | null = null;
+  beforeFinalRead(async () => {
+    database.query = original;
+    winner = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "61" })), approvalId);
+  });
+  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ run_id: "62" })), approvalId, STABLE, dry)).body,
+    { ok: false, reason: "consumed", dry_run: true });
+  assert.deepEqual(winner!.body, { ok: true, consumed: true });
 });
 
 test("gate redeem: dry_run runs every check, never consumes, and is audited as dry_run", async (t) => {
@@ -765,6 +846,58 @@ test("OIDC keys: a failed fetch backs off 30 s, serves the last good keys (or fa
   await assert.rejects(verify(token("forged-kid")), /oidc_invalid: unknown_key/);
 });
 
+test("OIDC keys: one shared refresh per issuer, a keys-less JWKS keeps the last good keys, the backoff starts at the failure, every fetch has a deadline (#278 review)", async () => {
+  const { workflowOidcVerifier, OidcKeysUnavailable } = await import("../src/delegation/oidc.js");
+  const github = issuer(GITHUB);
+  const serve = oidcFetch([github]);
+  const clock = { ms: Date.now() };
+  let mode: "ok" | "empty" | "slow-fail" = "ok";
+  let jwksFetches = 0;
+  const signals: Array<AbortSignal | null | undefined> = [];
+  let release: (() => void) | null = null;
+  const verify = workflowOidcVerifier({ issuers: [GITHUB], audience: "https://control.example.test", now: () => new Date(clock.ms),
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal);
+      const url = String(input);
+      if (url.endsWith("/jwks")) {
+        jwksFetches += 1;
+        if (mode === "empty") return Response.json({});
+      }
+      if (mode === "slow-fail") {
+        // The discovery call takes 35 s of clock, then fails.
+        clock.ms += 35_000;
+        return new Response("busy", { status: 503 });
+      }
+      if (url.endsWith("/jwks") && release === null) await new Promise<void>(resolve => { release = resolve; setImmediate(resolve); });
+      return serve(input, init);
+    }) as typeof fetch });
+  const seconds = () => Math.floor(clock.ms / 1000);
+  const token = () => mint(github, { iss: GITHUB, aud: "https://control.example.test", sub: "repo:x", repository: REPO,
+    workflow_ref: WORKFLOW, job_workflow_ref: WORKFLOW, ref: "refs/heads/main", event_name: "push", run_id: "1", run_attempt: "1",
+    sha: SHA, iat: seconds(), nbf: seconds(), exp: seconds() + 3600 });
+  // Two cold verifies at once share one discovery and JWKS fetch.
+  const both = await Promise.all([verify(token()), verify(token())]);
+  assert.deepEqual(both.map(claims => claims.repository), [REPO, REPO]);
+  assert.equal(jwksFetches, 1);
+  // Every request carries an abort deadline.
+  assert.ok(signals.length > 0 && signals.every(signal => signal instanceof AbortSignal));
+  // A 200 JWKS without a keys array is a failure: the cached key still verifies.
+  mode = "empty";
+  clock.ms += 11 * 60_000;
+  assert.equal((await verify(token())).repository, REPO);
+  // A slow failure backs off from when it failed: 31 s later (66 s after it started) no new fetch starts.
+  mode = "slow-fail";
+  clock.ms += 31_000;
+  const before = signals.length;
+  assert.equal((await verify(token())).repository, REPO);
+  const afterFailure = signals.length;
+  assert.ok(afterFailure > before);
+  clock.ms += 25_000;
+  assert.equal((await verify(token())).repository, REPO);
+  assert.equal(signals.length, afterFailure);
+  void OidcKeysUnavailable;
+});
+
 test("gate redeem: releases only; a gate without job_workflow_ref covers its own file's jobs; same_run by repository id", async (t) => {
   const env = await setup(t);
   // A deploy approval whose target happens to start with the gate's prefix is never spent through a gate.
@@ -784,9 +917,13 @@ test("gate redeem: releases only; a gate without job_workflow_ref covers its own
   const attested = await request(env.origin, `${env.base}/messaging/delegation`, { method: "POST", token: env.desktop.accessToken,
     body: { recipient_agent_id: recipient, recipient_token: coder.token, message_id: messageId } });
   assert.equal(attested.body.verdict, "delegate", attested.raw);
-  const deploy = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "950" })), attested.body.claims.approval_id, deployTarget);
+  // The job asks for the deploy action itself: only releases redeem through a gate.
+  const deploy = await env.redeem(mint(env.github, env.workflowClaims({ run_id: "950" })), attested.body.claims.approval_id,
+    deployTarget, { action: { class: "deploy", target: deployTarget } });
   assert.equal(deploy.status, 403, deploy.raw);
   assert.deepEqual(deploy.body, { ok: false, reason: "out_of_scope" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
+    [attested.body.claims.approval_id])).rows.length, 0);
   // A job inside a reusable workflow the gate does not name: gate_mismatch.
   const approvalId = await env.approval([STABLE]);
   const reusable = "AgentWorkforce/workflows/.github/workflows/publish.yml@refs/heads/main";

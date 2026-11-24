@@ -832,7 +832,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const issuer = (body.issuer ?? input.oidcIssuers[0]!).replace(/\/+$/, "");
         if (!input.oidcIssuers.includes(issuer)) fail("invalid_request", "issuer must be GitHub Actions or a configured issuer", 400);
         await requireEnabled(workspace.id);
-        // Pending Khaliq D5 (option b): only an org owner or admin may own a gate.
+        // D5 (#owner-decisions 250887862744305664): only an org owner or admin may own a gate.
         if (!caller.admin) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
         // As Cloud: the gate is pinned to the repository's GitHub ids at
         // registration (the workspace's GitHub connection, else the public
@@ -874,6 +874,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const role = await memberRole(tx, workspace.id, principal.userId, true);
           if (!role) fail("forbidden", "Forbidden", 403);
           if (!qualifiedGateOwner(role)) fail("gate_owner_unqualified", "Only an org owner or admin may register a release gate", 403);
+          // As every delegation write: delegation turned off after the check
+          // above refuses the gate (the policy row is share-locked until
+          // commit, after the membership row, as decideUnderLocks takes them).
+          if (!(await loadPolicy(tx, workspace.id, true)).delegation_enabled) NOT_ENABLED();
           // At most MAX_GATES_PER_WORKFLOW live gates per (workspace, repository,
           // workflow file without its @ref, so all tag patterns share one cap),
           // counted under an advisory lock so concurrent registrations cannot

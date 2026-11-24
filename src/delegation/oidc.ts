@@ -17,6 +17,8 @@ const JWKS_TTL_MS = 10 * 60 * 1000;
 const REFRESH_COOLDOWN_MS = 60 * 1000;
 /** After a failed fetch, no new fetch starts for this long: an outage does not add a fetch to every redeem (as Cloud). */
 const FAILURE_BACKOFF_MS = 30 * 1000;
+/** Each discovery or JWKS request, headers and body together (as Cloud). */
+const FETCH_TIMEOUT_MS = 5_000;
 const CLOCK_SKEW_SECONDS = 60;
 const MAX_TOKEN_CHARS = 16_384;
 
@@ -74,9 +76,13 @@ export function workflowOidcVerifier(input: {
   const issuers = new Set(input.issuers.map(issuer => issuer.replace(/\/+$/, "")));
   const cache = new Map<string, { at: number; keys: Jwk[] }>();
   const failedAt = new Map<string, number>();
+  /** One refresh per issuer at a time (as Cloud): concurrent callers share it, so cache writes land in order. */
+  const refreshing = new Map<string, Promise<Jwk[]>>();
 
   async function fetchJson(url: string): Promise<Record<string, unknown>> {
-    const response = await fetchImpl(url, { headers: { accept: "application/json" }, redirect: "error" });
+    // One deadline covers the headers and the body (as Cloud's 5 s): a stalled body aborts too.
+    const response = await fetchImpl(url, { headers: { accept: "application/json" }, redirect: "error",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!response.ok) throw new OidcKeysUnavailable(response.status);
     const body = await response.json().catch(() => null) as unknown;
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new OidcKeysUnavailable(response.status);
@@ -103,14 +109,23 @@ export function workflowOidcVerifier(input: {
       throw new OidcKeysUnavailable();
     }
     try {
-      return { keys: await fetchKeys(issuer), stale: false };
+      return { keys: await refreshKeys(issuer), stale: false };
     } catch (error) {
-      failedAt.set(issuer, at);
+      // The backoff starts when the fetch failed, not when it started (a slow failure backs off as long).
+      failedAt.set(issuer, now().getTime());
       logDependencyFailed("github_oidc_jwks", error, { stale_cache_served: Boolean(cached), refresh,
         ...(error instanceof OidcKeysUnavailable && error.status !== null ? { status: error.status } : {}) });
       if (cached) return { keys: cached.keys, stale: true };
       throw error instanceof OidcKeysUnavailable ? error : new OidcKeysUnavailable();
     }
+  }
+
+  function refreshKeys(issuer: string): Promise<Jwk[]> {
+    const pending = refreshing.get(issuer);
+    if (pending) return pending;
+    const started = fetchKeys(issuer).finally(() => refreshing.delete(issuer));
+    refreshing.set(issuer, started);
+    return started;
   }
 
   async function fetchKeys(issuer: string): Promise<Jwk[]> {
@@ -123,7 +138,9 @@ export function workflowOidcVerifier(input: {
       throw new OidcKeysUnavailable();
     }
     const jwks = await fetchJson(jwksUri);
-    const list = Array.isArray(jwks.keys) ? jwks.keys.filter((key): key is Jwk => Boolean(key) && typeof key === "object") : [];
+    // No keys array is a failed fetch (as Cloud): the last good keys keep serving.
+    if (!Array.isArray(jwks.keys)) throw new OidcKeysUnavailable();
+    const list = jwks.keys.filter((key): key is Jwk => Boolean(key) && typeof key === "object");
     cache.set(issuer, { at: now().getTime(), keys: list });
     return list;
   }

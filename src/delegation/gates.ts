@@ -321,9 +321,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // standing serves.
     const targetOwners = await loadTargetOwners(deps.database, workspace.id);
     let standingGate: GateRow | null = null;
-    // Pending Khaliq D5 (option b): a gate serves only while its owner is an
-    // org owner or admin (relay-control reads no CODEOWNERS, so that is the
-    // whole rule here, stricter than Cloud's code-owner-or-admin).
+    // D5 (#owner-decisions 250887862744305664): a gate serves only while its
+    // owner is an org owner or admin (relay-control reads no CODEOWNERS, so
+    // that is the whole rule here; Cloud also admits whole-repo code owners).
     let unqualified = 0;
     for (const candidate of candidates) {
       const role = await memberRole(deps.database, workspace.id, candidate.owner_user_id);
@@ -354,6 +354,17 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     if (fresh) return await refuse(fresh);
 
     if (dryRun) {
+      // A dry run takes no lock, so it answers from the state as it is now:
+      // the gate still live, and the action not consumed meanwhile by another
+      // run (#278 review). A change committing after this is not reflected.
+      const live = (await deps.database.query(
+        "SELECT 1 FROM delegation_gates WHERE workspace_id = $1 AND id = $2 AND deleted_at IS NULL",
+        [workspace.id, standingGate.id])).rows.length > 0;
+      if (!live) return await refuse("gate_unknown");
+      if (!spent && await actionConsumed(deps.database, approval.id, action) &&
+          !await boundRun(deps.database, approval.id, action, claims)) {
+        return await refuse("consumed");
+      }
       // A passing dry run is `gate.checked`, so `gate.redeemed` counts real uses only.
       await bestEffort("gate.checked", null, spent ? { same_run: true } : {});
       return { ok: true, consumed: false, dry_run: true };
@@ -374,6 +385,12 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       // Refusals and consumptions are kept apart: a refusal reason (even
       // "consumed") can never read as a successful first consumption.
       if (stale) return { refused: stale };
+      // Qualification (an org owner or admin), not only membership, as read
+      // from the share-locked membership row: a demotion that committed after
+      // the plain read decides (#278 review).
+      if (!qualifiedGateOwner(await memberRole(tx, workspace.id, servingGate.owner_user_id, true))) {
+        return { refused: "gate_owner_unqualified" as const };
+      }
       // Standing against the target owners as committed now (read locally).
       if (!resolveStanding({ approvalOwnerId: approval.owner_user_id, recipientOwnerId: servingGate.owner_user_id,
         accept: "code_owners", actions: [action],
@@ -600,7 +617,7 @@ export function gateAuditData(row: Pick<GateRow, "id" | "repo" | "repository_id"
 }
 
 /**
- * Pending Khaliq D5 (option b): who may own a release gate. relay-control has
+ * D5 (#owner-decisions 250887862744305664): who may own a release gate. relay-control has
  * no CODEOWNERS reads, so only an org owner or admin qualifies, at
  * registration and at every redeem.
  */

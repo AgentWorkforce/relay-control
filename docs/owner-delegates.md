@@ -94,8 +94,9 @@ on in production, check each of these (decided 2026-11-23):
       owner's words (#312).
 - [ ] Release gates: decide who may register a gate for a repository
       (installation coverage, code ownership or admin) before relying on
-      gates for another code owner's approvals (#313). Until D5 is recorded,
-      relay-control lets only org owners and admins own gates.
+      gates for another code owner's approvals (#313). D5 is recorded
+      (#owner-decisions 250887862744305664): relay-control lets only org
+      owners and admins own gates.
 
 ## Who may call what
 
@@ -392,7 +393,9 @@ then grants, then approvals) and revocation (grants, then approvals) take
 these rows in the same order. A consuming call (redeem, gate redeem) locks the
 approval `FOR NO KEY UPDATE` instead of `FOR SHARE`, so consumers of one
 approval run one at a time: insert the consumption, stamp `consumed_at`,
-write the event, commit. Attestation and gate dry runs keep `FOR SHARE`.
+write the event, commit. Attestation keeps `FOR SHARE`. A gate dry run takes
+no lock at all: it answers from plain reads, the last of them just before it
+answers, so a change committing after that is not reflected.
 
 ### Revoking or withdrawing one approval
 
@@ -422,8 +425,8 @@ job therefore cannot skip the check. No stored secret is involved.
 
 **Registering a gate.** `GET`/`POST`/`DELETE /delegates/gates` are for the
 owner, by browser session or verified Desktop bearer. **Gate-owner
-qualification is pending Khaliq's decision D5 (option b):** only an org owner
-or admin may register a gate (403 `gate_owner_unqualified` otherwise), and a
+qualification is Khaliq's decision D5, option (b) (#owner-decisions
+250887862744305664):** only an org owner or admin may register a gate (403 `gate_owner_unqualified` otherwise), and a
 gate serves only while its owner still is one. relay-control reads no
 CODEOWNERS, so this is stricter than Cloud's code-owner-or-admin rule. At
 most 10 live gates may share a repository and workflow file (the
@@ -575,7 +578,15 @@ dry_run?}`. Control checks, in order:
    approval is malformed (`no_approval` at attestation, `out_of_scope` here):
    - `<repo>:<channel>:v<version>:<source sha>:<candidate run id>[:<profile id>]`
    - `<repo>:land:<branch>:<head sha>`
-   - `<repo>:ios:<distribution>:<build number>:<sha>`
+   - `<repo>:ios:<distribution>:<build number>:<sha>` (the build number is
+     dot-separated digit groups, at most 32 characters)
+
+   Rollout: a `release` approval minted before this grammar with a bare
+   `owner/repo` (or any other non-release) target is deliberately not
+   migrated and has no legacy exception. It is never redeemable: it answers
+   `out_of_scope`, fails closed, and lapses at its own expiry. Ask for a new
+   approval that names the release. Nothing is consumed or invalidated by
+   the rollout itself.
 6. **A fresh re-read** of what the redeem rests on (delegation on, the
    approval unrevoked and unexpired, its tier D grant live and in scope and
    the class not newly tier O, its tier O owner and the gate's owner still
