@@ -74,11 +74,15 @@ answers `linked_agent` (and `replaced_agent` when it replaces another link);
 `watch_webhooks` and `GET /shims/current` (`agent.wake_agent`) report it for a
 linked inbox. Control keeps it in `events_shims.wake_agent` (migration 0095):
 the name `link_relay_wake` was given, or the bound agent's name for an agent
-link. Only a valid agent name is kept (letters, digits, dots, dashes and
-underscores, a leading @ dropped); anything else is stored as null, since
-`watch_webhooks` repeats it to other sessions. A link made without a valid
-name, or before 0095, has none, and the agent is
-told to assume the link belongs to another session unless it linked in this
+link. `link_relay_wake` refuses an `agent` that is not an Agent Relay agent
+name (letters, digits, dots, dashes and underscores, at most 100, a leading @
+dropped): the link is not made and an existing link stays. Control's store
+still keeps only a valid name, for a name that reaches the row another way,
+and the package shows only names that pass its check, since `watch_webhooks`
+repeats them to other sessions. A bound agent name of 101 to 128 characters
+(valid for Control, too long for the package) is stored but shown as none. A
+link with no name, or made before 0095, has none, and the agent is told to
+assume the link belongs to another session unless it linked in this
 conversation.
 The three tokens are shown once; an unknown or expired token answers 404.
 
