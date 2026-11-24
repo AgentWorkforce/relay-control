@@ -162,7 +162,10 @@ Consequences, all intended:
 - A person who changed team during the window counts under the later team for the whole window. The session
   totals the pipeline reports are per session, not per day, so there is nothing finer to split.
 - A person who left the organization during the window still counts under the team they left from. In the spend
-  proposal their sessions sit in the `former member` bucket per person; by team they stay where they were.
+  proposal their sessions sit in the `former member` bucket per person; by team they stay where they were. The
+  history this needs is the closed row in `organization_team_assignments`: it has no foreign key to the membership,
+  so it outlives the deleted membership row (section 3.2) and goes only with the user, the organization or a
+  retention limit (decision 5).
 - A person given a team today does not move their sessions of earlier windows.
 - The report states the rule in its output (`teamAsOf`), as the spend proposal states what its window means.
 
@@ -194,7 +197,9 @@ The spend proposal's current draft states all three: one bucket per sorted user 
 per scope (largest first by session count) and an `other` remainder. relay-control cannot resolve the `other` row to
 teams, so it is carried through as `notResolved` and shown as such. An organization whose sessions spread over more
 than 200 distinct user sets in one scope therefore sees part of its usage outside the team rows; the report gives
-that share, and it is the first thing to revisit if it is large in practice.
+that share. If it is large in practice, the fix to prefer is a cursor over the user-set buckets (same order, largest
+first) in a later version of the spend block, so relay-control can read on until the remainder is empty, within the
+bounds of section 5.3. Raising the cap is the weaker option.
 
 Still open on the pipeline side: the same user-set grouping on the per-user session aggregate (section 6), which
 is a different route from the spend block.
@@ -345,4 +350,5 @@ Tests that must exist before step 3 ships:
 7. **The hosted product.** Same model there, or self-hosted installations only for now.
 8. **The pipeline contract in section 5.1.** The spend proposal's draft now carries it (user ids on shared buckets,
    a cap of 200 with an `other` row, the join at read time). It is a draft on that side too, and the per-user
-   session aggregate has no user-set grouping yet. Section 5.2 is what happens without either.
+   session aggregate has no user-set grouping yet. Section 5.2 is what happens without either. If the
+   `notResolved` row proves large, a cursor over the user-set buckets is the change to ask for.
