@@ -1,6 +1,7 @@
 import type { BootstrapConfig } from "./config.js";
 import type { IdentityStore } from "./store.js";
 import type { FetchLike } from "./oidc.js";
+import { drainBody } from "../drain-body.js";
 
 /** A cold durable-actors workspace create has taken ~100 s; leave headroom. */
 const RELAYCAST_CREATE_TIMEOUT_MS = 300_000;
@@ -160,6 +161,7 @@ export function relaycastProvisioner(
           response.status >= 500,
         );
       }
+      await drainBody(response, "bootstrap.relaycast.workspace-remove");
     },
   };
 }

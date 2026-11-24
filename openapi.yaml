@@ -9142,6 +9142,8 @@ paths:
           description: Only POST.
         "413":
           description: Request over 64 KiB.
+        "429":
+          description: "events/stream only: this inbox already holds 4 open event streams on this process. JSON-RPC error with MCP Events' resource-exhausted code -32025 and the request's id; retry-after: 30. events/poll is never limited."
   /api/v1/events-shim/t/{mcpToken}/workspace:
     post:
       operationId: eventsShimTempWorkspace
