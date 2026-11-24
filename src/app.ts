@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
+import { delegationQuoteSecret, SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
@@ -105,6 +105,9 @@ import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
+import { createDelegationHandler } from "./delegation/routes.js";
+import { relaycastQuoteRedactor } from "./delegation/service.js";
+import { DelegationSigner } from "./delegation/jws.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
@@ -574,6 +577,26 @@ export function createApp(input: {
     browserOrigins,
   });
   const customerSupportNotice = createCustomerSupportNoticeHandler(config, store, messagingDeps);
+  // Owner-named trusted delegates (docs/owner-delegates.md). Off per
+  // workspace until an admin turns delegation_enabled on.
+  const delegation = createDelegationHandler({
+    database: store.database,
+    quoteKey: delegationQuoteSecret(config),
+    relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: config.relaycastUrl,
+      internalSecret: input.relaycastInternalSecret ?? null, fetchImpl: input.messagingFetch }),
+    relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
+    signer: config.delegationSigning ? new DelegationSigner(config.delegationSigning) : null,
+    gateOnly: Boolean(config.relaygatePublicUrl),
+    browserOrigins,
+    authenticateAccessToken: (token) => store.authenticateAccessToken(token),
+    workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
+    json,
+    // Never provisions: these lookups can run before any caller is proven.
+    relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
+    rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
+    clientKey: (request) => limiterKey(clientIp(request)),
+    now: input.now,
+  });
   const factory = input.factory ?? createFactoryModule({
     config,
     database: store.database,
@@ -1512,6 +1535,7 @@ export function createApp(input: {
     }
 
     if (await customerSupportNotice(request, response, publicPath, method)) return;
+    if (await delegation(request, response, path, publicPath, method)) return;
     // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
     // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
     if (await handleAcquisitionRoutes({
