@@ -695,7 +695,7 @@ test("redeem: single-use approvals are consumed once; replay and other recipient
   const messageId = send(env, bot, recipient, env.approval([prod]));
   const attested = await env.attest(recipient, messageId);
   assert.equal(attested.body.verdict, "delegate", attested.raw);
-  assert.equal(attested.body.claims.single_use, true);
+  assert.equal(attested.body.claims.single_use, false); // approval-wide flag only by explicit choice; the action is single use per action
   const approvalId = attested.body.claims.approval_id as string;
 
   // Out-of-approval action.
@@ -763,7 +763,7 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
   // No class needs tier O by default (§15, Khaliq 7:43): a tier D secret_change is single-use.
   const plain = await env.attest(recipient, send(env, bot, recipient, env.approval([secret])));
   assert.equal(plain.body.verdict, "delegate", plain.raw);
-  assert.equal(plain.body.claims.single_use, true);
+  assert.equal(plain.body.claims.single_use, false); // approval-wide flag only by explicit choice; the action is single use per action
   // An org that requires tier O for the class refuses it as tier D.
   await env.enable({ require_tier_o: ["secret_change"] });
   assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval([secret])))).body.reason, "tier_o_required");
@@ -781,7 +781,8 @@ test("tier O: owner-minted approvals carry the delegate's message and are single
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   assert.equal(attested.body.claims.tier, "O");
   assert.equal(attested.body.claims.approval_id, ref);
-  assert.equal(attested.body.claims.single_use, true);
+  // Minted without an explicit single_use: the secret_change is still single use per action.
+  assert.equal(attested.body.claims.single_use, false);
   assert.deepEqual((await env.redeem(recipient, ref, secret)).body, { ok: true, consumed: true });
   assert.deepEqual((await env.redeem(recipient, ref, secret)).body, { ok: false, reason: "consumed" });
   assert.equal((await env.attest(recipient, messageId)).body.reason, "consumed");
@@ -1079,7 +1080,7 @@ test("config_change: one exact setting of the recipient's own session, single-us
 
   const ok = await env.attest(session, change(`${session.id}:sandbox=workspace-write`));
   assert.equal(ok.body.verdict, "delegate", ok.raw);
-  assert.equal(ok.body.claims.single_use, true);
+  assert.equal(ok.body.claims.single_use, false); // approval-wide flag only by explicit choice; the action is single use per action
   assert.equal(ok.body.claims.standing, "own_owner");
   const action = { class: "config_change", target: `${session.id}:sandbox=workspace-write` };
   assert.deepEqual((await env.redeem(session, ok.body.claims.approval_id, action)).body, { ok: true, consumed: true });
@@ -1976,4 +1977,24 @@ test("review: a member redacts the ownerless refusal rows they caused; not anoth
     "SELECT quote FROM delegation_audit_events WHERE message_id = 'm-caused' AND event = 'approval.refused'")).rows[0]!;
   assert.equal(row.quote, null);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_quote_redactions WHERE message_id = 'm-caused'")).rows.length, 1);
+});
+
+test("review: single use is per action; a high-risk action never makes the whole approval single use", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  await env.grant(bot.id, [{ class: "merge", targets: ["AgentWorkforce/*"] }, { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }]);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#290" };
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v1.0.0:${"a".repeat(40)}:1` };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([merge, release])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  assert.equal(attested.body.claims.single_use, false);
+  const approvalId = attested.body.claims.approval_id as string;
+  // The release (high risk) is consumed once; the merge redeems again and again.
+  assert.deepEqual((await env.redeem(recipient, approvalId, release)).body, { ok: true, consumed: true });
+  assert.deepEqual((await env.redeem(recipient, approvalId, release)).body, { ok: false, reason: "consumed" });
+  assert.deepEqual((await env.redeem(recipient, approvalId, merge)).body, { ok: true, consumed: false });
+  assert.deepEqual((await env.redeem(recipient, approvalId, merge)).body, { ok: true, consumed: false });
+  const stored = (await env.database.query<{ single_use: boolean }>("SELECT single_use FROM delegation_approvals WHERE id = $1",
+    [approvalId])).rows[0]!;
+  assert.equal(stored.single_use, false);
 });

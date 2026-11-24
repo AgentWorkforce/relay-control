@@ -646,12 +646,19 @@ export async function recordRelaycastRedaction(executor: SqlExecutor, input: { w
  * Revokes grants and invalidates every unredeemed approval under them, in
  * the caller's transaction. Returns the revoked rows (inactive ones are skipped).
  */
-/** Whether every action of an approval has been consumed (single use is per action, §5.1). */
-async function allActionsConsumed(executor: SqlExecutor, approval: Pick<ApprovalRow, "id" | "actions">): Promise<boolean> {
-  const consumed = Number((await executor.query<{ count: string | number }>(
-    "SELECT count(*) AS count FROM delegation_action_consumptions WHERE approval_id = $1", [approval.id],
-  )).rows[0]?.count ?? 0);
-  return consumed >= approval.actions.length;
+/**
+ * Whether every single-use action of an approval has been consumed (single
+ * use is per action, §5.1: a high-risk action always is, and every action of
+ * an approval explicitly marked single use). False when it has none.
+ */
+async function everySingleUseActionSpent(executor: SqlExecutor,
+  approval: Pick<ApprovalRow, "id" | "actions" | "single_use">): Promise<boolean> {
+  const singleUse = approval.actions.filter(action => approval.single_use || highRisk(action));
+  if (!singleUse.length) return false;
+  const spent = new Set((await executor.query<{ class: string; target: string }>(
+    "SELECT class, target FROM delegation_action_consumptions WHERE approval_id = $1", [approval.id],
+  )).rows.map(row => `${row.class} ${row.target}`));
+  return singleUse.every(action => spent.has(`${action.class} ${action.target}`));
 }
 
 /** Whether one action of an approval has been consumed. */
@@ -667,22 +674,23 @@ export async function actionConsumed(executor: SqlExecutor, approvalId: string,
  * Consumes one action atomically; false when it was already consumed. Stamps
  * the approval's `consumed_at` once every single-use action of it has been
  * consumed (markSpentIfComplete). As Cloud's consumeApproval: given a
- * Database (no caller transaction) it opens its own and locks the approval
- * FOR NO KEY UPDATE first, so standalone consumers of one approval serialize
+ * Database (no caller transaction) it opens its own; either way it locks the
+ * approval FOR NO KEY UPDATE first, so consumers of one approval serialize
  * (no lock-upgrade deadlock with the stamp, and the stamp is never missed).
- * Given a caller's transaction, which already holds the approval FOR NO KEY
- * UPDATE (decideUnderLocks with `consuming`), it takes FOR SHARE.
  */
 export async function consumeAction(executor: SqlExecutor | Database, input: { approvalId: string; workspaceId: string;
   action: Pick<Action, "class" | "target">; consumedBy: string }): Promise<boolean> {
-  if ("transaction" in executor) return executor.transaction(tx => consumeLocked(tx, input, "FOR NO KEY UPDATE"));
-  return consumeLocked(executor, input, "FOR SHARE");
+  if ("transaction" in executor) return executor.transaction(tx => consumeLocked(tx, input));
+  return consumeLocked(executor, input);
 }
 
 async function consumeLocked(tx: SqlExecutor, input: { approvalId: string; workspaceId: string;
-  action: Pick<Action, "class" | "target">; consumedBy: string }, lock: "FOR NO KEY UPDATE" | "FOR SHARE"): Promise<boolean> {
+  action: Pick<Action, "class" | "target">; consumedBy: string }): Promise<boolean> {
+  // Always FOR NO KEY UPDATE (as Cloud): re-locking in a caller's transaction
+  // that already holds it is free, and a weaker lock here could deadlock with
+  // the consumed_at stamp.
   const live = (await tx.query(
-    `SELECT 1 FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL ${lock}`,
+    `SELECT 1 FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 AND invalidated_at IS NULL FOR NO KEY UPDATE`,
     [input.workspaceId, input.approvalId],
   )).rows.length > 0;
   if (!live) return false;
@@ -1160,12 +1168,15 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       if (minted!.invalidated_at) refuse("revoked");
       // A tier O approval belongs to the grant's owner (§6.2).
       if (minted!.owner_user_id !== grant.owner_user_id) refuse("no_approval");
-      if (minted!.single_use && await allActionsConsumed(deps.database, minted!)) refuse("consumed");
+      if (await everySingleUseActionSpent(deps.database, minted!)) refuse("consumed");
       if (time(minted!.expires_at) <= now.getTime()) refuse("expired");
       if (!sameActions(minted!.actions, messageActions)) refuse("out_of_scope");
       actions = minted!.actions.map(canonicalAction);
       expiresAt = Math.min(time(minted!.expires_at), time(grant.expires_at));
-      singleUse = minted!.single_use || actions.some(highRisk);
+      // The approval-wide flag is the owner's explicit choice only; a
+      // high-risk action is single use per action (at redeem), never the
+      // whole approval.
+      singleUse = minted!.single_use;
     } else {
       tier = "D";
       actions = messageActions;
@@ -1187,7 +1198,9 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       // attestation stores it.
       const requested = approval.expires_at ? Date.parse(approval.expires_at) : sentAt + APPROVAL_DEFAULT_MS;
       expiresAt = Math.min(requested, sentAt + APPROVAL_MAX_MS, time(grant.expires_at));
-      singleUse = actions.some(highRisk);
+      // A delegate's approval has no approval-wide single use: high-risk
+      // actions are single use per action, at redeem.
+      singleUse = false;
     }
     if (expiresAt <= now.getTime()) refuse("expired");
     const outOfScope = scopeRefusal(actions, grant, policy, recipient.agentId);
@@ -1216,7 +1229,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       )).rows[0];
       if (!stored) refuse("unavailable");
       if (stored!.invalidated_at || stored!.grant_id !== grant.id) refuse("revoked");
-      if ((stored!.single_use || actions.every(highRisk)) && await allActionsConsumed(deps.database, stored!)) refuse("consumed");
+      if (await everySingleUseActionSpent(deps.database, stored!)) refuse("consumed");
       expiresAt = Math.min(expiresAt, time(stored!.expires_at));
       singleUse = stored!.single_use || singleUse;
     }
