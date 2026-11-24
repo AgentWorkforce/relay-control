@@ -56,6 +56,8 @@ export type AdminRouteHelpers = {
   organizationAccess(request: IncomingMessage, organizationId: string, admin: boolean): Promise<unknown>;
   requestObject(request: IncomingMessage): Promise<JsonObject>;
   bearer(request: IncomingMessage): string | null;
+  /** True when the request carries an allowed browser Origin (or same-origin fetch metadata). */
+  cookieOriginAllowed(request: IncomingMessage): boolean;
   /** app.ts's shared limiter: throws 429 (with retry-after) once `key` passes `rule`. */
   rateLimit(response: ServerResponse, key: string, rule: { limit: number; windowMs: number }): void;
   /** The workspace Relaycast roster check an agent-identity mint runs before its transaction. */
@@ -134,7 +136,16 @@ function userActor(access: WorkspaceAccess): AuditActor & { kind: "user" } {
   return { kind: "user", userId: access.principal.userId };
 }
 
-/** Refuse simple cross-site form posts for cookie-authenticated writes. */
+function csrfRejected(): AdminHttpError {
+  return new AdminHttpError(403, "csrf_rejected", "Cross-origin request refused");
+}
+
+/**
+ * Cookie-authenticated writes need JSON and an allowed Origin, like the other
+ * cookie writes. Runs before authentication, so the origin check applies only
+ * to a request that carries cookies and no bearer; one with neither is left
+ * to the 401 that authentication returns.
+ */
 function requireJsonWrite(request: IncomingMessage, helpers: AdminRouteHelpers): void {
   const method = request.method ?? "GET";
   if (method === "GET" || method === "HEAD" || method === "DELETE") return;
@@ -143,6 +154,14 @@ function requireJsonWrite(request: IncomingMessage, helpers: AdminRouteHelpers):
   if (type !== "application/json") {
     throw new AdminHttpError(415, "unsupported_media_type", "Use application/json");
   }
+  if (!helpers.bearer(request) && request.headers.cookie !== undefined && !helpers.cookieOriginAllowed(request)) {
+    throw csrfRejected();
+  }
+}
+
+/** Bodiless cookie writes (DELETE) need an allowed Origin; bearer callers are unaffected. */
+function requireCookieOrigin(request: IncomingMessage, helpers: AdminRouteHelpers): void {
+  if (!helpers.bearer(request) && !helpers.cookieOriginAllowed(request)) throw csrfRejected();
 }
 
 function listEntry(
@@ -514,6 +533,7 @@ export function createAdminModule(input: {
       logins,
       json,
       requireJsonWrite: (req) => requireJsonWrite(req, helpers),
+      requireCookieOrigin: (req) => requireCookieOrigin(req, helpers),
     })) {
       return true;
     }
@@ -559,6 +579,7 @@ export function createAdminModule(input: {
       }
       if (method === "DELETE") {
         const access = await helpers.workspaceAccess(request, workspaceId, true);
+        requireCookieOrigin(request, helpers);
         const record = await envVars.delete({
           workspaceId: access.workspace.id,
           organizationId: access.workspace.organizationId,
@@ -697,6 +718,7 @@ export function createAdminModule(input: {
       }
       if (method === "DELETE") {
         const access = await helpers.workspaceAccess(request, workspaceId, true);
+        requireCookieOrigin(request, helpers);
         const deleted = await connections.deleteOAuthApp({
           workspaceId: access.workspace.id,
           organizationId: access.workspace.organizationId,
@@ -756,6 +778,7 @@ export function createAdminModule(input: {
       }
       if (method === "DELETE") {
         const access = await helpers.workspaceAccess(request, workspaceId, true);
+        requireCookieOrigin(request, helpers);
         const deleted = await connections.disconnect({
           workspaceId: access.workspace.id,
           organizationId: access.workspace.organizationId,
@@ -855,6 +878,7 @@ export function createAdminModule(input: {
     const tokenItem = match(rest, /^deployment-api-tokens\/([^/]+)$/);
     if (tokenItem && method === "DELETE") {
       const caller = await apiTokenRouteCaller(request, helpers, workspaceId);
+      requireCookieOrigin(request, helpers);
       const revoked = await apiTokens.revoke({
         workspaceId: caller.workspace.id,
         organizationId: caller.workspace.organizationId,
@@ -897,6 +921,7 @@ export function createAdminModule(input: {
         );
       }
       if (selfTokenItem) {
+        requireCookieOrigin(request, helpers);
         const revoked = await apiTokens.revokeSelfMintedRelayNode({
           workspaceId: access.workspace.id,
           organizationId: access.workspace.organizationId,
