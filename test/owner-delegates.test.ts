@@ -2107,7 +2107,7 @@ test("review: an identical redeem refusal is audited once per 10 minutes", async
 
 test("review: redeem re-reads the clock after the bearer check, so a wait past expiry consumes nothing", async (t) => {
   const { env, recipient, bot } = await ready(t);
-  const release = { class: "release", target: "AgentWorkforce/relay" };
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v1.0.0:${"c".repeat(40)}:1` };
   const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([release])));
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   const approvalId = attested.body.claims.approval_id as string;
@@ -2133,4 +2133,36 @@ test("review: redeem re-reads the clock after the bearer check, so a wait past e
   const consumed = (await env.database.query("SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1",
     [approvalId])).rows;
   assert.deepEqual(consumed, []);
+});
+
+test("review: a mixed approval stamped spent by the earlier rule is refused as revoked, even under a new grant", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#310" };
+  const release = { class: "release", target: `AgentWorkforce/relay:stable:v1.0.0:${"b".repeat(40)}:1` };
+  const minted = await env.browser("/delegates/approvals", "POST", { actions: [merge, release] });
+  assert.equal(minted.status, 201, minted.raw);
+  const approvalId = minted.body.approval_id as string;
+  const messageId = send(env, bot, recipient, env.approval([merge, release], { approval_ref: approvalId }));
+  assert.equal((await env.attest(recipient, messageId)).body.verdict, "delegate");
+  assert.deepEqual((await env.redeem(recipient, approvalId, release)).body, { ok: true, consumed: true });
+  // The current rule never stamps a mixed approval spent.
+  const row = async () => (await env.database.query<{ consumed_at: Date | null; invalidated_at: Date | null }>(
+    "SELECT consumed_at, invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId])).rows[0]!;
+  assert.equal((await row()).consumed_at, null);
+
+  // What the earlier rule left: the release consumed, so the approval stamped
+  // spent; then a revoke-all that skipped it (the grant revoked, the approval
+  // never invalidated). The owner later grants the same delegate again.
+  await env.database.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = $1", [approvalId]);
+  await env.database.query("UPDATE delegation_grants SET status = 'revoked', revoked_at = now() WHERE id = $1", [grantId]);
+  await env.grant(bot.id, [{ class: "merge", targets: ["AgentWorkforce/*"] }, { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }]);
+  assert.equal((await row()).invalidated_at, null);
+
+  // Neither attest nor redeem trusts that stamp: the approval is refused as revoked.
+  const again = await env.attest(recipient, send(env, bot, recipient, env.approval([merge, release], { approval_ref: approvalId })));
+  assert.deepEqual(again.body, { verdict: "none", reason: "revoked" });
+  assert.deepEqual((await env.redeem(recipient, approvalId, merge)).body, { ok: false, reason: "revoked" });
+  // A revoke-all now invalidates it as well (it is not spent under the current rule).
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  assert.notEqual((await row()).invalidated_at, null);
 });

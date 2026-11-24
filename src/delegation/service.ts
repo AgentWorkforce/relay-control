@@ -670,6 +670,18 @@ function everyActionSingleUse(approval: Pick<ApprovalRow, "actions" | "single_us
   return approval.actions.length > 0 && approval.actions.every(action => approval.single_use || highRisk(action));
 }
 
+/**
+ * A `consumed_at` stamp on an approval that still has a reusable action. The
+ * current rule never stamps one (markSpentIfComplete), so it is left by the
+ * earlier rule, which stamped an approval once its single-use actions were
+ * consumed. A revoke-all or grant revocation under that rule skipped it, so
+ * `invalidated_at` may be missing although its owner revoked it. Such an
+ * approval is refused as `revoked` (fail closed: its owner approves again).
+ */
+export function legacySpentStamp(approval: Pick<ApprovalRow, "consumed_at" | "actions" | "single_use">): boolean {
+  return approval.consumed_at !== null && approval.consumed_at !== undefined && !everyActionSingleUse(approval);
+}
+
 async function everySingleUseActionSpent(executor: SqlExecutor,
   approval: Pick<ApprovalRow, "id" | "actions" | "single_use">): Promise<boolean> {
   if (!everyActionSingleUse(approval)) return false;
@@ -1201,7 +1213,7 @@ export function freshRefusal(state: DecisionState, input: { actions: readonly Ac
   ReasonCode | null {
   if (!state.member) return input.memberGone ?? "not_pending";
   if (!state.policy.delegation_enabled) return "not_enabled";
-  if (!state.approval || state.approval.invalidated_at) return "revoked";
+  if (!state.approval || state.approval.invalidated_at || legacySpentStamp(state.approval)) return "revoked";
   if (input.noGrant) {
     if (time(state.approval.expires_at) <= input.nowMs) return "expired";
     if (state.policy.allowed_classes && input.actions.some(action => !state.policy.allowed_classes!.includes(action.class))) {
@@ -1290,7 +1302,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         [approval.approval_ref, workspace.id],
       )).rows[0];
       if (!minted || minted.tier !== "O" || minted.owner_user_id !== approval.owner_id) refuse("no_approval");
-      if (minted!.invalidated_at) refuse("revoked");
+      if (minted!.invalidated_at || legacySpentStamp(minted!)) refuse("revoked");
       // A tier O approval belongs to the grant's owner (§6.2).
       if (minted!.owner_user_id !== grant.owner_user_id) refuse("no_approval");
       if (await everySingleUseActionSpent(deps.database, minted!)) refuse("consumed");
@@ -1353,7 +1365,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         [context.approvalId, workspace.id],
       )).rows[0];
       if (!stored) refuse("unavailable");
-      if (stored!.invalidated_at || stored!.grant_id !== grant.id) refuse("revoked");
+      if (stored!.invalidated_at || legacySpentStamp(stored!) || stored!.grant_id !== grant.id) refuse("revoked");
       if (await everySingleUseActionSpent(deps.database, stored!)) refuse("consumed");
       expiresAt = Math.min(expiresAt, time(stored!.expires_at));
       singleUse = stored!.single_use || singleUse;
@@ -1519,7 +1531,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     context.attested = true;
     context.ownerUserId = approval!.owner_user_id;
     context.grantId = attested!.grant_id;
-    if (approval!.invalidated_at) refuse("revoked");
+    if (approval!.invalidated_at || legacySpentStamp(approval!)) refuse("revoked");
     const grant = (await deps.database.query<GrantRow>(
       "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [attested!.grant_id, workspace.id],
     )).rows[0];

@@ -9,6 +9,7 @@ import {
   delegateStillBound,
   decideUnderLocks,
   freshRefusal,
+  legacySpentStamp,
   evaluateConditions,
   loadPolicy,
   loadTargetOwners,
@@ -269,7 +270,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     grantId = approval.grant_id;
     const action = approval.actions.find(item => item.class === input.action.class && item.target === input.action.target);
     if (!action || !actionIsValid(action)) return await refuse("out_of_scope");
-    if (approval.invalidated_at) return await refuse("revoked");
+    if (approval.invalidated_at || legacySpentStamp(approval)) return await refuse("revoked");
     // Release gates redeem releases only (§11a), as Cloud: a gate never spends a
     // deploy, destructive, secret_change or spend approval whose target happens
     // to start with its prefix, since only releases are bound to the run's commit.
