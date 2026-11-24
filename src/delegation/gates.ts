@@ -159,13 +159,17 @@ function gateMatchesByName(gate: GateMatchFields, claims: ClaimMatchFields): boo
  * at the caller's commit. Such a job serves only when the issuer read the
  * reusable workflow at the run's own commit (`job_workflow_sha` equals
  * `sha`), which the release binding ties to the approved commit. A reusable
- * workflow pinned to a 40-hex commit, or the gate's own file, is immutable
- * already (as Cloud).
+ * workflow pinned to a 40-hex commit serves when read at that very commit;
+ * the gate's own file runs at the run's commit already (as Cloud).
  */
 function reusableReadAtRunCommit(gate: GateMatchFields, claims: ClaimMatchFields): boolean {
-  if (gate.job_workflow_ref === null || gate.job_workflow_ref === gate.workflow_ref ||
-      /@[0-9a-f]{40}$/u.test(gate.job_workflow_ref)) return true;
-  return claims.job_workflow_sha !== null && claims.job_workflow_sha === claims.sha;
+  if (gate.job_workflow_ref === null || gate.job_workflow_ref === gate.workflow_ref) return true;
+  if (claims.job_workflow_sha === null) return false;
+  // A commit pin is judged by what the issuer read, never by the selector's
+  // shape: a branch may itself be named `…@<40 hex>` (as Cloud).
+  const selector = gate.job_workflow_ref.slice(gate.job_workflow_ref.lastIndexOf("@") + 1);
+  if (/^[0-9a-f]{40}$/u.test(selector) && claims.job_workflow_sha === selector) return true;
+  return claims.job_workflow_sha === claims.sha;
 }
 
 /**
