@@ -515,13 +515,15 @@ test("revoke-all racing a gate consume never leaves the gate-redeemed approval l
          VALUES ('apv_gateracing001', $1, $2, $3, 'gate_racing000001', 'https://token.actions.githubusercontent.com',
            'AgentWorkforce/relay', '1', '555', 1)`, [release.class, release.target, workspaceId]);
       await consumer.query("UPDATE delegation_approvals SET consumed_at = now() WHERE id = 'apv_gateracing001'");
+      const consumerPid = (await consumer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
       // Revoke-all starts now, while the consume still holds the row, and waits on it.
       revokeAll = database.transaction(tx => revokeAllGrants(tx, { workspaceId, ownerUserId: ownerId, actorUserId: ownerId,
         reason: "owner_revoke_all", authMethod: "session" }));
+      // Only a session the consumer itself blocks counts: revoke-all, waiting on the approval it holds.
       let blocked = false;
       for (let attempt = 0; attempt < 200 && !blocked; attempt += 1) {
         blocked = (await database.query<{ count: number }>(
-          "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
+          "SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [consumerPid],
         )).rows[0]!.count > 0;
         if (!blocked) await new Promise(resolve => setTimeout(resolve, 10));
       }

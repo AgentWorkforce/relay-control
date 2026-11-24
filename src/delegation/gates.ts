@@ -170,7 +170,8 @@ function reusableReadAtRunCommit(gate: GateMatchFields, claims: ClaimMatchFields
   // The selector is everything after the FIRST `@`: owner, repo and file
   // name hold none, so a branch such as `refs/heads/a@<40 hex>` stays a branch.
   const selector = gate.job_workflow_ref.slice(gate.job_workflow_ref.indexOf("@") + 1);
-  if (/^[0-9a-f]{40}$/u.test(selector) && claims.job_workflow_sha === selector) return true;
+  // A commit pin must be the commit read; any other selector, the run's commit.
+  if (/^[0-9a-f]{40}$/u.test(selector)) return claims.job_workflow_sha === selector;
   return claims.job_workflow_sha === claims.sha;
 }
 

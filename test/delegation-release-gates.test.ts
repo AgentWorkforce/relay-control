@@ -925,9 +925,12 @@ test("gates: workflow_ref is at the gate's ref; a reusable workflow may be pinne
   const dry = { dry_run: true };
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable, job_workflow_sha: sha })), approvalId,
     STABLE, dry)).body, { ok: true, consumed: false, dry_run: true });
-  // A pin is judged by what the issuer read: the selector names a commit the workflow was not read at.
-  assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable, job_workflow_sha: "f".repeat(40) })),
-    approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true });
+  // A pin is judged by what the issuer read: the selector names a commit the workflow was not read at,
+  // even when it was read at the run's own commit.
+  for (const job_workflow_sha of ["f".repeat(40), SHA]) {
+    assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: reusable, job_workflow_sha })),
+      approvalId, STABLE, dry)).body, { ok: false, reason: "gate_mismatch", dry_run: true }, job_workflow_sha);
+  }
   const otherSha = reusable.replace(sha, "f".repeat(40));
   assert.deepEqual((await env.redeem(mint(env.github, env.workflowClaims({ job_workflow_ref: otherSha })), approvalId, STABLE, dry)).body,
     { ok: false, reason: "gate_mismatch", dry_run: true });
