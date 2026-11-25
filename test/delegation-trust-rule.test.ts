@@ -622,19 +622,88 @@ test("round 3 (1): a system grant covers only the chain it was created on; a rec
   assert.equal(first.verdict, "delegate", JSON.stringify(first));
   const [old] = await env.grants(gpt.id);
   // Revoked and reconnected without any use in between: the chain proves out again, through a new OAuth grant.
+  const beforeReconnect = env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() - 60_000).toISOString() });
   await reconnect(env, gpt);
-  const after = await env.verdict(recipient, env.send(gpt, recipient));
-  assert.equal(after.reason, "revoked", JSON.stringify(after));
+  // A message sent before the reconnect: the old grant ends (a hand-over), and the new one never covers it.
+  const stale = await env.verdict(recipient, beforeReconnect);
+  assert.equal(stale.reason, "predates_grant", JSON.stringify(stale));
   const ended = (await env.grants(gpt.id)).find(row => row.id === old!.id)!;
-  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "binding_changed"]);
+  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "chain_changed"]);
   // The old coverage's approval never redeems again.
   assert.equal((await env.redeem(recipient, first.claims!.approval_id, MERGE[0])).body.reason, "revoked");
-  // The next message is covered by a fresh system grant, dated after the gap.
-  const fresh = await env.verdict(recipient, env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() + 3_000).toISOString() }));
+  // A message sent after the reconnect is covered by a fresh system grant dated
+  // from the new OAuth grant, not from when the change was noticed (Devin on cloud train #6652).
+  const fresh = await env.verdict(recipient, env.send(gpt, recipient, MERGE));
   assert.equal(fresh.verdict, "delegate", JSON.stringify(fresh));
   const renewed = (await env.grants(gpt.id)).find(row => row.status === "active")!;
   assert.notEqual(renewed.id, old!.id);
-  assert.ok(new Date(renewed.created_at).getTime() >= new Date(ended.revoked_at!).getTime());
+  assert.ok(new Date(renewed.created_at).getTime() <= new Date(ended.revoked_at!).getTime());
+});
+
+test("a reclaim noticed late: an approval sent after the new claim but attested later is covered, in the same call", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  await turnOn(env);
+  const worker = await env.spawn(bot.id, "worker-1");
+  assert.equal((await env.verdict(recipient, env.send(worker, recipient))).verdict, "delegate");
+  const [old] = await env.grants(worker.id);
+  // The owner releases and reclaims the worker's root; nothing the worker sends is attested until later.
+  assert.equal((await env.browser(`/delegates/claims/${bot.claimId}`, "DELETE")).status, 200);
+  const started = await env.browser("/delegates/claims", "POST");
+  assert.equal((await request(env.origin, `${env.base}/delegates/claims/complete`, {
+    method: "POST", body: { code: started.body.code, agent_id: bot.id, agent_token: bot.token } })).status, 200);
+  const sent = env.send(worker, recipient, MERGE);
+  await new Promise(resolve => setTimeout(resolve, 2_500));
+  const late = await env.verdict(recipient, sent);
+  assert.equal(late.verdict, "delegate", JSON.stringify(late));
+  const ended = (await env.grants(worker.id)).find(row => row.id === old!.id)!;
+  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "chain_changed"]);
+});
+
+// d5 B1 (Devin on #340): a connector root's pin has no time, so a hand-over to
+// another connector grant is not dated by its records: the cutoff stays at the retirement.
+test("a hand-over to another connector grant keeps the cutoff at the retirement", async (t) => {
+  const { env, recipient } = await ready(t);
+  await turnOn(env);
+  const gpt = await env.connector("chatgpt-assistant");
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient))).verdict, "delegate");
+  // Reconnected through an OAuth grant created a day ago (as a backfill re-pin of an older grant would look).
+  await reconnect(env, gpt, new Date(Date.now() - 86_400_000).toISOString());
+  const sent = env.send(gpt, recipient, MERGE);
+  await new Promise(resolve => setTimeout(resolve, 2_500));
+  assert.equal((await env.verdict(recipient, sent)).reason, "predates_grant");
+  // A message sent after the hand-over was noticed is covered.
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient, MERGE))).verdict, "delegate");
+});
+
+// d5 B2 (Devin on cloud#6654): the exclusion is of the agent, not the row the person saw.
+test("revoking a system grant the rule already replaced excludes the agent; a retired one is recorded as the exclusion", async (t) => {
+  const { env, recipient } = await ready(t);
+  await turnOn(env);
+  const gpt = await env.connector("chatgpt-assistant");
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient))).verdict, "delegate");
+  const [shown] = await env.grants(gpt.id);
+  await reconnect(env, gpt);
+  // The hand-over retires the shown grant and the rule covers the agent through a new one.
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient, MERGE))).verdict, "delegate");
+  const replacement = (await env.grants(gpt.id)).find(row => row.status === "active")!;
+  assert.notEqual(replacement.id, shown!.id);
+  assert.equal((await env.browser(`/delegates/${shown!.id}`, "DELETE")).status, 200);
+  const after = await env.grants(gpt.id);
+  assert.deepEqual([after.find(row => row.id === replacement.id)!.status, after.find(row => row.id === replacement.id)!.revoked_reason],
+    ["revoked", "owner_excluded"]);
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient, MERGE))).verdict, "none");
+  assert.equal((await env.grants(gpt.id)).filter(row => row.status === "active").length, 0);
+
+  // Nothing active any more: the retired grant itself is re-recorded as the exclusion.
+  const other = await env.connector("other-assistant");
+  assert.equal((await env.verdict(recipient, env.send(other, recipient))).verdict, "delegate");
+  const [retired] = await env.grants(other.id);
+  await env.database.query("UPDATE delegation_grants SET status = 'revoked', revoked_at = now(), revoked_reason = 'chain_changed' WHERE id = $1",
+    [retired!.id]);
+  assert.equal((await env.browser(`/delegates/${retired!.id}`, "DELETE")).status, 200);
+  assert.equal((await env.grants(other.id))[0]!.revoked_reason, "owner_excluded");
+  assert.equal((await env.verdict(recipient, env.send(other, recipient, MERGE))).verdict, "none");
+  assert.equal((await env.events("grant.revoked")).at(-1)!.data.already_ended, true);
 });
 
 test("round 3 (2): a grant that stands on a proof covers messages only from the proof's records on", async (t) => {
