@@ -1384,3 +1384,51 @@ test("gates: one redeem evaluates at most 10 candidate gates, oldest first", asy
   assert.deepEqual((await env.redeem(claims(), approvalId, STABLE, { dry_run: true })).body,
     { ok: true, consumed: false, dry_run: true });
 });
+
+test("gate redeem under the owner's trust rule: the rule is locked with the grant; a dry run writes nothing (C1)", async (t) => {
+  const env = await setup(t);
+  // The owner's own grant gives way: the assistant is covered by the rule through a system grant.
+  const [own] = (await env.database.query<{ id: string }>("SELECT id FROM delegation_grants WHERE status = 'active'")).rows;
+  assert.equal((await env.browser(`/delegates/${own!.id}`, "DELETE")).status, 200);
+  assert.equal((await env.browser("/delegates/trust-rule", "PUT", {})).status, 201);
+  const approvalId = await env.approval([STABLE]);
+  const system = (await env.database.query<{ id: string; trust_rule_id: string | null }>(
+    "SELECT id, trust_rule_id FROM delegation_grants WHERE status = 'active'")).rows[0]!;
+  assert.ok(system.trust_rule_id);
+  await env.gate();
+  const token = () => mint(env.github, env.workflowClaims());
+  const dry = await env.redeem(token(), approvalId, STABLE, { dry_run: true });
+  assert.deepEqual(dry.body, { ok: true, consumed: false, dry_run: true }, dry.raw);
+
+  // The chain breaks (a second binding for the assistant's id): a dry run is refused but revokes nothing.
+  const assistant = env.world.agents.get("assistant")!;
+  const shadow = randomUUID();
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+       agent_remote_id, address, token_ciphertext) VALUES ($1, $2, $3, $4, 'rw_primary', $5, 'shadow', $6, 'shadow@x', $7)`,
+    [shadow, env.workspaceId, env.orgId, env.ownerId, randomUUID(), assistant.id, encryptSecret(assistant.token, KEYRING.active)]);
+  const refused = await env.redeem(token(), approvalId, STABLE, { dry_run: true });
+  assert.deepEqual(refused.body, { ok: false, reason: "revoked", dry_run: true }, refused.raw);
+  const still = (await env.database.query<{ status: string }>("SELECT status FROM delegation_grants WHERE id = $1", [system.id])).rows[0]!;
+  assert.equal(still.status, "active");
+  // A real redeem revokes the system grant durably.
+  assert.equal((await env.redeem(token(), approvalId)).body.reason, "revoked");
+  const gone = (await env.database.query<{ status: string; revoked_reason: string }>(
+    "SELECT status, revoked_reason FROM delegation_grants WHERE id = $1", [system.id])).rows[0]!;
+  assert.deepEqual([gone.status, gone.revoked_reason], ["revoked", "binding_changed"]);
+});
+
+test("gate redeem under the owner's trust rule: a rule revoked after a dry run refuses the redeem; nothing is consumed", async (t) => {
+  const env = await setup(t);
+  const [own] = (await env.database.query<{ id: string }>("SELECT id FROM delegation_grants WHERE status = 'active'")).rows;
+  assert.equal((await env.browser(`/delegates/${own!.id}`, "DELETE")).status, 200);
+  assert.equal((await env.browser("/delegates/trust-rule", "PUT", {})).status, 201);
+  const approvalId = await env.approval([STABLE]);
+  await env.gate();
+  const token = () => mint(env.github, env.workflowClaims());
+  assert.equal((await env.redeem(token(), approvalId, STABLE, { dry_run: true })).body.ok, true);
+  // A rule revoked after the dry run: the fresh re-read refuses it, and the locked decision would too.
+  await env.database.query("UPDATE delegation_trust_rules SET revoked_at = now()");
+  assert.deepEqual((await env.redeem(token(), approvalId)).body, { ok: false, reason: "revoked" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+});

@@ -34,6 +34,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "delegation_policies",
   "delegation_quote_redactions",
   "delegation_target_owners",
+  "delegation_trust_rules",
   "desktop_attestation_keys",
   "desktop_consent_tokens",
   "desktop_feed_assets",

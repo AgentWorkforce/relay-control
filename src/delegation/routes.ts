@@ -44,6 +44,13 @@ import {
   grantFitsPolicy,
   grantView,
   listAuditPage,
+  liveTrustRule,
+  putTrustRule,
+  revokeTrustRule,
+  ruleGrants,
+  TrustRuleMembershipGone,
+  TrustRuleNotEnabled,
+  type TrustRuleRow,
   loadOrgPolicy,
   loadPolicy,
   loadTargetOwners,
@@ -69,7 +76,11 @@ import {
   type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
+  connectorRootProven, trustProver,
 } from "./service.js";
+import { backfillConnectorRoots } from "./trust-backfill.js";
+import { trustPathFingerprint } from "./trust.js";
+import { secureEqual } from "../crypto.js";
 
 /**
  * HTTP surface for owner-named trusted delegates (relay
@@ -126,6 +137,8 @@ export type DelegationRoutesInput = {
   rateLimit: (response: ServerResponse, key: string, rule: { limit: number; windowMs: number }) => void;
   clientKey: (request: IncomingMessage) => string;
   now?: () => Date;
+  /** SELFHOST_INTERNAL_TOKEN: the service bearer of the trust backfill (null: that route answers 404). */
+  internalServiceToken?: string | null;
 };
 
 type AuthMethod = "session" | "desktop_bearer";
@@ -187,6 +200,15 @@ const patchGrantBody = z.object({
   require_tier_o: classList.optional(),
 }).strict().refine(body => Object.keys(body).length > 0, "nothing to change");
 const revokeAllBody = z.object({ all: z.boolean().optional() }).strict();
+/** PUT /delegates/trust-rule: turn the owner's rule on, or set which classes still need an owner tap. */
+const trustRulePutBody = z.object({ require_tier_o: classList.optional() }).strict();
+/** POST /internal/v1/delegation/trust-backfill: a dry run unless `apply` is true; pages by grant id. */
+const trustBackfillBody = z.object({
+  apply: z.boolean().optional(),
+  limit: z.number().int().min(1).max(2000).optional(),
+  after: z.string().uuid().optional(),
+}).strict();
+export const TRUST_BACKFILL_PATH = "/internal/v1/delegation/trust-backfill";
 const mintBody = z.object({
   actions: mintActionsSchema,
   expires_at: rfc3339.optional(),
@@ -375,6 +397,7 @@ function policyRefusal(classes: readonly ActionClass[], policy: DelegationPolicy
 
 export function isDelegationPath(path: string): boolean {
   return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}` || ORG_POLICY_PATH.test(path)
+    || path === TRUST_BACKFILL_PATH
     || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates|\/withdraw)?)$/.test(path);
 }
 
@@ -550,6 +573,25 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const jwks = input.signer ? input.signer.jwks() : { keys: [] };
       response.setHeader("cache-control", jwks.keys.length ? "public, max-age=300" : "no-store");
       input.json(response, 200, jwks);
+      return true;
+    }
+    if (path === TRUST_BACKFILL_PATH) {
+      // Service-authenticated (SELFHOST_INTERNAL_TOKEN) and off without it: an
+      // operator's one-shot run, never a person's or an agent's.
+      const token = bearer(request);
+      if (!input.internalServiceToken) return fail("not_found", "Route not found", 404);
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      if (!token || !secureEqual(token, input.internalServiceToken)) return fail("unauthorized", "Unauthorized", 401);
+      const raw = await readJson(request);
+      const body = parse(trustBackfillBody, raw === undefined ? {} : raw, "Invalid request");
+      let report;
+      try {
+        report = await backfillConnectorRoots(input.database, { apply: body.apply === true, limit: body.limit, after: body.after });
+      } catch (error) {
+        logUnavailable("trust_backfill", error, {});
+        return UNAVAILABLE();
+      }
+      input.json(response, 200, report, true);
       return true;
     }
     const orgMatch = ORG_POLICY_PATH.exec(path);
@@ -796,6 +838,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (!binding || binding.userId !== principal.userId) {
         fail("not_delegate", "The agent must be bound to you; claim it first", 403);
       }
+      // A connected assistant (hosted participant) must prove out as the owner's connector root, as in Cloud.
+      if (binding!.source === "hosted" && !await connectorRootProven(trustProver(deps, workspace, false), principal.userId, binding!.agentId)) {
+        fail("not_delegate", "The agent must be bound to you; claim it first", 403);
+      }
       const requireTierO = uniqueClasses(body.require_tier_o);
       let row: GrantRow;
       try {
@@ -821,12 +867,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
             fail("not_delegate", "The agent must be bound to you; claim it first", 403);
           }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
-          const existing = await tx.query(
-            `SELECT 1 FROM delegation_grants
+          const existing = (await tx.query<GrantRow>(
+            `SELECT * FROM delegation_grants
               WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active'`,
             [workspace.id, principal.userId, binding!.agentId],
-          );
-          if (existing.rows.length) throw new GrantConflict();
+          )).rows[0];
+          // The owner's own grant wins over the trust rule (#owner-decisions
+          // 251241083284656128 answer 1): a rule-backed grant for the pair gives way.
+          if (existing?.trust_rule_id) {
+            await revokeGrants(tx, { workspaceId: workspace.id, grantIds: [existing.id], actorUserId: principal.userId,
+              reason: "superseded_by_grant", authMethod: caller.authMethod });
+          } else if (existing) throw new GrantConflict();
           const created = (await tx.query<GrantRow>(
             `INSERT INTO delegation_grants
                (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
@@ -986,6 +1037,68 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         });
         if (!deleted) fail("not_found", "Gate not found", 404);
         json(200, { gate_id: gateId, deleted: true });
+        return true;
+      }
+      return fail("method_not_allowed", "Method not allowed", 405);
+    }
+
+    if (sub === "trust-rule") {
+      // The owner's set-once trust rule (docs/owner-delegates.md, "Trust rule"):
+      // people only, like every route here. An admin may read or revoke another
+      // owner's rule with `?owner=<user id>`; a PUT is always the caller's own.
+      const requested = new URL(request.url ?? "/", "http://localhost").searchParams.get("owner");
+      let ownerUserId = principal.userId;
+      if (requested && requested.toLowerCase() !== principal.userId.toLowerCase()) {
+        if (method === "PUT") fail("invalid_request", "A trust rule is only ever turned on by its owner", 400);
+        if (!UUID.test(requested)) fail("invalid_request", "Invalid owner", 400);
+        if (!caller.admin) fail("forbidden", "Only org owners and admins can manage another owner's trust rule", 403);
+        ownerUserId = requested.toLowerCase();
+      }
+      if (method === "GET") {
+        const rule = await liveTrustRule(input.database, workspace.id, ownerUserId);
+        const at = now();
+        // Agents with a live grant of the owner's own: that grant wins over the rule for them.
+        const shadowed = rule ? (await input.database.query<GrantRow>(
+          `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND trust_rule_id IS NULL
+              AND status = 'active' AND expires_at > $3 ORDER BY created_at`,
+          [workspace.id, ownerUserId, at],
+        )).rows.map(grant => ({ grant_id: grant.id, delegate_agent_id: grant.delegate_agent_id,
+          expires_at: new Date(grant.expires_at).toISOString() })) : [];
+        // Each covered agent's chain is read now, writing nothing: `broken` when
+        // it no longer proves out on the records its grant was created on (its
+        // next use revokes it), `unknown` when it cannot be read right now.
+        const prove = trustProver(deps, workspace, true);
+        const covered = rule ? await Promise.all((await ruleGrants(input.database, workspace.id, rule.id)).map(async grant => {
+          if (!grant.trust_path) return coveredView(grant, "unknown");
+          const proof = await prove(grant.owner_user_id, grant.delegate_agent_id).catch(() => undefined);
+          return coveredView(grant, proof === undefined ? "unknown" :
+            proof && trustPathFingerprint(proof.path) === trustPathFingerprint(grant.trust_path) ? "proven" : "broken");
+        })) : [];
+        json(200, { rule: rule ? trustRuleView(rule) : null, covered, shadowed });
+        return true;
+      }
+      if (method === "PUT") {
+        const raw = await readJson(request);
+        const body = parse(trustRulePutBody, raw === undefined ? {} : raw, "Invalid trust rule");
+        try {
+          const { rule, created } = await putTrustRule(input.database, { workspaceId: workspace.id, ownerUserId,
+            requireTierO: uniqueClasses(body.require_tier_o), authMethod: caller.authMethod });
+          json(created ? 201 : 200, { rule: trustRuleView(rule) });
+        } catch (error) {
+          if (error instanceof TrustRuleNotEnabled) NOT_ENABLED();
+          if (error instanceof TrustRuleMembershipGone) fail("forbidden", "Forbidden", 403);
+          throw error;
+        }
+        return true;
+      }
+      if (method === "DELETE") {
+        // One-click revoke, allowed while delegation is off: revoking only removes authority.
+        const revoked = await revokeTrustRule(input.database, { workspaceId: workspace.id, ownerUserId,
+          actorUserId: principal.userId, authMethod: caller.authMethod,
+          reason: ownerUserId === principal.userId ? "owner_revoked" : "admin_revoked" });
+        if (!revoked) fail("not_found", "No trust rule is on", 404);
+        json(200, { revoked: revoked!.rule.id, revoked_grants: revoked!.revokedGrants.length,
+          revoked_grant_ids: revoked!.revokedGrants });
         return true;
       }
       return fail("method_not_allowed", "Method not allowed", 405);
@@ -1196,9 +1309,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const active = (await tx.query<GrantRow>(
           "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND status = 'active' FOR UPDATE", [workspace.id],
         )).rows;
-        const misfits = active.filter(grant =>
-          (next.allowed_classes && grant.scopes.some(scope => !next.allowed_classes!.includes(scope.class))) ||
-          time(grant.expires_at) - time(grant.created_at) > next.max_expiry_days * 86_400_000 + 60_000);
+        // grantFitsPolicy: a rule-backed grant (no scopes, exempt from the expiry cap by its rule link) always fits.
+        const misfits = active.filter(grant => !grantFitsPolicy(grant, next));
         return revokeGrants(tx, { workspaceId: workspace.id, grantIds: misfits.map(grant => grant.id),
           actorUserId: principal.userId, reason: "policy_changed", authMethod: caller.authMethod });
       });
@@ -1242,9 +1354,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const grant = await grantFor(workspace.id, sub);
         if (!grant || (grant.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Grant not found", 404);
         const own = grant!.owner_user_id === principal.userId;
+        // A person revoking one system grant excludes that agent from the rule:
+        // it is not covered again by the same rule.
         await input.database.transaction(tx => revokeGrants(tx, {
           workspaceId: workspace.id, grantIds: [grant!.id], actorUserId: principal.userId,
-          reason: own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod,
+          reason: grant!.trust_rule_id ? "owner_excluded" : own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod,
         }));
         json(200, grantView((await grantFor(workspace.id, grant!.id)) ?? grant!, now()));
         return true;
@@ -1262,6 +1376,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [sub, workspace.id],
         )).rows[0];
         if (!grant || grant.owner_user_id !== principal.userId) return fail("not_found", "Grant not found", 404);
+        // A system grant follows its trust rule; it is narrowed by revoking it (which excludes that agent from the rule).
+        if (grant.trust_rule_id) {
+          fail("trust_rule_grant", "This grant comes from your trust rule. Revoke it to exclude this agent, or create your own grant for it", 409);
+        }
         const at = now();
         if (grant.status !== "active" || time(grant.expires_at) <= at.getTime()) {
           fail("not_active", "Only an active grant can be changed", 409);
@@ -1401,6 +1519,21 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
 }
 
 class GrantConflict extends Error {}
+
+/** The owner's trust rule as the API shows it (as Cloud's ruleJson). */
+function trustRuleView(rule: TrustRuleRow) {
+  return { trust_rule_id: rule.id, owner_id: rule.owner_user_id, require_tier_o: rule.require_tier_o,
+    created_at: new Date(rule.created_at).toISOString(), updated_at: new Date(rule.updated_at).toISOString() };
+}
+
+/** An agent the rule covers now, with the root it was proven through, so revoking that connector or claim is easy to find. */
+function coveredView(grant: GrantRow, chain: "proven" | "broken" | "unknown") {
+  const root = grant.trust_path?.root;
+  return { grant_id: grant.id, chain, delegate_agent_id: grant.delegate_agent_id, created_at: new Date(grant.created_at).toISOString(),
+    root_kind: root?.kind ?? null, connector: root?.kind === "connector" ? root.connector : null,
+    root_agent_id: root?.agent_id ?? null, launched_by: grant.trust_path?.hops.at(-1)?.actor_id ?? null,
+    hops: grant.trust_path?.hops.length ?? 0 };
+}
 
 /**
  * PATCH may only narrow (Cloud's narrowingRefusal): every new pattern sits

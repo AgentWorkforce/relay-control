@@ -124,6 +124,58 @@ tags:
         ED25519_SHA_512, 4096-byte message cap), one key per profile,
         addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
+  /internal/v1/delegation/trust-backfill:
+    post:
+      operationId: delegationTrustBackfill
+      summary: Pin existing MCP OAuth connections to their agent ids for the trust rule (one-shot, operator)
+      security: [{ factoryInternalToken: [] }]
+      description: |
+        SELFHOST_INTERNAL_TOKEN only (404 when it is unset). A dry run unless
+        `{"apply": true}`. Pins an unpinned, live MCP OAuth grant to its agent id
+        only where stored rows prove it (exactly one hosted participant of the same
+        owner holds the consented name, no other binding, no retirement in flight);
+        creates no rule and no grant; idempotent; each pin is audited
+        `trust_root.backfilled` (actor system, reason backfill). Pages by grant id:
+        pass `next_cursor` as `after`. See docs/owner-delegates.md.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                apply: { type: boolean }
+                limit: { type: integer, minimum: 1, maximum: 2000 }
+                after: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The report (ids only, never tokens)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dry_run, scanned, provable, pinned, skipped, pins, next_cursor]
+                properties:
+                  dry_run: { type: boolean }
+                  scanned: { type: integer }
+                  provable: { type: integer }
+                  pinned: { type: integer }
+                  skipped: { type: object, additionalProperties: { type: integer } }
+                  pins:
+                    type: array
+                    items:
+                      type: object
+                      required: [workspace_id, owner_id, oauth_grant_id, agent_id]
+                      properties:
+                        workspace_id: { type: string }
+                        owner_id: { type: string }
+                        oauth_grant_id: { type: string }
+                        agent_id: { type: string }
+                  next_cursor: { type: [string, "null"] }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "404": { description: "`not_found`: SELFHOST_INTERNAL_TOKEN is not set" }
   /internal/v1/customer-support/reply-notice:
     post:
       operationId: customerSupportReplyNotice
@@ -3506,6 +3558,128 @@ paths:
                   revoked: { type: array, items: { type: string } }
         "400": { description: "`invalid_request`" }
         "403": { description: "`forbidden` (including `all` without admin role) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/trust-rule:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: owner
+        in: query
+        required: false
+        description: GET and DELETE only. An org owner or admin may act on another owner's rule by user id.
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only. The owner's set-once trust rule (null when off), the agents it
+        covers now (one system grant each, with the root it was proven through),
+        and the agents an unexpired owner-made grant shadows (that grant wins).
+        See docs/owner-delegates.md, "Trust rule".
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The rule and its coverage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rule, covered, shadowed]
+                properties:
+                  rule:
+                    oneOf:
+                      - $ref: "#/components/schemas/DelegationTrustRule"
+                      - type: "null"
+                  covered:
+                    type: array
+                    items:
+                      type: object
+                      required: [grant_id, chain, delegate_agent_id, created_at, root_kind, connector, root_agent_id, launched_by, hops]
+                      properties:
+                        grant_id: { type: string }
+                        chain:
+                          type: string
+                          enum: [proven, broken, unknown]
+                          description: The chain read now, writing nothing. `broken` when it no longer proves out on the records the grant was created on (its next use revokes it).
+                        delegate_agent_id: { type: string }
+                        created_at: { type: string, format: date-time }
+                        root_kind: { type: [string, "null"], enum: [claim, connector, null] }
+                        connector: { type: [string, "null"] }
+                        root_agent_id: { type: [string, "null"] }
+                        launched_by: { type: [string, "null"] }
+                        hops: { type: integer, minimum: 0 }
+                  shadowed:
+                    type: array
+                    items:
+                      type: object
+                      required: [grant_id, delegate_agent_id, expires_at]
+                      properties:
+                        grant_id: { type: string }
+                        delegate_agent_id: { type: string }
+                        expires_at: { type: string, format: date-time }
+        "400": { description: "`invalid_request` (a malformed `owner`)" }
+        "403": { description: "`forbidden` (another owner without admin role)" }
+    put:
+      operationId: putDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only, delegation on. Turns the caller's own trust rule on (201 the
+        first time, 200 after: idempotent), or sets which classes still need an
+        owner-minted (tier O) approval under it (default none; copied to every
+        system grant of the rule in the same transaction). The rule covers every
+        agent the caller connected (a completed claim, or a live MCP OAuth grant
+        pinned to the agent's id) and every agent those launch through Control,
+        for every class the workspace policy allows, with no expiry, until revoked.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+      responses:
+        "200":
+          description: The rule was already on
+          content:
+            application/json:
+              schema: { type: object, required: [rule], properties: { rule: { $ref: "#/components/schemas/DelegationTrustRule" } } }
+        "201":
+          description: The rule was turned on
+          content:
+            application/json:
+              schema: { type: object, required: [rule], properties: { rule: { $ref: "#/components/schemas/DelegationTrustRule" } } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled`, `forbidden` or `csrf_rejected`" }
+    delete:
+      operationId: revokeDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only one-click revoke, allowed while delegation is off: the rule,
+        every system grant it created, and their unredeemed and gate-spent
+        approvals, in one transaction. `revoked_grants` counts the grants this
+        call revoked.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, revoked_grants, revoked_grant_ids]
+                properties:
+                  revoked: { type: string }
+                  revoked_grants: { type: integer, minimum: 0 }
+                  revoked_grant_ids: { type: array, items: { type: string } }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: no trust rule is on" }
   /api/v1/workspaces/{workspaceId}/delegates/claims:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -10729,6 +10903,21 @@ components:
         revoked_at: { type: [string, "null"], format: date-time }
         revoked_reason: { type: [string, "null"] }
         status: { type: string, enum: [active, revoked, expired] }
+        trust_rule_id:
+          type: [string, "null"]
+          description: Set only on a system grant the owner's trust rule created (no scopes, no expiry; the live rule decides).
+        trust_path:
+          type: [object, "null"]
+          description: The ownership chain proven when the system grant was created (root, then each launch down to the delegate).
+    DelegationTrustRule:
+      type: object
+      required: [trust_rule_id, owner_id, require_tier_o, created_at, updated_at]
+      properties:
+        trust_rule_id: { type: string }
+        owner_id: { type: string }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     DelegationPolicy:
       type: object
       required: [delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match]

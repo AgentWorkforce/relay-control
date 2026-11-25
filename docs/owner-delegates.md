@@ -679,6 +679,90 @@ the event data, as in Cloud. An exception is logged as
 Migration `0089_delegation_release_gates.sql` adds `delegation_gates` and
 `delegation_gate_redemptions`.
 
+## Trust rule
+
+The owner's set-once trust rule, the self-hosted twin of Cloud's
+(cloud#6635). One live rule per owner per workspace
+(`delegation_trust_rules`) trusts every agent the owner connected, and every
+agent those launch through Control, for every class the workspace policy
+allows, with no expiry and no Tier O by default, until revoked.
+
+Routes (people only, as the other human routes; an org owner or admin may
+read or revoke another owner's rule with `?owner=<user id>`):
+
+| Route | Behavior |
+| --- | --- |
+| `GET /delegates/trust-rule` | `{rule \| null, covered, shadowed}`: the agents covered now (one system grant each, with `root_kind`, `connector`, `root_agent_id`, `launched_by`, `hops`) and the agents an unexpired owner-made grant shadows. |
+| `PUT /delegates/trust-rule` | Body `{require_tier_o?}`. Idempotent: 201 the first time, 200 after. 403 `not_enabled` while delegation is off. A Tier O change reaches every system grant of the rule in the same transaction. |
+| `DELETE /delegates/trust-rule` | One-click revoke of the rule, its system grants and their unredeemed and gate-spent approvals, in one transaction. Allowed while delegation is off. 404 when no rule is on. |
+
+Coverage is proven by stored ownership records, never by a name:
+
+- **Roots:** a completed, unreleased claim of the owner, or a live MCP OAuth
+  grant of the owner (unrevoked, with a live session) pinned to the agent's
+  immutable id (`mcp_oauth_grants.agent_remote_id`) and joined to the owner's
+  hosted participant for that id. The owner's internal launcher is never a
+  root. A connector root is proven no earlier than its OAuth grant.
+- **Hops:** a `relay_spawns` launch of the owner, in state `ready`, whose
+  launching actor is itself covered. relay-control records no owner-verified
+  ready audit like Cloud's; a launch reaches `ready` only after its
+  invocation's caller and node match the journaled actor and node.
+- Every node has exactly one Control binding; the walk is cycle-safe and at
+  most 8 deep. It is walked again at every attest, redeem, gate redeem and
+  gate dry run (once per attest or redeem call). A chain that no longer
+  proves out revokes the system grant durably (`binding_changed` or
+  `delegate_released`); a gate dry run refuses without revoking. The rule stays.
+
+The rule acts through system grants (`delegation_grants.trust_rule_id`,
+`trust_path`, `created_auth_method = 'system'`): attest creates one when the
+sender has no live owner-made grant and its chain proves out
+(`grant.created`, reason `trust_rule`). An unexpired owner-made grant wins; a
+lapsed one is expired first. Creating an owner-made grant supersedes the
+pair's system grant (`superseded_by_grant`). A person revoking one system
+grant records `owner_excluded`, and the same rule never covers that agent
+again. A system grant cannot be PATCHed (409 `trust_rule_grant`). A
+re-created system grant starts no earlier than the end of the rule's
+earlier coverage of the pair, so a message sent in the gap predates it.
+`revoke-all` revokes the scope's live rules first. With the rule live,
+prompt-delegates proves each root (never their workers) and creates its
+system grant before listing.
+
+Any relation between sender and recipient is allowed under the rule,
+including a bot approving its own requests (`TRUST_RELATION_MODE =
+"allow_all"` in `src/delegation/trust.ts`; `down_tree_only` allows only
+ancestor-to-descendant or outside the tree). A bot with its own owner-made
+grant may approve its own requests too. Trusted agents never register, own
+or edit release gates: those routes take a person's credential and an org
+owner or admin.
+
+A system grant covers only the chain it was created on (its fingerprint: the
+root's claim or OAuth grant id, the agent ids and the launch ids). A chain
+that now proves through other records (a claim released and reclaimed, a
+connector revoked and reconnected, a relaunch) revokes the grant
+(`binding_changed`) with its approvals, and the rule creates a fresh one
+dated no earlier than the end of any earlier grant of the pair (owner-made
+included). A grant that stands on a proof (rule-backed, or owner-made to a
+connected assistant) covers messages only from the proof's records on
+(`predates_grant` otherwise). `GET /delegates/trust-rule` reports each
+covered agent's `chain` as `proven`, `broken` or `unknown`, read without
+writing. Launched workers are never prompt delegates.
+
+Lock order, for every writer and decision: the workspace row (decisions take
+FOR KEY SHARE, so a workspace deletion queues behind them), memberships (the
+caller's and the grant owner's, sorted), policy, rule, grants by id, the
+delegate's chain rows (re-read under share locks, after the grant and before
+the approval), approvals. Revoke-all locks the scope's rules, then every grant
+of the scope by id, owner-made included, before any approval.
+
+`POST /internal/v1/delegation/trust-backfill` (SELFHOST_INTERNAL_TOKEN; 404
+without it) pins existing unpinned MCP OAuth grants to their agent ids where
+stored rows prove it (exactly one hosted participant of the same owner holds
+the consented name, no other binding, no retirement in flight, and a live
+session; grants without one are skipped and counted as `no_live_session`). It is a dry
+run unless `{"apply": true}`, idempotent, pages by grant id (`after`,
+`next_cursor`), creates no rule or grant, and audits each pin as
+`trust_root.backfilled` (actor system, reason backfill).
+
 ## Revocation
 
 Revocation happens in these cases:
@@ -814,6 +898,13 @@ records it (`relaycast_outcome`, `relaycast_status`):
 - `delegation_audit_events`
 
 All of them are workspace-scoped and cascade on workspace delete.
+
+`0098_delegation_trust_rules.sql` (additive) adds `delegation_trust_rules`,
+`delegation_grants.trust_rule_id` and `trust_path`, widens
+`delegation_grants_auth_method` to admit `system` for rule-backed rows only,
+and adds `delegation_grants_expiry_cap`: only a row with `trust_rule_id` may
+expire more than 2160 hours (90 days of 24 hours, counted in hours so a DST
+change never refuses a full-length grant) and 60 s after it was created.
 
 ## Not on relay-control yet
 
