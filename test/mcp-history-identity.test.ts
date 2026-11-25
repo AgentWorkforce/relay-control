@@ -263,14 +263,23 @@ test("summary reads use the per-user reader and never fall back after refusal or
   }
 });
 
-test("a disabled recorded-summary opt-in never retries without the parameter or on History", async t => {
-  const seen=fake(t,{readStatus:()=>501,errorReason:"param_includeShortSummary"}),cfg=config();
-  await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(
-    "/v1/sessions?includeShortSummary=recorded&limit=50"),/unsupported_by_backend/);
-  assert.equal(seen.reads.length,1);
-  assert.equal(seen.reads[0]!.url.searchParams.get("includeShortSummary"),"recorded");
-  assert.equal(seen.reads[0]!.url.searchParams.get("workspace"),"ws-a");
-  assert.equal(seen.history.length,0);assert.equal(seen.handoffs.length,0);
+test("a recorded-list refusal keeps the selector and the selected reader in either MCP mode", async t => {
+  for (const on of [true, false]) {
+    const cfg = config(on);
+    const seen = fake(t, {
+      readStatus: () => 501,
+      historyStatus: () => 501,
+      errorReason: "param_includeShortSummary",
+    });
+    const read = historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a");
+    await assert.rejects(read(RECORDED_LIST), /unsupported_by_backend/);
+    const selected = on ? seen.reads : seen.history;
+    assert.equal(selected.length, 1);
+    assert.deepEqual(selected[0]!.url.searchParams.getAll("includeShortSummary"), ["recorded"]);
+    assert.deepEqual(selected[0]!.url.searchParams.getAll("workspace"), ["ws-a"]);
+    assert.equal((on ? seen.history : seen.reads).length, 0);
+    assert.equal((on ? seen.handoffs : seen.issues).length, 0);
+  }
 });
 
 test("a read API cursor is never restarted on History", async (t) => {
@@ -598,6 +607,7 @@ test("staff, Desktop and OAuth grants read list and point summary through the sa
     assert.deepEqual(await read(POINT_SUMMARY), { from: "history" });
     assert.deepEqual(seen.history.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]),
       [["/v1/sessions", ["ws-a"]], ["/v1/sessions/s-1/summary", ["ws-a"]]], `${name} setting ${on}`);
+    assert.deepEqual(seen.history[0]!.url.searchParams.getAll("includeShortSummary"), ["recorded"]);
     assert.equal(seen.history[0]!.bearer, seen.history[1]!.bearer);
     assert.equal(seen.reads.length + seen.issues.length, 0, `${name} never takes the per-user hop`);
     assert.equal(seen.handoffs.length, 1);
