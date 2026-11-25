@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, randomBytes, randomUUID, sign, type KeyObject } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test, { type TestContext } from "node:test";
 import { parse as parseYaml } from "yaml";
@@ -99,8 +99,8 @@ async function setup(t: TestContext) {
   assert.equal(grant.status, 201, grant.raw);
 
   /** A delegate's tier D approval for `targets`, attested to the recipient so Control records it. */
-  async function approval(targets: string[]) {
-    const messageId = env.world.sendApprovalAs("assistant", "relay-coder", "ship it", {
+  async function approval(targets: string[], sender = "assistant") {
+    const messageId = env.world.sendApprovalAs(sender, "relay-coder", "ship it", {
       v: 1, owner_id: env.ownerId, actions: targets.map(target => ({ class: "release", target })),
     }).message.id;
     const attested = await request(env.origin, `${base}/messaging/delegation`, {
@@ -780,6 +780,68 @@ test("gate redeem: a gate deleted, an approval revoked or a grant narrowed durin
   };
   assert.deepEqual((await env.redeem(token("3"), second, BETA)).body, { ok: false, reason: "out_of_scope" });
   // Nothing was consumed by any of these.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
+  env.world.handle = handle;
+});
+
+// Cloud's twin (Devin on cloud train #6652, gates.ts:371): an owner-made grant
+// to a connected assistant stands on its connector. The proof is read before
+// the binding check and re-checked under the deciding locks, so a disconnect
+// committing during the redeem's checks is never skipped.
+test("gate redeem: a connector disconnected during the checks refuses a redeem under an owner-made grant, real or dry run", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  const sha = (value: string) => createHash("sha256").update(value).digest("hex");
+  // The owner's connected assistant: a live OAuth grant pinned to its id and the owner's hosted participant.
+  const gpt = env.world.addAgent("gpt-assistant", { source: "cloud-hosted-mcp", owner_hash: sha(env.ownerId),
+    cloud_workspace_id: env.workspaceId });
+  const clientId = `client-${randomUUID()}`;
+  const oauthId = randomUUID();
+  const family = randomUUID();
+  await env.database.query("INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ($1, 'ChatGPT', $2)",
+    [clientId, ["https://chatgpt.com/connector_platform_oauth_redirect"]]);
+  await env.database.query(
+    `INSERT INTO mcp_oauth_grants (id, client_id, client_name, user_id, organization_id, workspace_id, agent_name, agent_remote_id,
+       scopes, resource, token_family_id) VALUES ($1, $2, 'ChatGPT', $3, $4, $5, 'gpt-assistant', $6, ARRAY['relay:mcp'],
+       'https://control.test/mcp', $7)`, [oauthId, clientId, env.ownerId, env.orgId, env.workspaceId, gpt.id, family]);
+  await env.database.query(
+    `INSERT INTO mcp_oauth_sessions (id, grant_id, token_family_id, user_id, organization_id, workspace_id, scopes,
+       access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, ARRAY['relay:mcp'], $7, $8, now() + interval '1 hour', now() + interval '30 days', now(), now())`,
+    [randomUUID(), oauthId, family, env.ownerId, env.orgId, env.workspaceId, sha(randomUUID()), sha(randomUUID())]);
+  await env.database.query(
+    `INSERT INTO hosted_relay_participants (id, workspace_id, user_id, relaycast_workspace_id, agent_name, agent_remote_id, token_ciphertext)
+     VALUES ($1, $2, $3, 'rw_primary', 'gpt-assistant', $4, $5)`,
+    [randomUUID(), env.workspaceId, env.ownerId, gpt.id, encryptSecret(gpt.token, KEYRING.active)]);
+  const owned = await env.browser("/delegates", "POST", {
+    delegate_agent_id: gpt.id, scopes: [{ class: "release", targets: [`${REPO}:*:*:*:*`] }] });
+  assert.equal(owned.status, 201, owned.raw);
+
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/gpt-assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  const disconnect = async () => { await env.database.query("UPDATE mcp_oauth_grants SET revoked_at = now() WHERE id = $1", [oauthId]); };
+  const reconnect = () => env.database.query("UPDATE mcp_oauth_grants SET revoked_at = NULL WHERE id = $1", [oauthId]);
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId }));
+
+  // A dry run: the owner disconnects the connector while the delegate's binding is re-checked.
+  const first = await env.approval([STABLE], "gpt-assistant");
+  during = disconnect;
+  const dry = await env.redeem(token("11"), first, STABLE, { dry_run: true });
+  assert.equal(dry.body.ok, false, dry.raw);
+  // A real redeem, the same way (a fresh grant: the dry run wrote nothing durable, the real one revokes).
+  await reconnect();
+  during = disconnect;
+  const real = await env.redeem(token("12"), first);
+  assert.equal(real.body.ok, false, real.raw);
+  assert.ok(["revoked", "not_delegate"].includes(real.body.reason), real.raw);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
   env.world.handle = handle;
 });

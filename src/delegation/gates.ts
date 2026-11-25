@@ -2,6 +2,7 @@ import { drainBody } from "../drain-body.js";
 import type { SqlExecutor } from "../database.js";
 import { GITHUB_ACTIONS_OIDC_ISSUER, OidcKeysUnavailable, type WorkflowClaims, type WorkflowOidcVerifier } from "./oidc.js";
 import { logAuditWriteFailed, logRefused, logRepositoryMismatch, logUnavailable } from "./observe.js";
+import type { TrustProof } from "./trust.js";
 import { actionIsValid, canonicalAction, releaseTargetSha, type Action, type ActionClass, type Condition, type ReasonCode } from "./scope.js";
 import {
   actionConsumed,
@@ -328,12 +329,19 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     let ruleId: string | null = null;
     let chain: ReturnType<typeof chainUnderLock>;
     let grantOwnerUserId: string | null = null;
+    let reliedChain: TrustProof | null = null;
     if (approval.tier === "D") {
       const grant = approval.grant_id ? (await deps.database.query<GrantRow>(
         "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [approval.grant_id, workspace.id],
       )).rows[0] : undefined;
       if (!grant || grant.status === "revoked") return await refuse("revoked");
       if (grant.status === "expired" || time(grant.expires_at) <= now.getTime()) return await refuse("expired");
+      // The chain an owner-made grant to a connected assistant stands on is
+      // read BEFORE the binding check, and that same proof is what the
+      // deciding transaction re-checks under share locks (chainUnderLock). Read
+      // after it, a connector disconnected in between read as "no chain" and
+      // the lock-time check was skipped (Cloud's twin, Devin on cloud train #6652).
+      reliedChain = await reliedProof(trustProver(deps, workspace, false), grant);
       // A dry run writes nothing: a delegate found unbound is refused, not revoked.
       const unbound = await delegateStillBound(deps, workspace, grant, true, { durable: !dryRun });
       if (unbound) return await refuse(unbound);
@@ -345,7 +353,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       grantOwnerUserId = grant.owner_user_id;
       // The ownership chain the grant (rule-backed, or owner-made to a connected
       // assistant) stands on, re-read in the deciding transaction under share locks.
-      chain = chainUnderLock(workspace, grant, await reliedProof(trustProver(deps, workspace, false), grant));
+      chain = chainUnderLock(workspace, grant, reliedChain);
     } else {
       if (!await memberRole(deps.database, workspace.id, approval.owner_user_id)) return await refuse("revoked");
       if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return await refuse("out_of_scope");
@@ -389,7 +397,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     // The relay and OIDC calls above take time: the policy, approval, grant,
     // memberships and clock as they are now decide, not the ones read before.
     const fresh = await currentGateAuthority(deps, workspace, approval.id, action, standingGate.owner_user_id,
-      deps.now().getTime(), !dryRun);
+      deps.now().getTime(), !dryRun, reliedChain);
     if (fresh) return await refuse(fresh);
 
     if (dryRun) {
@@ -524,7 +532,7 @@ export async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: s
  * allowed. Null when all hold.
  */
 async function currentGateAuthority(deps: DelegationDeps, workspace: DelegationWorkspace, approvalId: string, action: Action,
-  gateOwnerId: string, atMs: number, durable: boolean): Promise<ReasonCode | null> {
+  gateOwnerId: string, atMs: number, durable: boolean, reliedChain: TrustProof | null = null): Promise<ReasonCode | null> {
   const executor = deps.database;
   const workspaceId = workspace.id;
   const policy = await loadPolicy(executor, workspaceId);
@@ -547,9 +555,13 @@ async function currentGateAuthority(deps: DelegationDeps, workspace: DelegationW
     // ownership chain still proves out, read now (never from a cached walk): a
     // dry run (which takes no lock) answers revoked the moment a hop drops,
     // and writes nothing.
-    if (grant.trust_rule_id) {
-      const rule = await getTrustRule(executor, workspaceId, grant.trust_rule_id);
-      if (!rule || rule.revoked_at) return "revoked";
+    // So does an owner-made grant that stood on a connector root (reliedChain):
+    // its connector is re-proved now, so a dry run refuses once it is disconnected.
+    if (grant.trust_rule_id || reliedChain) {
+      if (grant.trust_rule_id) {
+        const rule = await getTrustRule(executor, workspaceId, grant.trust_rule_id);
+        if (!rule || rule.revoked_at) return "revoked";
+      }
       const unbound = await delegateStillBound(deps, workspace, grant, true, { durable });
       if (unbound) return unbound;
     }
