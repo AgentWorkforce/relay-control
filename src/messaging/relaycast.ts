@@ -115,6 +115,9 @@ export type RelaySpawnTarget = {
   raw: Record<string, unknown>;
 };
 
+export const RELAY_APPROVAL_PROFILES = ["interactive", "requester", "full_access"] as const;
+export type RelayApprovalProfile = typeof RELAY_APPROVAL_PROFILES[number];
+
 /** A native spawn or release action invocation. */
 export type RelaySpawnInvocation = {
   id: string;
@@ -977,7 +980,7 @@ export function createRelaycastClient(input: {
      * requester (sent beside `input`, not inside it) is the verified desktop chat behind the
      * launch: Relaycast echoes it next to the caller and the node treats its DMs as native input.
      */
-    async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string },
+    async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string; approval_profile?: RelayApprovalProfile },
       idempotencyKey: string, requester?: { agentId: string; name: string }): Promise<RelaySpawnInvocation> {
       const data = await labeled("spawn_agent", () => call("POST", "/v1/actions/spawn/invoke", token,
         { input: { ...input, verify_ready: true },

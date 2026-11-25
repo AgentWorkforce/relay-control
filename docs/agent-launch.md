@@ -62,7 +62,8 @@ and memory) ranks above everything but permission; see [Free memory](#free-memor
    name of exactly one live node; see [Target node input](#target-node-input)),
    `task` (at most
    8,192 UTF-8 bytes), optional `worker_cwd` (literal absolute path) and a
-   stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
+   stable `idempotency_key`. Optional `approval_profile` accepts `interactive`,
+   `requester`, or `full_access`; omit it to preserve the node default. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
    `spawn_target_unavailable`, `spawn_harness_unavailable`,
    `spawn_capacity_exceeded`, `spawn_memory_low` (retryable; under the
@@ -249,3 +250,26 @@ Add `launch` to `SELFHOST_FEATURES` (chart: `selectedFeatures`). The install's
 Relaycast must serve the native node and action API (relaycast-self-host
 12.7.0 or later does). Desktops enroll their spawn node against that Relaycast
 when their person signs in to this site.
+
+### Approval profiles
+
+Explicit profiles require a node release containing
+[relay#2226](https://github.com/AgentWorkforce/relay/pull/2226). Update the selected
+nodes before relying on this field. Omitted profiles send no new field, preserve
+the existing node default and keep pre-profile idempotency hashes unchanged.
+Explicit profile changes under an existing key are refused as a different launch.
+
+`interactive` keeps prompts with the machine owner. `requester` also permits the
+authenticated spawning agent to answer over Relay, subject to the node's
+requester/native-input controls. `full_access` disables prompts only when the
+machine owner enabled full access for that harness. The node enforces approval
+authorization and competing answers; the control plane does not grant it.
+
+The reservation audit and spawn/status receipts include `approval_profile`, or
+`node_default` for omitted profiles and older rows. This records the requested
+policy rather than proving what a node applied. A profile refusal from an older
+or owner-restricted node is terminal for that receipt (`spawn_failed`,
+`retryable: false`), with any allowed alternatives. Retain the original receipt
+for investigation; only a new intentional launch uses a new key.
+
+Hosted counterpart: [cloud#6421](https://github.com/AgentWorkforce/cloud/pull/6421).

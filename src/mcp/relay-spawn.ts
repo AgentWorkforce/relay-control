@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { SqlExecutor } from "../database.js";
 import {
-  RELAY_HARNESS_ID_PATTERN, RELAY_NODE_PAGE_LIMIT, RelaycastCallError, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
+  RELAY_HARNESS_ID_PATTERN, RELAY_APPROVAL_PROFILES, RELAY_NODE_PAGE_LIMIT, RelaycastCallError, type RelayApprovalProfile, type RelaycastClient, type RelaySpawnInvocation, type RelaySpawnTarget,
 } from "../messaging/relaycast.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import type { McpContext } from "./context.js";
@@ -90,6 +90,7 @@ export const spawnInput = z.object({
   worker_cwd: z.string().max(1024).refine(value => /^(\/|[A-Za-z]:[\\/])/.test(value) && !/[\x00-\x1f\x7f$`]/.test(value)
     && !value.split(/[\\/]/).includes(".."), "Use a literal absolute directory on the selected machine.").optional()
     .describe("worker_cwd (strongly recommended): absolute working directory for the agent on the target machine. If omitted, the node applies the machine default."),
+  approval_profile: z.enum(RELAY_APPROVAL_PROFILES).optional().describe("Optional prompt policy. Omit to preserve the node default. requester lets the authenticated spawning agent and machine owner answer over Relay; interactive keeps prompts owner-only; full_access disables prompts only when the machine owner enabled it for this harness."),
   idempotency_key: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/).optional()
     .describe("Use a stable key for this launch. Reuse it after a lost response; a new request without a key may describe another launch."),
 }).strict();
@@ -101,7 +102,7 @@ type SpawnInput = z.infer<typeof spawnInput>;
 export type SpawnState = "reserved" | "accepted" | "unknown" | "ready" | "failed" | "releasing" | "released";
 export type SpawnOwner = { workspaceId: string; userId: string; authorityHash: string; relaycastWorkspaceId: string; actorId: string };
 export type SpawnFailure = { code: string; message: string; node: string; harness: string; retryable: boolean; observed_at: string };
-export type SpawnAudit = { event: string; at: string; failure?: SpawnFailure };
+export type SpawnAudit = { event: string; at: string; failure?: SpawnFailure; approval_profile?: RelayApprovalProfile | "node_default" };
 export type SpawnRow = SpawnOwner & {
   id: string; idempotencyHash: string; requestHash: string; agentName: string; cli: string; nodeId: string; state: SpawnState;
   invocationId: string | null; workerId: string | null; workerAddress: string | null; releaseInvocationId: string | null;
@@ -310,6 +311,7 @@ function releaseDispatched(row: SpawnRow): boolean {
 function result(row: SpawnRow) {
   const recorded = [...row.audit].reverse().find(entry => entry.failure)?.failure ?? failure(null, row.nodeId, row.cli);
   return {
+    approval_profile: row.audit.find(entry => entry.event === "reserved")?.approval_profile ?? "node_default",
     spawn_id: row.id, name: row.agentName, cli: row.cli, target_node: row.nodeId, status: row.state,
     ready: row.state === "ready", address: row.state === "ready" ? row.workerAddress : null,
     ...(row.taskUnconfirmed ? { warning: "spawn_task_unconfirmed" } : {}),
@@ -450,7 +452,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       return run(async (actor, owned) => {
         const key = input.idempotency_key ?? (sessionId ? ownerHash(JSON.stringify([sessionId, requestId])) : randomUUID());
         const launch = { name: input.name, cli: input.cli, task: input.task, target_node: input.target_node,
-          ...(input.worker_cwd ? { worker_cwd: input.worker_cwd } : {}) };
+          ...(input.worker_cwd ? { worker_cwd: input.worker_cwd } : {}),
+          ...(input.approval_profile ? { approval_profile: input.approval_profile } : {}) };
         const idempotencyHash = ownerHash(JSON.stringify(["selfhost-spawn:v1", owned, key]));
         const requestHash = ownerHash(JSON.stringify(launch));
         const previous = await deps.store.findKey(owned, idempotencyHash, ownership);
@@ -607,7 +610,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const reserved = await deps.store.reserve({ ...owned, id: randomUUID(), idempotencyHash, requestHash,
           agentName: input.name, cli: input.cli, nodeId: target.id, state: "reserved", invocationId: null, workerId: null,
           workerAddress: null, releaseInvocationId: null, taskUnconfirmed: false, revision: 0,
-          audit: [{ event: "reserved", at: now }] });
+          audit: [{ event: "reserved", at: now, approval_profile: input.approval_profile ?? "node_default" }] });
         if (!reserved.created) return result(reserved.row);
         let row = reserved.row;
         // Minted before the launch is sent and kept sealed; the invocation below never carries it.
@@ -764,7 +767,7 @@ export function registerRelaySpawnTools(server: McpServer, context: McpContext, 
     inputSchema: targetsInput.shape, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(service => service.targets(input)));
   server.registerTool("spawn_relay_agent", {
-    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or a name that only one node has, live) with a harness that target advertises. Among nodes sharing a name case-insensitively, the exact (case-sensitive) stored name wins when that node is live; otherwise the name is refused, and a value matching nothing is refused with the valid ids and names. The receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
+    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or a name that only one node has, live) with a harness that target advertises. Among nodes sharing a name case-insensitively, the exact (case-sensitive) stored name wins when that node is live; otherwise the name is refused, and a value matching nothing is refused with the valid ids and names. The receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. approval_profile is optional: omit it to preserve the node default; requester lets the authenticated spawning agent and machine owner answer prompts over Relay, interactive keeps them owner-only, and full_access requires the machine owner to enable it for this harness. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
     inputSchema: spawnInput.shape, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   }, (input, extra) => run(service => service.spawn(input, extra.requestId)));
   server.registerTool("get_relay_spawn_status", {
