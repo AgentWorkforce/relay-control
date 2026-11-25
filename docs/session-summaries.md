@@ -107,3 +107,11 @@ Calls are recorded in `shared_session_read_audit`, including filters and
 returned session/owner IDs, never summary text or the raw person name/email
 lookup. No migration or new feature
 flag is required for these tools.
+
+## Dashboard workspace selection
+
+[Cloud #6649](https://github.com/AgentWorkforce/cloud/pull/6649) adds an exact-workspace selector to Cloud's dashboard recency loader. Control serves a dashboard list at `GET /cloud/api/v1/workspaces/{workspaceId}/sessions` in `src/sessions/routes.ts`. Its query contract excludes `includeShortSummary`. The self-host web client can request recorded summaries directly from its configured reader. Neither path implements Cloud's dashboard loader or reads `SESSIONS_READ_96BULLS_DASHBOARD_RECORDED_WORKSPACE`.
+
+Control MCP continues to request recorded lists and point summaries through its existing workspace-scoped readers. `SESSION_READ_API_MCP_READS` controls the per-user hop for eligible callers. Grant-backed reads retain the workspace reader. The dashboard selector does not change the reader origin, caller identity, workspace binding or cursor format for either MCP path.
+
+To roll back the Cloud dashboard selection, remove the selector and restart dashboard pagination. Cloud's selected `b96d1:` continuations expire with HTTP 410. Control needs no configuration change or cursor reset for this rollback. Reader support for recorded fields is a separate deployment setting.

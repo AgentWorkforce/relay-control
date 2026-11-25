@@ -27,6 +27,20 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("Cloud's dashboard workspace selector leaves both Control MCP reader modes unchanged", () => {
+  for (const mode of ["true", "false"]) {
+    const env = { ...completeEnv, SESSION_READ_API_MCP_READS: mode };
+    const baseline = loadConfig(env);
+    const selected = loadConfig({
+      ...env,
+      SESSIONS_READ_96BULLS_DASHBOARD_RECORDED_WORKSPACE: "11111111-2222-4333-8444-555555555555",
+    });
+    assert.equal(selected.sessionReadMcpReads, mode === "true");
+    assert.deepEqual(selected.sessionReadApi, baseline.sessionReadApi);
+    assert.equal(selected.relayhistoryUrl, baseline.relayhistoryUrl);
+  }
+});
+
 test("customer support uses an optional complete dedicated service connection, never a customer allowlist", () => {
   assert.equal(loadConfig(completeEnv).customerSupport, null);
   const support = { SELFHOST_CUSTOMER_SUPPORT_URL: "https://support.example.test/", SELFHOST_CUSTOMER_SUPPORT_TOKEN: "s".repeat(32) };

@@ -547,6 +547,17 @@ test("per-session events and turns with a missing or different attestation give 
   }
 });
 
+test("the Control dashboard list rejects the direct reader's recorded-list parameter before forwarding", async t => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const before = env.history.requests.length;
+  const response = await call(env.origin,
+    `/cloud/api/v1/workspaces/${env.alpha}/sessions?includeShortSummary=recorded`, { token });
+  assert.equal(response.status, 400);
+  assert.equal(response.body.message, "Invalid session parameter: includeShortSummary");
+  assert.equal(env.history.requests.length, before);
+});
+
 test("members: names for the dashboard without a History read", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
