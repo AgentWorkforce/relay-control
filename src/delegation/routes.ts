@@ -71,6 +71,7 @@ import {
   resolveBinding,
   revokeAllGrants,
   revokeGrants,
+  excludeFromRule,
   time,
   type DelegationDeps,
   type DelegationPolicy,
@@ -1355,11 +1356,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         if (!grant || (grant.owner_user_id !== principal.userId && !caller.admin)) fail("not_found", "Grant not found", 404);
         const own = grant!.owner_user_id === principal.userId;
         // A person revoking one system grant excludes that agent from the rule:
-        // it is not covered again by the same rule.
-        await input.database.transaction(tx => revokeGrants(tx, {
-          workspaceId: workspace.id, grantIds: [grant!.id], actorUserId: principal.userId,
-          reason: grant!.trust_rule_id ? "owner_excluded" : own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod,
-        }));
+        // it is not covered again by the same rule (excludeFromRule, of the agent, not the row).
+        await input.database.transaction(async tx => {
+          if (grant!.trust_rule_id) {
+            await excludeFromRule(tx, { workspaceId: workspace.id, grant: grant!, actorUserId: principal.userId,
+              authMethod: caller.authMethod });
+            return;
+          }
+          await revokeGrants(tx, { workspaceId: workspace.id, grantIds: [grant!.id], actorUserId: principal.userId,
+            reason: own ? "owner_revoked" : "admin_revoked", authMethod: caller.authMethod });
+        });
         json(200, grantView((await grantFor(workspace.id, grant!.id)) ?? grant!, now()));
         return true;
       }

@@ -166,6 +166,59 @@ export const TRUST_RULE_GRANT_EXPIRY = new Date("9999-12-31T00:00:00.000Z");
  * gap in coverage, so it does not floor the replacement grant (Cloud's CHAIN_CHANGED).
  */
 export const CHAIN_CHANGED = "chain_changed";
+/** The revoke reason of a system grant a person revoked: the rule does not cover that agent again. */
+export const OWNER_EXCLUDED = "owner_excluded";
+
+/**
+ * Whether `next`'s own records date its start reliably enough that a hand-over
+ * from `previous` leaves no gap before its provenAt (Cloud's handOverDated). A
+ * claim root dates from its completion and a launch from its spawn. A
+ * connector root does not: a grant becomes a root only once pinned to the
+ * agent, and the pin has no time, so an older grant pinned later would date
+ * the new coverage from before the gap. Only the same pinned connector root,
+ * with changed launches, counts.
+ */
+export function handOverDated(previous: TrustPath | null, next: TrustPath): boolean {
+  if (next.root.kind === "claim") return true;
+  return previous?.root.kind === "connector" && next.root.kind === "connector" &&
+    previous.root.oauth_grant_id === next.root.oauth_grant_id;
+}
+
+/**
+ * A person revoking one system grant excludes that agent from the rule, not
+ * just that row (Cloud's excludeFromRule): the grant they saw may already have
+ * been replaced by a hand-over, so every active system grant of the rule for
+ * that agent is revoked as owner_excluded, and when none is left the retired
+ * one is re-recorded as the exclusion. Rule (share), then the delegate's lock
+ * and the pair's grants by id: materializeRuleGrant's order.
+ */
+export async function excludeFromRule(tx: SqlExecutor, input: { workspaceId: string; grant: GrantRow; actorUserId: string;
+  authMethod: string | null }): Promise<boolean> {
+  const { grant } = input;
+  await tx.query("SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE",
+    [input.workspaceId, grant.trust_rule_id]);
+  await lockDelegateAgent(tx, input.workspaceId, grant.delegate_agent_id);
+  const active = (await tx.query<{ id: string }>(
+    `SELECT id FROM delegation_grants
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4 AND status = 'active'
+      ORDER BY id FOR UPDATE`,
+    [input.workspaceId, grant.owner_user_id, grant.delegate_agent_id, grant.trust_rule_id],
+  )).rows.map(row => row.id);
+  const revoked = await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds: active, actorUserId: input.actorUserId,
+    reason: OWNER_EXCLUDED, authMethod: input.authMethod });
+  if (revoked.length) return true;
+  // Nothing active: the grant shown had already ended. Its end is re-recorded as the person's exclusion.
+  const marked = (await tx.query(
+    `UPDATE delegation_grants SET revoked_reason = $3, revoked_by = $4, updated_at = now()
+      WHERE workspace_id = $1 AND id = $2 AND status = 'revoked' AND revoked_reason IS DISTINCT FROM $3 RETURNING id`,
+    [input.workspaceId, grant.id, OWNER_EXCLUDED, input.actorUserId],
+  )).rows.length > 0;
+  if (!marked) return false;
+  await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "grant.revoked", actorUserId: input.actorUserId,
+    authMethod: input.authMethod, ownerUserId: grant.owner_user_id, grantId: grant.id, reason: OWNER_EXCLUDED,
+    data: { delegate_agent_id: grant.delegate_agent_id, already_ended: true } });
+  return true;
+}
 
 export type ApprovalRow = {
   id: string;
@@ -2317,26 +2370,26 @@ export async function materializeRuleGrant(database: Database, input: { workspac
     const excluded = (await tx.query(
       `SELECT 1 FROM delegation_grants
         WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
-          AND status = 'revoked' AND revoked_reason = 'owner_excluded' LIMIT 1`,
-      [...pair, rule.id],
+          AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
+      [...pair, rule.id, OWNER_EXCLUDED],
     )).rows.length > 0;
     if (excluded) return null;
     // Any earlier grant of the pair counts, owner-made ones too: while the
     // bot's own grant governed it (until it was revoked or lapsed), the rule did
     // not, so a message refused under that grant's scope stays refused. A
     // system grant retired for a changed chain (CHAIN_CHANGED) is the one
-    // exception: the new chain's own records (provenAt) date the hand-over.
-    const history = (await tx.query<{ ended: Date | string | null }>(
-      `SELECT max(CASE WHEN status = 'revoked' THEN revoked_at ELSE expires_at END) AS ended
+    // exception, when the new chain's own records date the hand-over
+    // (handOverDated, as Cloud).
+    const ended = (await tx.query<{ status: string; revoked_at: Date | string | null; expires_at: Date | string;
+      trust_rule_id: string | null; revoked_reason: string | null; trust_path: TrustPath | null }>(
+      `SELECT status, revoked_at, expires_at, trust_rule_id, revoked_reason, trust_path
          FROM delegation_grants
-        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status <> 'active'
-          AND NOT (trust_rule_id IS NOT NULL AND status = 'revoked' AND revoked_reason IS NOT DISTINCT FROM $4)`,
-      [...pair, CHAIN_CHANGED],
-    )).rows[0];
-    // Created no earlier than the rule, every record of the chain, and the
-    // last time this rule's coverage of the agent ended: a message the agent
-    // sent while it was uncovered (a broken chain, a revoked connector)
-    // predates this grant even when the chain proves out again from older records.
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status <> 'active'`,
+      pair,
+    )).rows.filter(row => !(row.trust_rule_id && row.status === "revoked" && row.revoked_reason === CHAIN_CHANGED &&
+      handOverDated(row.trust_path, input.trustPath)));
+    const history = { ended: ended.length ? new Date(Math.max(...ended.map(row =>
+      time(row.status === "revoked" ? row.revoked_at ?? row.expires_at : row.expires_at)))) : null };
     const createdAt = new Date(Math.max(time(rule.created_at), input.provenAt.getTime(),
       history?.ended ? time(history.ended) : 0));
     const row = (await tx.query<GrantRow>(
