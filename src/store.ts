@@ -6,6 +6,7 @@ import { capturePolicyFromRow, type CapturePolicy } from "./capture-policy.js";
 import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
+import { closeOpenTeamAssignmentInTx } from "./teams/store.js";
 import { lockRelaycastWorkspace } from "./relaycast-workspace-lock.js";
 import { retireWorkspaceIdentitiesInTx } from "./replicas/service.js";
 import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
@@ -762,15 +763,24 @@ export class ControlPlaneStore {
     }));
   }
 
-  async listMemberships(organizationId: string): Promise<Array<Record<string, unknown>>> {
+  /** `teams` (the teams feature is on): each item also carries its current `teamId` or null. */
+  async listMemberships(organizationId: string, options: { teams?: boolean } = {}): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query<{
       user_id: string;
       email: string;
       name: string;
       role: Principal["role"];
       created_at: Date | string;
+      team_id?: string | null;
     }>(
-      `SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
+      options.teams
+        ? `SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at, a.team_id
+             FROM organization_memberships m
+             JOIN users u ON u.id = m.user_id
+             LEFT JOIN organization_team_assignments a
+               ON a.organization_id = m.organization_id AND a.user_id = m.user_id AND a.ends_at IS NULL
+            WHERE m.organization_id = $1 ORDER BY u.email`
+        : `SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
          FROM organization_memberships m
          JOIN users u ON u.id = m.user_id
         WHERE m.organization_id = $1 ORDER BY u.email`,
@@ -782,6 +792,7 @@ export class ControlPlaneStore {
       name: row.name,
       role: row.role,
       joinedAt: new Date(row.created_at).toISOString(),
+      ...(options.teams ? { teamId: row.team_id ?? null } : {}),
     }));
   }
 
@@ -878,6 +889,8 @@ export class ControlPlaneStore {
       if (deleted || !(await tx.query("SELECT user_id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
         [organizationId,userId])).rows.length) {
         await retireCapyBindingsInTx(tx,{organizationId,userId},"capy_member_removed");
+        // Teams: the open window closes with the membership, feature on or off.
+        await closeOpenTeamAssignmentInTx(tx, { organizationId, userId });
         await beforeCommit?.(tx, { organizationId, userId });
       }
       return deleted;
@@ -1240,6 +1253,19 @@ export class ControlPlaneStore {
           AND relaycast_api_key_ciphertext IS NULL`,
       [workspaceId, claimId],
     );
+  }
+
+  /**
+   * The workspace's existing Relaycast binding, or null. Unlike
+   * relaycastBinding, it never provisions one, so routes that run before any
+   * caller is proven (delegation claims/complete, withdraw, gate redeem)
+   * cannot cause a persistent change.
+   */
+  async existingRelaycastBinding(workspaceId: string): Promise<{
+    relaycastWorkspaceId: string;
+    relaycastApiKey: string;
+  } | null> {
+    return this.relaycastBindingRow(workspaceId);
   }
 
   private async relaycastBindingRow(workspaceId: string): Promise<{

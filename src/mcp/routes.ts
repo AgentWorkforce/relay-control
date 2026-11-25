@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { correlateMcpResponse, instrumentMcpTransport, withMcpDiagnosticContext } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { AgentRules } from "../agent-rules/service.js";
 import { connectorKind, isGrokRoutineKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -22,8 +23,9 @@ import { relayLaunchCheck } from "./relay-launch-check.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_IDENTITY_TOOLS, MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
-import { historyReader, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
-import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
+import { historyReadable, historyReader, sessionAccessDeps, type McpContext, type McpMember, type McpWorkspace } from "./context.js";
+import { sessionAccessConfigured } from "../sessions/access.js";
+import { ClaudeAttestationError, claudeAttestationFor, postgresClaudeHandoffStore, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
 import { nativeContextRefusalReason, responseCorrelationId, type NativeContextStage } from "./native-context-refusal.js";
@@ -174,6 +176,8 @@ export function createMcpHandler(input: {
   oauthSessions?: McpOAuthSessions;
   grokRoutines?: GrokRoutines;
   cursorCloud?: CursorCloudDeps;
+  /** get_agent_rules source; every context but a staff read grant gets it. */
+  agentRules?: AgentRules;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
   /** Observe handled unexpected failures without changing their MCP response. */
@@ -184,6 +188,7 @@ export function createMcpHandler(input: {
   const desktopCredentials = new DesktopMcpCredentials(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
+  const claudeHandoffs = postgresClaudeHandoffStore(store.database);
   // Calls made under the hosted-MCP owner lock share one time budget; all others are unchanged.
   const relayFetch = ownerLockFetch(input.fetchImpl);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: relayFetch });
@@ -439,13 +444,18 @@ export function createMcpHandler(input: {
       // that does not verify refuses the call (no unattested fallback).
       // Copilot credentials carry a Copilot proof; every other call may carry
       // a Claude Code or Cursor proof, which counts only on desktop-managed calls (as Cloud).
-      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
+      // A Claude Code proof may instead have been handed off ahead of the call
+      // (keyed by _meta claudecode/toolUseId), so the hook never rewrites input.
+      // The token family binds a handed-off proof to the Desktop session that
+      // deposited it (a provider credential shares its parent's family).
+      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider,
+        tokenFamilyId: principal.tokenFamilyId };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
       const callHeaders = oauth || staffGrant || agentToken ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
-        : await claudeAttestationFor(body, callHeaders, auth, attestations);
+        : await claudeAttestationFor(body, callHeaders, auth, attestations, undefined, { store: claudeHandoffs });
       stage = "desktop_context";
       desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {
@@ -473,6 +483,17 @@ export function createMcpHandler(input: {
     }
 
     const site = input.siteBaseUrl(request);
+    const members = async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
+      userId: String(row.userId),
+      email: String(row.email),
+      name: typeof row.name === "string" && row.name.trim() ? row.name : null,
+    }));
+    // Session access management: a person's own exchanged session only (never
+    // OAuth, a Desktop provider credential, a staff grant or an agent
+    // identity), on a relaygate read path.
+    const sessionAccess = !oauth && personOnly && provider === undefined && sessionAccessConfigured(config) &&
+      token.startsWith("sh_at_") && principal.scopes.includes("rth:read") && !principal.pendingHandoff
+      ? sessionAccessDeps(config, principal, workspace, token, members) : undefined;
     const context: McpContext = {
       principal,
       workspace,
@@ -485,12 +506,12 @@ export function createMcpHandler(input: {
       ...(oauth ? { oauth } : {}),
       ...(agentIdentity ? { agentIdentity } : {}),
       readHistory: historyReader(config, principal, workspace, token),
+      // Per-session access mode: roster session bindings follow the caller's
+      // own read access (list_team_activity).
+      ...(config.sessionReadApi?.mintReaderKind
+        ? { sessionBindings: historyReadable(principal, token) ? "probe" as const : "none" as const } : {}),
       agentTokens: config.sessionSearchAgentTokens,
-      members: async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
-        userId: String(row.userId),
-        email: String(row.email),
-        name: typeof row.name === "string" && row.name.trim() ? row.name : null,
-      })),
+      members,
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
@@ -515,9 +536,11 @@ export function createMcpHandler(input: {
       ...(!oauth && personOnly && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
       ...(input.launch && personOnly ? { launch: true } : {}),
+      ...(sessionAccess ? { sessionAccess } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
+    if (input.agentRules && !staffGrant) context.agentRules = input.agentRules;
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];

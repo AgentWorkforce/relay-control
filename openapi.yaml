@@ -78,6 +78,16 @@ tags:
     description: |
       In-cluster service routes under /internal/v1. Never served through the
       /cloud alias; each operation names the service credential it accepts.
+  - name: Owner delegates
+    description: |
+      Owner-named trusted delegates (relay docs/design/owner-trusted-delegates.md
+      §16): grants, claims, tier O approvals, attestation (EdDSA JWS), redeem
+      and audit. Off per workspace until an admin sets delegation_enabled.
+      Same paths, bodies, status codes and shapes as Agent Relay Cloud
+      (cloud#6501). Unlike the rest of this API, refusals use Cloud's
+      delegation error body `{"error": "<message>", "code": "<code>"}`
+      (schema DelegationError); an unexpected failure is 503 `unavailable`.
+      See docs/owner-delegates.md.
   - name: Desktop feed
     description: |
       Private, workspace-authenticated release feed for enterprise Desktop
@@ -114,6 +124,58 @@ tags:
         ED25519_SHA_512, 4096-byte message cap), one key per profile,
         addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
+  /internal/v1/delegation/trust-backfill:
+    post:
+      operationId: delegationTrustBackfill
+      summary: Pin existing MCP OAuth connections to their agent ids for the trust rule (one-shot, operator)
+      security: [{ factoryInternalToken: [] }]
+      description: |
+        SELFHOST_INTERNAL_TOKEN only (404 when it is unset). A dry run unless
+        `{"apply": true}`. Pins an unpinned, live MCP OAuth grant to its agent id
+        only where stored rows prove it (exactly one hosted participant of the same
+        owner holds the consented name, no other binding, no retirement in flight);
+        creates no rule and no grant; idempotent; each pin is audited
+        `trust_root.backfilled` (actor system, reason backfill). Pages by grant id:
+        pass `next_cursor` as `after`. See docs/owner-delegates.md.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                apply: { type: boolean }
+                limit: { type: integer, minimum: 1, maximum: 2000 }
+                after: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The report (ids only, never tokens)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dry_run, scanned, provable, pinned, skipped, pins, next_cursor]
+                properties:
+                  dry_run: { type: boolean }
+                  scanned: { type: integer }
+                  provable: { type: integer }
+                  pinned: { type: integer }
+                  skipped: { type: object, additionalProperties: { type: integer } }
+                  pins:
+                    type: array
+                    items:
+                      type: object
+                      required: [workspace_id, owner_id, oauth_grant_id, agent_id]
+                      properties:
+                        workspace_id: { type: string }
+                        owner_id: { type: string }
+                        oauth_grant_id: { type: string }
+                        agent_id: { type: string }
+                  next_cursor: { type: [string, "null"] }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "404": { description: "`not_found`: SELFHOST_INTERNAL_TOKEN is not set" }
   /internal/v1/customer-support/reply-notice:
     post:
       operationId: customerSupportReplyNotice
@@ -548,6 +610,7 @@ paths:
   /cloud/api/v1/grok-bot/routine:
     parameters:
       - {name: grant, in: query, required: true, schema: {type: string, format: uuid}}
+      - {name: from, in: query, required: false, schema: {type: string, maxLength: 512}, description: "Cloud copy only: sender filter carried from connect_grok_bot_routine"}
     get:
       operationId: grokRoutineSetup
       tags: [MCP OAuth]
@@ -574,13 +637,16 @@ paths:
           application/json:
             schema:
               type: object
-              required: [webhook_url, authorization]
+              description: webhook_url and authorization are required unless SELFHOST_GROK_ROUTINES_CLOUD_COPY is on and routine_details is given.
               properties:
                 webhook_url: {type: string, maxLength: 512, writeOnly: true}
                 authorization: {type: string, writeOnly: true, description: The routine crsr_ key or Authorization Bearer header}
+                routine_details: {type: string, maxLength: 4096, writeOnly: true, description: "Cloud copy only: one paste containing exactly one routine URL and one crsr_ key"}
+                reply_mode: {type: string, enum: [notes-only, acknowledge, answer], description: "Cloud copy only; default notes-only. acknowledge and answer reply automatically only to agents the person owns"}
+                from: {type: string, maxLength: 512, description: "Cloud copy only: wake only for messages from this agent (defaults to the page's from query parameter)"}
       responses:
         "200": {description: Configuration saved without echoing secrets}
-        "400": {description: Invalid credentials or unavailable/unowned/unpinned Grok grant}
+        "400": {description: Invalid credentials or reply mode, a routine already saved under another connection, or an unavailable/unowned/unpinned Grok grant}
         "401": {description: Browser sign-in required; MCP bearers are refused}
         "403": {description: Invalid Origin or browser account capability}
         "404": {description: Module disabled, invalid grant ID or workspace inaccessible}
@@ -854,6 +920,56 @@ paths:
         "403": { $ref: "#/components/responses/DesktopMcpError" }
         "404": { $ref: "#/components/responses/DesktopMcpError" }
         "502": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/messaging/desktop-identities/attestations:
+    post:
+      operationId: handOffClaudeAttestation
+      summary: Hand a Claude Code call proof over ahead of its call.
+      description: |
+        Claude Code's auto mode refuses a call whose input a hook rewrote, so
+        Desktop posts the PreToolUse hook's proof here and sends the call
+        unchanged. Advertised as `capabilities.claude_attestation_handoff`.
+        Same auth as identity sync (`cli:auth`; cookie requests must pass the
+        origin check); the proof is stored for the authenticated workspace and
+        user, keyed by its `tuid` and bound to the calling session's token
+        family. Format, `kind: "claude"`, lifetime, key and
+        signature are checked here; the tool and tool use are bound, and the
+        tool use spent, only when the desktop-managed `tools/call` whose
+        `_meta["claudecode/toolUseId"]` equals `tuid`, on a session of the same
+        token family, takes it. The same proof again from the same session
+        family is 204; another proof (or the same one from another session
+        family) for a stored tool use, or a proof whose
+        tool use a call already spent, is 409 `conflict`. The Desktop
+        sign-in's redirect token is refused (403 `handoff_not_exchanged`
+        before its exchange, `forbidden` after).
+        A malformed body or proof, or one that is not `kind: "claude"`, is 400
+        `invalid_attestation`; an unknown key, bad signature, expired proof or
+        one issued in the future is 403 `attestation_rejected`. Neither the
+        proof nor key material is echoed. Also served at
+        `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attestation]
+              properties:
+                attestation: { type: string, minLength: 1, maxLength: 4096, description: Compact JWS, the Claude Code call proof. }
+      responses:
+        "204":
+          description: Stored (or already stored)
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "405": { $ref: "#/components/responses/DesktopMcpError" }
+        "409": { $ref: "#/components/responses/DesktopMcpError" }
   /api/v1/workspaces/{workspaceId}/messaging/people:
     get:
       operationId: listMessagingPeople
@@ -868,12 +984,38 @@ paths:
   /api/v1/workspaces/{workspaceId}/messaging/identity/credential:
     post:
       operationId: issuePersonCredential
-      summary: Mint or recover the caller's human-agent token. Session or cli:auth only.
+      summary: Mint or recover the caller's per-device human-agent token. Session or cli:auth only.
+      description: >-
+        The device is derived from the server-side calling session; body device fields
+        are ignored. The browser's web-device row is not bound to a sign-in, but the
+        session authorizing this request must remain live. Every upstream mint,
+        stored-token probe and legacy-fallback identity lookup has a 15-second
+        deadline; immediate undo of a mint whose authority ended has a 5-second
+        budget. Errors use the hosted {error: human-readable message, code:
+        machine-readable code} envelope. A Relaycast without the device-token route
+        retains the legacy shared-token success shape.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refusedTokenSha256:
+                  type: [string, "null"]
+                  pattern: '^[0-9a-f]{64}$'
+                  description: >-
+                    SHA-256 of the token the client saw refused. A match forces a
+                    re-mint at most once per device every 30 seconds; absent or null
+                    changes nothing. Other body keys are ignored.
       responses:
         "200":
-          description: Identity envelope with the human agent name, id, token, and public Relaycast origin
+          description: >-
+            Identity envelope with the human agent name, id, token and public
+            Relaycast origin. Device-token responses also include device and expiresAt;
+            only the legacy missing-route fallback omits them.
           content:
             application/json:
               schema:
@@ -888,15 +1030,88 @@ paths:
                       agentId: { type: string }
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
+                      device:
+                        type: object
+                        required: [id, name, kind]
+                        properties:
+                          id: { type: string }
+                          name: { type: string }
+                          kind: { type: string, enum: [desktop, cli, web] }
+                      expiresAt: { type: string, format: date-time }
+        "400":
+          description: invalid_request; malformed JSON, non-object body or invalid refusedTokenSha256
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "401":
+          description: Missing or invalid authentication before the credential operation starts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
         "403":
           description: >-
-            Agent, CI, or service credential, or cookie request failed the origin check;
-            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
-            identity is registered and no token is issued, the body carries
-            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
-            `workspace.person_credential.withheld`
+            Agent, CI or service credential, cookie origin-check failure, Desktop
+            handoff_not_exchanged or handoff_not_capable, or device_revoked when
+            a stored device is revoked or the calling session/membership ends while
+            this credential request is in flight (including browser requests).
+            On a gate-only install, gate_only carries urls.relaycastUrl and
+            urls.relaygateUrl; no identity or token is issued, and the call is
+            audited as workspace.person_credential.withheld.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
         "409":
           description: register_human admission is full, or the name is held by someone else
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "429":
+          description: rate_limited; a forced re-mint is inside the per-device 30-second window
+          headers:
+            Retry-After:
+              description: Seconds until a forced re-mint is allowed again
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "502":
+          description: >-
+            upstream_unavailable; Relaycast refused the mint or its outcome is
+            unknown after an outage/timeout. A probe outage may serve only an
+            unexpired stored token with live calling authority.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
     get:
       operationId: readPersonConversation
@@ -2358,7 +2573,12 @@ paths:
       operationId: listMemberships
       responses:
         "200":
-          description: Organization memberships
+          description: >-
+            Organization memberships: `{ memberships: [{ userId, email, name,
+            role, joinedAt }] }`. With the `teams` feature on and an owner,
+            admin or bootstrap bearer caller, each item also carries `teamId`
+            (uuid or null), the member's current team; a member never gets
+            `teamId`.
     post:
       operationId: putMembership
       description: >-
@@ -2404,6 +2624,157 @@ paths:
           description: Membership removed and its workspace token sessions cascaded
         "409":
           description: Membership is absent or is the last owner
+  /api/v1/organizations/{organizationId}/teams:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationTeams
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Organization owner/admin or bootstrap bearer; requires the `teams`
+        feature (docs/teams.md). Live teams ordered by lower(name), then id;
+        with `archived=true`, archived teams follow the live ones.
+      parameters:
+        - { name: archived, in: query, required: false, schema: { type: string, enum: ["true"] } }
+      responses:
+        "200":
+          description: "`{ teams: [OrganizationTeam] }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [teams]
+                properties:
+                  teams: { type: array, items: { $ref: "#/components/schemas/OrganizationTeam" } }
+        "400": { description: "`invalid_request`: `archived` has a value other than `true`" }
+        "403": { description: "`forbidden` (not an owner or admin) or `feature_not_enabled`" }
+        "404": { description: "`organization_not_found`" }
+    post:
+      operationId: createOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Creates a team. The name is trimmed and must be 1 to 80 characters
+        with no control characters (U+0000 to U+001F, U+007F). Writes a `team.create` audit row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: The created team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrganizationTeam" }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found`" }
+        "409": { description: "`team_name_taken`: a live team has the same name, ignoring case" }
+  /api/v1/organizations/{organizationId}/teams/{teamId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      operationId: renameOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Renames a live team (same name rules as create). The current name is
+        a no-op. Writes a `team.rename` audit row when the name changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "200":
+          description: The team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrganizationTeam" }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
+        "409": { description: "`team_archived` or `team_name_taken`" }
+    delete:
+      operationId: archiveOrganizationTeam
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Archives the team and closes its open assignments. Already archived:
+        200 with `unassigned` 0. Writes a `team.archive` audit row when it
+        archives.
+      responses:
+        "200":
+          description: "`{ team, unassigned }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [team, unassigned]
+                properties:
+                  team: { $ref: "#/components/schemas/OrganizationTeam" }
+                  unassigned: { type: integer, minimum: 0 }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
+  /api/v1/organizations/{organizationId}/teams/{teamId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      operationId: assignOrganizationTeamMember
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Puts a current member in the team, closing their current assignment
+        first (a person has one team per organization). Already in this team:
+        nothing is written and `previousTeamId` is the team id. Writes a
+        `team.assign` audit row when it changes something.
+      responses:
+        "200":
+          description: "`{ assignment: { userId, teamId, startsAt }, previousTeamId }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignment, previousTeamId]
+                properties:
+                  assignment:
+                    type: object
+                    required: [userId, teamId, startsAt]
+                    properties:
+                      userId: { type: string, format: uuid }
+                      teamId: { type: string, format: uuid }
+                      startsAt: { type: string, format: date-time }
+                  previousTeamId: { type: [string, "null"], format: uuid }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found`, `team_not_found` or `membership_not_found`" }
+        "409": { description: "`team_archived`" }
+    delete:
+      operationId: unassignOrganizationTeamMember
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: >-
+        Closes the person's assignment to this team. `unassigned` is false
+        (nothing written) when they are not in it. Writes a `team.unassign`
+        audit row when it closes one.
+      responses:
+        "200":
+          description: "`{ unassigned }`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unassigned]
+                properties:
+                  unassigned: { type: boolean }
+        "403": { description: "`forbidden`, `feature_not_enabled` or `csrf_rejected`" }
+        "404": { description: "`organization_not_found` or `team_not_found`" }
   /api/v1/organizations/{organizationId}/domains:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -3122,6 +3493,1122 @@ paths:
         "404": { description: Workspace not found or not the token's workspace }
         "429": { description: "`rate_limited`" }
         "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
+  /.well-known/relay-delegation-keys.json:
+    get:
+      operationId: getDelegationKeys
+      tags: [Owner delegates]
+      description: |
+        JWKS of the OKP Ed25519 keys that sign delegation attestations
+        (`kid` per key; the active key from SELFHOST_DELEGATION_SIGNING_KEY /
+        _KID plus retired keys from SELFHOST_DELEGATION_PREVIOUS_KEYS). Empty
+        `keys` when no signing key is configured. Public, cacheable for 300
+        seconds; also served at `/cloud/.well-known/relay-delegation-keys.json`.
+        See docs/owner-delegates.md.
+      security: []
+      responses:
+        "200":
+          description: JWKS
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationJwks" }
+  /api/v1/workspaces/{workspaceId}/delegates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegateGrants
+      tags: [Owner delegates]
+      description: |
+        Human-only (browser account session on `/cloud`, or a verified Agent
+        Relay Desktop bearer; never a device-flow CLI token, enrollment-key
+        session, workspace API token or agent token). The caller's grants;
+        workspace owner/admin may pass `all=1` for every grant. Allowed while
+        delegation is off.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: all, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Grants and policy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants: { type: array, items: { $ref: "#/components/schemas/DelegateGrant" } }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`: not a browser session or verified Desktop bearer, not a member, or `all=1` without admin role" }
+    post:
+      operationId: createDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only; refused with `not_enabled` while delegation is off. The
+        delegate must be bound to the
+        caller by exactly one Control binding (Desktop identity, hosted
+        participant, ready spawn, person identity or completed claim).
+        Expiry defaults to 30 days, at most min(90, policy max_expiry_days).
+        `prompt_approval` targets are `*` or `<agent id>:*`. One active grant
+        per (owner, delegate): widening is a new grant after revoking.
+        Audited `grant.created`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegateGrantInput" }
+      responses:
+        "201":
+          description: Created grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "400": { description: "`invalid_request` (unknown field, unknown class, invalid target pattern, duplicate class) or `invalid_expiry`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `not_delegate` (agent not bound to the caller) or `csrf_rejected`" }
+        "409": { description: "`grant_exists`" }
+        "503": { description: "`unavailable`" }
+  /api/v1/workspaces/{workspaceId}/delegates/{grantId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: grantId, in: path, required: true, schema: { type: string, pattern: "^grt_[A-Za-z0-9]{8,64}$" } }
+    patch:
+      operationId: narrowDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only, the grant's owner, delegation on.
+        Narrowing only: every new target must be covered by an existing
+        pattern of its class, expiry may only move earlier and
+        `require_tier_o` may only grow; anything wider is
+        `widening_not_allowed` (revoke and create a new grant). Audited
+        `grant.updated` with the scope diff.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegateGrantPatch" }
+      responses:
+        "200":
+          description: Updated grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "400": { description: "`invalid_request`, `invalid_expiry` or `widening_not_allowed`" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+        "404": { description: "`not_found` (unknown, or not the caller's grant)" }
+        "409": { description: "`not_active`" }
+    delete:
+      operationId: revokeDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only revocation by the grant's owner or a workspace owner/admin.
+        Allowed while delegation is off.
+        Invalidates every unredeemed approval under the grant. Idempotent.
+        Audited `grant.revoked`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The revoked grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/revoke-all:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: revokeAllDelegateGrants
+      tags: [Owner delegates]
+      description: |
+        Human-only panic button: revokes every active grant of the caller and
+        the caller's unredeemed tier O approvals, or with `{"all": true}`
+        (workspace owner/admin) every active grant and unredeemed approval in
+        the workspace. Allowed while delegation is off and without a recent
+        sign-in. Answers the revoked grant ids.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                all: { type: boolean }
+      responses:
+        "200":
+          description: Revoked grants
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: { type: array, items: { type: string } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden` (including `all` without admin role) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/trust-rule:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: owner
+        in: query
+        required: false
+        description: GET and DELETE only. An org owner or admin may act on another owner's rule by user id.
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only. The owner's set-once trust rule (null when off), the agents it
+        covers now (one system grant each, with the root it was proven through),
+        and the agents an unexpired owner-made grant shadows (that grant wins).
+        See docs/owner-delegates.md, "Trust rule".
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The rule and its coverage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rule, covered, shadowed]
+                properties:
+                  rule:
+                    oneOf:
+                      - $ref: "#/components/schemas/DelegationTrustRule"
+                      - type: "null"
+                  covered:
+                    type: array
+                    items:
+                      type: object
+                      required: [grant_id, chain, delegate_agent_id, created_at, root_kind, connector, root_agent_id, launched_by, hops]
+                      properties:
+                        grant_id: { type: string }
+                        chain:
+                          type: string
+                          enum: [proven, broken, unknown]
+                          description: The chain read now, writing nothing. `broken` when it no longer proves out on the records the grant was created on (its next use revokes it).
+                        delegate_agent_id: { type: string }
+                        created_at: { type: string, format: date-time }
+                        root_kind: { type: [string, "null"], enum: [claim, connector, null] }
+                        connector: { type: [string, "null"] }
+                        root_agent_id: { type: [string, "null"] }
+                        launched_by: { type: [string, "null"] }
+                        hops: { type: integer, minimum: 0 }
+                  shadowed:
+                    type: array
+                    items:
+                      type: object
+                      required: [grant_id, delegate_agent_id, expires_at]
+                      properties:
+                        grant_id: { type: string }
+                        delegate_agent_id: { type: string }
+                        expires_at: { type: string, format: date-time }
+        "400": { description: "`invalid_request` (a malformed `owner`)" }
+        "403": { description: "`forbidden` (another owner without admin role)" }
+    put:
+      operationId: putDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only, delegation on. Turns the caller's own trust rule on (201 the
+        first time, 200 after: idempotent), or sets which classes still need an
+        owner-minted (tier O) approval under it (default none; copied to every
+        system grant of the rule in the same transaction). The rule covers every
+        agent the caller connected (a completed claim, or a live MCP OAuth grant
+        pinned to the agent's id) and every agent those launch through Control,
+        for every class the workspace policy allows, with no expiry, until revoked.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+      responses:
+        "200":
+          description: The rule was already on
+          content:
+            application/json:
+              schema: { type: object, required: [rule], properties: { rule: { $ref: "#/components/schemas/DelegationTrustRule" } } }
+        "201":
+          description: The rule was turned on
+          content:
+            application/json:
+              schema: { type: object, required: [rule], properties: { rule: { $ref: "#/components/schemas/DelegationTrustRule" } } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled`, `forbidden` or `csrf_rejected`" }
+    delete:
+      operationId: revokeDelegationTrustRule
+      tags: [Owner delegates]
+      description: |
+        Human-only one-click revoke, allowed while delegation is off: the rule,
+        every system grant it created, and their unredeemed and gate-spent
+        approvals, in one transaction. `revoked_grants` counts the grants this
+        call revoked.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, revoked_grants, revoked_grant_ids]
+                properties:
+                  revoked: { type: string }
+                  revoked_grants: { type: integer, minimum: 0 }
+                  revoked_grant_ids: { type: array, items: { type: string } }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: no trust rule is on" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: startDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Human-only, delegation on. Starts a claim:
+        a one-time code (`dlg_` + 24 random bytes base64url, shown once,
+        stored as SHA-256) valid for 10 minutes, that an agent with no other Control binding presents with
+        its own Relaycast token to bind its immutable agent id to the caller.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "201":
+          description: Claim started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, code, expires_at]
+                properties:
+                  claim_id: { type: string, pattern: "^clm_[A-Za-z0-9]+$" }
+                  code: { type: string, pattern: "^dlg_[A-Za-z0-9_-]{32}$" }
+                  expires_at: { type: string, format: date-time }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims/{claimId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: claimId, in: path, required: true, schema: { type: string, pattern: "^clm_[A-Za-z0-9]{8,64}$" } }
+    delete:
+      operationId: releaseDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Human-only: the claim's owner, or an org owner or admin. Releases a
+        claimed agent (its binding ends and the owner's active grants to it
+        are revoked, `delegate_released`) or cancels a pending claim code.
+        Allowed while delegation is off: releasing only removes authority.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Released
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, released, revoked_grants]
+                properties:
+                  claim_id: { type: string }
+                  released: { const: true }
+                  revoked_grants: { type: array, items: { type: string } }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: unknown, already released, or not the caller's claim" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims/complete:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: completeDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Agent route. No Control credential: the proof is the one-time code
+        plus the agent's own Relaycast token, which must authenticate as
+        exactly `agent_id` (in this workspace's Relaycast workspace). The code
+        is consumed atomically. Refused when the agent already has any
+        Control binding. Rate limited per client address. Audited
+        `delegate.claimed`. Unavailable on gate-only installs.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, agent_id, agent_token]
+              properties:
+                code: { type: string, minLength: 16, maxLength: 128 }
+                agent_id: { type: string, minLength: 1, maxLength: 200 }
+                agent_token: { type: string, minLength: 12, maxLength: 512 }
+      responses:
+        "200":
+          description: Bound
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, agent_id, owner_id]
+                properties:
+                  claim_id: { type: string }
+                  agent_id: { type: string }
+                  owner_id: { type: string }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled` or `invalid_agent`" }
+        "404": { description: "`invalid_code`: unknown, expired or used code" }
+        "409": { description: "`already_bound`" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`: Relaycast unreachable, or a gate-only install" }
+  /api/v1/workspaces/{workspaceId}/delegates/approvals:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: mintOwnerApproval
+      tags: [Owner delegates]
+      description: |
+        Human-only tier O: the owner approves exact actions directly. Expiry
+        defaults to 1 hour, at most 24 hours. `single_use` is forced on for
+        high-risk actions. A delegate's message then names it in
+        `owner_approval.approval_ref`, with identical actions. Audited
+        `approval.minted`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [actions]
+              properties:
+                actions:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  description: One entry per class and target; no `note`.
+                  items: { $ref: "#/components/schemas/DelegationActionRef" }
+                expires_at: { type: string, format: date-time }
+                single_use: { type: boolean }
+      responses:
+        "201":
+          description: Minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approval_id]
+                properties:
+                  approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+        "400": { description: "`invalid_request` or `invalid_expiry`" }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationGates
+      tags: [Owner delegates]
+      description: |
+        Release gates (relay design §11a.3). Human-only (browser session or
+        verified Desktop bearer). The caller's gates; workspace owner/admin may
+        pass `all=1`. Allowed while delegation is off.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: all, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Gates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gates]
+                properties:
+                  gates: { type: array, items: { $ref: "#/components/schemas/DelegationGate" } }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`" }
+    post:
+      operationId: registerDelegationGate
+      tags: [Owner delegates]
+      description: |
+        Register exactly which workflow may redeem: `repo`, `workflow_ref`
+        (the workflow the run starts from, in that repo, pinned to a ref),
+        optionally `job_workflow_ref` (when the publishing job runs inside a
+        reusable workflow, which may live in another repo), `event`,
+        and either an exact `ref` (`refs/heads/...` or `refs/tags/...`) or a
+        `ref_pattern` of the form `refs/tags/<literal prefix>*` (one trailing
+        `*`). `target_prefix` must start with `<repo>:` and contain no
+        whitespace or `*`. `event` is one of push, workflow_dispatch, release
+        and schedule. Human-only (browser session or verified Desktop
+        bearer, of a current member), delegation on. The same live gate
+        (owner, repo, workflow_ref, job_workflow_ref, event, target_prefix)
+        cannot be registered twice. Audited `gate.registered`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationGateInput" }
+      responses:
+        "201":
+          description: Registered gate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationGate" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`, `not_enabled`, `csrf_rejected`, or `gate_owner_unqualified` (only an org owner or admin may own a gate, D5)" }
+        "409": { description: "`gate_exists`: you already registered this gate; `gate_limit`: 10 live gates already share this repository and workflow file (workflow_ref without its @ref)" }
+        "422": { description: "`repository_unresolved`: GitHub knows no repository by that name that this workspace can see (the gate is pinned to its ids at registration)" }
+        "503": { description: "`unavailable`: GitHub could not be reached to resolve the repository" }
+    delete:
+      operationId: deleteDelegationGate
+      tags: [Owner delegates]
+      description: |
+        Remove a gate named by `?gate_id=` or `{"gate_id": ...}`: its owner, or
+        a workspace owner/admin. Allowed while delegation is off. Audited
+        `gate.deleted`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: gate_id, in: query, required: false, schema: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gate_id: { type: string, pattern: "^gate_[A-Za-z0-9]{8,64}$" }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gate_id, deleted]
+                properties:
+                  gate_id: { type: string }
+                  deleted: { const: true }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/gates/redeem:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redeemThroughDelegationGate
+      tags: [Owner delegates]
+      description: |
+        The publishing job redeems the approval itself (§11a.3), with
+        `Authorization: Bearer <workflow OIDC token>`. The token is verified
+        against its issuer's JWKS (GitHub Actions, plus
+        SELFHOST_DELEGATION_OIDC_ISSUERS), its issuer, its audience (this
+        deployment's origin) and its validity window. `repository`,
+        `workflow_ref`, `ref` (or the gate's `ref_pattern`) and
+        `event_name` must match a registered gate exactly, plus
+        `job_workflow_ref` when the gate sets it (`gate_unknown` when
+        the repository has no gate, `gate_mismatch` when no gate's workflow
+        identity matches). The gate's repository ids were resolved and
+        pinned at registration, before its 201, and redeem never pins: a
+        token that matches a gate by name but does not carry those
+        `repository_id` and `repository_owner_id` is `repository_mismatch`,
+        not `gate_mismatch`.
+        and the action's target must start with that gate's `target_prefix`
+        (`target_prefix`). Until a gate matches, nothing is written to the
+        workspace's audit log; a key outage with no cached keys is
+        `unavailable`. Then the normal redeem checks run (approval, grant,
+        delegate binding, scope, policy, tier O, revocation, expiry, the gate
+        owner's standing, conditions). A `release` target must name exactly
+        one release (§11a.2); any other approval is malformed.
+
+        Single use is per action, `(approval_id, class, target)`, not per
+        approval: the first redeem of an action consumes that action and
+        binds it to the token's `run_id`. A later redeem of the same action
+        in the same run (another job, or a later attempt) answers
+        `{ok:true, consumed:true, same_run:true}`; any other run gets
+        `consumed`. Another action of the same approval is redeemed on its
+        own, with its own checks, and is never `same_run` because a sibling
+        was. `dry_run: true` runs every check, never consumes, and answers
+        `{ok:true, consumed:false, dry_run:true}` or
+        `{ok:false, reason, dry_run:true}`; it takes no lock, so a change
+        committing after its last read is not reflected. Audited `gate.redeemed`,
+        `gate.checked` (a passing dry run) or `gate.refused` (with
+        `dry_run: true` in the event data for a dry run), auth method
+        `github_oidc`. A gate serves only while its owner is still an org
+        owner or admin (D5), re-checked under the consuming transaction's
+        locks: an owner demoted to `member` no longer serves, and with no
+        other qualified gate the answer is `gate_owner_unqualified`.
+        Repository names match case-insensitively.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [approval_id, action]
+              properties:
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                action:
+                  type: object
+                  additionalProperties: false
+                  required: [class, target]
+                  properties:
+                    class: { $ref: "#/components/schemas/DelegationActionClass" }
+                    target: { type: string, maxLength: 256 }
+                dry_run: { type: boolean }
+      responses:
+        "200":
+          description: >-
+            A redeem (`ok: true`), or any dry run (report-only), with its verdict. Status codes fail closed for a
+            plain `curl -f` step, as Cloud: a refusal is 401 (`oidc_invalid`), 503 (`unavailable`,
+            `condition_unavailable`: retry) or 403 (every other reason: final), with the same body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, consumed]
+                    properties:
+                      ok: { const: true }
+                      consumed: { const: true }
+                      same_run: { const: true }
+                  - type: object
+                    required: [ok, consumed, dry_run]
+                    properties:
+                      ok: { const: true }
+                      consumed: { const: false }
+                      dry_run: { const: true }
+                  - type: object
+                    required: [ok, reason]
+                    properties:
+                      ok: { const: false }
+                      reason: { $ref: "#/components/schemas/DelegationReason" }
+                      unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
+                      dry_run: { const: true }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`: no bearer; or a refusal `{ok:false, reason:\"oidc_invalid\"}`" }
+        "403": { description: "A final refusal `{ok:false, reason}` (not a dry run)" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`, or a retryable refusal `{ok:false, reason}` (`unavailable`, `condition_unavailable`)" }
+  /api/v1/workspaces/{workspaceId}/delegates/audit:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationAudit
+      tags: [Owner delegates]
+      description: |
+        Human-only. The append-only delegation log: members see events where
+        they are the owner or actor, workspace owner/admin see all. Up to
+        `limit` (default and maximum 1000) events after `since`, oldest first.
+        `format=jsonl` answers
+        `application/x-ndjson`. Quote text older than the org's
+        `quote_retention_days` (default 90) is redacted to `quote_hash`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: grant_id, in: query, required: false, schema: { type: string, pattern: "^grt_[A-Za-z0-9]{8,64}$" } }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [json, jsonl] } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000 } }
+        - name: after_id
+          in: query
+          required: false
+          description: Page from the previous response's `next_after_id` (as Cloud); `0` or none is the first page, which lists every committed event. A cursor page lists events after that event in (writing transaction, id) order, only those of transactions older than every one still running, so paging never skips an event committed out of id order. An id that names no event of this workspace is 400 `invalid_request`.
+          schema: { type: string, pattern: "^(0|[1-9][0-9]{0,15})$" }
+      responses:
+        "200":
+          description: Events
+          headers:
+            X-Audit-Next-After-Id:
+              description: JSONL only. The safe cursor to page from (`next_after_id`); absent when there is none yet.
+              schema: { type: string }
+            X-Audit-Complete:
+              description: JSONL only. `true` or `false`, as `complete`.
+              schema: { type: string, enum: ["true", "false"] }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, next_after_id, complete]
+                properties:
+                  events: { type: array, items: { $ref: "#/components/schemas/DelegationAuditEvent" } }
+                  next_after_id:
+                    type: [string, "null"]
+                    description: The cursor to page from (`after_id`); every event at or before it is final. Not necessarily the last event's id; events after it may be listed again.
+                  complete:
+                    type: boolean
+                    description: False while the page is full or an event was held back behind a running transaction; page again from `next_after_id`.
+            application/x-ndjson:
+              schema: { type: string }
+        "400": { description: "`invalid_request`" }
+  /api/v1/workspaces/{workspaceId}/delegates/policy:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Human-only, any member of the workspace (a browser session or a
+        Desktop-verified bearer, as the other workspace delegation reads).
+        Read-only: the stored workspace policy, or the defaults when none is
+        stored yet (`delegation_enabled` false, `max_expiry_days` 90,
+        `allowed_classes` null, `require_tier_o` [], `code_owner_match`
+        any_path). Not audited.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The workspace delegation policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationPolicy" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`: not a member of this workspace, or not a human caller" }
+    put:
+      operationId: putDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Human-only, workspace owner/admin. The
+        workspace switch (`delegation_enabled`, off by default) and limits.
+        The fields given are set; an omitted field keeps its stored value
+        (the defaults `max_expiry_days` 90, `allowed_classes` null,
+        `require_tier_o` [], `code_owner_match` any_path when no policy exists
+        yet). `allowed_classes: null` means every class. Quote retention is not here: it is the
+        org setting `/api/v1/orgs/{organizationId}/delegation-policy`, which
+        no workspace overrides. Active grants that no
+        longer fit (a class no longer allowed, or a lifetime above the new
+        maximum) are revoked with reason `policy_changed`. Audited
+        `policy.updated`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationPolicyInput" }
+      responses:
+        "200":
+          description: Stored policy and grants it revoked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/DelegationPolicy"
+                  - type: object
+                    required: [revoked_grants]
+                    properties:
+                      revoked_grants: { type: array, items: { type: string } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+  /api/v1/orgs/{organizationId}/delegation-policy:
+    parameters:
+      - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      operationId: getOrgDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Org-wide delegation settings (§16.3), which apply to every workspace in
+        the org and which no workspace policy overrides. Only an owner or
+        admin of that organization, by browser session or verified Desktop
+        bearer, issued for that organization. Defaults when unset.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Org policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationOrgPolicy" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`: not a browser session or verified Desktop bearer, or not an owner/admin of the org" }
+        "404": { description: "`not_found`: not an organization id" }
+    put:
+      operationId: putOrgDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Replace the org's settings: `{quote_retention_days}`, an integer from 1
+        to 3650 (§15.9, Khaliq's decision; default 90). A shorter window
+        redacts existing older quotes at the next sweep; a longer one restores
+        nothing.
+        Audited `org_policy.updated` in every workspace of the org.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationOrgPolicy" }
+      responses:
+        "200":
+          description: Stored org policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationOrgPolicy" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/target-owners:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getDelegationTargetOwners
+      tags: [Owner delegates]
+      description: Human-only, workspace owner/admin. Owners of targets that are not repos (§5.4).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Entries, in order (the bare list)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+        "403": { description: "`forbidden`" }
+    put:
+      operationId: putDelegationTargetOwners
+      tags: [Owner delegates]
+      description: |
+        Human-only, workspace owner/admin, delegation on, recent browser
+        sign-in. Full replace. The body is the bare list (a
+        `{"target_owners": [...]}` wrapper is also accepted). Each entry maps
+        a target pattern to a repo (whose CODEOWNERS applies; relay-control
+        cannot resolve CODEOWNERS, so a repo confers no standing here) and/or
+        to people by id. Audited `target_owners.updated`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+                - type: object
+                  additionalProperties: false
+                  required: [target_owners]
+                  properties:
+                    target_owners: { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+      responses:
+        "200":
+          description: Stored entries (the bare list)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+        "400": { description: "`invalid_request`: invalid pattern or repo, or an entry naming neither a repo nor people" }
+        "403": { description: "`forbidden`, `not_enabled` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: attestDelegation
+      tags: [Owner delegates]
+      description: |
+        Agent route, called by the recipient's relay-node with its owner's
+        verified Agent Relay Desktop bearer (a current member of this
+        workspace's organization). The recipient must be bound to that person
+        and proven by `recipient_token`. Control reads the sender id and the
+        immutable `owner_approval` from Relaycast's
+        `GET /v1/deliveries/by-message/:id` for that token, checks the live
+        grant, delegate binding, policy, scope, tier, standing (`accept`) and
+        expiry, then signs a 300-second EdDSA JWS. Once the request is
+        authenticated and well formed, every failure, including an outage, is
+        `{"verdict": "none", "reason": ...}` with HTTP 200, and an
+        `approval.refused` audit event is written on a best-effort basis (it
+        may be absent if the audit insert itself fails). Credential and body
+        errors are the HTTP errors below, without an audit event. Never cached.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient_agent_id, recipient_token, message_id]
+              properties:
+                recipient_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                recipient_token: { type: string, minLength: 12, maxLength: 512 }
+                message_id: { type: string, minLength: 1, maxLength: 200 }
+                accept: { type: string, enum: [code_owners, own_owner], default: code_owners }
+      responses:
+        "200":
+          description: Verdict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationVerdict" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`: not a verified Desktop bearer, or not a member" }
+        "429": { description: "`rate_limited`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/redeem:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redeemDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        Agent route, same credentials as attestation. Called right before
+        every action (§6.3), and every redeem is audited
+        (`approval.redeemed`). Single use is per action (§5.1): each action of
+        a single-use approval (`release`, every `deploy`, `secret_change`,
+        `destructive`, `spend`, `config_change`, or a tier O approval minted
+        single-use) redeems once, and redeeming one never consumes another.
+        Requires an earlier attestation of this approval to this recipient
+        (otherwise `no_approval`); standing is re-checked under that
+        attestation's `accept`.
+        Re-checks revocation, binding, scope and expiry, then evaluates the
+        action's conditions: `not_before` here; GitHub conditions (`ci_green`,
+        `head_sha`, `reviews_approved`, `mergeable`) are
+        `condition_unavailable` on relay-control. An unmet condition answers
+        `condition_unmet` with `unmet` and does not consume. A single-use
+        action is consumed atomically; a second redeem of it is `consumed`.
+        `checked.head_sha` (the PR head Cloud checked) is never returned by
+        relay-control: it does not read GitHub, so a PR-condition redeem is
+        `condition_unavailable` instead.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient_agent_id, recipient_token, approval_id, action]
+              properties:
+                recipient_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                recipient_token: { type: string, minLength: 12, maxLength: 512 }
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                action:
+                  type: object
+                  additionalProperties: false
+                  required: [class, target]
+                  properties:
+                    class: { $ref: "#/components/schemas/DelegationActionClass" }
+                    target: { type: string, maxLength: 256 }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, consumed]
+                    properties:
+                      ok: { const: true }
+                      consumed: { type: boolean }
+                      checked:
+                        type: object
+                        description: Cloud only, for PR targets. relay-control never returns it.
+                        properties:
+                          head_sha: { type: string, pattern: "^[0-9a-f]{40}$" }
+                  - type: object
+                    required: [ok, reason]
+                    properties:
+                      ok: { const: false }
+                      reason: { $ref: "#/components/schemas/DelegationReason" }
+                      unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
+        "400": { description: "`invalid_request`" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/withdraw:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: withdrawDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        The delegate that sent an approval withdraws it (§7), for example when
+        the owner later says no. Proven by the delegate's own Relaycast token,
+        which must authenticate as `delegate_agent_id` and name an agent in
+        this workspace's relay; no person's credential is needed, because
+        withdrawing only ever narrows. Only an approval attested from this
+        delegate can be withdrawn. The next attest or redeem of it is
+        `revoked`. Allowed while delegation is off. Audited
+        `approval.withdrawn`. Rate limited per client address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [delegate_agent_id, delegate_token, approval_id]
+              properties:
+                delegate_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                delegate_token: { type: string, minLength: 12, maxLength: 512 }
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+      responses:
+        "200":
+          description: Withdrawn (also when it was already withdrawn or revoked)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { const: true }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`invalid_agent`" }
+        "404": { description: "`not_found`: unknown, or not an approval this delegate sent" }
+        "429": { description: "`rate_limited`" }
+        "503": { description: "`unavailable`" }
+  /api/v1/workspaces/{workspaceId}/delegates/approvals/{approvalId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: approvalId, in: path, required: true, schema: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" } }
+    delete:
+      operationId: revokeDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        Revoke one approval, tier D or tier O (§7): its owner, or a workspace
+        owner/admin. Allowed while delegation is off; revoking only narrows.
+        Every later attest or redeem of it is `revoked`. Audited
+        `approval.revoked`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approval_id, status]
+                properties:
+                  approval_id: { type: string }
+                  status: { const: revoked }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/quotes/redact:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redactDelegationQuote
+      tags: [Owner delegates]
+      description: |
+        Human-only (§8, §15.9). The owner redacts the quote of one delegate
+        message; a workspace owner/admin may redact any. The audit copies
+        become null (their digests stay), `quote.redacted` is audited, and
+        Relaycast is asked to redact its stored owner_approval quote; a
+        failure stays queued for the hourly sweep.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message_id]
+              properties:
+                message_id: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        "200":
+          description: Redacted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message_id, redacted_events, relaycast]
+                properties:
+                  message_id: { type: string }
+                  redacted_events: { type: integer, minimum: 1 }
+                  relaycast: { type: string, enum: [redacted, queued] }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: no quote of the caller's for that message" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: listPromptDelegates
+      tags: [Owner delegates]
+      description: |
+        Agent route, same credentials as attestation. The session must be the
+        caller's own agent, proven by `session_token`, otherwise 403. Lists
+        the machine owner's delegates (still bound, active grant) whose
+        `prompt_approval` targets cover the session, excluding the session
+        itself. Delegation off, the class not allowed by policy, or a
+        gate-only install is an empty list.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_agent_id, session_token]
+              properties:
+                session_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                session_token: { type: string, minLength: 12, maxLength: 512 }
+      responses:
+        "200":
+          description: Delegates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delegates]
+                properties:
+                  delegates:
+                    type: array
+                    items:
+                      type: object
+                      required: [agent_id, grant_id]
+                      properties:
+                        agent_id: { type: string }
+                        grant_id: { type: string }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
+        "403": { description: "`forbidden`: not a verified Desktop bearer, not a member, or the session is not the caller's" }
+        "503": { description: "`unavailable`" }
   /api/v1/organizations/{organizationId}/capture-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -3188,6 +4675,66 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/agent-rules/{audience}:
+    parameters:
+      - {name: audience, in: path, required: true, schema: {type: string, enum: [grok-bot, lead, worker]}}
+    get:
+      operationId: getAgentRules
+      description: |
+        Composed operating rules for the caller's organization: the image's base
+        bundle plus the organization overlay. Member with a cli:auth or account
+        bearer (or the /cloud session cookie); MCP OAuth bearers are refused, so use
+        the get_agent_rules MCP tool instead. Send `Accept: text/markdown` for the
+        text alone. See docs/agent-rules.md.
+      responses:
+        "200":
+          description: Composed rules; ETag is the sha256
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [audience, version, sha256, bootstrap_version_current, sections, text]
+                properties:
+                  audience: {type: string}
+                  version: {type: string, description: "Base CalVer, plus +org.<n> with an overlay"}
+                  sha256: {type: string}
+                  bootstrap_version_current: {type: integer}
+                  sections: {type: array, items: {type: object, properties: {id: {type: string}, title: {type: string}}}}
+                  text: {type: string}
+            text/markdown:
+              schema: {type: string}
+        "304": {description: Matches If-None-Match}
+        "401": {description: Authentication required}
+        "403": {description: Unexchanged handoff or missing cli:auth/account scope}
+        "404": {description: Unknown audience or no membership}
+  /api/v1/organizations/{organizationId}/agent-rules/{audience}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - {name: audience, in: path, required: true, schema: {type: string, enum: [grok-bot, lead, worker]}}
+    get:
+      operationId: getAgentRulesOverlay
+      description: Organization owner/admin or bootstrap bearer. The active overlay, or null. See docs/agent-rules.md.
+      responses:
+        "200": {description: "{audience, overlay: {version, text, updatedAt} | null, base_version}"}
+        "403": {description: Owner/admin role required}
+        "404": {description: Organization or audience not found}
+    put:
+      operationId: putAgentRulesOverlay
+      description: |
+        Organization owner/admin or bootstrap bearer. Appends a new overlay version;
+        an empty text clears it. At most 16 KiB; text that looks like a secret,
+        token, credential-bearing URL or routine webhook URL is refused. Audited as
+        agent_rules.overlay_set / agent_rules.overlay_cleared.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [text], properties: {text: {type: string, maxLength: 16384}}}
+      responses:
+        "200": {description: "{audience, version, cleared, version_string}"}
+        "400": {description: Invalid text}
+        "403": {description: Owner/admin role required or cross-origin cookie write}
+        "404": {description: Organization or audience not found}
   /api/v1/organizations/{organizationId}/workspace-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -4072,6 +5619,167 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnsupportedByBackend"
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccess
+      description: |
+        Who may read one session (docs/sessions-read-api.md, "Session
+        access"). Served only when read token mints carry the reader kind
+        (`SESSION_READ_MINT_INCLUDE_READER_KIND=true`, or unset with
+        `SELFHOST_RELAYGATE_PUBLIC_URL` set) and
+        `SESSION_READ_API_MCP_READS=true`, with the session read API URL
+        pointing at relaygate's sessions listener; otherwise 404
+        `session_access_not_configured`. Also served at the same path without
+        the `/cloud` prefix for a bearer. Control forwards relaygate
+        `GET /v1/sessions/{sessionId}/access` with the caller's own read
+        token; relaygate decides who is a session access administrator,
+        before it looks the session up. An administrator may manage a session
+        they cannot read; a non-administrator gets 403 whether or not the
+        session exists. Per-person entries name current members by email and name; a user
+        who is no longer a member is `member: false`.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+    patch:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: setSessionAccess
+      description: |
+        Change who may read one session. `members` and `groups`, when given,
+        REPLACE the current per-person and group lists; they are not merged.
+        Emails resolve to current members of the workspace's organization;
+        any unknown or ambiguous email refuses the whole change (400
+        `unknown_members`) and nothing is sent upstream. Only user ids go
+        upstream. Without `expectedVersion` the current version is read
+        first. A stale version is 409 `conflict` with `currentVersion` and is
+        never retried. A cookie-carried request needs an allowed Origin (403
+        `csrf_rejected`). A 504 `session_access_outcome_unknown` means the
+        change may have applied: read the access again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionAccessChange"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/reset:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: resetSessionAccess
+      description: |
+        Remove the session's access override so the installation's default
+        policy applies again. Versioned and audited like a PATCH; same
+        Origin check, conflict and unknown-outcome rules.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: Audited. Never put session content in it.
+                expectedVersion:
+                  type: integer
+                  minimum: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionAccessAnswer"
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "409": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
+        "504": { $ref: "#/components/responses/SessionAccessFailure" }
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/access/history:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getSessionAccessHistory
+      description: |
+        The audited before/after rows of every access change, oldest first.
+        Follow `nextAfter` (null on the last page). `actor` is the Control
+        person behind a row whose `actorName` is `ctl:<userId>`, else null;
+        `before` is null on a session's first change.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rows, nextAfter]
+                properties:
+                  rows:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SessionAccessHistoryRow"
+                  nextAfter:
+                    type: [integer, "null"]
+        "400": { $ref: "#/components/responses/SessionAccessFailure" }
+        "403": { $ref: "#/components/responses/SessionAccessFailure" }
+        "404": { $ref: "#/components/responses/SessionAccessFailure" }
+        "503": { $ref: "#/components/responses/SessionAccessFailure" }
   /api/v1/workspaces/{workspaceId}/relayhistory/origin:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -6495,6 +8203,16 @@ paths:
         `docs/shared-session-read-audit.md`): one record per MCP
         shared-session read tool call, oldest first, keyset-paginated. Never
         contains transcript content. A member is 403; another workspace 404.
+
+        When session reads follow per-session access
+        (SESSION_READ_MINT_INCLUDE_READER_KIND on), an exporter that does
+        not administer session access sees a session id, and its owners,
+        only for a session it may read itself. Other ids and owners are null
+        and the record carries `restricted: true`; on such a page every
+        record carries `restricted`, and the CSV gets a last `restricted`
+        column. Administrators, pages naming no session, and every export
+        without per-session access are unchanged and carry no `restricted`.
+        Filtering, ordering, page size and cursors are the same either way.
       parameters:
         - { name: since, in: query, required: false, schema: { type: string, format: date-time }, description: Inclusive }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: Exclusive }
@@ -6550,12 +8268,15 @@ paths:
                           items:
                             type: object
                             properties:
-                              session_id: { type: string }
+                              session_id: { type: [string, "null"], description: Null only when restricted }
                               source: { type: [string, "null"] }
-                              owner_user_ids: { type: array, maxItems: 10, items: { type: string } }
+                              owner_user_ids: { type: [array, "null"], maxItems: 10, items: { type: string }, description: Null only when restricted }
                         result_sessions_truncated: { type: boolean }
                         correlation_id: { type: [string, "null"] }
                         duration_ms: { type: integer }
+                        restricted:
+                          type: boolean
+                          description: Present only for an exporter that does not administer per-session access. True when a session id in this record was withheld (set to null) because the exporter may not read that session.
             text/csv:
               schema: { type: string }
         "400":
@@ -8904,6 +10625,8 @@ paths:
           description: Only POST.
         "413":
           description: Request over 64 KiB.
+        "429":
+          description: "events/stream only: this inbox already holds 4 open event streams on this process. JSON-RPC error with MCP Events' resource-exhausted code -32025 and the request's id; retry-after: 30. events/poll is never limited."
   /api/v1/events-shim/t/{mcpToken}/workspace:
     post:
       operationId: eventsShimTempWorkspace
@@ -9147,6 +10870,262 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    DelegationActionClass:
+      type: string
+      enum: [merge, pr_ops, deploy, release, secret_change, destructive, spend, external_comms, prompt_approval, config_change]
+    DelegationReason:
+      type: string
+      enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant, gate_unknown, oidc_invalid,
+        gate_mismatch, target_prefix, sha_mismatch, repository_mismatch, gate_owner_unqualified]
+    DelegationCondition:
+      oneOf:
+        - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
+        - type: object
+          additionalProperties: false
+          required: [type, sha]
+          properties: { type: { const: head_sha }, sha: { type: string, pattern: "^[0-9a-f]{40}$" } }
+        - type: object
+          additionalProperties: false
+          required: [type, min]
+          properties: { type: { const: reviews_approved }, min: { type: integer, minimum: 1, maximum: 10 } }
+        - { type: object, additionalProperties: false, required: [type], properties: { type: { const: mergeable } } }
+        - type: object
+          additionalProperties: false
+          required: [type, at]
+          properties: { type: { const: not_before }, at: { type: string, format: date-time } }
+    DelegationError:
+      type: object
+      description: Cloud's delegation error body, used by every Owner delegates refusal.
+      required: [error, code]
+      properties:
+        error: { type: string, description: Human-readable message }
+        code: { type: string, description: Stable machine-readable code }
+    DelegationGate:
+      type: object
+      required: [gate_id, owner_id, repo, workflow_ref, event, target_prefix, created_at]
+      description: Exactly one of `ref` and `ref_pattern` is present.
+      properties:
+        gate_id: { type: string }
+        repo: { type: string }
+        issuer: { type: string, description: Present only for a gate on a self-host issuer (relay-control) }
+        workflow_ref: { type: string }
+        job_workflow_ref: { type: string, description: Present only for a gate on a reusable workflow }
+        ref: { type: string }
+        ref_pattern: { type: string }
+        event: { type: string }
+        target_prefix: { type: string }
+        repository_id: { type: string, description: "GitHub's repository id, resolved and pinned at registration (before the 201); redeem never pins" }
+        repository_owner_id: { type: string, description: "GitHub's repository owner id, pinned with repository_id at registration" }
+        allow_source_sha_mismatch: { const: true, description: "Present only when true: candidate-run release targets may name a source commit other than the run's sha" }
+        default_branch: { type: string, description: "The repository's default branch, as GitHub reported it at registration" }
+        owner_id: { type: string }
+        created_at: { type: string, format: date-time }
+    DelegationGateInput:
+      type: object
+      additionalProperties: false
+      required: [repo, workflow_ref, event, target_prefix]
+      description: Exactly one of `ref` and `ref_pattern`.
+      oneOf:
+        - required: [ref]
+          not: { required: [ref_pattern] }
+        - required: [ref_pattern]
+          not: { required: [ref] }
+      properties:
+        repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
+        issuer: { type: string, description: "relay-control only: a self-host issuer from SELFHOST_DELEGATION_OIDC_ISSUERS. Default GitHub Actions. A same-named repository on another issuer is another repository." }
+        workflow_ref: { type: string, maxLength: 512, description: "<repo>/.github/workflows/<file>@<the gate's ref, or its ref_pattern for a tag gate>", example: "AgentWorkforce/relay-app/.github/workflows/desktop-promote.yml@refs/heads/main" }
+        job_workflow_ref: { type: string, maxLength: 512, description: "The reusable workflow the publishing job runs in: <owner>/<repo>/.github/workflows/<file>@<full ref, the gate's ref_pattern, or a 40-hex lowercase commit SHA>", example: "AgentWorkforce/release-workflows/.github/workflows/publish.yml@0123456789abcdef0123456789abcdef01234567" }
+        ref: { type: string, pattern: "^refs/(heads|tags)/[^\\s*]{1,250}$", example: "refs/heads/main" }
+        ref_pattern: { type: string, pattern: "^refs/tags/[^\\s*]{1,200}\\*$", example: "refs/tags/v2026.*" }
+        event: { type: string, enum: [push, workflow_dispatch, release, schedule], example: workflow_dispatch }
+        target_prefix: { type: string, maxLength: 256, description: "Starts with <repo>: and ends with : (a segment boundary); no wildcard", example: "AgentWorkforce/relay-app:" }
+        allow_source_sha_mismatch: { type: boolean, description: "Opt out of binding candidate-run release targets to the run's sha claim (land and iOS targets are always bound). Default false. Only on a gate whose ref is refs/heads/<the repository's default branch> (400 otherwise)." }
+        repository_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "relay-control only, for a gate on a self-host issuer (required there, refused for GitHub Actions): the repository's id, pinned as given. A GitHub Actions gate is resolved on GitHub." }
+        repository_owner_id: { type: string, pattern: "^[1-9][0-9]{0,19}$", description: "With repository_id." }
+        default_branch: { type: string, maxLength: 250, description: "relay-control only, with repository_id for a self-host issuer: the repository's default branch." }
+    DelegationAction:
+      type: object
+      description: An action as attested (class, target, conditions); a delegate's `note` never reaches a claim.
+      additionalProperties: false
+      required: [class, target]
+      properties:
+        class: { $ref: "#/components/schemas/DelegationActionClass" }
+        target: { type: string, minLength: 1, maxLength: 256 }
+        conditions: { type: array, maxItems: 5, items: { $ref: "#/components/schemas/DelegationCondition" } }
+    DelegationActionRef:
+      type: object
+      description: A tier O mint action. Concrete target; GitHub conditions only on `owner/repo#N`; one condition per type.
+      additionalProperties: false
+      required: [class, target]
+      properties:
+        class: { $ref: "#/components/schemas/DelegationActionClass" }
+        target: { type: string, minLength: 1, maxLength: 256 }
+        conditions: { type: array, maxItems: 5, items: { $ref: "#/components/schemas/DelegationCondition" } }
+    DelegationScope:
+      type: object
+      additionalProperties: false
+      required: [class, targets]
+      properties:
+        class: { $ref: "#/components/schemas/DelegationActionClass" }
+        targets: { type: array, minItems: 1, maxItems: 50, items: { type: string, maxLength: 256 } }
+    DelegateGrantInput:
+      type: object
+      additionalProperties: false
+      required: [delegate_agent_id, scopes]
+      properties:
+        delegate_agent_id: { type: string, minLength: 1, maxLength: 200 }
+        scopes: { type: array, minItems: 1, items: { $ref: "#/components/schemas/DelegationScope" } }
+        expires_at: { type: string, format: date-time }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+    DelegateGrantPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        scopes: { type: array, minItems: 1, items: { $ref: "#/components/schemas/DelegationScope" } }
+        expires_at: { type: string, format: date-time }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+    DelegateGrant:
+      type: object
+      required: [grant_id, owner_id, delegate_agent_id, scopes, require_tier_o, expires_at, status, created_at,
+        updated_at, revoked_at, revoked_reason]
+      properties:
+        grant_id: { type: string }
+        owner_id: { type: string }
+        delegate_agent_id: { type: string }
+        scopes: { type: array, items: { $ref: "#/components/schemas/DelegationScope" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        revoked_reason: { type: [string, "null"] }
+        status: { type: string, enum: [active, revoked, expired] }
+        trust_rule_id:
+          type: [string, "null"]
+          description: Set only on a system grant the owner's trust rule created (no scopes, no expiry; the live rule decides).
+        trust_path:
+          type: [object, "null"]
+          description: The ownership chain proven when the system grant was created (root, then each launch down to the delegate).
+    DelegationTrustRule:
+      type: object
+      required: [trust_rule_id, owner_id, require_tier_o, created_at, updated_at]
+      properties:
+        trust_rule_id: { type: string }
+        owner_id: { type: string }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    DelegationPolicy:
+      type: object
+      required: [delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match]
+      properties:
+        delegation_enabled: { type: boolean }
+        max_expiry_days: { type: integer, minimum: 1, maximum: 90 }
+        allowed_classes: { type: [array, "null"], items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        code_owner_match: { type: string, enum: [any_path, all_paths] }
+    DelegationPolicyInput:
+      type: object
+      additionalProperties: false
+      required: [delegation_enabled]
+      properties:
+        delegation_enabled: { type: boolean }
+        max_expiry_days: { type: integer, minimum: 1, maximum: 90 }
+        allowed_classes: { type: [array, "null"], items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        code_owner_match: { type: string, enum: [any_path, all_paths] }
+    DelegationOrgPolicy:
+      type: object
+      additionalProperties: false
+      required: [quote_retention_days]
+      properties:
+        quote_retention_days: { type: integer, minimum: 1, maximum: 3650, description: "§15.9 (Khaliq): days audit quotes are kept before redaction to their SHA-256 hash; default 90" }
+    DelegationTargetOwner:
+      type: object
+      additionalProperties: false
+      required: [pattern]
+      description: Names a repo, people, or both (at least one).
+      anyOf:
+        - required: [repo]
+        - required: [owner_ids]
+      properties:
+        pattern: { type: string, minLength: 1, maxLength: 256 }
+        repo: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" }
+        owner_ids: { type: array, minItems: 1, maxItems: 50, items: { type: string, format: uuid } }
+    DelegationAttestationClaims:
+      type: object
+      required: [v, ws, owner_id, owner_display, delegate_agent_id, grant_id, message_id, recipient_agent_id, approval_id,
+        tier, actions, standing, single_use, quote, iat, exp, jti]
+      properties:
+        v: { const: 1 }
+        ws: { type: string }
+        owner_id: { type: string }
+        owner_display: { type: string, maxLength: 80 }
+        delegate_agent_id: { type: string }
+        grant_id: { type: string }
+        message_id: { type: string }
+        recipient_agent_id: { type: string }
+        approval_id: { type: string }
+        tier: { type: string, enum: [D, O] }
+        actions: { type: array, items: { $ref: "#/components/schemas/DelegationAction" } }
+        standing: { type: string, enum: [own_owner, code_owner] }
+        quote: { type: [string, "null"], description: "§16.4: the stored quote, or null once redacted or never given" }
+        single_use: { type: boolean }
+        iat: { type: integer }
+        exp: { type: integer }
+        jti: { type: string }
+    DelegationVerdict:
+      oneOf:
+        - type: object
+          required: [verdict, attestation, claims]
+          properties:
+            verdict: { const: delegate }
+            attestation: { type: string, description: "Compact JWS, header {alg: EdDSA, typ: relay-delegation+jws, kid}" }
+            claims: { $ref: "#/components/schemas/DelegationAttestationClaims" }
+        - type: object
+          required: [verdict, reason]
+          properties:
+            verdict: { const: none }
+            reason: { $ref: "#/components/schemas/DelegationReason" }
+    DelegationAuditEvent:
+      type: object
+      required: [id, event, created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id, approval_id,
+        message_id, recipient_agent_id, reason, data, quote, quote_hash, quote_redacted_at]
+      properties:
+        id: { type: string, description: Monotonic per installation }
+        event: { type: string }
+        created_at: { type: string, format: date-time }
+        actor_user_id: { type: [string, "null"] }
+        actor_agent_id: { type: [string, "null"] }
+        auth_method: { type: [string, "null"], description: "session, desktop_bearer, agent_token or system" }
+        owner_id: { type: [string, "null"] }
+        grant_id: { type: [string, "null"] }
+        approval_id: { type: [string, "null"] }
+        message_id: { type: [string, "null"] }
+        recipient_agent_id: { type: [string, "null"] }
+        reason: { type: [string, "null"] }
+        data: { type: object }
+        quote: { type: [string, "null"] }
+        quote_hash: { type: [string, "null"] }
+        quote_redacted_at: { type: [string, "null"], format: date-time }
+    DelegationJwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, x, kid, alg, use]
+            properties:
+              kty: { const: OKP }
+              crv: { const: Ed25519 }
+              x: { type: string }
+              kid: { type: string }
+              alg: { const: EdDSA }
+              use: { const: sig }
     FleetView:
       type: object
       required: [policy_revision, range, totals, members, usage_unavailable, truncated, next_cursor]
@@ -9905,11 +11884,22 @@ components:
               type: integer
               minimum: 0
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
+    OrganizationTeam:
+      type: object
+      required: [id, name, memberCount, archivedAt, createdAt, updatedAt]
+      description: An organization team (docs/teams.md). memberCount counts open assignments of current members.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 80 }
+        memberCount: { type: integer, minimum: 0 }
+        archivedAt: { type: [string, "null"], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys, enrollment_self_mint]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, teams, session_delete, session_access, enrollment_keys, enrollment_self_mint]
       additionalProperties: false
-      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, not SELFHOST_FEATURES.
+      description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, and session_access from session-read configuration, not SELFHOST_FEATURES.
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
@@ -9918,9 +11908,13 @@ components:
         launch: { type: boolean }
         usage_people: { type: boolean }
         events_shim: { type: boolean }
+        teams: { type: boolean }
         session_delete:
           type: boolean
           description: True when the erase API URL and dedicated secret are configured and operator controls permit writes. Configuration availability only, not an upstream health or per-session storage verdict; owner/admin authorization is still required for DELETE.
+        session_access:
+          type: boolean
+          description: True when the session access routes are configured (SESSION_READ_MINT_INCLUDE_READER_KIND and SESSION_READ_API_MCP_READS on, and a History URL configured), so the dashboard may offer per-session access management. Configuration availability only; it grants nothing, and the routes still check rth:read and relaygate still decides who administers each session.
         enrollment_keys:
           type: boolean
           description: Always true. POST /api/v1/auth/enrollment/token exchanges desktop enrollment keys.
@@ -10401,6 +12395,192 @@ components:
                 coverage:
                   type: object
             - type: "null"
+    SessionAccessGrant:
+      type: object
+      required: [userId, perm, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        perm:
+          type: string
+          enum: [r, w, rw]
+        member:
+          type: boolean
+          description: False for a user who is no longer a member; remove the entry with a PATCH.
+    SessionAccessGroup:
+      type: object
+      required: [gid, perm]
+      properties:
+        gid:
+          type: integer
+          minimum: 0
+        perm:
+          type: string
+          enum: [r, w, rw]
+    SessionAccessPolicy:
+      type: object
+      required: [sessionId, runtime, reset, version, mode, gid, groups, members, label, updatedAt]
+      properties:
+        sessionId:
+          type: string
+        runtime:
+          type: boolean
+          description: True when a runtime override is in force.
+        reset:
+          type: boolean
+        version:
+          type: integer
+          minimum: 0
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        updatedAt:
+          type: [string, "null"]
+    SessionAccessAnswer:
+      type: object
+      required: [access]
+      properties:
+        access:
+          $ref: "#/components/schemas/SessionAccessPolicy"
+    SessionAccessChange:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      description: At least one of mode, members, groups or label.
+      properties:
+        mode:
+          type: string
+          pattern: "^[0246]{3}$"
+          description: Owner, group and other digits. "000" plus r entries restricts reading to those entries.
+        members:
+          type: array
+          maxItems: 64
+          description: Replaces the per-person list.
+          items:
+            type: object
+            required: [email, perm]
+            properties:
+              email:
+                type: string
+                maxLength: 320
+              perm:
+                type: string
+                enum: [r, w, rw]
+        groups:
+          type: array
+          maxItems: 64
+          description: Replaces the group list.
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        label:
+          type: [string, "null"]
+          pattern: "^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$"
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Audited. Never put session content in it.
+        expectedVersion:
+          type: integer
+          minimum: 0
+    SessionAccessSnapshot:
+      type: [object, "null"]
+      properties:
+        mode:
+          type: [string, "null"]
+        gid:
+          type: [integer, "null"]
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGroup"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionAccessGrant"
+        label:
+          type: [string, "null"]
+        reset:
+          type: boolean
+    SessionAccessHistoryRow:
+      type: object
+      required: [seq, at, actorId, actorName, actor, version, reason, before, after]
+      properties:
+        seq:
+          type: integer
+        at:
+          type: string
+        actorId:
+          type: [string, "null"]
+          description: relaygate's internal agent id, as recorded.
+        actorName:
+          type: [string, "null"]
+          description: relaygate's actor name, as recorded; `ctl:<userId>` for a Control person.
+        actor:
+          $ref: "#/components/schemas/SessionAccessActor"
+        version:
+          type: integer
+        reason:
+          type: [string, "null"]
+        before:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+          description: Null on a session's first change.
+        after:
+          $ref: "#/components/schemas/SessionAccessSnapshot"
+    SessionAccessActor:
+      type: [object, "null"]
+      description: |
+        The Control person named by `actorName` `ctl:<userId>`, resolved like a
+        per-person entry: email and name for a current member of the
+        organization, `member: false` with the user id only otherwise. Null
+        when `actorName` is not of that form.
+      required: [userId, member]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          description: Present only for a current member.
+        name:
+          type: [string, "null"]
+          description: Present only for a current member.
+        member:
+          type: boolean
+    SessionAccessError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, unknown_members, not_access_admin, csrf_rejected, forbidden, handoff_not_exchanged, not_found, session_access_not_configured, conflict, session_access_unavailable, session_access_outcome_unknown]
+        message:
+          type: string
+        currentVersion:
+          type: [integer, "null"]
+          description: With conflict.
+        emails:
+          type: array
+          items:
+            type: string
+          description: With unknown_members, the emails that name no single current member.
     DashboardSessionCatalog:
       type: object
       required: [catalog, parents, children, commitLinks, truncated]
@@ -10991,6 +13171,10 @@ components:
           type: integer
           const: 1
           description: Cursor chats may sync native_session kind cursor (the Cursor conversation_id) and send kind cursor call proofs.
+        claude_attestation_handoff:
+          type: integer
+          const: 1
+          description: POST .../desktop-identities/attestations takes a Claude Code proof ahead of its call, matched by _meta claudecode/toolUseId.
     DesktopIdentitySync:
       type: object
       additionalProperties: false
@@ -11519,6 +13703,19 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    SessionAccessFailure:
+      description: |
+        400 invalid_request or unknown_members; 403 not_access_admin (relaygate
+        refused: not a session access administrator, decided before the
+        session is looked up, so it says nothing about whether the session
+        exists), csrf_rejected, forbidden or handoff_not_exchanged; 404
+        not_found (an administrator naming a session relaygate does not know),
+        session_access_not_configured or a workspace outside the tenant; 409
+        conflict with currentVersion; 503 session_access_unavailable; 504
+        session_access_outcome_unknown (a write whose answer was lost).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SessionAccessError" }
     RelayNodeTokenInvalid:
       description: "token_invalid: no bearer, or not a live (unrevoked, unexpired) relay-node token."
       content:
@@ -11620,11 +13817,12 @@ components:
           schema: { $ref: "#/components/schemas/FactoryError" }
     DesktopMcpError:
       description: |
-        `{error, message}` with a stable code: invalid_request (400),
-        unauthorized (401), desktop_login_required, workspace_access_changed,
-        forbidden or csrf_rejected (403), workspace_not_found or
-        token_not_found (404), method_not_allowed (405, with Allow),
-        credential_conflict or too_many_credentials (409), rate_limited (429),
+        `{error, message}` with a stable code: invalid_request or
+        invalid_attestation (400), unauthorized (401), desktop_login_required,
+        workspace_access_changed, forbidden, csrf_rejected,
+        handoff_not_exchanged or attestation_rejected (403), workspace_not_found or token_not_found
+        (404), method_not_allowed (405, with Allow), credential_conflict,
+        too_many_credentials or conflict (409), rate_limited (429),
         upstream_unavailable (502).
       content:
         application/json:

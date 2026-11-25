@@ -15,6 +15,7 @@ import {
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
 import type { GithubAppConfig } from "./admin/github-app.js";
 import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
+import { privateKeyFromSeed, publicX, type DelegationSigningConfig } from "./delegation/jws.js";
 
 /** One extra site: a dashboard origin and an API origin (may be equal). */
 export type ExtraSite = { dashboardOrigin: string; apiOrigin: string };
@@ -50,6 +51,28 @@ export type SelfhostConfig = {
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
   /**
+   * SELFHOST_DELEGATION_SIGNING_KEY (or _FILE, a base64url 32-byte Ed25519
+   * seed) + SELFHOST_DELEGATION_SIGNING_KID: the owner-delegate attestation
+   * key (docs/owner-delegates.md). SELFHOST_DELEGATION_PREVIOUS_KEYS, a JSON
+   * array of {kid, x}, keeps retired public keys in the JWKS. Unset:
+   * attestation answers `unavailable` and the JWKS is empty.
+   */
+  delegationSigning?: DelegationSigningConfig | null;
+  /**
+   * SELFHOST_DELEGATION_QUOTE_KEY (or _FILE): at least 32 bytes, the server
+   * key behind the keyed quote digests in the delegation audit log (§8). Unset:
+   * derived from the active encryption key (HKDF), so it never leaves the
+   * server; set it to keep digests stable across encryption key rotations.
+   */
+  delegationQuoteKey?: string | null;
+  /**
+   * SELFHOST_DELEGATION_OIDC_ISSUERS: comma-separated OIDC issuers (https)
+   * whose workflow tokens may redeem through a release gate, in addition to
+   * GitHub Actions (https://token.actions.githubusercontent.com), which is
+   * always accepted. For example a GitHub Enterprise Server issuer.
+   */
+  delegationOidcIssuers?: string[];
+  /**
    * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
    * a workspace queues the same delete for relayfile-control's Flows data.
    * Unset: nothing is queued (the legacy local Flows rows still cascade).
@@ -59,10 +82,12 @@ export type SelfhostConfig = {
   customerSupport?: { url: string; token: string } | null;
   /**
    * Independent read service; owns issuance, rotation and verification of its tokens. Required.
-   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
-   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
-   * it before proxying, and the read API's strict mint schema rejects it.
-   * Absent means false.
+   * mintReaderKind: send `reader_kind` in the mint body. An explicit
+   * SESSION_READ_MINT_INCLUDE_READER_KIND (true or false) wins; unset, it is
+   * true exactly when SELFHOST_RELAYGATE_PUBLIC_URL is set. The receiving
+   * service must accept or strip the field: relaygate reads it and strips it
+   * before proxying, and the read API's strict mint schema rejects it, which is
+   * why it stays off by default without relaygate. Absent means false.
    */
   sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
@@ -570,7 +595,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
   const relaygatePublicUrl = loadRelaygatePublicUrl(env);
-  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: loadSessionReadMintIncludeReaderKind(env, relaygatePublicUrl !== null) };
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
   const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
@@ -596,6 +621,9 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
+    delegationSigning: loadDelegationSigning(env),
+    delegationQuoteKey: loadDelegationQuoteKey(env),
+    delegationOidcIssuers: loadDelegationOidcIssuers(env),
     flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
@@ -662,6 +690,14 @@ function loadSessionReadMintIncludeRole(env: Env): boolean {
   return true;
 }
 
+function loadSessionReadMintIncludeReaderKind(env: Env, defaultValue: boolean): boolean {
+  const value = env.SESSION_READ_MINT_INCLUDE_READER_KIND?.trim();
+  if (!value) return defaultValue;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("SESSION_READ_MINT_INCLUDE_READER_KIND must be true or false");
+}
+
 function loadSessionReadMcpReads(env: Env): boolean {
   const value = env.SESSION_READ_API_MCP_READS?.trim();
   if (!value || value === "false") return false;
@@ -679,6 +715,181 @@ function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureAp
     throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
   }
   return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+export function loadDelegationQuoteKey(env: Env): string | null {
+  const key = readSecret(env, "SELFHOST_DELEGATION_QUOTE_KEY");
+  if (!key) return null;
+  if (Buffer.byteLength(key) < 32) throw new Error("SELFHOST_DELEGATION_QUOTE_KEY (or _FILE) must be at least 32 bytes");
+  return key;
+}
+
+/**
+ * The secret quote digests are derived from (HKDF per workspace, as Cloud):
+ * SELFHOST_DELEGATION_QUOTE_KEY when set, else the active credential
+ * encryption key. Rotating it changes the digests of new quotes only.
+ */
+export function delegationQuoteSecret(config: Pick<SelfhostConfig, "delegationQuoteKey" | "encryptionKeyring">): Buffer {
+  return config.delegationQuoteKey ? Buffer.from(config.delegationQuoteKey, "utf8") : config.encryptionKeyring.active.key;
+}
+
+/** SELFHOST_DELEGATION_OIDC_ISSUERS: extra release-gate OIDC issuers, https origins with an optional path. */
+export function loadDelegationOidcIssuers(env: Env): string[] {
+  const raw = env.SELFHOST_DELEGATION_OIDC_ISSUERS?.trim();
+  if (!raw) return [];
+  const issuers = raw.split(",").map(value => value.trim()).filter(Boolean);
+  if (issuers.length > 8) throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS takes at most 8 issuers");
+  return [...new Set(issuers.map((value) => {
+    // A bare "?" or "#" leaves url.search and url.hash empty: refuse the raw delimiters too.
+    if (/[?#]/.test(value)) {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs without query, fragment or credentials");
+    }
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs");
+    }
+    if (url.protocol !== "https:" || url.search || url.hash || url.username || url.password) {
+      throw new Error("SELFHOST_DELEGATION_OIDC_ISSUERS must be https URLs without query, fragment or credentials");
+    }
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  }))];
+}
+
+const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;
+/** As Cloud: retired (or pre-published) public keys kept in the JWKS. */
+const MAX_PREVIOUS_DELEGATION_KEYS = 3;
+
+/** RFC 7638 thumbprint of an Ed25519 public key (members in lexicographic order, no whitespace), as Cloud's kid. */
+export function delegationKeyThumbprint(x: string): string {
+  return createHash("sha256").update(`{"crv":"Ed25519","kty":"OKP","x":"${x}"}`).digest("base64url");
+}
+
+/** As Cloud: empty, `unset` and any `*-disabled` placeholder mean "not configured". */
+function realDelegationKeyValue(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed && trimmed !== "unset" && !trimmed.endsWith("-disabled") ? trimmed : null;
+}
+
+/** A 32-byte Ed25519 seed from a PKCS#8 PEM private key. */
+function seedFromPem(pem: string, name: string): Buffer {
+  let key;
+  try {
+    key = createPrivateKey(pem);
+  } catch {
+    throw new Error(`${name} must be a PKCS#8 PEM Ed25519 private key`);
+  }
+  if (key.asymmetricKeyType !== "ed25519") throw new Error(`${name} must be an Ed25519 key`);
+  const der = key.export({ format: "der", type: "pkcs8" });
+  return Buffer.from(der.subarray(der.byteLength - 32));
+}
+
+function previousDelegationKey(value: unknown, name: string): { kid: string; x: string } {
+  const key = value as Record<string, unknown> | null;
+  if (!key || typeof key !== "object" || "d" in key || typeof key.x !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(key.x) ||
+      (key.kty !== undefined && key.kty !== "OKP") || (key.crv !== undefined && key.crv !== "Ed25519") ||
+      (key.kid !== undefined && (typeof key.kid !== "string" || !DELEGATION_KID.test(key.kid)))) {
+    throw new Error(`${name} must hold public Ed25519 keys ({kid?, x} or an OKP JWK without "d")`);
+  }
+  return { kid: typeof key.kid === "string" ? key.kid : delegationKeyThumbprint(key.x), x: key.x };
+}
+
+/**
+ * The attestation signing key, as Cloud's signing.ts reads its key ring.
+ * `SELFHOST_DELEGATION_SIGNING_KEY` (or `_FILE`) is one of:
+ *
+ * - a PKCS#8 PEM Ed25519 private key (`openssl genpkey -algorithm ed25519`);
+ * - Cloud's keyring JSON `{"currentPrivateKeyPem": "<PEM>", "kid"?: "<id>",
+ *   "previousPublicJwks"?: [<public OKP Ed25519 JWK>, …]}` (at most 3), used
+ *   across a rotation;
+ * - a base64url 32-byte seed (the earlier relay-control form).
+ *
+ * The kid defaults to the RFC 7638 thumbprint of the public key, as Cloud's.
+ * `SELFHOST_DELEGATION_SIGNING_KID` (or the keyring's `kid`) may name it
+ * explicitly; it is kept as given, because verifiers match a kid exactly and
+ * an install that already published one must not change it under them.
+ * `SELFHOST_DELEGATION_PREVIOUS_KEYS` may list retired or pre-published public
+ * keys (`[{kid?, x}]`), unless the keyring already does.
+ *
+ * Empty, `unset` or a `*-disabled` placeholder is not configured: attestation
+ * answers `unavailable` and the JWKS is empty. A value that is set but
+ * malformed stops startup, as every other relay-control secret does.
+ */
+export function loadDelegationSigning(env: Env): DelegationSigningConfig | null {
+  const raw = realDelegationKeyValue(readSecret(env, "SELFHOST_DELEGATION_SIGNING_KEY"));
+  const explicitKid = env.SELFHOST_DELEGATION_SIGNING_KID?.trim() || null;
+  const previousValue = env.SELFHOST_DELEGATION_PREVIOUS_KEYS?.trim() || null;
+  if (!raw) {
+    if (explicitKid || previousValue) {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KID and SELFHOST_DELEGATION_PREVIOUS_KEYS need SELFHOST_DELEGATION_SIGNING_KEY (or _FILE)");
+    }
+    return null;
+  }
+  let seed: Buffer;
+  let ringKid: string | null = null;
+  let previousInput: unknown[] = [];
+  if (raw.startsWith("{")) {
+    let ring: Record<string, unknown>;
+    try {
+      ring = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring must be JSON {currentPrivateKeyPem, kid?, previousPublicJwks?}");
+    }
+    if (typeof ring.currentPrivateKeyPem !== "string") {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring needs currentPrivateKeyPem");
+    }
+    seed = seedFromPem(ring.currentPrivateKeyPem, "SELFHOST_DELEGATION_SIGNING_KEY currentPrivateKeyPem");
+    if (ring.kid !== undefined && ring.kid !== null) {
+      if (typeof ring.kid !== "string" || !DELEGATION_KID.test(ring.kid)) {
+        throw new Error("SELFHOST_DELEGATION_SIGNING_KEY keyring kid must be 1-64 of A-Z a-z 0-9 . _ -");
+      }
+      ringKid = ring.kid;
+    }
+    if (ring.previousPublicJwks !== undefined) {
+      if (!Array.isArray(ring.previousPublicJwks)) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY previousPublicJwks must be an array");
+      previousInput = ring.previousPublicJwks;
+      if (previousValue && previousInput.length) {
+        throw new Error("Set previous keys in the keyring or in SELFHOST_DELEGATION_PREVIOUS_KEYS, not both");
+      }
+    }
+  } else if (raw.startsWith("-----BEGIN")) {
+    seed = seedFromPem(raw, "SELFHOST_DELEGATION_SIGNING_KEY");
+  } else {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(raw)) {
+      throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a PKCS#8 PEM, a keyring JSON, or a base64url 32-byte Ed25519 seed");
+    }
+    seed = Buffer.from(raw, "base64url");
+  }
+  if (seed.byteLength !== 32) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must hold a 32-byte Ed25519 seed");
+  const x = publicX(privateKeyFromSeed(seed));
+  if (explicitKid && ringKid && explicitKid !== ringKid) {
+    throw new Error("SELFHOST_DELEGATION_SIGNING_KID differs from the keyring's kid");
+  }
+  const kid = explicitKid ?? ringKid ?? delegationKeyThumbprint(x);
+  if (!DELEGATION_KID.test(kid)) throw new Error("SELFHOST_DELEGATION_SIGNING_KID must be 1-64 of A-Z a-z 0-9 . _ -");
+  if (previousValue) {
+    try {
+      const parsed = JSON.parse(previousValue) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("not an array");
+      previousInput = parsed;
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of {kid?, x}");
+    }
+  }
+  if (previousInput.length > MAX_PREVIOUS_DELEGATION_KEYS) {
+    throw new Error(`At most ${MAX_PREVIOUS_DELEGATION_KEYS} previous delegation signing keys may be published`);
+  }
+  // Every published kid is distinct (the active one included): a verifier
+  // uses the first key with a matching kid, so a duplicate would hide one.
+  const seen = new Set<string>([kid]);
+  const previous = previousInput.map(item => previousDelegationKey(item, "SELFHOST_DELEGATION_PREVIOUS_KEYS"))
+    .filter(key => !(key.x === x && key.kid === kid));
+  for (const key of previous) {
+    if (seen.has(key.kid)) throw new Error("Previous delegation signing keys must have distinct kids");
+    seen.add(key.kid);
+  }
+  return { kid, seed, previous };
 }
 
 function loadChiefRelaySecret(env: Env): string | null {

@@ -24,6 +24,7 @@ import {
   parseCredentialRequest,
   personDevice,
   sweepDeviceRevocations,
+  SIGN_OUT_REVOKE_TIMEOUT_MS,
 } from "./device-credentials.js";
 import { MessagingHttpError, SEND_UNCERTAIN_MESSAGE, SendAbandoned } from "./http.js";
 import { createRelaycastClient, RelaycastCallError } from "./relaycast.js";
@@ -48,6 +49,25 @@ type WorkspaceAccess = {
 };
 
 type JsonWriter = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
+
+/** The person credential POST shares Cloud's error envelope; other Control routes keep theirs. */
+export function credentialJsonWriter(path: string, method: string, write: JsonWriter): JsonWriter {
+  if (method !== "POST" || !/^\/(?:cloud\/)?api\/v1\/workspaces\/[^/]+\/messaging\/identity\/credential$/.test(path)) return write;
+  return (response, status, body, noStore) => {
+    if (status >= 400 && body && typeof body === "object" && !Array.isArray(body)) {
+      const { error, message, code, ...extra } = body as Record<string, unknown>;
+      if (typeof error === "string") {
+        write(response, status, {
+          ...extra,
+          error: typeof message === "string" ? message : error,
+          code: typeof code === "string" ? code : error,
+        }, true);
+        return;
+      }
+    }
+    write(response, status, body, noStore);
+  };
+}
 
 function safeDecode(value: string): string {
   try {
@@ -268,7 +288,9 @@ export function createMessagingHandler(input: MessagingDeps & {
       throw new MessagingHttpError(403, "csrf_rejected", "Cross-origin messaging write refused");
     }
     await sweepRevocations(deps, access.workspace.organizationId);
-    await sweepDeviceRevocations(deps, access.workspace.organizationId);
+    await sweepDeviceRevocations(deps, access.workspace.organizationId, {
+      signal: AbortSignal.timeout(deps.signOutRevokeTimeoutMs ?? SIGN_OUT_REVOKE_TIMEOUT_MS),
+    });
     const person = accessInput(access);
 
     if (people && method === "GET") {
@@ -338,7 +360,7 @@ export function createMessagingHandler(input: MessagingDeps & {
       const identity = await ensurePersonIdentity(deps, person);
       let issued: DeviceCredential;
       try {
-        issued = await ensureDeviceCredential(deps, person, identity, device, signInId, { refusedTokenSha256 });
+        issued = await ensureDeviceCredential(deps, person, identity, device, signInId, { refusedTokenSha256, requestSessionId: access.principal.sessionId });
       } catch (error) {
         if (error instanceof DeviceMintRateLimited) response.setHeader("retry-after", String(error.retryAfterSeconds));
         throw error;

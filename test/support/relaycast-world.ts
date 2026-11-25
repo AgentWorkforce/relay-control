@@ -15,9 +15,14 @@ type Agent = {
 type Message = {
   id: string; agent_name: string; agent_id: string; text: string; created_at: string;
   conversation_id: string | null; channel_id: string | null; thread_id: string | null;
+  /** Relaycast's immutable, server-stored owner_approval (relay owner-trusted-delegates §16.2). */
+  owner_approval?: unknown;
+  /** The send time the by-message proof reports as `created_at` (null: not reported). */
+  sent_at?: string | null;
 };
 /** Acknowledged rows are kept, owner-scoped, as Relaycast does; only unacknowledged ones are pending. */
-type Delivery = { id: string; agent: string; message: Message; reason: string; acked: boolean };
+/** `agentId` is the recipient's immutable id at delivery time; a same-name replacement never sees it. */
+type Delivery = { id: string; agent: string; agentId?: string; message: Message; reason: string; acked: boolean };
 type Channel = { id: string; name: string; topic: string | null; members: Set<string>; archived: boolean };
 /** An outbound webhook subscription, with the workspace key that created it. */
 type Subscription = {
@@ -26,6 +31,9 @@ type Subscription = {
 };
 
 export type RelaycastWorld = ReturnType<typeof createRelaycastWorld>;
+
+/** The RELAYCAST_INTERNAL_SECRET the world's internal routes accept. */
+export const RELAYCAST_INTERNAL_SECRET = "relaycast-internal-secret-for-tests-0000000000";
 
 export function createRelaycastWorld(roster: unknown[]) {
   let sequence = 1000;
@@ -58,6 +66,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   const releaseOutcome = { mode: "completed" as "completed" | "failed" };
   /** Workspace leaders patterns per workspace key (PUT/GET /v1/workspace/leaders). */
   const leaderPatterns = new Map<string, string[]>();
+  /** The Relaycast workspace id the by-message proof reports. */
+  const deliveryWorkspace = { id: "rw_primary" };
 
   const rosterEntry = (agent: Agent) => ({
     id: agent.id, name: agent.name, type: agent.type, metadata: agent.metadata,
@@ -92,7 +102,8 @@ export function createRelaycastWorld(roster: unknown[]) {
     return created;
   }
   function deliver(to: string, created: Message, reason: string): void {
-    if (agents.has(to)) deliveries.push({ id: `dl_${next()}`, agent: to, message: created, reason, acked: false });
+    const recipient = agents.get(to);
+    if (recipient) deliveries.push({ id: `dl_${next()}`, agent: to, agentId: recipient.id, message: created, reason, acked: false });
   }
   function directMessage(sender: Agent, to: string, text: string) {
     let conversation = conversations.find(item => item.participants.includes(sender.name) && item.participants.includes(to));
@@ -104,6 +115,9 @@ export function createRelaycastWorld(roster: unknown[]) {
     deliver(to, created, "dm");
     return { conversation_id: conversation.id, message: { id: created.id, agent_name: sender.name, text, created_at: created.created_at } };
   }
+
+  /** Quote redactions Relaycast confirmed through its internal route. */
+  const quoteRedactions: Array<{ workspaceId: string; messageId: string }> = [];
 
   async function handle(method: string, path: string, query: URLSearchParams, bearer: string, body: Record<string, any> | null,
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
@@ -120,6 +134,13 @@ export function createRelaycastWorld(roster: unknown[]) {
     idempotencyKey: string | null): Promise<{ status: number; body: unknown } | null> {
     const ok = (data: unknown, status = 200) => ({ status, body: { ok: true, data } });
     const fail = (status: number, code: string) => ({ status, body: { ok: false, error: { code } } });
+    const internal = /^\/internal\/workspaces\/([^/]+)\/messages\/([^/]+)\/owner-approval\/redact-quote$/.exec(path);
+    if (internal && method === "POST") {
+      // relaycast#710: the internal credential only, no body.
+      if (bearer !== RELAYCAST_INTERNAL_SECRET) return fail(401, "unauthorized");
+      quoteRedactions.push({ workspaceId: decodeURIComponent(internal[1]!), messageId: decodeURIComponent(internal[2]!) });
+      return ok({ redacted: true });
+    }
     const workspace = bearer.startsWith("rk_");
     const caller = workspace ? null : byToken(bearer);
     if (!workspace && !caller) return fail(401, "unauthorized");
@@ -301,6 +322,16 @@ export function createRelaycastWorld(roster: unknown[]) {
       return ok(deliveries.filter(row => row.agent === caller.name && !row.acked).map(row => ({
         id: row.id, conversation_id: row.message.conversation_id, reason: row.reason, channel_id: row.message.channel_id, message: row.message })));
     }
+    if ((match = /^\/v1\/deliveries\/by-message\/([^/]+)$/.exec(path)) && method === "GET" && caller) {
+      // Relaycast #543: only this token's own pending delivery of the message;
+      // unknown, foreign and acknowledged ids are the same 404.
+      const row = deliveries.find(item => (item.agentId ?? agents.get(item.agent)?.id) === caller.id && !item.acked && item.message.id === decodeURIComponent(match![1]!));
+      if (!row) return fail(404, "delivery_not_found");
+      return ok({ message_id: row.message.id, sender_agent_id: row.message.agent_id, workspace_id: deliveryWorkspace.id,
+        channel_id: row.message.channel_id ?? row.message.conversation_id, delivery_reason: row.reason,
+        owner_approval: row.message.owner_approval ?? null,
+        ...(row.message.sent_at ? { created_at: row.message.sent_at } : {}) });
+    }
     if ((match = /^\/v1\/deliveries\/([^/]+)\/ack$/.exec(path)) && method === "POST" && caller) {
       // Relaycast ackDelivery (engine/delivery.ts at ac38905): a repeat ack by
       // the owner succeeds with changed:false; 404 means absent or not owned.
@@ -384,8 +415,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   }
 
   return {
-    agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, everyStateNodesFailures, nodesHistory, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
+    quoteRedactions, agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
+    nodes, everyStateNodesFailures, nodesHistory, invocations, spawnOutcome, releaseOutcome, leaderPatterns, deliveryWorkspace,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);
@@ -405,8 +436,28 @@ export function createRelaycastWorld(roster: unknown[]) {
     sendAs(from: string, to: string, text: string) {
       return directMessage(agents.get(from)!, to, text);
     },
-    /** A peer agent creates or joins a channel and optionally posts to it. */
-    channelAs(from: string, name: string, text?: string) {
+    /** A DM carrying a server-stored owner_approval, as Relaycast would store it at send. */
+    /**
+     * A peer sends a message carrying an owner_approval. The by-message proof
+     * reports its send time as `created_at` (now, unless `createdAt` names one;
+     * null reports none). `id` gives the message a chosen id (a snowflake).
+     */
+    sendApprovalAs(from: string, to: string, text: string, ownerApproval: unknown,
+      options: { createdAt?: string | null; id?: string } = {}) {
+      const sent = directMessage(agents.get(from)!, to, text);
+      const stored = messages.get(sent.message.id)!;
+      stored.owner_approval = ownerApproval;
+      stored.sent_at = options.createdAt === undefined ? new Date().toISOString() : options.createdAt;
+      if (options.id) {
+        messages.delete(stored.id);
+        stored.id = options.id;
+        messages.set(stored.id, stored);
+        sent.message.id = options.id;
+      }
+      return sent;
+    },
+    /** A peer agent creates or joins a channel and optionally posts to it; `mention` gets the post as a mention delivery. */
+    channelAs(from: string, name: string, text?: string, options: { mention?: string } = {}) {
       let channel = channels.get(name);
       if (!channel) {
         channel = { id: `ch_${next()}`, name, topic: null, members: new Set<string>(), archived: false };
@@ -415,7 +466,7 @@ export function createRelaycastWorld(roster: unknown[]) {
       channel.members.add(from);
       if (text === undefined) return null;
       const created = message(agents.get(from)!, text, { channel_id: channel.id });
-      for (const member of channel.members) if (member !== from) deliver(member, created, "message");
+      for (const member of channel.members) if (member !== from) deliver(member, created, member === options.mention ? "mention" : "message");
       return created;
     },
   };

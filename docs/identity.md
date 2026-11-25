@@ -1772,25 +1772,33 @@ leaves Control while Relaycast serves device tokens.
   hash nor the token is logged) the stored token is dropped without a probe
   and a new one minted, at most once per device every 30 seconds, measured
   from the stored token's `minted_at` by the database clock so every replica
-  agrees. Inside that window the answer is `429 rate_limited`. Control also
-  sends `Retry-After` (seconds), but clients must not depend on it: the
-  hosted route sends none. A hash that does not match takes the normal path
-  (probe, no forced mint). A body that is not JSON or not an object, or a
+  agrees. Inside that window the answer is `429 rate_limited`, with
+  `Retry-After` in seconds, matching the hosted route. A hash that does not
+  match takes the normal path (probe, no forced mint). A body that is not JSON
+  or not an object, or a
   `refusedTokenSha256` that is not 64 lowercase hex (uppercase included), is
   `400 invalid_request`. The shared-token fallback below ignores the field.
-- A device row revoked while its sign-in still authenticates answers
-  `403 device_revoked`; sign in again for a new device. No Control route
-  leaves a row in that state today; the answer exists so clients handle the
-  same code as on the hosted service. The web device is bound to no sign-in,
-  so a new browser request mints it again.
+- Errors from this POST use the hosted envelope
+  `{error: "<human-readable message>", code: "<machine-readable code>"}`,
+  including authentication and origin-check failures. Clients branch on
+  `code`, rather than treating `error` as a code. Other Control routes retain
+  their existing envelopes.
+- A device row revoked while its calling session still authenticates answers
+  `403 device_revoked`; sign in again for a new device. If the calling session
+  or membership ends while a probe, mint or fallback lookup is in flight, the
+  request also answers `403 device_revoked` and never hands out a credential.
+  This live calling-session check includes browser requests: the web device
+  row remains unbound to a sign-in, but the browser session authorizing that
+  individual request must remain live. A later browser request with valid
+  authority can mint the web device again.
 - Mints, sweeps of revoked device tokens, the person agent's registration,
   takeover and recovery, and member revocation take the same per-person
   advisory lock, so a mint never interleaves with a recovery or a removal.
   After a minted token is saved, the mint re-checks in the same transaction
-  that the sign-in is live and the person is still a member; if not, the row
-  is revoked and the token revoked upstream (or left to the sweep). A sign-in
-  row deleted while the mint was in flight leaves the token recorded with no
-  sign-in, already revoked, for the same upstream revoke.
+  that the calling session is live and the person is still a member; if not,
+  the row is revoked and the token revoked upstream (or left to the sweep).
+  A sign-in row deleted while the mint was in flight leaves the token
+  recorded with no sign-in, already revoked, for the same upstream revoke.
 - A device token is never presented to Relaycast's token rotation, recovery
   or upgrade routes; recovery uses the workspace key and the shared token.
   Relaycast refuses device tokens there with `403 device_token_forbidden`,
@@ -1815,11 +1823,17 @@ leaves Control while Relaycast serves device tokens.
 - Removing a membership deletes the person's sign-in rows, and with them
   their device rows. Their device tokens end because member revocation
   deletes the person agent at Relaycast, not by per-device revokes.
-- A bearer sign-in that ends while its token is being minted answers `401`,
-  including when the membership is removed (the sign-in goes with it). The
-  web device is bound to no sign-in, so for it a membership removed during
-  the mint answers `403`. Either way the minted token is revoked upstream at
-  once, or by the sweep if that fails.
+- Each upstream device-token mint, stored-token probe and missing-route
+  confirmation lookup has a 15-second deadline. A probe outage or timeout can
+  serve an existing token only while it is unexpired and the calling session
+  and membership are still live. With live authority, a timed-out mint has
+  an unknown upstream outcome and answers `502 upstream_unavailable`; it is never reported as a
+  successful mint. This is a bound per operation, not on the total request.
+- If a mint loses its calling session or membership, its immediate upstream
+  undo has a 5-second budget. The cleanup rechecks the revoked row under the
+  person lock before revoking, so it cannot revoke a newer live replacement
+  for the same device. An unsuccessful undo leaves the row pending for the
+  bounded sweep and the token's expiry remains the backstop.
 - A Desktop browser handoff token never holds a messaging credential: before
   its PKCE exchange it answers `403 handoff_not_exchanged`, after it
   `403 handoff_not_capable`. The session the exchange issues is the device.

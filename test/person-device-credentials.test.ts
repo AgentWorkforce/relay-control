@@ -58,6 +58,12 @@ type RelayState = {
   issuedTokens: string[];
   /** Device-token DELETEs are accepted and never answered. */
   deleteHangs: boolean;
+  /** Hooks run outside the Control mint transaction (fallback lookup and cached-token probe). */
+  beforeAgentLookup?: () => Promise<void> | void;
+  beforeProbe?: () => Promise<void> | void;
+  mintHangs: boolean;
+  probeHangs: boolean;
+  agentLookupHangs: boolean;
 };
 
 function relayState(): RelayState {
@@ -78,6 +84,9 @@ function relayState(): RelayState {
     deviceTokenPrefix: "at_live_dv_",
     issuedTokens: [],
     deleteHangs: false,
+    mintHangs: false,
+    probeHangs: false,
+    agentLookupHangs: false,
   };
 }
 
@@ -146,6 +155,8 @@ function createRelay(state: RelayState) {
 
     if (request.method === "GET" && url.pathname === "/v1/agent") {
       state.probeCalls += 1;
+      await state.beforeProbe?.();
+      if (state.probeHangs) return;
       if (state.probeDown) {
         response.socket?.destroy();
         return;
@@ -167,6 +178,7 @@ function createRelay(state: RelayState) {
 
     if (request.method === "POST" && mint) {
       state.mints.push(parsed);
+      if (state.mintHangs) return;
       const answer = state.mintAnswers.shift();
       if (answer) {
         sendJson(response, answer.status, answer.body);
@@ -227,6 +239,8 @@ function createRelay(state: RelayState) {
       const name = decodeURIComponent(agentPath[1]!);
       const agent = state.agents.get(name);
       if (request.method === "GET" && !agentPath[2]) {
+        await state.beforeAgentLookup?.();
+        if (state.agentLookupHangs) return;
         if (!agent) {
           sendJson(response, 404, { error: { code: "agent_not_found", message: "Agent not found" } });
           return;
@@ -293,12 +307,13 @@ async function jsonRequest(
 type Hooks = {
   beforeDeviceSave?: (tx: SqlExecutor) => Promise<void> | void;
   afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void;
+  beforeDeviceRevoke?: () => Promise<void> | void;
 };
 type SignIn = { accessToken: string; refreshToken: string; sessionId: string };
 
 async function harness(
   t: { after: (fn: () => Promise<void>) => void },
-  options?: { config?: Partial<SelfhostConfig>; signOutRevokeTimeoutMs?: number },
+  options?: { config?: Partial<SelfhostConfig>; signOutRevokeTimeoutMs?: number; deviceRequestTimeoutMs?: number },
 ) {
   const state = relayState();
   const hooks: Hooks = {};
@@ -337,6 +352,8 @@ async function harness(
     messaging: {
       beforeDeviceSave: (tx) => hooks.beforeDeviceSave?.(tx),
       afterDeviceMint: (tx) => hooks.afterDeviceMint?.(tx),
+      beforeDeviceRevoke: () => hooks.beforeDeviceRevoke?.(),
+      ...(options?.deviceRequestTimeoutMs !== undefined ? { deviceRequestTimeoutMs: options.deviceRequestTimeoutMs } : {}),
       ...(options?.signOutRevokeTimeoutMs !== undefined ? { signOutRevokeTimeoutMs: options.signOutRevokeTimeoutMs } : {}),
       warn: (message, fields) => { warnings.push({ message, fields }); },
     },
@@ -464,6 +481,9 @@ test("a browser session gets the web device and each bearer sign-in its own devi
     assert.notEqual(answer.body.identity.token, "ar_ag_1");
     assert.equal(answer.body.identity.relaycastUrl, "https://cast.selfhosted.example");
     assert.equal(typeof answer.body.identity.expiresAt, "string");
+    assert.deepEqual(Object.keys(answer.body), ["identity"]);
+    assert.deepEqual(Object.keys(answer.body.identity).sort(), ["agentId", "device", "expiresAt", "name", "relaycastUrl", "token"]);
+    assert.equal(answer.headers.get("cache-control"), "no-store");
   }
   // Every mint names the agent, the device and the TTL.
   assert.equal(fx.state.mints.length, 3);
@@ -657,7 +677,11 @@ test("a second reported refusal of a device token within 30 seconds of its mint 
     json: { refusedTokenSha256: sha256Hex(minted.body.identity.token as string) },
   });
   assert.equal(limited.status, 429);
-  assert.equal(limited.body.error, "rate_limited");
+  assert.equal(limited.body.code, "rate_limited");
+  assert.equal(typeof limited.body.error, "string");
+  assert.notEqual(limited.body.error, limited.body.code);
+  assert.deepEqual(Object.keys(limited.body).sort(), ["code", "error"]);
+  assert.equal(limited.headers.get("cache-control"), "no-store");
   const retryAfter = Number(limited.headers.get("retry-after"));
   assert.equal(Number.isInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 30, true, String(retryAfter));
   assert.equal(mentionsIssuedToken(fx.state, limited.body), false);
@@ -723,7 +747,7 @@ test("a malformed credential request body is refused with 400 before anything is
   ]) {
     const refused = await fx.credential({ token: signIn.accessToken }, { raw });
     assert.equal(refused.status, 400, raw);
-    assert.equal(refused.body.error, "invalid_request", raw);
+    assert.equal(refused.body.code, "invalid_request", raw);
   }
   assert.equal(fx.state.registerCalls, 0);
   assert.equal(fx.state.mints.length, 0);
@@ -760,12 +784,12 @@ test("a device revoked while its sign-in still authenticates answers 403 device_
 
   const revoked = await fx.credential({ token: signIn.accessToken });
   assert.equal(revoked.status, 403);
-  assert.equal(revoked.body.error, "device_revoked");
+  assert.equal(revoked.body.code, "device_revoked");
   const reported = await fx.credential({ token: signIn.accessToken }, {
     json: { refusedTokenSha256: sha256Hex(minted.body.identity.token as string) },
   });
   assert.equal(reported.status, 403);
-  assert.equal(reported.body.error, "device_revoked");
+  assert.equal(reported.body.code, "device_revoked");
   assert.equal(mentionsIssuedToken(fx.state, [revoked.body, reported.body]), false);
   assert.equal(fx.state.mints.length, 1);
 
@@ -789,7 +813,7 @@ test("a probe answered device_token_forbidden is an upstream error, never a re-m
   });
   const failed = await fx.credential({ token: signIn.accessToken });
   assert.equal(failed.status, 502);
-  assert.equal(failed.body.error, "upstream_unavailable");
+  assert.equal(failed.body.code, "upstream_unavailable");
   assert.equal(fx.state.mints.length, 1);
   const [row] = await fx.deviceRows();
   assert.equal(row!.revoked, false);
@@ -806,13 +830,13 @@ test("Desktop handoff tokens never hold a messaging credential", async (t) => {
   });
   const pending = await fx.credential({ token: handoff.accessToken });
   assert.equal(pending.status, 403);
-  assert.equal(pending.body.error, "handoff_not_exchanged");
+  assert.equal(pending.body.code, "handoff_not_exchanged");
 
   const exchanged = await fx.store.exchangeDesktopHandoff(handoff.accessToken, () => true);
   assert(exchanged);
   const spent = await fx.credential({ token: handoff.accessToken });
   assert.equal(spent.status, 403);
-  assert.equal(spent.body.error, "handoff_not_capable");
+  assert.equal(spent.body.code, "handoff_not_capable");
   assert.equal(fx.state.mints.length, 0);
   assert.equal(JSON.stringify([pending.body, spent.body]).includes("ar_ag_"), false);
 
@@ -881,7 +905,7 @@ test("a Relaycast without device tokens serves the shared token and logs the fal
     fx.state.mintAnswers.push(answer);
     const failed = await fx.credential({ token: signIn.accessToken });
     assert.equal(failed.status, 502, JSON.stringify(answer));
-    assert.equal(failed.body.error, "upstream_unavailable");
+    assert.equal(failed.body.code, "upstream_unavailable");
     assert.equal(JSON.stringify(failed.body).includes("ar_ag_"), false);
   }
   assert.equal(fx.warnings.length, 1);
@@ -896,7 +920,7 @@ test("a mint answer naming another agent is refused", async (t) => {
   });
   const refused = await fx.credential({ token: signIn.accessToken });
   assert.equal(refused.status, 502);
-  assert.equal(refused.body.error, "upstream_unavailable");
+  assert.equal(refused.body.code, "upstream_unavailable");
   assert.equal(JSON.stringify(refused.body).includes("at_live_dv_foreign"), false);
   assert.equal((await fx.deviceRows()).length, 0);
 });
@@ -912,7 +936,7 @@ test("a mint answer naming another device id or kind is refused", async (t) => {
     });
     const refused = await fx.credential({ token: signIn.accessToken });
     assert.equal(refused.status, 502, JSON.stringify(device));
-    assert.equal(refused.body.error, "upstream_unavailable");
+    assert.equal(refused.body.code, "upstream_unavailable");
     assert.equal(JSON.stringify(refused.body).includes("ar_ad_foreign"), false);
   }
   assert.equal((await fx.deviceRows()).length, 0);
@@ -938,8 +962,12 @@ test("an identity refusal of the mint recovers the person agent once and expires
     // The takeover ended every device token of the agent; the stored one is expired, not served.
     const firstRow = (await fx.deviceRows()).find((row) => row.session_id === first.sessionId);
     assert.equal(firstRow!.expired, true);
-    const reminted = await fx.credential({ token: first.accessToken });
+    const reminted = await fx.credential({ token: first.accessToken }, {
+      json: { refusedTokenSha256: sha256Hex(stored.body.identity.token as string) },
+    });
     assert.equal(reminted.status, 200);
+    assert.equal(reminted.headers.get("retry-after"), null);
+    assert.equal(await relayAccepts(fx.config.relaycastUrl, reminted.body.identity.token as string), true);
     assert.notEqual(reminted.body.identity.token, stored.body.identity.token);
     assert.equal(fx.state.mints.length, 4);
 
@@ -987,7 +1015,7 @@ test("ending a sign-in revokes its device token, retried by the sweep after an u
   assert.equal(fx.state.deviceDeletes.length, 2);
 });
 
-test("a sign-in that ends while its device token is minted gets 401 and the token is revoked upstream", async (t) => {
+test("a sign-in that ends while its device token is minted gets 403 and the token is revoked upstream", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
   fx.hooks.afterDeviceMint = async (tx) => {
@@ -998,8 +1026,8 @@ test("a sign-in that ends while its device token is minted gets 401 and the toke
     await tx.query("UPDATE token_sessions SET revoked_at = now() WHERE id = $1", [signIn.sessionId]);
   };
   const refused = await fx.credential({ token: signIn.accessToken });
-  assert.equal(refused.status, 401);
-  assert.equal(refused.body.error, "unauthorized");
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, "device_revoked");
   assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
   assert.equal(fx.state.mints.length, 1);
   assert.equal(fx.state.deviceDeletes.length, 1);
@@ -1009,7 +1037,7 @@ test("a sign-in that ends while its device token is minted gets 401 and the toke
   assert.equal(row!.upstream_revoked, true);
 });
 
-test("a sign-in row deleted while its device token is minted gets 401 and the token is recorded revoked and revoked upstream", async (t) => {
+test("a sign-in row deleted while its device token is minted gets 403 and the token is recorded revoked and revoked upstream", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
   // PGlite runs a transaction on its only connection, so the delete that
@@ -1020,8 +1048,8 @@ test("a sign-in row deleted while its device token is minted gets 401 and the to
     await tx.query("DELETE FROM token_sessions WHERE id = $1", [signIn.sessionId]);
   };
   const refused = await fx.credential({ token: signIn.accessToken });
-  assert.equal(refused.status, 401);
-  assert.equal(refused.body.error, "unauthorized");
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, "device_revoked");
   assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
   assert.equal(fx.state.mints.length, 1);
   assert.equal(fx.state.deviceDeletes.length, 1);
@@ -1033,7 +1061,7 @@ test("a sign-in row deleted while its device token is minted gets 401 and the to
   assert.equal(rows[0]!.upstream_revoked, true);
 });
 
-test("a membership that ends while a bearer device token is minted gets 401, since its sign-in goes with it, and the token is revoked upstream", async (t) => {
+test("a membership that ends while a bearer device token is minted gets 403 and the token is revoked upstream", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
   fx.hooks.afterDeviceMint = async (tx) => {
@@ -1045,8 +1073,8 @@ test("a membership that ends while a bearer device token is minted gets 401, sin
     await tx.query("DELETE FROM organization_memberships WHERE user_id = $1", [fx.userId]);
   };
   const refused = await fx.credential({ token: signIn.accessToken });
-  assert.equal(refused.status, 401);
-  assert.equal(refused.body.error, "unauthorized");
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, "device_revoked");
   assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
   assert.equal(fx.state.deviceDeletes.length, 1);
   assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
@@ -1069,7 +1097,7 @@ test("a membership that ends while the web device token is minted gets 403 and t
   };
   const refused = await fx.credential({ cookie: `agent_relay_session=${signIn.accessToken}` });
   assert.equal(refused.status, 403);
-  assert.equal(refused.body.error, "forbidden");
+  assert.equal(refused.body.code, "device_revoked");
   assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
   assert.deepEqual(fx.state.deviceDeletes, ["web"]);
   assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
@@ -1102,11 +1130,11 @@ test("a gate-only install mints no device token", async (t) => {
   const signIn = await fx.signIn();
   const withheld = await fx.credential({ token: signIn.accessToken });
   assert.equal(withheld.status, 403);
-  assert.equal(withheld.body.error, "gate_only");
+  assert.equal(withheld.body.code, "gate_only");
   // The body is not read on a gate-only install.
   const withBody = await fx.credential({ token: signIn.accessToken }, { raw: "not json" });
   assert.equal(withBody.status, 403);
-  assert.equal(withBody.body.error, "gate_only");
+  assert.equal(withBody.body.code, "gate_only");
   assert.equal(fx.state.registerCalls, 0);
   assert.equal(fx.state.mints.length, 0);
   assert.equal((await fx.deviceRows()).length, 0);
@@ -1124,3 +1152,209 @@ test("the device kind column accepts only desktop, cli and web", async (t) => {
   await insert("web");
   await assert.rejects(insert("phone"));
 });
+
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function assertCredentialRefused(response: Awaited<ReturnType<typeof jsonRequest>>, status: number, code: string) {
+  assert.equal(response.status, status);
+  assert.equal(response.body.code, code);
+  assert.equal(typeof response.body.error, "string");
+  assert.notEqual(response.body.error, code);
+  assert.deepEqual(Object.keys(response.body).sort(), ["code", "error"]);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+}
+
+for (const ended of ["sign-in", "browser sign-in", "browser membership"] as const) {
+  test(`an old-relay fallback refuses a ${ended} ended during its agent lookup`, { timeout: 10_000 }, async (t) => {
+    const fx = await harness(t);
+    const signIn = await fx.signIn();
+    const started = deferred(), release = deferred();
+    t.after(() => release.resolve());
+    fx.state.mintAnswers.push({ status: 404, body: ROUTE_NOT_FOUND });
+    fx.state.beforeAgentLookup = async () => {
+      fx.state.beforeAgentLookup = undefined;
+      started.resolve();
+      await release.promise;
+    };
+    const pending = fx.credential(ended === "sign-in"
+      ? { token: signIn.accessToken }
+      : { cookie: `agent_relay_session=${signIn.accessToken}` });
+    await started.promise;
+    // The failed mint's transaction already rolled back before this lookup.
+    if (ended !== "browser membership") {
+      const revoked = await jsonRequest(fx.origin, "/api/v1/auth/token/revoke", {
+        method: "POST", body: { token: signIn.accessToken },
+      });
+      assert.equal(revoked.status, 200);
+    } else {
+      await fx.database.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [fx.orgId, fx.userId]);
+    }
+    release.resolve();
+    const refused = await pending;
+    assertCredentialRefused(refused, 403, "device_revoked");
+    assert.equal(fx.warnings.length, 0);
+    assert.equal(JSON.stringify(refused.body).includes("ar_ag_"), false);
+    assert.equal((await fx.deviceRows()).length, 0);
+  });
+}
+
+for (const ended of ["sign-in", "browser sign-in", "browser membership"] as const) {
+  test(`a cached credential refuses a ${ended} ended during its token probe`, { timeout: 10_000 }, async (t) => {
+    const fx = await harness(t);
+    const signIn = await fx.signIn();
+    const auth = ended === "sign-in" ? { token: signIn.accessToken } : { cookie: `agent_relay_session=${signIn.accessToken}` };
+    const minted = await fx.credential(auth);
+    assert.equal(minted.status, 200);
+    const started = deferred(), release = deferred();
+    t.after(() => release.resolve());
+    fx.state.beforeProbe = async () => {
+      fx.state.beforeProbe = undefined;
+      started.resolve();
+      await release.promise;
+    };
+    const pending = fx.credential(auth);
+    await started.promise;
+    // Keep the relay token live to prove the post-probe authority check refuses it.
+    if (ended !== "browser membership") {
+      await fx.database.query("UPDATE token_sessions SET revoked_at = now() WHERE id = $1", [signIn.sessionId]);
+    } else {
+      await fx.database.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [fx.orgId, fx.userId]);
+    }
+    release.resolve();
+    const refused = await pending;
+    assertCredentialRefused(refused, 403, "device_revoked");
+    assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+    assert.equal(fx.state.mints.length, 1);
+  });
+}
+
+test("a delayed old web-device undo cannot revoke its valid replacement after rejoin", { timeout: 10_000 }, async (t) => {
+  const fx = await harness(t);
+  const signIn = await fx.signIn();
+  const paused = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  fx.hooks.afterDeviceMint = async (tx) => {
+    fx.hooks.afterDeviceMint = undefined;
+    await tx.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [fx.orgId, fx.userId]);
+  };
+  fx.hooks.beforeDeviceRevoke = async () => {
+    fx.hooks.beforeDeviceRevoke = undefined;
+    paused.resolve();
+    await release.promise;
+  };
+  const old = fx.credential({ cookie: `agent_relay_session=${signIn.accessToken}` });
+  await paused.promise;
+  // The refused mint has committed before this hook; the rejoin uses another transaction.
+  await fx.database.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [fx.orgId, fx.userId]);
+  const newSignIn = await fx.signIn();
+  const replacement = await fx.credential({ cookie: `agent_relay_session=${newSignIn.accessToken}` });
+  assert.equal(replacement.status, 200);
+  const deletesBeforeOldUndo = fx.state.deviceDeletes.length;
+  release.resolve();
+  assertCredentialRefused(await old, 403, "device_revoked");
+  assert.equal(fx.state.deviceDeletes.length, deletesBeforeOldUndo);
+  assert.equal(await relayAccepts(fx.config.relaycastUrl, replacement.body.identity.token as string), true);
+  const rows = await fx.deviceRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.revoked, false);
+});
+
+for (const operation of ["mint", "probe", "fallback lookup"] as const) {
+  test(`a hung device-token ${operation} respects its deadline`, { timeout: 10_000 }, async (t) => {
+    const fx = await harness(t, { deviceRequestTimeoutMs: 75 });
+    const signIn = await fx.signIn();
+    const minted = operation === "probe" ? await fx.credential({ token: signIn.accessToken }) : null;
+    if (minted) assert.equal(minted.status, 200);
+    fx.state.mintHangs = operation === "mint";
+    fx.state.probeHangs = operation === "probe";
+    fx.state.agentLookupHangs = operation === "fallback lookup";
+    if (operation === "fallback lookup") fx.state.mintAnswers.push({ status: 404, body: ROUTE_NOT_FOUND });
+    const started = Date.now();
+    const answer = await fx.credential({ token: signIn.accessToken });
+    assert.equal(Date.now() - started < 3_000, true, "credential request exceeded its upstream deadline");
+    if (minted) {
+      // A timeout is an outage, not a refusal of an unexpired cached token.
+      assert.equal(answer.status, 200);
+      assert.equal(answer.body.identity.token, minted.body.identity.token);
+      assert.equal(fx.state.mints.length, 1);
+    } else {
+      assertCredentialRefused(answer, 502, "upstream_unavailable");
+      assert.equal((await fx.deviceRows()).length, 0);
+      assert.equal(fx.warnings.length, 0);
+    }
+  });
+}
+
+for (const operation of ["probe", "fallback lookup"] as const) {
+  for (const browser of [false, true]) {
+    test(`a ${browser ? "browser" : "bearer"} calling session ended during a hung ${operation} is refused after timeout`, { timeout: 10_000 }, async (t) => {
+      const fx = await harness(t, { deviceRequestTimeoutMs: 75 });
+      const signIn = await fx.signIn();
+      const auth = browser ? { cookie: `agent_relay_session=${signIn.accessToken}` } : { token: signIn.accessToken };
+      if (operation === "probe") assert.equal((await fx.credential(auth)).status, 200);
+      const started = deferred();
+      if (operation === "probe") {
+        fx.state.probeHangs = true;
+        fx.state.beforeProbe = () => {
+          fx.state.beforeProbe = undefined;
+          started.resolve();
+        };
+      } else {
+        fx.state.mintAnswers.push({ status: 404, body: ROUTE_NOT_FOUND });
+        fx.state.agentLookupHangs = true;
+        fx.state.beforeAgentLookup = () => {
+          fx.state.beforeAgentLookup = undefined;
+          started.resolve();
+        };
+      }
+      const pending = fx.credential(auth);
+      await started.promise;
+      // Cached probes hold no transaction; fallback lookup starts after mint rollback.
+      // The still-live relay token is deliberately untouched, so refusal must come
+      // from rechecking the calling session, rather than from the upstream timeout.
+      await fx.database.query("UPDATE token_sessions SET revoked_at = now() WHERE id = $1", [signIn.sessionId]);
+      const refused = await pending;
+      assertCredentialRefused(refused, 403, "device_revoked");
+      assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+      assert.equal(fx.warnings.length, 0);
+      if (operation === "probe") assert.equal(fx.state.mints.length, 1);
+      else assert.equal((await fx.deviceRows()).length, 0);
+    });
+  }
+}
+
+for (const hook of ["beforeDeviceSave", "afterDeviceMint"] as const) {
+  test(`a browser calling session ended at ${hook} gets no token and retains failed upstream cleanup for retry`, { timeout: 10_000 }, async (t) => {
+    const fx = await harness(t);
+    const signIn = await fx.signIn(), remaining = await fx.signIn();
+    fx.state.deleteFailures = 1;
+    fx.hooks[hook] = async (tx) => {
+      fx.hooks[hook] = undefined;
+      // PGlite has one connection: model the concurrent durable revocation
+      // inside the mint transaction rather than deadlocking an external query.
+      await tx.query("UPDATE token_sessions SET revoked_at = now() WHERE id = $1", [signIn.sessionId]);
+    };
+    const refused = await fx.credential({ cookie: `agent_relay_session=${signIn.accessToken}` });
+    assertCredentialRefused(refused, 403, "device_revoked");
+    assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+    const [pending] = await fx.deviceRows();
+    assert.equal(pending!.device_id, "web");
+    assert.equal(pending!.session_id, null);
+    assert.equal(pending!.revoked, true);
+    assert.equal(pending!.upstream_revoked, false);
+    assert.deepEqual(fx.state.deviceDeletes, ["web"]);
+    assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), true);
+    const sweep = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.workspaceId}/messaging/people`, {
+      token: remaining.accessToken,
+    });
+    assert.equal(sweep.status, 200);
+    assert.deepEqual(fx.state.deviceDeletes, ["web", "web"]);
+    assert.equal((await fx.deviceRows())[0]!.upstream_revoked, true);
+    assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
+  });
+}

@@ -25,6 +25,8 @@ export const FORCED_MINT_INTERVAL_SECONDS = 30;
 /** Upstream device-token revocations attempted per sweep. */
 const SWEEP_BATCH = 10;
 const MAX_DEVICE_NAME_UNITS = 80;
+/** Match the hosted credential path: every mint, probe and fallback lookup is bounded. */
+const DEVICE_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_DEVICE_ID_SLUG = 32;
 /** Relaycast's device id rule. */
 const DEVICE_ID = /^[a-z0-9-]{1,64}$/;
@@ -216,6 +218,25 @@ function nowOf(deps: MessagingDeps): Date {
   return deps.now?.() ?? new Date();
 }
 
+/** Cleanup never waits behind a mint or recovery; a busy person's rows stay pending. */
+async function tryPersonCleanupLock(
+  deps: MessagingDeps,
+  key: string,
+  signal: AbortSignal | undefined,
+  run: (tx: SqlExecutor) => Promise<void>,
+): Promise<void> {
+  if (signal?.aborted) return;
+  await deps.database.transaction(async (tx) => {
+    if (signal?.aborted) return;
+    const lock = await tx.query<{ acquired: boolean }>(
+      "SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired",
+      ["selfhost-person", key],
+    );
+    if (!lock.rows[0]?.acquired || signal?.aborted) return;
+    await run(tx);
+  });
+}
+
 async function readDeviceRow(executor: SqlExecutor, access: PersonAccess, deviceIdValue: string): Promise<DeviceRow | null> {
   const result = await executor.query<DeviceRow>(
     `SELECT id, device_name, session_id, relaycast_workspace_id, agent_name, agent_remote_id, token_ciphertext, expires_at, revoked_at,
@@ -260,7 +281,7 @@ function usableRow(
  */
 async function probeServes(deps: MessagingDeps, token: string, identity: PersonIdentity): Promise<boolean> {
   try {
-    const agent = await client(deps).authenticatedAgent(token);
+    const agent = await client(deps).authenticatedAgent(token, AbortSignal.timeout(deps.deviceRequestTimeoutMs ?? DEVICE_REQUEST_TIMEOUT_MS));
     return agent.id === identity.agentId;
   } catch (error) {
     if (error instanceof RelaycastCallError && error.status === 403 && error.code === "device_token_forbidden") {
@@ -291,6 +312,20 @@ async function sessionLive(tx: SqlExecutor, signInId: string): Promise<boolean> 
     [signInId],
   );
   return result.rows.length === 1;
+}
+
+/** A cached request may outlive sign-out or membership removal while upstream is awaited. */
+async function assertCredentialAccess(executor: SqlExecutor, access: PersonAccess, requestSessionId: string): Promise<void> {
+  // A preflight is a read, not a session-row lock held over an upstream call.
+  // The mint locks that row only when persisting, preserving sign-out latency.
+  const session = await executor.query(
+    "SELECT 1 FROM token_sessions WHERE id = $1 AND revoked_at IS NULL AND refresh_token_expires_at > now()",
+    [requestSessionId],
+  );
+  if ((session.rows.length !== 1) ||
+      !(await isMember(executor, access.organizationId, access.user.userId))) {
+    throw deviceRevoked();
+  }
 }
 
 async function storeRow(
@@ -349,7 +384,7 @@ type MintOutcome =
   | { kind: "served"; stored: StoredToken }
   | { kind: "rate_limited"; retryAfterSeconds: number }
   | { kind: "device_revoked" }
-  | { kind: "refused"; status: 401 | 403; rowId: string };
+  | { kind: "refused"; rowId: string };
 
 /** A row revoked while its own sign-in still authenticates: the device was revoked, not the sign-in. */
 function revokedForSignIn(row: DeviceRow | null, signInId: string | null): boolean {
@@ -374,6 +409,7 @@ async function mintUnderLock(
   identity: PersonIdentity,
   device: DeviceTokenDevice,
   signInId: string | null,
+  requestSessionId: string,
   droppedToken: string | null,
   forced: boolean,
 ): Promise<StoredToken> {
@@ -382,6 +418,7 @@ async function mintUnderLock(
     deps.database,
     personLockKey(access.workspaceId, access.user.userId),
     async (tx) => {
+      await assertCredentialAccess(tx, access, requestSessionId);
       const row = await readDeviceRow(tx, access, device.id);
       if (revokedForSignIn(row, signInId)) return { kind: "device_revoked" };
       // Another request may have minted while this one waited for the lock.
@@ -394,7 +431,7 @@ async function mintUnderLock(
         expectedAgentId: identity.agentId,
         device,
         ttlSeconds: DEVICE_TOKEN_TTL_SECONDS,
-      });
+      }, AbortSignal.timeout(deps.deviceRequestTimeoutMs ?? DEVICE_REQUEST_TIMEOUT_MS));
       const stored: StoredToken = {
         token: issued.token,
         expiresAt: deviceTokenExpiry(issued.expiresAt, nowOf(deps)),
@@ -404,43 +441,54 @@ async function mintUnderLock(
       // A refused token stays recorded, revoked and with no session, so the
       // sweep retries the upstream revoke if the immediate one fails.
       const recordRevoked = () => storeRow(tx, deps, { access, identity, signInId: null, revoked: true, ...stored });
-      if (signInId && !(await lockSession(tx, signInId))) {
-        return { kind: "refused", status: 401, rowId: await recordRevoked() };
+      if (!(await lockSession(tx, requestSessionId))) {
+        return { kind: "refused", rowId: await recordRevoked() };
       }
       const rowId = await storeRow(tx, deps, { access, identity, signInId, revoked: false, ...stored });
       if (deps.afterDeviceMint) await deps.afterDeviceMint(tx);
       // Checked after the save: a sign-out or member removal that commits
       // before this point is seen here, one that comes later waits for this
       // transaction and revokes or deletes the saved row.
-      const refusal = signInId && !(await sessionLive(tx, signInId))
-        ? 401 as const
-        : !(await isMember(tx, access.organizationId, access.user.userId)) ? 403 as const : null;
-      if (refusal === null) return { kind: "served", stored };
+      const accessEnded = !(await sessionLive(tx, requestSessionId)) ||
+        !(await isMember(tx, access.organizationId, access.user.userId));
+      if (!accessEnded) return { kind: "served", stored };
       const revoked = await tx.query<{ id: string }>(
         "UPDATE person_device_credentials SET revoked_at = now(), updated_at = now() WHERE id = $1 RETURNING id",
         [rowId],
       );
       // A deleted session row takes its device rows with it.
-      return { kind: "refused", status: refusal, rowId: revoked.rows[0]?.id ?? await recordRevoked() };
+      return { kind: "refused", rowId: revoked.rows[0]?.id ?? await recordRevoked() };
     },
   );
   if (outcome.kind === "served") return outcome.stored;
   if (outcome.kind === "rate_limited") throw new DeviceMintRateLimited(outcome.retryAfterSeconds);
   if (outcome.kind === "device_revoked") throw deviceRevoked();
+  if (deps.beforeDeviceRevoke) await deps.beforeDeviceRevoke();
+  const revokeSignal = AbortSignal.timeout(deps.signOutRevokeTimeoutMs ?? SIGN_OUT_REVOKE_TIMEOUT_MS);
   try {
-    await relaycast.revokeDeviceToken(access.relaycastApiKey, identity.name, device.id);
-    await deps.database.query(
-      `UPDATE person_device_credentials SET upstream_revoked_at = now(), updated_at = now()
-        WHERE id = $1 AND revoked_at IS NOT NULL AND upstream_revoked_at IS NULL`,
-      [outcome.rowId],
-    );
+    // A later web request may have replaced this row after a rejoin. Reacquire
+    // the person lock and re-read pending state before deleting any upstream
+    // token, so an old undo never revokes a valid replacement.
+    await tryPersonCleanupLock(deps, personLockKey(access.workspaceId, access.user.userId), revokeSignal, async (tx) => {
+      const pending = await tx.query(
+        `SELECT 1 FROM person_device_credentials
+          WHERE id = $1 AND revoked_at IS NOT NULL AND upstream_revoked_at IS NULL
+            AND relaycast_workspace_id = $2 AND agent_remote_id = $3 AND device_id = $4`,
+        [outcome.rowId, identity.relaycastWorkspaceId, identity.agentId, device.id],
+      );
+      if (pending.rows.length === 0) return;
+      await relaycast.revokeDeviceToken(access.relaycastApiKey, identity.name, device.id,
+        revokeSignal);
+      await tx.query(
+        `UPDATE person_device_credentials SET upstream_revoked_at = now(), updated_at = now()
+          WHERE id = $1 AND revoked_at IS NOT NULL AND upstream_revoked_at IS NULL`,
+        [outcome.rowId],
+      );
+    });
   } catch {
     // The revoked row stays pending for sweepDeviceRevocations.
   }
-  if (outcome.status === 401) {
-    throw new MessagingHttpError(401, "unauthorized", "The sign-in ended before the credential was issued");
-  }
-  throw new MessagingHttpError(403, "forbidden", "Organization membership ended before the credential was issued");
+  throw deviceRevoked();
 }
 
 /**
@@ -462,9 +510,10 @@ export async function ensureDeviceCredential(
   identity: PersonIdentity,
   device: DeviceTokenDevice,
   signInId: string | null,
-  options: { refusedTokenSha256?: string | null } = {},
+  options: { requestSessionId: string; refusedTokenSha256?: string | null },
 ): Promise<DeviceCredential> {
   if (!isValidDeviceId(device.id)) throw new Error("device id is outside Relaycast's device id rule");
+  await assertCredentialAccess(deps.database, access, options.requestSessionId);
   let current = identity;
   let droppedToken: string | null = null;
   let forced = false;
@@ -473,23 +522,31 @@ export async function ensureDeviceCredential(
   const stored = usableRow(row, current, device, signInId, nowOf(deps), deps);
   if (stored) {
     forced = options.refusedTokenSha256 ? tokenHashMatches(stored.token, options.refusedTokenSha256) : false;
-    if (!forced && await probeServes(deps, stored.token, current)) {
-      return { kind: "device", identity: current, ...stored };
+    if (!forced) {
+      let serves: boolean;
+      try {
+        serves = await probeServes(deps, stored.token, current);
+      } finally {
+        await assertCredentialAccess(deps.database, access, options.requestSessionId);
+      }
+      if (serves) return { kind: "device", identity: current, ...stored };
     }
     droppedToken = stored.token;
   }
   let recovered = false;
   for (;;) {
     try {
-      const minted = await mintUnderLock(deps, access, current, device, signInId, droppedToken, forced);
+      const minted = await mintUnderLock(deps, access, current, device, signInId, options.requestSessionId, droppedToken, forced);
       return { kind: "device", identity: current, ...minted };
     } catch (error) {
       if (!(error instanceof RelaycastCallError)) throw error;
+      await assertCredentialAccess(deps.database, access, options.requestSessionId);
       if (!recovered && isIdentityRefusal(error)) {
         recovered = true;
         try {
           current = await recoverPersonIdentity(deps, access, current);
         } catch (recoveryError) {
+          await assertCredentialAccess(deps.database, access, options.requestSessionId);
           if (recoveryError instanceof RelaycastCallError) {
             throw new MessagingHttpError(502, "upstream_unavailable", "The relay is not reachable right now. Try again shortly.");
           }
@@ -500,9 +557,11 @@ export async function ensureDeviceCredential(
       const agentName = current.name;
       const missingRoute = await isMissingDeviceTokenRoute(
         error,
-        () => client(deps).getAgent(access.relaycastApiKey, agentName),
+        () => client(deps).getAgent(access.relaycastApiKey, agentName,
+          AbortSignal.timeout(deps.deviceRequestTimeoutMs ?? DEVICE_REQUEST_TIMEOUT_MS)),
         current.agentId,
       );
+      await assertCredentialAccess(deps.database, access, options.requestSessionId);
       if (missingRoute) {
         (deps.warn ?? defaultWarn)("messaging device credential fallback: Relaycast has no device-token route", {
           workspaceId: access.workspaceId,
@@ -535,15 +594,8 @@ export async function sweepDeviceRevocations(
     id: string;
     workspace_id: string;
     user_id: string;
-    device_id: string;
-    agent_name: string;
-    row_relaycast_workspace_id: string;
-    relaycast_workspace_id: string;
-    relaycast_api_key_ciphertext: string;
   }>(
-    `SELECT device.id, device.workspace_id, device.user_id, device.device_id, device.agent_name,
-            device.relaycast_workspace_id AS row_relaycast_workspace_id,
-            workspace.relaycast_workspace_id, workspace.relaycast_api_key_ciphertext
+    `SELECT device.id, device.workspace_id, device.user_id
        FROM person_device_credentials device
        JOIN workspaces workspace ON workspace.id = device.workspace_id
       WHERE device.revoked_at IS NOT NULL AND device.upstream_revoked_at IS NULL
@@ -558,21 +610,35 @@ export async function sweepDeviceRevocations(
   for (const row of rows.rows) {
     if (options.signal?.aborted) return;
     try {
-      await withLock(deps.database, personLockKey(row.workspace_id, row.user_id), async (tx) => {
-        // A mint may have replaced the row with a live token since it was read.
-        const pending = await tx.query(
-          `SELECT 1 FROM person_device_credentials
-            WHERE id = $1 AND revoked_at IS NOT NULL AND upstream_revoked_at IS NULL`,
+      await tryPersonCleanupLock(deps, personLockKey(row.workspace_id, row.user_id), options.signal, async (tx) => {
+        // An upsert preserves the row id. Re-read its complete binding and the
+        // workspace key: a replacement may now be pending for another agent
+        // or Relaycast workspace than the one selected by the batch.
+        const pending = await tx.query<{
+          device_id: string;
+          agent_name: string;
+          row_relaycast_workspace_id: string;
+          relaycast_workspace_id: string;
+          relaycast_api_key_ciphertext: string;
+        }>(
+          `SELECT device.device_id, device.agent_name,
+                  device.relaycast_workspace_id AS row_relaycast_workspace_id,
+                  workspace.relaycast_workspace_id, workspace.relaycast_api_key_ciphertext
+             FROM person_device_credentials device
+             JOIN workspaces workspace ON workspace.id = device.workspace_id
+            WHERE device.id = $1 AND device.revoked_at IS NOT NULL AND device.upstream_revoked_at IS NULL
+              AND workspace.relaycast_api_key_ciphertext IS NOT NULL`,
           [row.id],
         );
-        if (pending.rows.length === 0) return;
+        const current = pending.rows[0];
+        if (!current) return;
         // The workspace key only reaches the workspace's current Relaycast
         // workspace; a token minted on an earlier one runs out at its expiry.
-        if (row.row_relaycast_workspace_id === row.relaycast_workspace_id) {
+        if (current.row_relaycast_workspace_id === current.relaycast_workspace_id) {
           await relaycast.revokeDeviceToken(
-            decryptSecret(row.relaycast_api_key_ciphertext, deps.keyring),
-            row.agent_name,
-            row.device_id,
+            decryptSecret(current.relaycast_api_key_ciphertext, deps.keyring),
+            current.agent_name,
+            current.device_id,
             options.signal,
           );
         }

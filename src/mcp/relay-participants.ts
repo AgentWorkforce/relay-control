@@ -119,6 +119,8 @@ export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thre
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
+/** A managed join never changes the desktop identity's card, so its description is not applied. */
+export const MANAGED_JOIN_DESCRIPTION_IGNORED = "The description was not applied: joining does not change this desktop identity's card. Use set_relay_agent_card to change it.";
 /** Cloud's DESKTOP_RELAY_GUIDANCE without the web-session sentence: self-host has no web sessions. */
 export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; DMs and subscribed channel posts are then injected.";
 export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session is not linked to Agent Relay Desktop, so channel posts would not reach your local session. Call join_relay with desktop_address (from GET /whoami on the relay socket, or an injected Agent Relay message), then retry. To use this MCP session's hosted inbox instead (posts arrive in check_relay_inbox; poll it), pass hosted: true.";
@@ -142,7 +144,7 @@ export const CHANNEL_CREATE_LIMIT_PER_HOUR = 5;
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const CHANNEL_DELIVERY_REASONS: ReadonlySet<string> = new Set(["message", "mention", "thread-reply"]);
-const isChannelDelivery = (delivery: { reason?: string | null }) =>
+export const isChannelDelivery = (delivery: { reason?: string | null }) =>
   Boolean(delivery.reason && CHANNEL_DELIVERY_REASONS.has(delivery.reason));
 
 export function normalizeChannelName(channel: string): string {
@@ -1096,11 +1098,17 @@ function createRelayService(context: McpContext) {
     }
     if (managed) {
       const identity = await desktop();
-      if (input.name || input.description || (input.desktop_address && input.desktop_address !== identity.address)) {
+      // Desktop no longer strips name/description (a hook that rewrites input
+      // breaks Claude Code's auto mode): the verified identity's own name is
+      // accepted (trimmed, any letter case) and description is ignored, since
+      // this join never changes the card. Another name or address is refused.
+      const otherName = Boolean(input.name) && input.name!.trim().toLowerCase() !== identity.name.toLowerCase();
+      if (otherName || (input.desktop_address && input.desktop_address !== identity.address)) {
         throw new RelayToolError(MANAGED_JOIN_REFUSED);
       }
       return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
-        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE };
+        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE,
+        ...(input.description ? { note: MANAGED_JOIN_DESCRIPTION_IGNORED } : {}) };
     }
     if (input.desktop_address) return joinDesktop(input.desktop_address.trim(), input);
     if (oauth && !oauth.access.agentRemoteId) oauth.assertActor(input.name);

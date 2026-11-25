@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   EVENTS_SHIM_LIMITS,
+  MCP_EVENTS_ERRORS,
   handleEventsShimRequest,
   sha256Hex,
   type EventsShimHttpOptions,
@@ -17,8 +18,33 @@ export const EVENTS_SHIM_PREFIX = "/api/v1/events-shim";
 /** Largest request body read: the package's webhook and MCP limit. */
 const MAX_BODY_BYTES = EVENTS_SHIM_LIMITS.maxBodyBytes;
 
+/**
+ * MCP Events (SEP-3415) receiver document, served at the origin root while the
+ * feature is on: it lists the path prefix of this install's `/h/<token>/mcp`
+ * webhook URLs so an MCP Events server can deliver without a challenge round trip.
+ */
+export const MCP_WEBHOOK_RECEIVER_DOCUMENT = "/.well-known/mcp-webhook-receiver.json";
+/**
+ * How often an open `events/stream` re-reads Postgres. The package default is
+ * 1s; 2s halves the reads per open stream and matches hosted Cloud.
+ */
+export const EVENTS_SHIM_STREAM_POLL_MS = 2_000;
+/**
+ * Most `events/stream` requests one inbox may hold open on this process at once. Each open
+ * stream re-reads Postgres every 2 s for up to 5 minutes, so an MCP URL holder cannot pin an
+ * unbounded number of them; a client needs one stream per subscription.
+ */
+export const EVENTS_SHIM_MAX_OPEN_STREAMS_PER_INBOX = 4;
+
 export function isEventsShimPath(path: string): boolean {
-  return path === EVENTS_SHIM_PREFIX || path.startsWith(`${EVENTS_SHIM_PREFIX}/`);
+  return path === EVENTS_SHIM_PREFIX || path.startsWith(`${EVENTS_SHIM_PREFIX}/`)
+    || path === MCP_WEBHOOK_RECEIVER_DOCUMENT;
+}
+
+/** Origin-relative prefixes of the webhook URLs, for `mcpWebhookReceivers`. */
+export function eventsShimMcpWebhookReceivers(publicBaseUrl: string): string[] {
+  const basePath = new URL(publicBaseUrl).pathname.replace(/\/+$/, "");
+  return [`${basePath}${EVENTS_SHIM_PREFIX}/h/`];
 }
 
 export type EventsShimRoutesInput = {
@@ -63,6 +89,8 @@ export function eventsShimUrls(publicBaseUrl: string): ShimUrls {
  */
 export function createEventsShimRoutes(input: EventsShimRoutesInput) {
   const urls = eventsShimUrls(input.publicBaseUrl);
+  /** Open `events/stream` requests per inbox MCP token hash, on this process. */
+  const openStreams = new Map<string, number>();
   const clock = input.now ?? (() => new Date());
 
   return async function handle(
@@ -72,7 +100,9 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
     method: string,
   ): Promise<boolean> {
     if (!isEventsShimPath(path)) return false;
-    const relative = path.slice(EVENTS_SHIM_PREFIX.length) || "/";
+    const relative = path === MCP_WEBHOOK_RECEIVER_DOCUMENT
+      ? path
+      : path.slice(EVENTS_SHIM_PREFIX.length) || "/";
     const temp: TempWorkspaceDeps | null = input.relaycast && !input.gateOnly
       ? {
         database: input.database,
@@ -138,6 +168,8 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
       },
       urls,
       relayOrigins: input.relayOrigins,
+      mcpWebhookReceivers: eventsShimMcpWebhookReceivers(input.publicBaseUrl),
+      eventsStream: { pollMs: EVENTS_SHIM_STREAM_POLL_MS },
       ...(input.pollIntervalMs ? { pollIntervalMs: input.pollIntervalMs } : {}),
       beforeCreate: async () => {
         creator = await input.authorizeCreate(request, response);
@@ -150,16 +182,90 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
         return undefined;
       },
     };
-    const answer = await handleEventsShimRequest(webRequest, relative, options);
-    await send(response, answer ?? new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-    }));
+    // A bounded number of open event streams per inbox (EVENTS_SHIM_MAX_OPEN_STREAMS_PER_INBOX).
+    const mcpBody = method === "POST" && parts.length === 3 && parts[0] === "t" && parts[2] === "mcp" && body !== null
+      ? new TextDecoder().decode(body)
+      : null;
+    const streamKey = mcpBody !== null && isEventsStreamRequest(mcpBody) ? await sha256Hex(parts[1]!) : null;
+    if (streamKey) {
+      const open = openStreams.get(streamKey) ?? 0;
+      if (open >= EVENTS_SHIM_MAX_OPEN_STREAMS_PER_INBOX) {
+        await send(response, tooManyStreams(mcpBody!));
+        return true;
+      }
+      openStreams.set(streamKey, open + 1);
+    }
+    try {
+      const answer = await handleEventsShimRequest(webRequest, relative, options);
+      await send(response, answer ?? new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404,
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      }));
+    } finally {
+      if (streamKey) {
+        const left = (openStreams.get(streamKey) ?? 1) - 1;
+        if (left > 0) openStreams.set(streamKey, left);
+        else openStreams.delete(streamKey);
+      }
+    }
     return true;
   };
 }
 
 const NO_STORE = { "content-type": "application/json", "cache-control": "no-store" };
+
+/** Whether a JSON-RPC body is an `events/stream` request (the package never streams a batch). */
+function isEventsStreamRequest(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { method?: unknown } | null;
+    return !Array.isArray(parsed) && parsed?.method === "events/stream";
+  } catch {
+    return false;
+  }
+}
+
+/** The refusal for one stream too many: MCP Events' resource-exhausted error, as JSON-RPC. */
+function tooManyStreams(body: string): Response {
+  let id: unknown = null;
+  try {
+    const parsed = JSON.parse(body) as { id?: unknown };
+    if (!Array.isArray(parsed) && (typeof parsed.id === "string" || typeof parsed.id === "number")) id = parsed.id;
+  } catch {
+    /* isEventsStreamRequest parsed it already. */
+  }
+  return new Response(JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: MCP_EVENTS_ERRORS.RESOURCE_EXHAUSTED,
+      message: `At most ${EVENTS_SHIM_MAX_OPEN_STREAMS_PER_INBOX} event streams may be open for one inbox. Close one, or use events/poll.`,
+    },
+  }), { status: 429, headers: { ...NO_STORE, "retry-after": "30" } });
+}
+
+/** How long a stream waits for a full socket to drain before cutting the client off. */
+export const EVENTS_SHIM_STREAM_DRAIN_TIMEOUT_MS = 30_000;
+
+/**
+ * Resolves true once the response can take more; false if it closed first or did not drain
+ * within `timeoutMs` (the caller then destroys the connection).
+ */
+export function drained(response: ServerResponse, timeoutMs = EVENTS_SHIM_STREAM_DRAIN_TIMEOUT_MS): Promise<boolean> {
+  if (response.destroyed) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      resolve(ok);
+    };
+    const onDrain = () => done(true);
+    const onClose = () => done(false);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+  });
+}
 
 /** The 404 a control plane that issues no temporary workspaces answers, with the gate-only reason. */
 function gateOnlyTempWorkspace(publicBaseUrl: string): Response {
@@ -220,6 +326,36 @@ async function send(response: ServerResponse, answer: Response): Promise<void> {
   answer.headers.forEach((value, name) => {
     headers[name] = value;
   });
+  // `events/stream` answers Server-Sent Events: write each chunk as it comes,
+  // or the client sees nothing until the stream closes minutes later.
+  if (answer.body && (headers["content-type"] ?? "").startsWith("text/event-stream")) {
+    if (response.writableEnded || response.destroyed) {
+      await answer.body.cancel().catch(() => undefined);
+      return;
+    }
+    // A proxy that buffers (nginx's default) would hold the frames back as the old send() did.
+    response.writeHead(answer.status, { ...headers, "x-accel-buffering": "no" });
+    response.flushHeaders();
+    const reader = answer.body.getReader();
+    let stalled = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || response.destroyed) break;
+        // A full socket: wait (bounded) for it to drain. A client that stops reading but keeps
+        // the connection open is cut off, so it cannot hold the handler and a stream slot.
+        if (!response.write(value) && !(await drained(response))) {
+          stalled = true;
+          break;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      if (stalled) response.destroy();
+      else if (!response.writableEnded) response.end();
+    }
+    return;
+  }
   const body = Buffer.from(await answer.arrayBuffer());
   if (response.writableEnded || response.destroyed) return;
   response.writeHead(answer.status, headers);

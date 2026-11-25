@@ -10,6 +10,8 @@ import { agentIdentityHoldsName, ownerHash, HOSTED_SOURCE } from "./mcp/relay-pa
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { GrokRoutines, grokRoutinesOptions } from "./mcp/grok-routines.js";
+import { AgentRules, isAgentRulesAudience } from "./agent-rules/service.js";
+import { AgentRulesInputError } from "./agent-rules/overlays.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -18,7 +20,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
+import { delegationQuoteSecret, SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
@@ -41,7 +43,11 @@ import {
 } from "./fleet/view.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
-import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
+import {
+  listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError, restrictReadAudit, type ReadAuditAccessProbe,
+} from "./mcp/read-audit.js";
+import { accessViaDashboardReader, readWorkspaceHistory, type HistoryIdentity } from "./sessions/history.js";
+import { confirmsAccessAdministrator, sessionAccessConfigured } from "./sessions/access.js";
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
@@ -88,6 +94,7 @@ import {
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
 import { isUuid, type FlowsStore } from "./flows/store.js";
+import { OrganizationTeams, TeamsError, teamName } from "./teams/store.js";
 import {
   grantJson,
   parseMintRequest,
@@ -99,7 +106,13 @@ import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { SIGN_OUT_REVOKE_TIMEOUT_MS, sweepDeviceRevocations } from "./messaging/device-credentials.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
-import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
+import { createMessagingHandler, credentialJsonWriter, MessagingHttpError } from "./messaging/routes.js";
+import { createDelegationHandler } from "./delegation/routes.js";
+import { ConnectionError } from "./admin/connections.js";
+import { GithubUnavailable } from "./delegation/gates.js";
+import { relaycastQuoteRedactor } from "./delegation/service.js";
+import { DelegationSigner } from "./delegation/jws.js";
+import { GITHUB_ACTIONS_OIDC_ISSUER, workflowOidcVerifier } from "./delegation/oidc.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
@@ -431,6 +444,8 @@ export function createApp(input: {
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
+  /** The rules source (docs/agent-rules.md); tests may inject one with a fixture bundle. */
+  agentRules?: AgentRules;
   /** Cursor's OIDC signing keys (tests inject a local issuer); default api.cursor.com's JWKS. */
   cursorJwks?: CursorJwks;
   /**
@@ -454,6 +469,10 @@ export function createApp(input: {
   };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
+  /** Test hook: fetch for release-gate OIDC discovery and JWKS (docs/owner-delegates.md). */
+  delegationOidcFetch?: typeof fetch;
+  /** GitHub's REST API, for resolving a gate's repository ids at registration (tests inject it). */
+  delegationGithubFetch?: typeof fetch;
   /** RELAYCAST_INTERNAL_SECRET: lets webhook inboxes issue temporary Agent Relay workspaces. */
   relaycastInternalSecret?: string | null;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -481,7 +500,8 @@ export function createApp(input: {
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck"
-    | "beforeDeviceSave" | "afterDeviceMint" | "signOutRevokeTimeoutMs" | "warn">;
+    | "beforeDeviceSave" | "afterDeviceMint" | "beforeDeviceRevoke"
+    | "deviceRequestTimeoutMs" | "signOutRevokeTimeoutMs" | "warn">;
 }): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
@@ -506,6 +526,8 @@ export function createApp(input: {
   const capabilities = () => ({
     ...features,
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
+    // Session reads follow per-session access (docs/sessions-read-api.md#session-access).
+    session_access: sessionAccessConfigured(config) && Boolean(config.relayhistoryUrl),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
     // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
@@ -566,6 +588,49 @@ export function createApp(input: {
     browserOrigins,
   });
   const customerSupportNotice = createCustomerSupportNoticeHandler(config, store, messagingDeps);
+  // Owner-named trusted delegates (docs/owner-delegates.md). Off per
+  // workspace until an admin turns delegation_enabled on.
+  const delegation = createDelegationHandler({
+    database: store.database,
+    quoteKey: delegationQuoteSecret(config),
+    relaycastRedact: relaycastQuoteRedactor({ relaycastUrl: config.relaycastUrl,
+      internalSecret: input.relaycastInternalSecret ?? null, fetchImpl: input.messagingFetch }),
+    relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
+    signer: config.delegationSigning ? new DelegationSigner(config.delegationSigning) : null,
+    gateOnly: Boolean(config.relaygatePublicUrl),
+    browserOrigins,
+    authenticateAccessToken: (token) => store.authenticateAccessToken(token),
+    workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
+    json,
+    workflowOidc: workflowOidcVerifier({
+      issuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+      audience: new URL(config.publicBaseUrl).origin,
+      fetchImpl: input.delegationOidcFetch,
+      now: input.now,
+    }),
+    oidcIssuers: [GITHUB_ACTIONS_OIDC_ISSUER, ...(config.delegationOidcIssuers ?? [])],
+    githubFetch: input.delegationGithubFetch ?? globalThis.fetch,
+    // The workspace's GitHub connection (App installation or OAuth), when it has one, as Cloud's installation reader.
+    // No connection (404 connection_not_found) is "not installed": registration may fall back to the public API.
+    // Any other failure is an outage: no fallback (registration answers 503).
+    githubToken: async (workspaceId, userId) => {
+      if (!admin) return null;
+      try {
+        return (await admin.connections.runtimeToken({ workspaceId, provider: "github",
+          actor: userId ? { kind: "user", userId } : { kind: "service", subject: "delegation-gate-redeem" } })).accessToken;
+      } catch (error) {
+        if (error instanceof ConnectionError && error.status === 404) return null;
+        throw new GithubUnavailable();
+      }
+    },
+    // Never provisions: these lookups can run before any caller is proven.
+    relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
+    rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
+    clientKey: (request) => limiterKey(clientIp(request)),
+    now: input.now,
+    // The trust rule's existing-connections backfill (POST /internal/v1/delegation/trust-backfill).
+    internalServiceToken: config.internalServiceToken,
+  });
   const factory = input.factory ?? createFactoryModule({
     config,
     database: store.database,
@@ -683,6 +748,8 @@ export function createApp(input: {
     ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,
       fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)})} : {}),
   }) : null;
+  // Loaded once: a malformed or unpinned bundle fails start-up.
+  const agentRules = input.agentRules ?? new AgentRules({ database: store.database, now: input.now });
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines(grokRoutinesOptions(config,{
       database:store.database,tenancyMode:store.tenancy,client:oauthRelay,fetchImpl:input.messagingFetch,now:input.now,
     })) : undefined;
@@ -750,6 +817,7 @@ export function createApp(input: {
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
     grokRoutines,
+    agentRules,
     ...(cursorCloud ? { cursorCloud } : {}),
     ...(input.now ? { now: input.now } : {}),
   });
@@ -840,6 +908,7 @@ export function createApp(input: {
   /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
   const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
+  const organizationTeams = new OrganizationTeams(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
@@ -1110,6 +1179,41 @@ export function createApp(input: {
     return { principal: auth.principal, workspace, token: auth.token };
   }
 
+  // The audit exporter's own session access, asked with its own read token.
+  // A credential that cannot hold a person's read token reads nothing (null).
+  function readAuditAccessProbe(
+    access: Awaited<ReturnType<typeof workspaceAccess>>,
+    request: IncomingMessage,
+  ): ReadAuditAccessProbe | null {
+    if (!access.principal.scopes.includes("rth:read") || access.principal.pendingHandoff || !config.relayhistoryUrl) return null;
+    const identity: HistoryIdentity = {
+      userId: access.principal.userId,
+      organizationId: access.workspace.organizationId,
+      workspaceId: access.workspace.id,
+      role: access.workspace.role,
+      callerToken: access.token,
+      readerKind: readerKindOf(request),
+    };
+    return {
+      // Fails closed (confirmsAccessAdministrator): a 200 naming the asked
+      // session, or relaygate's session-not-found 404 (it checks administration
+      // before existence). Any other answer, including another 404 body, is not
+      // an administrator, so a backend without the access routes cannot make
+      // every exporter one.
+      administrator: async (sessionId) => {
+        const reply = await accessViaDashboardReader(config, identity, {
+          method: "GET", path: `/v1/sessions/${encodeURIComponent(sessionId)}/access`,
+        });
+        return reply.kind === "response" && confirmsAccessAdministrator(reply.status, reply.body, sessionId);
+      },
+      readable: async (sessionId) => {
+        const read = await readWorkspaceHistory(config, identity, `/v1/sessions/${encodeURIComponent(sessionId)}/metadata`,
+          new URLSearchParams(), { allowNotFound: true });
+        return read.status === "ok" && read.body.sessionId === sessionId;
+      },
+    };
+  }
+
   // Deployment sharing-mode values (docs/capture-policy.md), applied per caller.
   const sharing = sharingDeployment(config);
   const sharingConfigured = sharing.defaultSharingMode !== undefined || sharing.overrideRoles !== undefined;
@@ -1346,6 +1450,8 @@ export function createApp(input: {
       store: input.flows,
       publicBaseUrl: config.publicBaseUrl,
       requireFeature: () => requireFeature("flows"),
+      csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
+      originAllowed: incoming => Boolean(bearer(incoming)) || cookieDeleteAllowed(incoming, browserOrigins),
       userAccess: async (request, admin = false) => {
         const auth = await authenticate(request);
         if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1362,7 +1468,8 @@ export function createApp(input: {
     })
     : null;
 
-  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  async function handle(request: IncomingMessage, response: ServerResponse, writeJson = json): Promise<void> {
+    const json = writeJson;
     const method = request.method ?? "GET";
     const url = new URL(request.url ?? "/", config.publicBaseUrl);
     const publicPath = url.pathname.replace(/\/+$/, "") || "/";
@@ -1466,6 +1573,7 @@ export function createApp(input: {
     }
 
     if (await customerSupportNotice(request, response, publicPath, method)) return;
+    if (await delegation(request, response, path, publicPath, method)) return;
     // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
     // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
     if (await handleAcquisitionRoutes({
@@ -1814,6 +1922,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      // Both methods carry a JSON body, so both get the JSON + origin check.
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       const body = await requestObject(request);
       const workspaceId = stringField(body, "workspaceId")!;
       if (workspaceId !== auth.principal.workspaceId) {
@@ -2575,6 +2687,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw error;
       }
       const page = await listReadAudit(store.database, access.workspace.id, query);
+      // With per-session access, a non-administrator exporter sees only the
+      // session ids it may itself read (docs/shared-session-read-audit.md).
+      const shown = config.sessionReadApi?.mintReaderKind
+        ? await restrictReadAudit(page.records, readAuditAccessProbe(access, request))
+        : { restricted: false as const, records: page.records };
       if (query.format === "csv") {
         response.writeHead(200, {
           "content-type": "text/csv; charset=utf-8",
@@ -2582,10 +2699,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           "content-disposition": `attachment; filename="shared-session-read-audit-${access.workspace.id}.csv"`,
           ...(page.nextCursor ? { "x-next-cursor": page.nextCursor } : {}),
         });
-        response.end(readAuditCsv(page.records));
+        response.end(readAuditCsv(shown.records, { restricted: shown.restricted }));
         return;
       }
-      json(response, 200, { workspace_id: access.workspace.id, records: page.records, next_cursor: page.nextCursor }, true);
+      json(response, 200, { workspace_id: access.workspace.id, records: shown.records, next_cursor: page.nextCursor }, true);
       return;
     }
 
@@ -2625,6 +2742,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (method === "POST") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         const workspace = await store.createWorkspace({
           organizationId,
@@ -2648,6 +2768,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // minted there. Bootstrap bearer or organization owner/admin.
       const [organizationId, workspaceId] = workspaceItem as [string, string];
       await organizationAccess(request, organizationId, true);
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       const body = await requestObject(request);
       if (body.name === undefined && body.relaycastWorkspaceId === undefined && body.relaycastApiKey === undefined) {
         throw new HttpError(400, "invalid_request", "Send name, relaycastWorkspaceId, or relaycastApiKey");
@@ -2733,10 +2856,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const organizationId = membershipCollection[0]!;
       const auth = await organizationAccess(request, organizationId, method === "POST");
       if (method === "GET") {
-        json(response, 200, { memberships: await store.listMemberships(organizationId) });
+        // teamId is shown only to the operator bearer and live owners and
+        // admins, the callers the team routes admit (docs/teams.md).
+        const teams = features.teams && (auth.kind === "bootstrap" ||
+          ["owner", "admin"].includes(await store.memberRole(organizationId, auth.principal.userId) ?? ""));
+        json(response, 200, { memberships: await store.listMemberships(organizationId, { teams }) });
         return;
       }
       if (method === "POST") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         const role = stringField(body, "role")!;
         if (role !== "owner" && role !== "admin" && role !== "member") {
@@ -2775,6 +2905,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (membershipItem && method === "DELETE") {
       const [organizationId, userId] = membershipItem as [string, string];
       const auth = await organizationAccess(request, organizationId, true);
+      if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
       if (auth.kind === "user" && auth.principal.role !== "owner" &&
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
@@ -2813,6 +2946,62 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       oauthTeardown?.kick();
       response.writeHead(204);
       response.end();
+      return;
+    }
+
+    // Organization teams (docs/teams.md): owners and admins, behind the teams feature.
+    const teamCollection = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams$/);
+    const teamItem = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams\/([^/]+)$/);
+    const teamMember = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
+    const teamRoute = teamCollection && (method === "GET" || method === "POST") ? teamCollection
+      : teamItem && (method === "PATCH" || method === "DELETE") ? teamItem
+      : teamMember && (method === "PUT" || method === "DELETE") ? teamMember
+      : undefined;
+    if (teamRoute) {
+      const organizationId = teamRoute[0]!;
+      const auth = await organizationAccess(request, organizationId, true);
+      requireFeature("teams");
+      // Cookie writes: JSON from an allowed origin; a bodiless PUT or DELETE
+      // needs an allowed Origin (or same-origin fetch metadata).
+      if (method !== "GET" && !bearer(request)) {
+        const allowed = method === "POST" || method === "PATCH"
+          ? cookieRequestAllowed(request, browserOrigins)
+          : cookieDeleteAllowed(request, browserOrigins);
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const actor = auth.kind === "user"
+        ? { kind: "user" as const, userId: auth.principal.userId }
+        : { kind: "bootstrap" as const };
+      if (teamCollection && method === "GET") {
+        const archived = url.searchParams.getAll("archived");
+        if (archived.length > 1 || (archived.length === 1 && archived[0] !== "true")) {
+          throw new HttpError(400, "invalid_request", "archived must be true when present");
+        }
+        json(response, 200, { teams: await organizationTeams.list(organizationId, archived.length === 1) }, true);
+        return;
+      }
+      if (teamCollection) {
+        const body = await requestObject(request);
+        json(response, 201, await organizationTeams.create({ organizationId, name: teamName(body.name), actor }), true);
+        return;
+      }
+      if (teamItem && method === "PATCH") {
+        const body = await requestObject(request);
+        json(response, 200, await organizationTeams.rename({
+          organizationId, teamId: teamItem[1]!, name: teamName(body.name), actor,
+        }), true);
+        return;
+      }
+      if (teamItem) {
+        json(response, 200, await organizationTeams.archive({ organizationId, teamId: teamItem[1]!, actor }), true);
+        return;
+      }
+      const [, teamId, userId] = teamMember as [string, string, string];
+      if (method === "PUT") {
+        json(response, 200, await organizationTeams.assign({ organizationId, teamId, userId, actor }), true);
+        return;
+      }
+      json(response, 200, { unassigned: await organizationTeams.unassign({ organizationId, teamId, userId, actor }) }, true);
       return;
     }
 
@@ -2972,6 +3161,64 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Agent rules (docs/agent-rules.md). Any signed-in member reads the
+    // composed rules for their organization; owners and admins write overlays.
+    const rulesRead = routeMatch(path, /^\/api\/v1\/agent-rules\/([^/]+)$/);
+    if (rulesRead && method === "GET") {
+      const audience = rulesRead[0]!;
+      if (!isAgentRulesAudience(audience)) throw new HttpError(404, "not_found", "Unknown audience");
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const { principal } = auth;
+      if (principal.pendingHandoff) throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      if (!principal.scopes.includes("cli:auth") && !principal.scopes.includes(ACCOUNT_SCOPE)) {
+        throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
+      }
+      if (!await store.memberRole(principal.organizationId, principal.userId)) throw new HttpError(404, "not_found", "Organization not found");
+      const composed = await agentRules.compose(principal.organizationId, audience);
+      const etag = `"${composed.sha256}"`;
+      response.setHeader("etag", etag);
+      response.setHeader("cache-control", "private, no-cache");
+      if (request.headers["if-none-match"] === etag) {
+        response.statusCode = 304;
+        response.end();
+        return;
+      }
+      if (/\btext\/markdown\b/.test(String(request.headers.accept ?? ""))) {
+        response.setHeader("content-type", "text/markdown; charset=utf-8");
+        response.end(composed.text);
+        return;
+      }
+      json(response, 200, { audience: composed.audience, version: composed.version, sha256: composed.sha256,
+        bootstrap_version_current: composed.bootstrapVersion, sections: composed.sections, text: composed.text }, true);
+      return;
+    }
+    const rulesOverlay = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/agent-rules\/([^/]+)$/);
+    if (rulesOverlay && (method === "GET" || method === "PUT")) {
+      const [organizationId, audience] = rulesOverlay as [string, string];
+      if (!isAgentRulesAudience(audience)) throw new HttpError(404, "not_found", "Unknown audience");
+      const auth = await organizationAccess(request, organizationId, true);
+      if (method === "GET") {
+        const overlay = await agentRules.overlays.read(organizationId, audience);
+        json(response, 200, { audience, overlay, base_version: agentRules.bundle.version }, true);
+        return;
+      }
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const body = await requestObject(request);
+      if (typeof body.text !== "string") throw new HttpError(400, "invalid_request", "text must be a string; an empty string clears the overlay");
+      try {
+        const written = await agentRules.overlays.write({ organizationId, audience, text: body.text,
+          actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" } });
+        json(response, 200, { audience, ...written, version_string: written.cleared ? agentRules.bundle.version : `${agentRules.bundle.version}+org.${written.version}` }, true);
+      } catch (error) {
+        if (error instanceof AgentRulesInputError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      return;
+    }
+
     const workspacePolicy = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/workspace-policy$/);
     if (workspacePolicy && (method === "GET" || method === "PUT" || method === "DELETE")) {
       const organizationId = workspacePolicy[0]!;
@@ -3106,6 +3353,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (method === "PUT") {
+        if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+          throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+        }
         const body = await requestObject(request);
         if (!("runtime" in body) || body.runtime === undefined) {
           throw new HttpError(400, "invalid_request", "runtime is required");
@@ -3132,6 +3382,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         recordUsage(() => usage.increment(organizationId, "searches"));
         recordPeople(() => people.recordSearch(organizationId, userId));
       },
+      readBody: () => requestObject(request),
+      originAllowed: () => cookieRequestAllowed(request, browserOrigins),
+      hasBearer: () => Boolean(bearer(request)),
     })) {
       return;
     }
@@ -3409,6 +3662,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      cookieOriginAllowed: incoming => cookieDeleteAllowed(incoming, browserOrigins),
       agentRoster: agentIdentityRoster,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
@@ -3420,6 +3674,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      cookieOriginAllowed: incoming => cookieDeleteAllowed(incoming, browserOrigins),
     })) {
       return;
     }
@@ -3437,7 +3692,15 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         status: response.statusCode,
       }));
     }
-    void handle(request, response).catch((error: unknown) => {
+    let writeJson = json;
+    try {
+      const publicPath = new URL(request.url ?? "/", config.publicBaseUrl).pathname.replace(/\/+$/, "") || "/";
+      writeJson = credentialJsonWriter(normalizeRoutePath(publicPath), request.method ?? "GET", json);
+    } catch {
+      // Let handle's existing error path answer a malformed request URL.
+    }
+    void handle(request, response, writeJson).catch((error: unknown) => {
+      const json = writeJson;
       if (response.headersSent) {
         response.end();
         return;
@@ -3452,6 +3715,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (error instanceof CapturePolicyError) {
+        json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
+      if (error instanceof TeamsError) {
         json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }

@@ -67,6 +67,10 @@ export type MessagingDeps = {
    * saved and before the session and membership re-check.
    */
   afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void;
+  /** Tests shorten the bound on upstream device-token mint and identity probes. */
+  deviceRequestTimeoutMs?: number;
+  /** Tests pause after mint commit and before an immediate device-token undo rechecks ownership. */
+  beforeDeviceRevoke?: () => Promise<void> | void;
   /** Tests shorten the bound on the upstream revokes a sign-out waits for. */
   signOutRevokeTimeoutMs?: number;
   /** Server-side warning sink; defaults to console.warn. Never given a token or a device name. */

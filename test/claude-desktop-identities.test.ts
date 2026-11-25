@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import { request } from "./support/harness.js";
-import { copilotDesktopSetup, identitiesPath, MCP_PATH } from "./support/copilot-desktop.js";
+import { copilotDesktopSetup, desktopSecret, identitiesPath, installationId, MCP_PATH, tokensPath } from "./support/copilot-desktop.js";
 import { claudeSigner, toolUseId } from "./support/claude-signer.js";
+import { postgresClaudeHandoffStore } from "../src/mcp/claude-attestation.js";
 
 // Claude Code chat identity end to end: Desktop syncs a Claude chat and its
 // attestation key, the site advertises claude_session_attestation, and each
@@ -62,7 +63,10 @@ test("desktop identities advertise claude_session_attestation and MCP initialize
   assert.deepEqual(synced.body, { synced: 1, identities: [{ agent_id: chat.id, linked_mcp: null, linked_at: null }] });
   const listed = await request(env.origin, `/cloud${identitiesPath(env.workspaceId)}?source_id=${sourceId}`, { token: parent.accessToken });
   assert.equal(listed.status, 200);
-  assert.deepEqual(listed.body.capabilities, { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1, cursor_session_attestation: 1 });
+  assert.deepEqual(listed.body.capabilities, {
+    native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1, cursor_session_attestation: 1,
+    claude_attestation_handoff: 1,
+  });
   const stored = await env.database.query<{ native_session_kind: string }>(
     "SELECT native_session_kind FROM desktop_relay_identities WHERE agent_remote_id = $1", [chat.id]);
   assert.equal(stored.rows[0]!.native_session_kind, "claude");
@@ -203,4 +207,291 @@ test("outside desktop management a Claude proof is stripped and ignored", async 
   assert.equal(plain.status, 200, JSON.stringify(plain.body));
   const spent = await env.database.query("SELECT 1 FROM mcp_attestation_tool_uses");
   assert.equal(spent.rows.length, 0);
+});
+
+// The handoff: Claude Code's auto mode refuses a call whose input a hook
+// rewrote, so Desktop posts the proof first and the call goes out unchanged.
+
+const handoffPath = (workspaceId: string) => `${identitiesPath(workspaceId)}/attestations`;
+
+/** A Claude Desktop that hands proofs off: `hand` posts one, `plain` is the unchanged call. */
+async function handoffDesktop(t: TestContext) {
+  const desktop = await claudeDesktop(t);
+  const { env, parent, signer, sourceId, sid } = desktop;
+  const sign = (tool: string, tuid: string, overrides: Partial<Parameters<typeof signer.sign>[0]> & { signWith?: typeof signer } = {}) => {
+    const { signWith, ...claims } = overrides;
+    return (signWith ?? signer).sign({ tool, src: sourceId, sid, tuid, ...claims });
+  };
+  const hand = (body: unknown, token = parent.accessToken, path = handoffPath(env.workspaceId)) =>
+    request(env.origin, path, { method: "POST", token, body });
+  const plain = (tool: string, args: Record<string, unknown>, tuid: string) => ({
+    jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: tool, arguments: args, _meta: { "claudecode/toolUseId": tuid } },
+  });
+  return { ...desktop, sign, hand, plain };
+}
+
+test("a handed-off proof makes the unchanged call act as the verified desktop identity", async (t) => {
+  const { env, parent, chat, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  const handed = await hand({ attestation: await sign("send_relay_message", tuid) });
+  assert.equal(handed.status, 204, handed.raw);
+  assert.equal(handed.raw, "");
+  const rows = await env.database.query("SELECT 1 FROM mcp_attestation_handoffs");
+  assert.equal(rows.rows.length, 1);
+  const sent = await rpc(env.origin, parent.accessToken, plain("send_relay_message", { to: "peer", text: "handed off" }, tuid));
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.notEqual(sent.body.result.isError, true, JSON.stringify(sent.body.result));
+  const dm = env.world.bodies.find((row) => row.method === "POST" && row.path === "/v1/dm");
+  assert.deepEqual(dm?.body, { to: "peer", text: "handed off" });
+  assert.deepEqual(env.world.conversations.find((row) => row.participants.includes("peer"))?.participants.slice().sort(),
+    ["claude-chat", "peer"]);
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0, "taken");
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_tool_uses WHERE tool_use_id = $1", [tuid])).rows.length, 1, "spent");
+
+  // Under /cloud too, and an in-argument proof still works next to it.
+  const cloudTuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("relay_status", cloudTuid) }, parent.accessToken,
+    `/cloud${handoffPath(env.workspaceId)}`)).status, 204);
+  const status = await rpc(env.origin, parent.accessToken, plain("relay_status", {}, cloudTuid), { path: `/cloud${MCP_PATH}` });
+  assert.equal(status.status, 200, JSON.stringify(status.body));
+  assert.equal(status.body.result.structuredContent.address, `claude-chat@cloud-${chat.id}`, JSON.stringify(status.body.result));
+});
+
+test("a handoff is used once, binds its tool, and a call with nothing handed off gets today's guidance", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  const proof = await sign("relay_status", tuid);
+  assert.equal((await hand({ attestation: proof })).status, 204);
+  assert.equal((await rpc(env.origin, parent.accessToken, plain("relay_status", {}, tuid))).status, 200);
+  // The same call again: nothing is handed off any more, so it carries no identity.
+  const again = await rpc(env.origin, parent.accessToken, plain("send_relay_message", { to: "peer", text: "x" }, tuid));
+  assert.equal(again.status, 200);
+  assert.equal(again.body.result.isError, true);
+  assert.match(again.body.result.content[0].text, /cannot verify this chat's desktop identity/);
+  // Handing the spent proof off again is a conflict, and nothing is stored.
+  const respent = await hand({ attestation: proof });
+  assert.equal(respent.status, 409, respent.raw);
+  assert.equal(respent.body.error, "conflict");
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0);
+
+  const other = toolUseId();
+  assert.equal((await hand({ attestation: await sign("relay_status", other) })).status, 204);
+  const wrongTool = await rpc(env.origin, parent.accessToken, plain("send_relay_message", { to: "peer", text: "x" }, other));
+  assert.equal(wrongTool.status, 400, "a proof for another tool is refused");
+  assert.equal(wrongTool.body.error.message, "Invalid native chat context.");
+  assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
+});
+
+test("a handoff is idempotent for the same proof and 409 for another one", async (t) => {
+  const { sign, hand } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  const proof = await sign("relay_status", tuid);
+  assert.equal((await hand({ attestation: proof })).status, 204);
+  assert.equal((await hand({ attestation: proof })).status, 204);
+  const conflict = await hand({ attestation: await sign("send_relay_message", tuid) });
+  assert.equal(conflict.status, 409, conflict.raw);
+  assert.equal(conflict.body.error, "conflict");
+  assert.equal(conflict.raw.includes(proof.split(".")[2]!), false);
+});
+
+test("a malformed, unknown-key, forged, expired or Cursor handoff is refused and nothing is stored", async (t) => {
+  const { env, parent, sign, hand } = await handoffDesktop(t);
+  const rejected = async (body: unknown, status: number, code: string, label: string) => {
+    const response = await hand(body);
+    assert.equal(response.status, status, `${label}: ${response.raw}`);
+    assert.equal(response.body.error, code, label);
+  };
+  const tuid = toolUseId();
+  const good = await sign("relay_status", tuid);
+  await rejected({ attestation: await sign("relay_status", tuid, { signWith: await claudeSigner() }) }, 403, "attestation_rejected", "unknown key");
+  const [head, payload] = good.split(".");
+  await rejected({ attestation: `${head}.${payload}.${Buffer.alloc(64, 1).toString("base64url")}` }, 403, "attestation_rejected", "bad signature");
+  const now = Math.floor(Date.now() / 1000);
+  await rejected({ attestation: await sign("relay_status", tuid, { iat: now - 120, exp: now - 60 }) }, 403, "attestation_rejected", "expired");
+  await rejected({ attestation: "not-a-proof" }, 400, "invalid_attestation", "malformed");
+  await rejected({ attestation: good, extra: true }, 400, "invalid_attestation", "unknown field");
+  await rejected({}, 400, "invalid_attestation", "missing");
+  await rejected({ attestation: "a".repeat(4097) }, 400, "invalid_attestation", "too large");
+  await rejected({ attestation: await sign("relay_status", tuid, { kind: "cursor", extra: { args: {} } }) }, 400, "invalid_attestation", "cursor kind");
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0);
+  // Only POST, and only with the identity sync's auth.
+  const get = await request(env.origin, handoffPath(env.workspaceId), { token: parent.accessToken });
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.get("allow"), "POST");
+  const anonymous = await request(env.origin, handoffPath(env.workspaceId), { method: "POST", body: { attestation: good } });
+  assert.equal(anonymous.status, 401);
+});
+
+test("a Cursor credential never takes a handed-off Claude proof", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const secret = desktopSecret();
+  const registered = await request(env.origin, tokensPath(env.workspaceId), {
+    method: "POST", token: parent.accessToken, body: { provider: "cursor", installationId: installationId(), accessToken: secret },
+  });
+  assert.equal(registered.status, 201, registered.raw);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("send_relay_message", tuid) })).status, 204);
+  const sent = await rpc(env.origin, secret, plain("send_relay_message", { to: "peer", text: "x" }, tuid), { desktop: false });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.equal(sent.body.result.isError, true, "no verified chat on a Cursor credential");
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 1, "not taken");
+  assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
+});
+
+test("a native join keeps its name: the verified identity's own name joins, another name or address is refused", async (t) => {
+  const { env, parent, chat, sign, hand, plain, call } = await handoffDesktop(t);
+  const join = async (args: Record<string, unknown>) => {
+    const tuid = toolUseId();
+    assert.equal((await hand({ attestation: await sign("join_relay", tuid) })).status, 204);
+    return rpc(env.origin, parent.accessToken, plain("join_relay", args, tuid));
+  };
+  for (const args of [{ name: "claude-chat" }, { name: "  claude-chat " }, { name: "claude-chat", description: "ignored" }, { description: "ignored" }]) {
+    const joined = await join(args);
+    assert.equal(joined.status, 200, JSON.stringify(joined.body));
+    assert.notEqual(joined.body.result.isError, true, `${JSON.stringify(args)}: ${JSON.stringify(joined.body.result)}`);
+    assert.equal(joined.body.result.structuredContent.linked, "desktop");
+    assert.equal(joined.body.result.structuredContent.address, `claude-chat@cloud-${chat.id}`);
+    // An ignored description says so; a join without one carries no note.
+    if ("description" in args) assert.match(joined.body.result.structuredContent.note, /description was not applied/);
+    else assert.equal(joined.body.result.structuredContent.note, undefined);
+  }
+  for (const args of [{ name: "someone-else" }, { desktop_address: "other@cloud-x" }]) {
+    const refusedJoin = await join(args);
+    assert.equal(refusedJoin.status, 200);
+    assert.equal(refusedJoin.body.result.isError, true, JSON.stringify(args));
+    assert.match(refusedJoin.body.result.content[0].text, /can only use its verified desktop identity/);
+  }
+  // The in-argument path follows the same rule.
+  const inArgument = await rpc(env.origin, parent.accessToken, await call("join_relay", { name: "claude-chat" }));
+  assert.notEqual(inArgument.body.result.isError, true, JSON.stringify(inArgument.body.result));
+  assert.equal(env.world.bodies.some((row) => row.method === "PATCH" || (row.method === "POST" && row.path.includes("card"))), false);
+});
+
+test("a spent tool use cannot be handed off again: the re-POST after the call is 409", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  const proof = await sign("relay_status", tuid);
+  assert.equal((await hand({ attestation: proof })).status, 204);
+  assert.equal((await rpc(env.origin, parent.accessToken, plain("relay_status", {}, tuid))).status, 200);
+  const again = await hand({ attestation: proof });
+  assert.equal(again.status, 409, again.raw);
+  assert.equal(again.body.error, "conflict");
+  // A different proof for the spent tool use is refused the same way.
+  assert.equal((await hand({ attestation: await sign("send_relay_message", tuid) })).status, 409);
+});
+
+test("two concurrent calls with one handed-off tool use: exactly one verifies", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("send_relay_message", tuid) })).status, 204);
+  const [a, b] = await Promise.all([1, 2].map((n) =>
+    rpc(env.origin, parent.accessToken, plain("send_relay_message", { to: "peer", text: `race ${n}` }, tuid))));
+  const sent = [a!, b!].filter((row) => row.status === 200 && row.body.result?.isError !== true);
+  assert.equal(sent.length, 1, JSON.stringify([a, b]));
+  const other = sent[0] === a ? b! : a!;
+  assert.equal(other.body.result?.isError, true, "the other call had nothing to take");
+  assert.equal(env.world.bodies.filter((row) => row.method === "POST" && row.path === "/v1/dm").length, 1);
+});
+
+test("the handoff store's take is atomic: of two parallel takes exactly one gets the proof", async (t) => {
+  const { env, sign, hand } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("relay_status", tuid) })).status, 204);
+  const owner = await env.database.query<{ workspace_id: string; user_id: string; token_family_id: string }>(
+    "SELECT workspace_id, user_id, token_family_id FROM mcp_attestation_handoffs");
+  const store = postgresClaudeHandoffStore(env.database);
+  const key = { workspaceId: owner.rows[0]!.workspace_id, userId: owner.rows[0]!.user_id, toolUseId: tuid,
+    tokenFamilyId: owner.rows[0]!.token_family_id };
+  const taken = await Promise.all([store.take(key), store.take(key)]);
+  assert.equal(taken.filter((proof) => proof !== null).length, 1);
+});
+
+test("a handoff belongs to the Desktop sign-in that deposited it: another sign-in cannot take it, a refreshed token can", async (t) => {
+  const { env, parent, sign, hand, plain } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("send_relay_message", tuid) })).status, 204);
+  const family = await env.database.query<{ token_family_id: string | null }>("SELECT token_family_id FROM mcp_attestation_handoffs");
+  assert.ok(family.rows[0]!.token_family_id, "stored with the depositing session's token family");
+  // The same person's second Desktop sign-in holding the tool-use id: the call runs unattested.
+  const other = await env.desktopSignIn({ hostName: "other-mac" });
+  const stolen = await rpc(env.origin, other.accessToken, plain("send_relay_message", { to: "peer", text: "x" }, tuid));
+  assert.equal(stolen.status, 200);
+  assert.equal(stolen.body.result.isError, true);
+  assert.match(stolen.body.result.content[0].text, /cannot verify this chat's desktop identity/);
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 1, "not taken");
+  assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
+  // The depositing sign-in after an access-token refresh keeps its family and takes it.
+  const refreshed = await request(env.origin, "/cloud/api/v1/auth/token/refresh", {
+    method: "POST", body: { refreshToken: parent.refreshToken },
+  });
+  assert.equal(refreshed.status, 200, refreshed.raw);
+  const fresh = refreshed.body.accessToken as string;
+  assert.notEqual(fresh, parent.accessToken);
+  const sent = await rpc(env.origin, fresh, plain("send_relay_message", { to: "peer", text: "mine" }, tuid));
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.notEqual(sent.body.result.isError, true, JSON.stringify(sent.body.result));
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0, "taken");
+});
+
+test("a handoff stored with no token family is never taken", async (t) => {
+  const { env, sign, hand } = await handoffDesktop(t);
+  const tuid = toolUseId();
+  assert.equal((await hand({ attestation: await sign("relay_status", tuid) })).status, 204);
+  const row = await env.database.query<{ workspace_id: string; user_id: string; token_family_id: string }>(
+    "SELECT workspace_id, user_id, token_family_id FROM mcp_attestation_handoffs");
+  await env.database.query("UPDATE mcp_attestation_handoffs SET token_family_id = NULL");
+  const store = postgresClaudeHandoffStore(env.database);
+  assert.equal(await store.take({ workspaceId: row.rows[0]!.workspace_id, userId: row.rows[0]!.user_id, toolUseId: tuid,
+    tokenFamilyId: row.rows[0]!.token_family_id }), null);
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 1);
+});
+
+test("the sign-in redirect token is refused by the handoff and identity sync, exchanged or not", async (t) => {
+  const { env, sign, hand, sourceId } = await handoffDesktop(t);
+  const pending = await env.desktopSignIn({ exchange: false });
+  const exchanged = await env.desktopSignIn();
+  const attestation = await sign("relay_status", toolUseId());
+  for (const [token, code] of [[pending.handoffToken, "handoff_not_exchanged"], [exchanged.handoffToken, "forbidden"]] as const) {
+    const handed = await hand({ attestation }, token);
+    assert.equal(handed.status, 403, handed.raw);
+    assert.equal(handed.body.error, code);
+    const listed = await request(env.origin, `${identitiesPath(env.workspaceId)}?source_id=${sourceId}`, { token });
+    assert.equal(listed.status, 403, listed.raw);
+    assert.equal(listed.body.error, code);
+    const synced = await request(env.origin, identitiesPath(env.workspaceId), {
+      method: "PUT", token, body: { source_id: sourceId, identities: [] },
+    });
+    assert.equal(synced.status, 403, synced.raw);
+  }
+  assert.equal((await env.database.query("SELECT 1 FROM mcp_attestation_handoffs")).rows.length, 0);
+  // The exchanged Desktop session itself still works.
+  assert.equal((await hand({ attestation }, exchanged.accessToken)).status, 204);
+});
+
+test("handoff and take outcomes are logged without the proof, the tool-use id or key material", async (t) => {
+  const { env, parent, signer, sign, hand, plain } = await handoffDesktop(t);
+  const warn = t.mock.method(console, "warn", () => undefined);
+  const tuid = toolUseId();
+  const proof = await sign("relay_status", tuid);
+  await hand({ attestation: proof });
+  await hand({ attestation: proof });
+  await hand({ attestation: await sign("send_relay_message", tuid) });
+  await hand({ attestation: "not-a-proof" });
+  await hand({ attestation: await sign("relay_status", toolUseId(), { signWith: await claudeSigner() }) });
+  await rpc(env.origin, parent.accessToken, plain("relay_status", {}, tuid));
+  await rpc(env.origin, parent.accessToken, plain("relay_status", {}, toolUseId()));
+  const other = toolUseId();
+  await hand({ attestation: await sign("relay_status", other) });
+  await rpc(env.origin, parent.accessToken, plain("send_relay_message", { to: "peer", text: "x" }, other));
+  const lines = warn.mock.calls.map((call) => call.arguments as [string, Record<string, unknown>])
+    .filter(([message]) => typeof message === "string" && message.includes("claude attestation handoff"));
+  const outcomes = (suffix: string) => lines.filter(([message]) => message.endsWith(suffix)).map(([, fields]) =>
+    fields.reason ? `${fields.outcome}:${fields.reason}` : fields.outcome);
+  assert.deepEqual(outcomes("claude attestation handoff"),
+    ["stored", "repeat", "conflict:other_proof", "invalid:malformed_proof", "rejected:unknown_key", "stored"]);
+  assert.deepEqual(outcomes("handoff take"), ["hit", "miss", "verify_failed:tool_mismatch"]);
+  const serialized = JSON.stringify(lines);
+  for (const secret of [proof, tuid, other, signer.publicKey, signer.kid, proof.split(".")[2]!]) {
+    assert.equal(serialized.includes(secret), false);
+  }
 });

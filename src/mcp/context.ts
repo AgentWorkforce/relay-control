@@ -8,7 +8,8 @@ import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
-import { readViaSessionRead } from "./session-read-reader.js";
+import { accessViaSessionRead, readViaSessionRead } from "./session-read-reader.js";
+import type { AccessDeps } from "../sessions/access.js";
 import { DESKTOP_MCP_SCOPE, DESKTOP_MCP_TOKEN } from "../auth/desktop-mcp-credentials.js";
 import { mcpReaderMarker } from "../session-read.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
@@ -22,6 +23,7 @@ import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
 import type { CustomerSupportConnection } from "./customer-support.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { AgentRules } from "../agent-rules/service.js";
 import type { RelayLaunchCheck } from "./relay-launch-check.js";
 
 export type McpWorkspace = {
@@ -55,11 +57,21 @@ export type McpContext = {
    */
   agentIdentity?: { id: string; name: string };
   grokRoutines?: GrokRoutines;
+  /** The rules source for get_agent_rules (docs/agent-rules.md); absent for staff read grants. */
+  agentRules?: AgentRules;
   /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
   cursorCloud?: CursorCloudDeps;
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
+  /**
+   * Set only when session reads follow per-session access (the reader-kind
+   * mint setting): list_team_activity then shows a roster session binding
+   * only once `readHistory` proved the session readable ("probe"), or shows
+   * none ("none") for a caller `readHistory` would refuse. Absent, bindings
+   * are shown as declared.
+   */
+  sessionBindings?: "probe" | "none";
   /** Read `@name` tokens in search text as agent filters. */
   agentTokens?: boolean;
   members: () => Promise<McpMember[]>;
@@ -104,6 +116,12 @@ export type McpContext = {
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
+  /**
+   * Session access management (./session-access.ts), bound to this person.
+   * Present only on a relaygate read path (sessionAccessConfigured) for a
+   * person's own exchanged session with rth:read; see sessionAccessDeps.
+   */
+  sessionAccess?: AccessDeps;
   /** Internal native send resolver; absent until a complete Capy module is mounted. */
   capy?: Pick<CapyBindings, "agentFor">;
   /** Explicit exact-grant reply permits; never the native resolver or a persona pin. */
@@ -135,6 +153,32 @@ export class BackendUnsupportedError extends SharedSessionsToolError {
 export const UNAVAILABLE_MESSAGE = "Shared session history is temporarily unavailable. Please try again.";
 const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
+
+function historyReadGrant(principal: Principal, callerToken: string) {
+  // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
+  // this workspace; RelayHistory introspects it at Control like sh_at_.
+  const staffGrant = callerToken.startsWith("sh_sr_");
+  // A Desktop provider grant (cld_at_, mcp:desktop) was admitted by
+  // DesktopMcpCredentials.resolve, which re-checks its lease, verified
+  // parent and membership on every request. It authenticates nowhere else,
+  // so it reads through the workspace reader, never the session-read hop.
+  const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
+  // An OAuth connection reads only with the opt-in relay:history scope its
+  // person approved as a separate consent line; relay:mcp alone never does.
+  const oauthToken = callerToken.startsWith("mcp_at_");
+  const oauthGrant = oauthToken && principal.scopes.includes(MCP_HISTORY_SCOPE);
+  const nativeGrant = principal.scopes.includes("rth:read") && (callerToken.startsWith("sh_at_") || staffGrant || desktopGrant);
+  return { staffGrant, desktopGrant, oauthToken, oauthGrant, nativeGrant };
+}
+
+/**
+ * True when historyReader would read for this caller at all: every such read
+ * carries a read token for this person (its own, or one minted for it).
+ */
+export function historyReadable(principal: Principal, callerToken: string): boolean {
+  const { oauthGrant, nativeGrant } = historyReadGrant(principal, callerToken);
+  return !principal.pendingHandoff && (nativeGrant || oauthGrant);
+}
 
 /**
  * Reads through the dashboard's workspace-scoped reader: a History
@@ -173,21 +217,9 @@ export function historyReader(
     // MCP admission authenticates the person; content reads additionally need
     // the issue-time read scope. Neither a handoff nor a service credential
     // may be promoted by the reader's Control handoff.
-    // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
-    // this workspace; RelayHistory introspects it at Control like sh_at_.
-    const staffGrant = callerToken.startsWith("sh_sr_");
-    // A Desktop provider grant (cld_at_, mcp:desktop) was admitted by
-    // DesktopMcpCredentials.resolve, which re-checks its lease, verified
-    // parent and membership on every request. It authenticates nowhere else,
-    // so it reads through the workspace reader, never the session-read hop.
-    const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
-    // An OAuth connection reads only with the opt-in relay:history scope its
-    // person approved as a separate consent line; relay:mcp alone never does.
-    const oauthToken = callerToken.startsWith("mcp_at_");
-    const oauthGrant = oauthToken && principal.scopes.includes(MCP_HISTORY_SCOPE);
-    const nativeGrant = principal.scopes.includes("rth:read") && (callerToken.startsWith("sh_at_") || staffGrant || desktopGrant);
+    const { staffGrant, desktopGrant, oauthToken, oauthGrant } = historyReadGrant(principal, callerToken);
     // A pending handoff is refused at OAuth admission too; checked here again.
-    if (principal.pendingHandoff || !(nativeGrant || oauthGrant)) {
+    if (!historyReadable(principal, callerToken)) {
       throw new SharedSessionsToolError(oauthToken && !principal.pendingHandoff
         ? "Session reads need the relay:history scope on this OAuth connection."
         : "Session reads require an exchanged user session with rth:read.");
@@ -222,6 +254,33 @@ export function historyReader(
       throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
     }
   };
+}
+
+/**
+ * Session access calls as this person: the per-person session-read hop
+ * (reader kind `mcp`), never the workspace reader, a service token or the
+ * caller's own token upstream. The MCP route offers this only to an exchanged
+ * user session (`sh_at_`) with rth:read and no pending handoff; an OAuth
+ * connection, a Desktop provider credential, a staff read grant and an agent
+ * identity never get it.
+ */
+export function sessionAccessDeps(
+  config: SelfhostConfig,
+  principal: Principal,
+  workspace: McpWorkspace,
+  callerToken: string,
+  members: () => Promise<McpMember[]>,
+): AccessDeps {
+  const identity = {
+    userId: principal.userId,
+    organizationId: workspace.organizationId,
+    workspaceId: workspace.id,
+    role: workspace.role,
+    callerToken,
+    readerKind: "mcp" as const,
+  };
+  const marker = mcpReaderMarker(config.sessionReadApi.secret);
+  return { send: request => accessViaSessionRead(config, identity, request, marker), members };
 }
 
 export function toolError(error: unknown, options: { correlationId?: string } = {}) {

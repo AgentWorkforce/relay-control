@@ -49,12 +49,42 @@ All under `/api/v1/events-shim` (also `/cloud/api/v1/events-shim`).
 | `POST /shims` | A signed-in person (bearer access token, or the session cookie on `/cloud` with a same-origin JSON request). Records the person and workspace; at most 20 per person per hour |
 | `GET /shims/current` | `Authorization: Bearer <manage token>`: the feed |
 | `POST /shims/current/rotate` | Manage token: replaces the webhook URL; the old one answers 404 at once |
-| `PUT /shims/current/secrets/{github,stripe,linear,bearer}` | Manage token: sets (`{"secret": "..."}`) or clears (`null`) a verification secret; `bearer` with no secret generates one, shown once |
+| `PUT /shims/current/secrets/{github,stripe,linear,bearer,mcp}` | Manage token: sets (`{"secret": "..."}`) or clears (`null`) a verification secret; `bearer` and `mcp` with no secret generate one, shown once (`mcp` as a Standard Webhooks `whsec_` secret) |
 | `POST /h/<hook token>[/<mode>]` | The token in the URL. `open` is unverified; the other modes check the sender's signature or bearer against the stored secret |
-| `POST /t/<mcp token>/mcp` | The token in the URL. Stateless Streamable HTTP MCP |
+| `POST /t/<mcp token>/mcp` | The token in the URL. Stateless Streamable HTTP MCP, and an MCP Events (SEP-3415) server: `events/list`, `events/poll`, `events/stream` (Server-Sent Events, written as they come with `x-accel-buffering: no`; closed after 5 minutes to resume by cursor; the store is re-read every 2 s per open stream; at most 4 open per inbox on one process, a fifth answers 429 with MCP Events' resource-exhausted error `-32025`; a client that stops reading for 30 s while the socket is full is disconnected) |
 | `POST /t/<mcp token>/workspace` | The token in the URL. The inbox's temporary Agent Relay workspace (`workspace_id`, `workspace_key`, `workspace_expires_at`), made on first call; see below |
 
+`GET /.well-known/mcp-webhook-receiver.json` (at the origin root, only while
+`events_shim` is selected) answers `{"receivers": ["<base path>/api/v1/events-shim/h/"]}`,
+so an MCP Events server can deliver to `/h/<hook token>/mcp` without a
+challenge round trip. Deliveries to that URL are checked as Standard Webhooks,
+deduplicated by `webhook-id`, verification challenges are echoed, and
+`gap`/`terminated` envelopes wake the agent like posts.
+
+Behind a reverse proxy, event streams need response buffering off for the
+inbox's MCP path. Control sends `X-Accel-Buffering: no`, which nginx honours;
+for other proxies turn buffering off for `/api/v1/events-shim/t/` (and the
+`/cloud` alias) and allow a read timeout of at least 5 minutes, or a stream's
+frames arrive late or the proxy cuts it.
+
 `POST /shims` answers `{shim_id, mcp_url, webhook_url, webhook_urls, manage_token, limits}`.
+
+The linked agent's name: `link_relay_wake` takes an optional `agent` and
+answers `linked_agent` (and `replaced_agent` when it replaces another link);
+`watch_webhooks` and `GET /shims/current` (`agent.wake_agent`) report it for a
+linked inbox. Control keeps it in `events_shims.wake_agent` (migration 0095):
+the name `link_relay_wake` was given, or the bound agent's name for an agent
+link. `link_relay_wake` refuses an `agent` that is not an Agent Relay agent
+name (letters, digits, dots, dashes and underscores, at most 128 from package
+18.15.0, a leading @ dropped): the link is not made and an existing link stays.
+Control's store still keeps only a valid name, for a name that reaches the row
+another way, and the package shows only names that pass its check, since
+`watch_webhooks` repeats them to other sessions. Package and Control now share
+the 128-character limit (18.14.0 allowed 100, so a bound agent name of 101 to
+128 characters was stored but shown as none). A
+link with no name, or made before 0095, has none, and the agent is told to
+assume the link belongs to another session unless it linked in this
+conversation.
 The three tokens are shown once; an unknown or expired token answers 404.
 
 MCP tools: `watch_webhooks` (start here), `link_relay_wake`,
@@ -201,7 +231,7 @@ Stripe event id) are stored once and still count toward the limits.
 
 Migration 0047 adds `events_shims`, `events_shim_posts` and
 `events_shim_events`; 0076 adds `events_shim_agent_links` (see "Linking an
-inbox to a bound agent").
+inbox to a bound agent"); 0092 lets `events_shim_events.mode` be `mcp`; 0095 adds `events_shims.wake_agent`.
 
 - MCP, webhook and manage tokens are stored as SHA-256 hashes. The webhook
   token is also stored encrypted with `SELFHOST_ENCRYPTION_KEY` so the MCP

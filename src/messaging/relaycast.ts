@@ -397,8 +397,8 @@ export function createRelaycastClient(input: {
       return { id, name: registeredName, token };
     },
 
-    async getAgent(workspaceKey: string, name: string): Promise<RemoteAgent | null> {
-      const data = await call("GET", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey, undefined, undefined, true);
+    async getAgent(workspaceKey: string, name: string, signal?: AbortSignal): Promise<RemoteAgent | null> {
+      const data = await call("GET", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey, undefined, undefined, true, signal);
       return data === null ? null : agentFrom(data);
     },
 
@@ -438,6 +438,7 @@ export function createRelaycastClient(input: {
       workspaceKey: string,
       name: string,
       input: { expectedAgentId: string; device: DeviceTokenDevice; ttlSeconds: number },
+      signal?: AbortSignal,
     ): Promise<IssuedDeviceToken> {
       const data = record(await labeled("issue_device_token", () => call(
         "POST",
@@ -448,6 +449,9 @@ export function createRelaycastClient(input: {
           device: { id: input.device.id, name: input.device.name, kind: input.device.kind },
           ttl_seconds: input.ttlSeconds,
         },
+        undefined,
+        false,
+        signal,
       )));
       const token = text(data?.token);
       const agentId = text(data?.agent_id);
@@ -567,8 +571,9 @@ export function createRelaycastClient(input: {
     },
 
     /** Idempotent for the owner (Relaycast engine/delivery.ts ackDelivery changed:false at ac38905); 404 = absent or not owned. */
-    async acknowledgeDelivery(token: string, deliveryId: string): Promise<void> {
-      await labeled("ack_delivery", () => call("POST", `/v1/deliveries/${encodeURIComponent(deliveryId)}/ack`, token, {}));
+    async acknowledgeDelivery(token: string, deliveryId: string, signal?: AbortSignal): Promise<void> {
+      await labeled("ack_delivery", () =>
+        call("POST", `/v1/deliveries/${encodeURIComponent(deliveryId)}/ack`, token, {}, undefined, false, signal));
     },
 
     /** Workspace roster with the default metadata (ownership and declared sessions). */
@@ -786,6 +791,31 @@ export function createRelaycastClient(input: {
         return id && name ? [{ id, name }] : [];
       });
       return { ...agent, channels, workspaceId: text(record(data)?.workspace_id) };
+    },
+
+    /**
+     * Relaycast #543 GET /v1/deliveries/by-message/:id: proof that this exact
+     * message is still pending for the agent token, with the server-derived
+     * sender id and, where the engine stores one, the immutable
+     * `owner_approval` (relay docs/design/owner-trusted-delegates.md §16.2).
+     * Unknown, foreign, acknowledged and expired ids all answer null.
+     */
+    async pendingDeliveryForMessage(token: string, messageId: string): Promise<{
+      message_id: string; sender_agent_id: string | null; workspace_id: string; channel_id: string;
+      owner_approval: unknown; created_at: string | null;
+    } | null> {
+      const data = await labeled("delivery_by_message", () =>
+        call("GET", `/v1/deliveries/by-message/${encodeURIComponent(messageId)}`, token, undefined, undefined, true));
+      if (data === null) return null;
+      const row = record(data);
+      const id = text(row?.message_id);
+      const workspace = text(row?.workspace_id);
+      const channel = text(row?.channel_id);
+      if (!row || id !== messageId || !workspace || !channel) throw new RelaycastCallError(502, "", true);
+      return {
+        message_id: id, sender_agent_id: text(row.sender_agent_id), workspace_id: workspace, channel_id: channel,
+        owner_approval: row.owner_approval ?? null, created_at: text(row.created_at),
+      };
     },
 
     async heartbeat(token: string): Promise<void> {
