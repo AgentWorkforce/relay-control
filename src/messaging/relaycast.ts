@@ -113,8 +113,10 @@ export type RelaySpawnTarget = {
   stale: boolean;
   /** The raw node record, for the allowlisted placement reader. */
   raw: Record<string, unknown>;
+  approvalProfilesSupported?: boolean;
 };
 
+export const RELAY_APPROVAL_PROFILE_CAPABILITY = "relay:spawn-approval-profile:v1";
 export const RELAY_APPROVAL_PROFILES = ["interactive", "requester", "full_access"] as const;
 export type RelayApprovalProfile = typeof RELAY_APPROVAL_PROFILES[number];
 
@@ -227,6 +229,8 @@ function spawnTargetFrom(value: unknown): RelaySpawnTarget[] {
     maxAgents: node.max_agents as number,
     stale: node.live !== true || node.active_agents_stale === true || !reservedValid,
     raw: node,
+    ...(node.capabilities.some(item => (typeof item === "string" ? item : text(record(item)?.name)) === RELAY_APPROVAL_PROFILE_CAPABILITY)
+      ? { approvalProfilesSupported: true } : {}),
   }];
 }
 

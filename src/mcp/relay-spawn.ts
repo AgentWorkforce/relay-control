@@ -90,7 +90,7 @@ export const spawnInput = z.object({
   worker_cwd: z.string().max(1024).refine(value => /^(\/|[A-Za-z]:[\\/])/.test(value) && !/[\x00-\x1f\x7f$`]/.test(value)
     && !value.split(/[\\/]/).includes(".."), "Use a literal absolute directory on the selected machine.").optional()
     .describe("worker_cwd (strongly recommended): absolute working directory for the agent on the target machine. If omitted, the node applies the machine default."),
-  approval_profile: z.enum(RELAY_APPROVAL_PROFILES).optional().describe("Optional prompt policy. Omit to preserve the node default. requester lets the authenticated spawning agent and machine owner answer over Relay; interactive keeps prompts owner-only; full_access disables prompts only when the machine owner enabled it for this harness."),
+  approval_profile: z.enum(RELAY_APPROVAL_PROFILES).optional().describe("Optional prompt policy. Omit to preserve the node default. requester lets the authenticated spawning agent and machine owner answer over Relay; interactive excludes spawning-requester approval (owner and independently authorized leaders retain access); full_access disables prompts only when the machine owner enabled it for this harness."),
   idempotency_key: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/).optional()
     .describe("Use a stable key for this launch. Reuse it after a lost response; a new request without a key may describe another launch."),
 }).strict();
@@ -467,10 +467,14 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
             const live = (await deps.client.listSpawnTargets(deps.workspaceKey)).filter(eligible);
             const ranking = rankTargets(live, await deps.owners(live.map(item => item.id)), userId, await placementOptions(input.cli));
             const recorded = ranking.targets.find(item => item.target_node === previous.nodeId);
-            return alternativesFor({ ...ranking, ranked: ranking.ranked.filter(entry => !padded(entry.candidate.placed)) }, input.cli,
+            return alternativesFor({ ...ranking, ranked: ranking.ranked.filter(entry => !padded(entry.candidate.placed) &&
+              (!input.approval_profile || live.find(node => node.id === entry.candidate.id)?.approvalProfilesSupported)) }, input.cli,
               { id: previous.nodeId, repositories: recorded?.repositories }).map(displayPlaced);
           })().catch(() => null);
           return alternatives ? { ...result(previous), alternatives } : result(previous);
+        }
+        if (input.approval_profile === "requester" && context.relay.relaygatePublicUrl && !actor.requester) {
+          throw new RelayToolError("requester approvals need a verified Desktop chat on this gate-only install. Call join_relay with desktop_address to link that chat before starting a new launch; omit approval_profile only to intentionally use the node default.");
         }
         const online = await deps.client.listSpawnTargets(deps.workspaceKey);
         // Ids first. Only an id miss on the live page reads nodes of every state, so offline nodes never displace
@@ -514,7 +518,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         const options = await placementOptions(input.cli);
         const ranking: PlacementRanking = rankTargets(online.filter(eligible), owners, userId, options);
         // A padded name is never offered: it would be refused the same way.
-        const offered: PlacementRanking = { ...ranking, ranked: ranking.ranked.filter(entry => !padded(entry.candidate.placed)) };
+        const offered: PlacementRanking = { ...ranking, ranked: ranking.ranked.filter(entry => !padded(entry.candidate.placed) &&
+          (!input.approval_profile || online.find(node => node.id === entry.candidate.id)?.approvalProfilesSupported)) };
         const alternativesTo = (id: string, repositories?: readonly string[]) =>
           alternativesFor(offered, input.cli, { id, repositories }).map(displayPlaced);
         const refuse = (code: string, refused: RelaySpawnTarget | undefined, placed?: PlacedTarget, memory?: MemoryAssessment,
@@ -592,6 +597,10 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         if (!target || !target.live) throw refuse("spawn_target_offline", known, placed);
         if (!target.handlersLive || target.stale || target.name === "self") throw refuse("spawn_target_unavailable", target, placed);
         if (!target.capabilities.includes(`spawn:${input.cli}`)) throw refuse("spawn_harness_unavailable", target, placed);
+        if (input.approval_profile && !target.approvalProfilesSupported) {
+          throw refuse("spawn_approval_profile_unsupported", target, placed, undefined, { retryable: false,
+            message: `Node "${displayName(target.name)}" does not advertise approval-profile support. Update the node before requesting an explicit profile; omit approval_profile only to intentionally use its existing default.` });
+        }
         if (!eligible(target)) throw refuse("spawn_capacity_exceeded", target, placed);
         // Memory last: under enforce a fresh sample without room refuses (fail open when unknown); otherwise counted only.
         const assessed = ranking.ranked.find(entry => entry.candidate.id === target!.id);
@@ -767,7 +776,7 @@ export function registerRelaySpawnTools(server: McpServer, context: McpContext, 
     inputSchema: targetsInput.shape, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(service => service.targets(input)));
   server.registerTool("spawn_relay_agent", {
-    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or a name that only one node has, live) with a harness that target advertises. Among nodes sharing a name case-insensitively, the exact (case-sensitive) stored name wins when that node is live; otherwise the name is refused, and a value matching nothing is refused with the valid ids and names. The receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. approval_profile is optional: omit it to preserve the node default; requester lets the authenticated spawning agent and machine owner answer prompts over Relay, interactive keeps them owner-only, and full_access requires the machine owner to enable it for this harness. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
+    description: "Start an agent on one exact allowed target_node (a node id from list_relay_spawn_targets, or a name that only one node has, live) with a harness that target advertises. Among nodes sharing a name case-insensitively, the exact (case-sensitive) stored name wins when that node is live; otherwise the name is refused, and a value matching nothing is refused with the valid ids and names. The receipt always records the node id. worker_cwd (strongly recommended) is the absolute working directory on that machine. approval_profile requires node-advertised support when explicit; omit it to preserve the node default; requester lets the authenticated spawning agent and machine owner answer prompts over Relay, interactive excludes requester approval, and full_access requires the machine owner to enable it for this harness. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
     inputSchema: spawnInput.shape, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   }, (input, extra) => run(service => service.spawn(input, extra.requestId)));
   server.registerTool("get_relay_spawn_status", {

@@ -32,7 +32,7 @@ const FIRST_KEY = "rk_live_first";
 const OTHER_KEY = "rk_live_other";
 
 function node(id: string, name: string, options: { kind?: "desktop" | "broker" | null; teammates?: boolean; live?: boolean;
-  harnesses?: string[]; max?: number; active?: number; memory?: { availableGiB: number; totalGiB: number } } = {}) {
+  harnesses?: string[]; max?: number; active?: number; memory?: { availableGiB: number; totalGiB: number }; profiles?: boolean } = {}) {
   const configured: Record<string, unknown> = {};
   // A fresh relay-node sample (metadata.live) when the test gives one.
   const live = options.memory ? { live: { observed_at: new Date().toISOString(), resources: { cpus: 8, load_1m: 1,
@@ -42,7 +42,8 @@ function node(id: string, name: string, options: { kind?: "desktop" | "broker" |
   return {
     id, name, live: options.live ?? true, handlers_live: options.live ?? true,
     active_agents: options.active ?? 0, max_agents: options.max ?? 0, reserved_agents: 0,
-    capabilities: (options.harnesses ?? ["codex", "claude"]).map(harness => ({ name: `spawn:${harness}`, metadata: { configured, ...live } })),
+    capabilities: [...(options.harnesses ?? ["codex", "claude"]).map(harness => ({ name: `spawn:${harness}`, metadata: { configured, ...live } })),
+      ...(options.profiles ? [{ name: "relay:spawn-approval-profile:v1" }] : [])],
     tags: ["repo:acme/app"],
   };
 }
@@ -243,7 +244,7 @@ test("targets: only this workspace's relay nodes and claims; unclaimed desktops 
 
 test("approval profiles: strict discovery, unchanged omission, explicit forwarding, audit and replay isolation", async (t) => {
   const env = await setup(t);
-  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop", { profiles: true })]);
   await env.claim("node-1");
   const client = await env.connect();
   const tool = (await client.listTools()).tools.find(tool => tool.name === "spawn_relay_agent")!;
@@ -277,9 +278,29 @@ test("approval profiles: strict discovery, unchanged omission, explicit forwardi
   assert.equal(spawnInvocations(env), 4);
 });
 
+test("legacy nodes reject explicit policies before journaling while omission and saved receipt recovery remain available", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop", { profiles: true })]);
+  await env.claim("node-1");
+  const client = await env.connect();
+  const savedArgs = launch("node-1", { approval_profile: "interactive" });
+  const saved = data(await client.callTool({ name: "spawn_relay_agent", arguments: savedArgs }));
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: savedArgs })).spawn_id, saved.spawn_id);
+  for (const approval_profile of ["interactive", "requester", "full_access"]) {
+    const refused = await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1", { approval_profile, idempotency_key: `unsupported-${approval_profile}` }) });
+    assert.equal(refused.isError, true);
+    assert.equal((refused.structuredContent as Record<string, any>).error.code, "spawn_approval_profile_unsupported");
+    assert.equal((refused.structuredContent as Record<string, any>).error.retryable, false);
+  }
+  assert.equal((await env.database.query("SELECT id FROM relay_spawns")).rows.length, 1);
+  assert.equal(spawnInvocations(env), 1);
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1", { idempotency_key: "old-node-default" }) })).status, "accepted");
+});
+
 test("a node's profile refusal stays terminal and recoverable without another dispatch", async (t) => {
   const env = await setup(t);
-  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop", { profiles: true })]);
   await env.claim("node-1");
   const client = await env.connect();
   for (const code of ["unsupported_profile", "full_access_not_allowed"]) {
@@ -361,7 +382,7 @@ test("a desktop-linked chat's launch names it as the requester; the launcher sta
   const synced = await request(env.origin, identitiesPath(env.workspaceId), { method: "PUT", token: parent.accessToken,
     body: { source_id: randomUUID(), identities: [{ name: chat.name, address, agent_id: chat.id, token: chat.token }] } });
   assert.equal(synced.status, 200, synced.raw);
-  env.world.nodes.set("rk_primary", [node("node-1", "studio-desktop")]);
+  env.world.nodes.set("rk_primary", [node("node-1", "studio-desktop", { profiles: true })]);
   await env.database.query(
     `INSERT INTO fleet_node_owners (id, workspace_id, organization_id, relaycast_workspace_id, node_id, node_name, user_id)
      VALUES ($1, $2, $3, 'rw_primary', 'node-1', 'node-1', $4)`, [randomUUID(), env.workspaceId, env.orgId, env.ownerId]);
@@ -371,8 +392,9 @@ test("a desktop-linked chat's launch names it as the requester; the launcher sta
   t.after(() => client.close());
   assert.equal(data(await client.callTool({ name: "join_relay", arguments: { desktop_address: address } })).linked, "desktop");
 
-  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") })).status, "accepted");
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1", { approval_profile: "requester" }) })).status, "accepted");
   const invocation = [...env.world.invocations.values()][0]!;
+  assert.equal(invocation.input.approval_profile, "requester");
   assert.equal(invocation.requester_agent_id, chat.id);
   assert.equal(invocation.requester_name, "desk-chat");
   assert.equal("requester_agent_id" in invocation.input, false);
