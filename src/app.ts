@@ -1463,9 +1463,8 @@ export function createApp(input: {
     })
     : null;
 
-  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  async function handle(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     const method = request.method ?? "GET";
-    const url = new URL(request.url ?? "/", config.publicBaseUrl);
     const publicPath = url.pathname.replace(/\/+$/, "") || "/";
     const path = normalizeRoutePath(publicPath);
 
@@ -3672,16 +3671,21 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
   }
 
   const handler = (request: IncomingMessage, response: ServerResponse): void => {
+    const target = request.url ?? "/";
+    const url = /^[\\/]{2}/.test(target) ? null : URL.parse(target, config.publicBaseUrl);
+    if (!url) {
+      json(response, 400, { error: "invalid_request", message: "Invalid request target" }, true);
+      return;
+    }
     // telemetry lane: aggregate usage per feature area (no bodies or queries).
     if (telemetry) {
-      const routePath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
       response.once("finish", () => telemetry.observeRequest({
         method: request.method ?? "GET",
-        path: routePath,
+        path: url.pathname,
         status: response.statusCode,
       }));
     }
-    void handle(request, response).catch((error: unknown) => {
+    void handle(request, response, url).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
         return;
@@ -3732,7 +3736,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof UpstreamError) {
         telemetry?.observeError(error, {
-          path: new URL(request.url ?? "/", config.publicBaseUrl).pathname,
+          path: url.pathname,
           status: error.status ?? 502,
           component: "relayhistory",
         });
@@ -3782,7 +3786,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       telemetry?.observeError(error, {
-        path: new URL(request.url ?? "/", config.publicBaseUrl).pathname,
+        path: url.pathname,
         status: 500,
       });
       console.error("[selfhost-api] request failed", {
