@@ -2,7 +2,7 @@
 // a mock hosted ingest that verifies signatures. Covers levels, preview,
 // outbox retry/backoff, error bursts, issue reports, and air-gapped export.
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, get, type IncomingMessage, type Server } from "node:http";
 import test from "node:test";
 import { PGlite } from "@electric-sql/pglite";
 import { createApp } from "../src/app.js";
@@ -188,6 +188,23 @@ function assertPrivate(raw: string, h: Harness): void {
     assert.equal(raw.includes(forbidden), false, `payload leaked ${forbidden.slice(0, 12)}…`);
   }
 }
+
+test("invalid request targets return 400 and the server continues serving requests", async (t) => {
+  const h = await harness({});
+  t.after(() => h.cleanup());
+
+  for (const path of ["//example.invalid/healthz", "http://example.invalid:bad/"]) {
+    // Supply the target separately so the client does not normalize it.
+    const response = await new Promise<IncomingMessage>((resolve, reject) => {
+      get(h.baseUrl, { path }, resolve).on("error", reject);
+    });
+    assert.equal(response.statusCode, 400);
+    assert.equal(JSON.parse(await readBody(response)).error, "invalid_request");
+  }
+  const health = await call(h.baseUrl, "/healthz?probe=1");
+  assert.equal(health.status, 200);
+  assert.equal(health.body.status, "ok");
+});
 
 test("full level: preview shows exactly the scrubbed next digest; outbox retries then delivers", async (t) => {
   const h = await harness({ SELFHOST_TELEMETRY_LEVEL: "full" });
