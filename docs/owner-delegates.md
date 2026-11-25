@@ -738,6 +738,14 @@ owner or admin.
 Lock order, for every writer and decision: membership, policy, rule, grants
 by id, approvals.
 
+`POST /internal/v1/delegation/trust-backfill` (SELFHOST_INTERNAL_TOKEN; 404
+without it) pins existing unpinned MCP OAuth grants to their agent ids where
+stored rows prove it (exactly one hosted participant of the same owner holds
+the consented name, no other binding, no retirement in flight). It is a dry
+run unless `{"apply": true}`, idempotent, pages by grant id (`after`,
+`next_cursor`), creates no rule or grant, and audits each pin as
+`trust_root.backfilled` (actor system, reason backfill).
+
 ## Revocation
 
 Revocation happens in these cases:

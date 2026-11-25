@@ -625,6 +625,8 @@ export function createApp(input: {
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
     clientKey: (request) => limiterKey(clientIp(request)),
     now: input.now,
+    // The trust rule's existing-connections backfill (POST /internal/v1/delegation/trust-backfill).
+    internalServiceToken: config.internalServiceToken,
   });
   const factory = input.factory ?? createFactoryModule({
     config,

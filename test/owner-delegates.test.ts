@@ -1045,6 +1045,7 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/delegates/{grantId}": ["patch", "delete"],
     "/api/v1/workspaces/{workspaceId}/delegates/revoke-all": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/trust-rule": ["get", "put", "delete"],
+    "/internal/v1/delegation/trust-backfill": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims/complete": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/approvals": ["post"],

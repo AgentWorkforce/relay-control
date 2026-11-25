@@ -6,6 +6,7 @@ import { delegateStillBound, grantFitsPolicy, type DelegationDeps, type GrantRow
 import {
   launcherName, MAX_TRUST_DEPTH, resolveTrustPath, trustRelation, trustRelationAllowed, type TrustPath, type TrustReader,
 } from "../src/delegation/trust.js";
+import { backfillConnectorRoots } from "../src/delegation/trust-backfill.js";
 import { copilotDesktopSetup } from "./support/copilot-desktop.js";
 import { request } from "./support/harness.js";
 
@@ -529,4 +530,43 @@ test("the DB refuses an owner-made grant past the 90-day cap and admits a rule-b
   // Only a rule-backed grant may be created by the system.
   await assert.rejects(insert("grt_ownerSys001", null, "system"), /delegation_grants_auth_method/);
   await insert("grt_ruleBack001", rule.trust_rule_id, "system");
+});
+
+test("backfill: service-authenticated, dry run by default, pins only provable connections, idempotent, paged", async (t) => {
+  const { env } = await ready(t);
+  const call = (body: unknown, token: string | null = INTERNAL) => request(env.origin, "/internal/v1/delegation/trust-backfill", {
+    method: "POST", ...(token ? { token } : {}), body });
+  assert.equal((await call({}, null)).status, 401);
+  assert.equal((await call({}, env.desktop.accessToken)).status, 401);
+  const provable = await env.connector("old-assistant", { pinned: false });
+  const launcher = await env.connector(launcherName(env.ownerId), { pinned: false });
+  void launcher;
+  const dry = await call({});
+  assert.equal(dry.status, 200, dry.raw);
+  assert.deepEqual([dry.body.dry_run, dry.body.provable, dry.body.pinned, dry.body.skipped.launcher], [true, 1, 0, 1]);
+  assert.deepEqual(dry.body.pins.map((pin: { agent_id: string }) => pin.agent_id), [provable.id]);
+  assert.equal((await env.database.query("SELECT agent_remote_id FROM mcp_oauth_grants WHERE id = $1", [provable.grantId])).rows[0]!
+    .agent_remote_id, null);
+  assert.equal((await env.events("trust_root.backfilled")).length, 0);
+
+  // Paged by id with an `after` cursor.
+  const page = await backfillConnectorRoots(env.database, { apply: false, limit: 1 });
+  assert.equal(page.scanned, 1);
+  assert.ok(page.next_cursor);
+  const rest = await backfillConnectorRoots(env.database, { apply: false, limit: 1, after: page.next_cursor! });
+  assert.equal(rest.scanned, 1);
+  assert.equal((await backfillConnectorRoots(env.database, { apply: false, limit: 1, after: rest.next_cursor! })).scanned, 0);
+
+  const applied = await call({ apply: true });
+  assert.deepEqual([applied.body.dry_run, applied.body.pinned], [false, 1]);
+  assert.equal((await env.database.query("SELECT agent_remote_id FROM mcp_oauth_grants WHERE id = $1", [provable.grantId])).rows[0]!
+    .agent_remote_id, provable.id);
+  const [event] = await env.events("trust_root.backfilled");
+  assert.deepEqual([event!.reason, event!.auth_method, event!.actor_user_id, event!.data.oauth_grant_id], ["backfill", "system", null,
+    provable.grantId]);
+  // No rule and no grant are created; a rerun pins nothing again.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_trust_rules")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_grants")).rows.length, 0);
+  assert.equal((await call({ apply: true })).body.pinned, 0);
+  assert.equal((await env.events("trust_root.backfilled")).length, 1);
 });

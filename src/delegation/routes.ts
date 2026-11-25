@@ -77,7 +77,8 @@ import {
   type DelegationWorkspace,
   type GrantRow,
 } from "./service.js";
-
+import { backfillConnectorRoots } from "./trust-backfill.js";
+import { secureEqual } from "../crypto.js";
 
 /**
  * HTTP surface for owner-named trusted delegates (relay
@@ -134,6 +135,8 @@ export type DelegationRoutesInput = {
   rateLimit: (response: ServerResponse, key: string, rule: { limit: number; windowMs: number }) => void;
   clientKey: (request: IncomingMessage) => string;
   now?: () => Date;
+  /** SELFHOST_INTERNAL_TOKEN: the service bearer of the trust backfill (null: that route answers 404). */
+  internalServiceToken?: string | null;
 };
 
 type AuthMethod = "session" | "desktop_bearer";
@@ -197,7 +200,13 @@ const patchGrantBody = z.object({
 const revokeAllBody = z.object({ all: z.boolean().optional() }).strict();
 /** PUT /delegates/trust-rule: turn the owner's rule on, or set which classes still need an owner tap. */
 const trustRulePutBody = z.object({ require_tier_o: classList.optional() }).strict();
-
+/** POST /internal/v1/delegation/trust-backfill: a dry run unless `apply` is true; pages by grant id. */
+const trustBackfillBody = z.object({
+  apply: z.boolean().optional(),
+  limit: z.number().int().min(1).max(2000).optional(),
+  after: z.string().uuid().optional(),
+}).strict();
+export const TRUST_BACKFILL_PATH = "/internal/v1/delegation/trust-backfill";
 const mintBody = z.object({
   actions: mintActionsSchema,
   expires_at: rfc3339.optional(),
@@ -386,6 +395,7 @@ function policyRefusal(classes: readonly ActionClass[], policy: DelegationPolicy
 
 export function isDelegationPath(path: string): boolean {
   return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}` || ORG_POLICY_PATH.test(path)
+    || path === TRUST_BACKFILL_PATH
     || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates|\/withdraw)?)$/.test(path);
 }
 
@@ -561,6 +571,25 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const jwks = input.signer ? input.signer.jwks() : { keys: [] };
       response.setHeader("cache-control", jwks.keys.length ? "public, max-age=300" : "no-store");
       input.json(response, 200, jwks);
+      return true;
+    }
+    if (path === TRUST_BACKFILL_PATH) {
+      // Service-authenticated (SELFHOST_INTERNAL_TOKEN) and off without it: an
+      // operator's one-shot run, never a person's or an agent's.
+      const token = bearer(request);
+      if (!input.internalServiceToken) return fail("not_found", "Route not found", 404);
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      if (!token || !secureEqual(token, input.internalServiceToken)) return fail("unauthorized", "Unauthorized", 401);
+      const raw = await readJson(request);
+      const body = parse(trustBackfillBody, raw === undefined ? {} : raw, "Invalid request");
+      let report;
+      try {
+        report = await backfillConnectorRoots(input.database, { apply: body.apply === true, limit: body.limit, after: body.after });
+      } catch (error) {
+        logUnavailable("trust_backfill", error, {});
+        return UNAVAILABLE();
+      }
+      input.json(response, 200, report, true);
       return true;
     }
     const orgMatch = ORG_POLICY_PATH.exec(path);
