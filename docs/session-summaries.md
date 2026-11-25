@@ -38,9 +38,12 @@ Readers can expose nullable `shortSummary` and `shortSummaryGeneratedAt`
 fields on list rows. When either field is omitted, its output is null and
 `short_summary_status` is `unsupported`; session metadata remains usable.
 When both fields are present, the status is `empty` for a null summary and
-`available` for recorded text. The current reader omits the fields for
-compatibility with older clients; this tool requests the explicit
-`includeShortSummary=recorded` extension. Readers with that extension disabled
+`available` for recorded text. The tool requests the fields with
+`includeShortSummary=recorded`. For a pipeline-backed deployment, set
+`transcriptStore.sessionReadApi.listShortSummary` to `true` on the serving
+reader stack. This renders `READ_API_LIST_SHORT_SUMMARY_ENABLED=true` on
+the reader. Control forwards the request to its configured History origin;
+setting the flag on Control itself has no effect. Readers with that extension disabled
 answer 501, which remains unsupported: the tool never retries without the
 parameter or switches backends. Recorded text is bounded to 1000 Unicode
 code points. Null stays null: task titles, the generic list
