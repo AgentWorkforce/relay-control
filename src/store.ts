@@ -229,6 +229,21 @@ type TokenContextRow = {
   desktop_host_name: string | null;
 };
 
+/**
+ * Ends the per-device messaging credentials bound to sign-in sessions that
+ * were just revoked. Call it in the transaction that revokes the sessions;
+ * the messaging sweep sends the upstream revoke later.
+ */
+export async function revokeSessionDeviceCredentials(executor: SqlExecutor, sessionIds: string[]): Promise<void> {
+  if (sessionIds.length === 0) return;
+  await executor.query(
+    `UPDATE person_device_credentials
+        SET revoked_at = now(), upstream_revoked_at = NULL, updated_at = now()
+      WHERE session_id = ANY($1::uuid[]) AND revoked_at IS NULL`,
+    [sessionIds],
+  );
+}
+
 function cleanName(value: string, field: string): string {
   const cleaned = value.replace(/[\p{C}]/gu, " ").trim().slice(0, 120);
   if (!cleaned) throw new Error(`${field} is required`);
@@ -2070,6 +2085,7 @@ export class ControlPlaneStore {
           WHERE id = $1`,
         [input.sessionId],
       );
+      await revokeSessionDeviceCredentials(tx, [input.sessionId]);
       await tx.query(
         "UPDATE users SET last_organization_id = $2, last_workspace_id = $3, updated_at = now() WHERE id = $1",
         [input.userId, organizationId, input.workspaceId],
@@ -2171,14 +2187,17 @@ export class ControlPlaneStore {
 
   async revoke(token: string): Promise<boolean> {
     const hash = hashSecret(token);
-    const result = await this.database.query<{ id: string }>(
-      `UPDATE token_sessions AS s
-          SET revoked_at = now(), revoked_reason = 'user_requested', updated_at = now()
-        WHERE (access_token_hash = $1 OR refresh_token_hash = $1) AND revoked_at IS NULL
-        RETURNING id`,
-      [hash],
-    );
-    return result.rows.length === 1;
+    return this.database.transaction(async (tx) => {
+      const result = await tx.query<{ id: string }>(
+        `UPDATE token_sessions AS s
+            SET revoked_at = now(), revoked_reason = 'user_requested', updated_at = now()
+          WHERE (access_token_hash = $1 OR refresh_token_hash = $1) AND revoked_at IS NULL
+          RETURNING id`,
+        [hash],
+      );
+      await revokeSessionDeviceCredentials(tx, result.rows.map((row) => row.id));
+      return result.rows.length === 1;
+    });
   }
 
   /**
@@ -2205,6 +2224,15 @@ export class ControlPlaneStore {
         WHERE user_id = $1 AND revoked_at IS NULL
         RETURNING id`,
       [userId, reason],
+    );
+    await revokeSessionDeviceCredentials(executor, sessions.rows.map((row) => row.id));
+    // The web device is shared by all of the person's browser sessions, so it
+    // has no session binding; ending every session ends it too.
+    await executor.query(
+      `UPDATE person_device_credentials
+          SET revoked_at = now(), upstream_revoked_at = NULL, updated_at = now()
+        WHERE user_id = $1 AND session_id IS NULL AND revoked_at IS NULL`,
+      [userId],
     );
     // Desktop relay identity tokens let the MCP endpoint act as the person's
     // Desktop agents. They are deleted (the table has no revoked state), so

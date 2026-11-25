@@ -303,7 +303,9 @@ function createRelay(state: RelayState) {
       return;
     }
 
-    sendJson(response, 404, { error: { code: "not_found", message: "missing" } });
+    // Relaycast answers routes it does not have with this exact body; the
+    // device-token mint falls back to the shared person token only on it.
+    sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
   });
 }
 
@@ -481,8 +483,18 @@ test("person messaging round trip reads both authors and refuses the wrong calle
   });
   const refused = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, true), { method: "POST", token: agentToken.accessToken });
   assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, "forbidden");
+  assert.equal(typeof refused.body.error, "string");
   const serviceRefused = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.config.internalServiceToken! });
   assert.equal(serviceRefused.status, 403);
+  assert.equal(serviceRefused.body.code, "forbidden");
+  assert.equal(typeof serviceRefused.body.error, "string");
+  const unauthenticated = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, true), { method: "POST" });
+  assert.equal(unauthenticated.status, 401);
+  assert.deepEqual(unauthenticated.body, { error: "Authentication required", code: "unauthorized" });
+  const foreignCredential = await jsonRequest(fx.origin, credentialPath(fx.otherWorkspaceId), { method: "POST", token: fx.accessToken });
+  assert.equal(foreignCredential.status, 404);
+  assert.deepEqual(foreignCredential.body, { error: "Workspace not found", code: "workspace_not_found" });
   const wrongWorkspace = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.otherWorkspaceId}/messaging/people`, { token: fx.accessToken });
   assert.equal(wrongWorkspace.status, 404);
 
@@ -684,7 +696,7 @@ test("cookie writes require the existing origin guard and bearer still works", a
     rawBody: "{}",
   });
   assert.equal(evil.status, 403);
-  assert.equal(evil.body.error, "csrf_rejected");
+  assert.equal(evil.body.code, "csrf_rejected");
   const crossSite = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper", true), {
     method: "POST",
     cookie,
@@ -1064,7 +1076,7 @@ test("register_human admission stays a typed conflict", async (t) => {
   fx.state.admission = true;
   const full = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
   assert.equal(full.status, 409);
-  assert.equal(full.body.error, "register_human_admission");
+  assert.equal(full.body.code, "register_human_admission");
   assert.equal((await fx.database.query("SELECT id FROM person_identities")).rows.length, 0);
 });
 
@@ -1490,8 +1502,8 @@ test("person credential: gate-only issues no Relaycast token", async (t) => {
   ] as const) {
     const withheld = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, cloud), { method: "POST", body: {}, ...auth });
     assert.equal(withheld.status, 403);
-    assert.equal(withheld.body.error, "gate_only");
-    assert.equal(typeof withheld.body.message, "string");
+    assert.equal(withheld.body.code, "gate_only");
+    assert.equal(typeof withheld.body.error, "string");
     assert.deepEqual(withheld.body.urls, {
       relaycastUrl: "https://cast.selfhosted.example",
       relaygateUrl: "https://gate.selfhosted.example",
@@ -1523,15 +1535,15 @@ test("person credential: gate-only issues no Relaycast token", async (t) => {
   });
   const agent = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: agentToken.accessToken });
   assert.equal(agent.status, 403);
-  assert.notEqual(agent.body.error, "gate_only");
+  assert.notEqual(agent.body.code, "gate_only");
   const service = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.config.internalServiceToken! });
   assert.equal(service.status, 403);
-  assert.notEqual(service.body.error, "gate_only");
+  assert.notEqual(service.body.code, "gate_only");
   const lowScope = await fx.signIn(fx.userId);
   await dropCliAuth(fx.database, lowScope);
   const scoped = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: lowScope });
   assert.equal(scoped.status, 403);
-  assert.equal(scoped.body.error, "forbidden");
+  assert.equal(scoped.body.code, "forbidden");
   const foreign = await jsonRequest(fx.origin, credentialPath(fx.otherWorkspaceId), { method: "POST", token: fx.accessToken });
   assert.equal(foreign.status, 404);
   const evil = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, true), {
@@ -1542,7 +1554,7 @@ test("person credential: gate-only issues no Relaycast token", async (t) => {
     rawBody: "{}",
   });
   assert.equal(evil.status, 403);
-  assert.equal(evil.body.error, "csrf_rejected");
+  assert.equal(evil.body.code, "csrf_rejected");
   assert.equal((await credentialWithheldAudits(fx.database)).length, 2);
   assert.equal(fx.state.registerCalls, 0);
 

@@ -57,11 +57,38 @@ export type MessagingDeps = {
   beforeMembershipRecheck?: (tx: SqlExecutor) => Promise<void> | void;
   beforeDispatch?: () => Promise<void> | void;
   afterUpstream?: () => Promise<void> | void;
+  /**
+   * Runs inside the device-credential lock after Relaycast minted a device
+   * token and before the session row is locked and the token row saved.
+   */
+  beforeDeviceSave?: (tx: SqlExecutor) => Promise<void> | void;
+  /**
+   * Runs inside the device-credential lock after the minted token row is
+   * saved and before the session and membership re-check.
+   */
+  afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void;
+  /** Tests shorten the bound on upstream device-token mint and identity probes. */
+  deviceRequestTimeoutMs?: number;
+  /** Tests pause after mint commit and before an immediate device-token undo rechecks ownership. */
+  beforeDeviceRevoke?: () => Promise<void> | void;
+  /** Tests shorten the bound on the upstream revokes a sign-out waits for. */
+  signOutRevokeTimeoutMs?: number;
+  /** Server-side warning sink; defaults to console.warn. Never given a token or a device name. */
+  warn?: (message: string, fields: Record<string, string>) => void;
+};
+
+/** The workspace and person a messaging credential is issued for. */
+export type PersonAccess = {
+  workspaceId: string;
+  organizationId: string;
+  relaycastWorkspaceId: string;
+  relaycastApiKey: string;
+  user: PersonUser;
 };
 
 type Relaycast = ReturnType<typeof createRelaycastClient>;
 
-function slug(value: string): string {
+export function slug(value: string): string {
   return value
     .toLowerCase()
     .normalize("NFKD")
@@ -97,7 +124,16 @@ function ownerOf(workspaceId: string, user: PersonUser): PersonOwner {
   };
 }
 
-async function withLock<T>(database: Database, key: string, run: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * The per-person advisory lock key. Identity creation, recovery (takeover),
+ * membership-removal revocation and every device-token mint and revoke for
+ * one person in one workspace take this one lock, so they serialize.
+ */
+export function personLockKey(workspaceId: string, userId: string): string {
+  return `${workspaceId}:${userId}`;
+}
+
+export async function withLock<T>(database: Database, key: string, run: (tx: SqlExecutor) => Promise<T>): Promise<T> {
   return database.transaction(async (tx) => {
     await tx.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", ["selfhost-person", key]);
     return run(tx);
@@ -124,7 +160,7 @@ function usable(row: IdentityRow | null, relaycastWorkspaceId: string, keyring: 
   };
 }
 
-async function isMember(executor: SqlExecutor, organizationId: string, userId: string): Promise<boolean> {
+export async function isMember(executor: SqlExecutor, organizationId: string, userId: string): Promise<boolean> {
   const result = await executor.query<{ present: boolean }>(
     `SELECT true AS present
        FROM organization_memberships
@@ -159,7 +195,7 @@ async function saveIdentity(
   );
 }
 
-function client(deps: MessagingDeps): Relaycast {
+export function client(deps: MessagingDeps): Relaycast {
   return createRelaycastClient({ internalOrigin: deps.relaycastUrl, fetchImpl: deps.fetchImpl });
 }
 
@@ -240,6 +276,14 @@ async function persistRecovery(
     identity,
     keyring: deps.keyring,
   });
+  // A takeover revokes every device token of the agent upstream, so the
+  // person's stored device tokens are expired here and re-minted, not served.
+  await executor.query(
+    `UPDATE person_device_credentials
+        SET expires_at = LEAST(expires_at, now()), updated_at = now()
+      WHERE workspace_id = $1 AND user_id = $2`,
+    [access.workspaceId, access.user.userId],
+  );
   return identity;
 }
 
@@ -248,7 +292,7 @@ export async function ensurePersonIdentity(
   access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
 ): Promise<PersonIdentity> {
   const relaycast = client(deps);
-  const outcome = await withLock(deps.database, `${access.workspaceId}:${access.user.userId}`, async (tx) => {
+  const outcome = await withLock(deps.database, personLockKey(access.workspaceId, access.user.userId), async (tx) => {
     if (!(await isMember(tx, access.organizationId, access.user.userId))) {
       throw new MessagingHttpError(403, "forbidden", "Organization membership is required");
     }
@@ -281,8 +325,15 @@ export async function ensurePersonIdentity(
   return outcome.identity!;
 }
 
+/**
+ * A 401/403 that refuses the presented token. `device_token_forbidden` is
+ * not one: it means a device token reached a route that only takes the
+ * agent's own token, an error to surface, never a reason to recover.
+ */
 export function isRefusedToken(error: unknown): boolean {
-  return error instanceof RelaycastCallError && (error.status === 401 || error.status === 403);
+  return error instanceof RelaycastCallError
+    && (error.status === 401 || error.status === 403)
+    && error.code !== "device_token_forbidden";
 }
 
 export async function recoverPersonIdentity(
@@ -291,7 +342,7 @@ export async function recoverPersonIdentity(
   refused: PersonIdentity,
 ): Promise<PersonIdentity> {
   const relaycast = client(deps);
-  return withLock(deps.database, `${access.workspaceId}:${access.user.userId}`, async (tx) => {
+  return withLock(deps.database, personLockKey(access.workspaceId, access.user.userId), async (tx) => {
     const current = usable(await readRow(tx, access.workspaceId, access.user.userId), access.relaycastWorkspaceId, deps.keyring);
     if (current && current.token !== refused.token) return current;
     const remote = await relaycast.getAgent(access.relaycastApiKey, refused.name);
@@ -340,6 +391,17 @@ async function queueRevocation(executor: SqlExecutor, target: RevocationTarget):
       WHERE workspace_id = $1 AND user_id = $2 AND agent_remote_id = $3`,
     [target.workspaceId, target.userId, target.agentRemoteId],
   );
+  // Deleting the agent upstream ends its device tokens with it. Rows minted for
+  // another agent id stay pending for the upstream device-token sweep.
+  await executor.query(
+    `UPDATE person_device_credentials
+        SET revoked_at = COALESCE(revoked_at, now()),
+            upstream_revoked_at = CASE WHEN agent_remote_id = $3 THEN COALESCE(upstream_revoked_at, now())
+                                       ELSE upstream_revoked_at END,
+            updated_at = now()
+      WHERE workspace_id = $1 AND user_id = $2`,
+    [target.workspaceId, target.userId, target.agentRemoteId],
+  );
 }
 
 /** Membership removal retires the human credential. Session sign-out does not. */
@@ -361,7 +423,9 @@ export async function revokeRemovedMember(deps: MessagingDeps, organizationId: s
   );
   for (const row of rows.rows) {
     const relaycastApiKey = decryptSecret(row.relaycast_api_key_ciphertext, deps.keyring);
-    await deps.database.transaction(async (tx) => {
+    // Under the person lock: a device-token mint in flight commits its row
+    // first, and this revocation then revokes it.
+    await withLock(deps.database, personLockKey(row.workspace_id, userId), async (tx) => {
       await queueRevocation(tx, {
         workspaceId: row.workspace_id,
         userId,

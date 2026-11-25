@@ -984,12 +984,38 @@ paths:
   /api/v1/workspaces/{workspaceId}/messaging/identity/credential:
     post:
       operationId: issuePersonCredential
-      summary: Mint or recover the caller's human-agent token. Session or cli:auth only.
+      summary: Mint or recover the caller's per-device human-agent token. Session or cli:auth only.
+      description: >-
+        The device is derived from the server-side calling session; body device fields
+        are ignored. The browser's web-device row is not bound to a sign-in, but the
+        session authorizing this request must remain live. Every upstream mint,
+        stored-token probe and legacy-fallback identity lookup has a 15-second
+        deadline; immediate undo of a mint whose authority ended has a 5-second
+        budget. Errors use the hosted {error: human-readable message, code:
+        machine-readable code} envelope. A Relaycast without the device-token route
+        retains the legacy shared-token success shape.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refusedTokenSha256:
+                  type: [string, "null"]
+                  pattern: '^[0-9a-f]{64}$'
+                  description: >-
+                    SHA-256 of the token the client saw refused. A match forces a
+                    re-mint at most once per device every 30 seconds; absent or null
+                    changes nothing. Other body keys are ignored.
       responses:
         "200":
-          description: Identity envelope with the human agent name, id, token, and public Relaycast origin
+          description: >-
+            Identity envelope with the human agent name, id, token and public
+            Relaycast origin. Device-token responses also include device and expiresAt;
+            only the legacy missing-route fallback omits them.
           content:
             application/json:
               schema:
@@ -1004,15 +1030,88 @@ paths:
                       agentId: { type: string }
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
+                      device:
+                        type: object
+                        required: [id, name, kind]
+                        properties:
+                          id: { type: string }
+                          name: { type: string }
+                          kind: { type: string, enum: [desktop, cli, web] }
+                      expiresAt: { type: string, format: date-time }
+        "400":
+          description: invalid_request; malformed JSON, non-object body or invalid refusedTokenSha256
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "401":
+          description: Missing or invalid authentication before the credential operation starts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
         "403":
           description: >-
-            Agent, CI, or service credential, or cookie request failed the origin check;
-            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
-            identity is registered and no token is issued, the body carries
-            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
-            `workspace.person_credential.withheld`
+            Agent, CI or service credential, cookie origin-check failure, Desktop
+            handoff_not_exchanged or handoff_not_capable, or device_revoked when
+            a stored device is revoked or the calling session/membership ends while
+            this credential request is in flight (including browser requests).
+            On a gate-only install, gate_only carries urls.relaycastUrl and
+            urls.relaygateUrl; no identity or token is issued, and the call is
+            audited as workspace.person_credential.withheld.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
         "409":
           description: register_human admission is full, or the name is held by someone else
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "429":
+          description: rate_limited; a forced re-mint is inside the per-device 30-second window
+          headers:
+            Retry-After:
+              description: Seconds until a forced re-mint is allowed again
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
+        "502":
+          description: >-
+            upstream_unavailable; Relaycast refused the mint or its outcome is
+            unknown after an outage/timeout. A probe outage may serve only an
+            unexpired stored token with live calling authority.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error: { type: string, description: Human-readable explanation }
+                  code: { type: string, description: Machine-readable error code }
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
     get:
       operationId: readPersonConversation

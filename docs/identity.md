@@ -1729,6 +1729,126 @@ capability scope:
 Membership is checked live on every request and mint, so removing a person
 from an organization takes effect on their next request.
 
+### Person messaging credential
+
+`POST /api/v1/workspaces/{id}/messaging/identity/credential` (scope
+`cli:auth` or the browser session) hands the caller a Relaycast token for the
+person's own human agent. Each signed-in device gets its own device token for
+that one agent, minted with the workspace key
+(`POST /v1/agents/{name}/device-tokens`). The agent's shared token never
+leaves Control while Relaycast serves device tokens.
+
+- The device comes from the server-side session only; the client cannot name
+  it (device fields in the body are ignored). The browser session (the `/cloud`
+  cookie) is the device `{id: "web", name: "web", kind: "web"}`, bound to no
+  sign-in. A bearer is its
+  own sign-in's device: kind `desktop` when the session carries a Desktop host
+  name (the handoff consent or an enrollment key exchange), otherwise `cli`.
+  The name is that host name with control and bidirectional formatting
+  characters removed, cut to 80 UTF-16 units on a grapheme boundary, or the
+  kind when empty. The id is `<slug of the name, up to 32 chars>-<first 8 hex
+  of sha256(session id)>`: lowercase `[a-z0-9-]`, at most 64 characters, never
+  Relaycast's reserved `unknown` or `direct`. The session id survives a token
+  refresh, so a refreshed sign-in keeps its device and token.
+- Every mint asks for a 12 hour TTL (`ttl_seconds: 43200`) and sends the
+  expected `agent_id`; an answer naming another agent, or another device id
+  or kind, is refused. Relaycast cleans the device name it records (control
+  characters to spaces, whitespace collapsed, trimmed, at most 80
+  characters), so the name stored and served is the one in its answer. The
+  stored expiry is the earlier of Relaycast's `expires_at` and now + 12 hours.
+- The answer is
+  `{identity: {name, agentId, token, relaycastUrl, device: {id, name, kind}, expiresAt}}`.
+  A stored token is served again while it is more than one hour from expiry
+  and Relaycast still accepts it (`GET /v1/agent` with the token, on every
+  request, never cached). A refused token is re-minted. While Relaycast is
+  unreachable the stored token is served as long as it is unexpired. A probe
+  answered `403 device_token_forbidden` is a `502`, never a re-mint.
+- The request body is optional and read the same way as on the hosted
+  service, so one client works against both. No body, a JSON object without
+  `refusedTokenSha256`, or `"refusedTokenSha256": null` changes nothing;
+  other keys are ignored. A client that saw its token refused may send
+  `{"refusedTokenSha256": "<64 lowercase hex>"}`, the SHA-256 of that token.
+  When it matches the stored token (compared in constant time; neither the
+  hash nor the token is logged) the stored token is dropped without a probe
+  and a new one minted, at most once per device every 30 seconds, measured
+  from the stored token's `minted_at` by the database clock so every replica
+  agrees. Inside that window the answer is `429 rate_limited`, with
+  `Retry-After` in seconds, matching the hosted route. A hash that does not
+  match takes the normal path (probe, no forced mint). A body that is not JSON
+  or not an object, or a
+  `refusedTokenSha256` that is not 64 lowercase hex (uppercase included), is
+  `400 invalid_request`. The shared-token fallback below ignores the field.
+- Errors from this POST use the hosted envelope
+  `{error: "<human-readable message>", code: "<machine-readable code>"}`,
+  including authentication and origin-check failures. Clients branch on
+  `code`, rather than treating `error` as a code. Other Control routes retain
+  their existing envelopes.
+- A device row revoked while its calling session still authenticates answers
+  `403 device_revoked`; sign in again for a new device. If the calling session
+  or membership ends while a probe, mint or fallback lookup is in flight, the
+  request also answers `403 device_revoked` and never hands out a credential.
+  This live calling-session check includes browser requests: the web device
+  row remains unbound to a sign-in, but the browser session authorizing that
+  individual request must remain live. A later browser request with valid
+  authority can mint the web device again.
+- Mints, sweeps of revoked device tokens, the person agent's registration,
+  takeover and recovery, and member revocation take the same per-person
+  advisory lock, so a mint never interleaves with a recovery or a removal.
+  After a minted token is saved, the mint re-checks in the same transaction
+  that the calling session is live and the person is still a member; if not,
+  the row is revoked and the token revoked upstream (or left to the sweep).
+  A sign-in row deleted while the mint was in flight leaves the token
+  recorded with no sign-in, already revoked, for the same upstream revoke.
+- A device token is never presented to Relaycast's token rotation, recovery
+  or upgrade routes; recovery uses the workspace key and the shared token.
+  Relaycast refuses device tokens there with `403 device_token_forbidden`,
+  which Control treats as an error, never as a refused token to re-mint.
+- A relay node token minted with a device token ends when that device token
+  is revoked, renewed or expires, or when the person agent is taken over. A
+  client mints its node token again after it receives a renewed device token.
+- A mint refused with `404 agent_not_found` or `409 agent_identity_conflict`
+  recovers the person agent once (the same recovery as a refused shared
+  token, which ends every device token of the agent) and mints again. Any
+  other refusal, including `400` and `409 not_a_person_agent`, answers
+  `502 upstream_unavailable`.
+- Tokens are stored encrypted in `person_device_credentials` (migration
+  0082), one row per workspace, person and device. A device row is deleted
+  with its sign-in row. Ending a sign-in (sign-out, workspace switch,
+  revoke-all, API token or Desktop credential revocation) revokes its rows in
+  the same transaction; revoke-all also revokes the web row. Relaycast is told
+  with `DELETE /v1/agents/{name}/device-tokens/{device}` (a `404` means
+  already gone) right after sign-out, which waits at most 5 seconds for it,
+  and by a bounded sweep on every messaging request until it confirms. A
+  token Relaycast never hears about still ends at its 12 hour expiry.
+- Removing a membership deletes the person's sign-in rows, and with them
+  their device rows. Their device tokens end because member revocation
+  deletes the person agent at Relaycast, not by per-device revokes.
+- Each upstream device-token mint, stored-token probe and missing-route
+  confirmation lookup has a 15-second deadline. A probe outage or timeout can
+  serve an existing token only while it is unexpired and the calling session
+  and membership are still live. With live authority, a timed-out mint has
+  an unknown upstream outcome and answers `502 upstream_unavailable`; it is never reported as a
+  successful mint. This is a bound per operation, not on the total request.
+- If a mint loses its calling session or membership, its immediate upstream
+  undo has a 5-second budget. The cleanup rechecks the revoked row under the
+  person lock before revoking, so it cannot revoke a newer live replacement
+  for the same device. An unsuccessful undo leaves the row pending for the
+  bounded sweep and the token's expiry remains the backstop.
+- A Desktop browser handoff token never holds a messaging credential: before
+  its PKCE exchange it answers `403 handoff_not_exchanged`, after it
+  `403 handoff_not_capable`. The session the exchange issues is the device.
+- A Relaycast release without device tokens is detected only by its own
+  missing-route answer to the mint (`404` with code `not_found` and message
+  `Route not found`) while a workspace-key lookup still finds the person's
+  agent under the expected id. Control then answers with the shared person
+  token in the old shape (`{name, agentId, token, relaycastUrl}`, no `device`
+  or `expiresAt`) and logs
+  `[selfhost-api] messaging device credential fallback: Relaycast has no device-token route`
+  with `workspaceId` and `deviceKind`. Any other answer is not a missing
+  route.
+
+Gate-only installs answer `403 gate_only` instead (below).
+
 ### Gate-only installs (relaygate)
 
 On a gate-only install, relaygate is the only public way into Relaycast and

@@ -17,6 +17,15 @@ import {
   type PersonIdentity,
   type SendClaim,
 } from "./identity.js";
+import {
+  DeviceMintRateLimited,
+  ensureDeviceCredential,
+  type DeviceCredential,
+  parseCredentialRequest,
+  personDevice,
+  sweepDeviceRevocations,
+  SIGN_OUT_REVOKE_TIMEOUT_MS,
+} from "./device-credentials.js";
 import { MessagingHttpError, SEND_UNCERTAIN_MESSAGE, SendAbandoned } from "./http.js";
 import { createRelaycastClient, RelaycastCallError } from "./relaycast.js";
 
@@ -40,6 +49,25 @@ type WorkspaceAccess = {
 };
 
 type JsonWriter = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
+
+/** The person credential POST shares Cloud's error envelope; other Control routes keep theirs. */
+export function credentialJsonWriter(path: string, method: string, write: JsonWriter): JsonWriter {
+  if (method !== "POST" || !/^\/(?:cloud\/)?api\/v1\/workspaces\/[^/]+\/messaging\/identity\/credential$/.test(path)) return write;
+  return (response, status, body, noStore) => {
+    if (status >= 400 && body && typeof body === "object" && !Array.isArray(body)) {
+      const { error, message, code, ...extra } = body as Record<string, unknown>;
+      if (typeof error === "string") {
+        write(response, status, {
+          ...extra,
+          error: typeof message === "string" ? message : error,
+          code: typeof code === "string" ? code : error,
+        }, true);
+        return;
+      }
+    }
+    write(response, status, body, noStore);
+  };
+}
 
 function safeDecode(value: string): string {
   try {
@@ -260,6 +288,9 @@ export function createMessagingHandler(input: MessagingDeps & {
       throw new MessagingHttpError(403, "csrf_rejected", "Cross-origin messaging write refused");
     }
     await sweepRevocations(deps, access.workspace.organizationId);
+    await sweepDeviceRevocations(deps, access.workspace.organizationId, {
+      signal: AbortSignal.timeout(deps.signOutRevokeTimeoutMs ?? SIGN_OUT_REVOKE_TIMEOUT_MS),
+    });
     const person = accessInput(access);
 
     if (people && method === "GET") {
@@ -311,14 +342,45 @@ export function createMessagingHandler(input: MessagingDeps & {
         }, true);
         return true;
       }
+      // A Desktop browser handoff token, exchanged or not, is never a device:
+      // only the session its PKCE exchange issues may hold a messaging token.
+      if (access.principal.pendingHandoff) {
+        throw new MessagingHttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (access.principal.handoff) {
+        throw new MessagingHttpError(
+          403,
+          "handoff_not_capable",
+          "This sign-in handoff cannot hold a messaging credential; use the session issued by POST /api/v1/auth/desktop/session",
+        );
+      }
+      // Optional `{"refusedTokenSha256": ...}`: the client saw that token refused.
+      const { refusedTokenSha256 } = parseCredentialRequest(await requestBody(request));
+      const { device, signInId } = personDevice(access.principal, !bearerToken);
       const identity = await ensurePersonIdentity(deps, person);
+      let issued: DeviceCredential;
+      try {
+        issued = await ensureDeviceCredential(deps, person, identity, device, signInId, { refusedTokenSha256, requestSessionId: access.principal.sessionId });
+      } catch (error) {
+        if (error instanceof DeviceMintRateLimited) response.setHeader("retry-after", String(error.retryAfterSeconds));
+        throw error;
+      }
       helpers.json(response, 200, {
-        identity: {
-          name: identity.name,
-          agentId: identity.agentId,
-          token: identity.token,
-          relaycastUrl: publicOrigin,
-        },
+        identity: issued.kind === "device"
+          ? {
+            name: issued.identity.name,
+            agentId: issued.identity.agentId,
+            token: issued.token,
+            relaycastUrl: publicOrigin,
+            device: issued.device,
+            expiresAt: issued.expiresAt.toISOString(),
+          }
+          : {
+            name: issued.identity.name,
+            agentId: issued.identity.agentId,
+            token: issued.identity.token,
+            relaycastUrl: publicOrigin,
+          },
       }, true);
       return true;
     }
