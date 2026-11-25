@@ -111,7 +111,9 @@ export type DelegationDeps = {
   trustReader?: TrustReader;
 };
 
-export type AgentBinding = { userId: string; agentId: string; name: string; address: string | null };
+export type AgentBinding = { userId: string; agentId: string; name: string; address: string | null;
+  /** Which binding table holds the agent: `hosted` is an MCP connector's hosted participant. */
+  source?: string };
 
 type BindingRow = {
   source: string; user_id: string; agent_id: string; agent_name: string; address: string | null; verified: boolean;
@@ -276,7 +278,19 @@ export async function resolveBinding(executor: SqlExecutor, workspaceId: string,
   if (rows.length !== 1) return null;
   const row = rows[0]!;
   if (!row.verified) return null;
-  return { userId: row.user_id, agentId: row.agent_id, name: row.agent_name, address: row.address };
+  return { userId: row.user_id, agentId: row.agent_id, name: row.agent_name, address: row.address, source: row.source };
+}
+
+/**
+ * Whether a hosted-participant binding still stands for an owner-made grant:
+ * the agent must prove out as the owner's connector root (a live OAuth grant
+ * and session pinned to its id, exactly one owned participant), as Cloud's
+ * ownedDelegateBinding requires. The participant row alone is not enough: a
+ * revoked connector must end the owner's grant too.
+ */
+export async function connectorRootProven(prove: TrustProver, ownerUserId: string, agentId: string): Promise<TrustProof | null> {
+  const proof = await prove(ownerUserId, agentId);
+  return proof && proof.path.root.kind === "connector" && !proof.path.hops.length ? proof : null;
 }
 
 /** Whether any Control binding (of anyone) names this agent id. */
@@ -1244,9 +1258,18 @@ export async function delegateStillBound(deps: DelegationDeps, workspace: Delega
     grant.delegate_agent_id, true);
   if (!binding) return "not_delegate";
   if (binding.userId !== grant.owner_user_id) return revoke("binding_changed");
+  // An owner-made grant to a connected assistant re-proves its connector at
+  // every use (live OAuth grant and session, the owner's marker), so revoking
+  // the connector ends the grant (cloud#6635 parity, d5-gate-owner P1).
+  const connector = binding.source === "hosted" ?
+    await connectorRootProven(options.prove ?? trustProver(deps, workspace, false), grant.owner_user_id, grant.delegate_agent_id) : null;
+  if (binding.source === "hosted" && !connector) return revoke("binding_changed");
   if (live) {
     const agent = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, binding.name);
     if (!agent || agent.id !== binding.agentId || agent.status === "released") return revoke("agent_released");
+    if (connector && !(agent.metadata?.source === HOSTED_SOURCE && agent.metadata.owner_hash === sha256Hex(grant.owner_user_id))) {
+      return revoke("agent_released");
+    }
   }
   if (!await memberRole(deps.database, workspace.id, grant.owner_user_id)) return revoke("owner_left");
   return null;

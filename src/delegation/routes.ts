@@ -76,6 +76,7 @@ import {
   type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
+  connectorRootProven, trustProver,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
 import { secureEqual } from "../crypto.js";
@@ -834,6 +835,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const binding = await resolveBinding(input.database, workspace.id, workspace.relaycastWorkspaceId,
         body.delegate_agent_id, true);
       if (!binding || binding.userId !== principal.userId) {
+        fail("not_delegate", "The agent must be bound to you; claim it first", 403);
+      }
+      // A connected assistant (hosted participant) must prove out as the owner's connector root, as in Cloud.
+      if (binding!.source === "hosted" && !await connectorRootProven(trustProver(deps, workspace, false), principal.userId, binding!.agentId)) {
         fail("not_delegate", "The agent must be bound to you; claim it first", 403);
       }
       const requireTierO = uniqueClasses(body.require_tier_o);

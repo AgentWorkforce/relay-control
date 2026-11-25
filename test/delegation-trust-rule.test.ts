@@ -518,6 +518,28 @@ test("C1: delegateStillBound with durable false refuses an unbound delegate with
   assert.equal((await env.grants(bobAgent.id))[0]!.revoked_reason, "binding_changed");
 });
 
+test("P1: an owner-made grant to a connected assistant re-proves its connector; a revoked connector refuses and revokes it", async (t) => {
+  const { env, recipient } = await ready(t);
+  const gpt = await env.connector("chatgpt-assistant");
+  const grant = (scopes: unknown) => request(env.origin, `${env.base}/delegates`, { method: "POST", token: env.desktop.accessToken,
+    body: { delegate_agent_id: gpt.id, scopes } });
+  const created = await grant([{ class: "merge", targets: ["AgentWorkforce/*"] }]);
+  assert.equal(created.status, 201, created.raw);
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient))).verdict, "delegate");
+  // The connector is revoked: the participant row and the live agent remain, the owner's grant does not.
+  await env.database.query("UPDATE mcp_oauth_grants SET revoked_at = now() WHERE id = $1", [gpt.grantId]);
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient))).reason, "revoked");
+  const [owned] = await env.grants(gpt.id);
+  assert.deepEqual([owned!.status, owned!.revoked_reason, owned!.trust_rule_id], ["revoked", "binding_changed", null]);
+  // A new owner-made grant needs a proven connector too.
+  const refused = await grant([{ class: "merge", targets: ["AgentWorkforce/*"] }]);
+  assert.equal(refused.status, 403, refused.raw);
+  const unpinned = await env.connector("unpinned-assistant", { pinned: false });
+  const unproven = await request(env.origin, `${env.base}/delegates`, { method: "POST", token: env.desktop.accessToken,
+    body: { delegate_agent_id: unpinned.id, scopes: [{ class: "merge", targets: ["AgentWorkforce/*"] }] } });
+  assert.equal(unproven.status, 403, unproven.raw);
+});
+
 test("the DB refuses an owner-made grant past the 90-day cap and admits a rule-backed one", async (t) => {
   const { env, bot } = await ready(t);
   const rule = await turnOn(env);
