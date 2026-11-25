@@ -39,10 +39,11 @@ fields on list rows. When either field is omitted, its output is null and
 `short_summary_status` is `unsupported`; session metadata remains usable.
 When both fields are present, the status is `empty` for a null summary and
 `available` for recorded text. The tool requests the fields with
-`includeShortSummary=recorded`. For a pipeline-backed deployment, set
-`transcriptStore.sessionReadApi.listShortSummary` to `true` on the serving
-reader stack. This renders `READ_API_LIST_SHORT_SUMMARY_ENABLED=true` on
-the reader. Control forwards the request to its configured History origin;
+`includeShortSummary=recorded`. On the pipeline AWS stack, set
+`transcriptStore.sessionReadApi.listShortSummary` to `true`. On the self-host
+Helm umbrella chart, set `sessions-pipeline.sessionReadApi.summaries.listShortSummary`
+to `true`. Both settings render `READ_API_LIST_SHORT_SUMMARY_ENABLED=true` on
+the serving reader. Control forwards the request to its configured History origin;
 setting the flag on Control itself has no effect. Readers with that extension disabled
 answer 501, which remains unsupported: the tool never retries without the
 parameter or switches backends. Recorded text is bounded to 1000 Unicode
