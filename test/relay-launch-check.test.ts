@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { NO_FEATURES } from "../src/features.js";
+import { ownerHash } from "../src/mcp/relay-participants.js";
 import { relayLaunchCheck } from "../src/mcp/relay-launch-check.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
@@ -131,8 +132,8 @@ async function setup(t: TestContext, options: { gate?: boolean } = {}) {
      VALUES ($1, $2, $3, 'rc-first', 'node-1', 'node-1', $4)`, [randomUUID(), workspaceId, orgId, ownerId]);
   world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
 
-  const spawn = (client: Client, key: string) => client.callTool({ name: "spawn_relay_agent", arguments: {
-    name: "reviewer-1", cli: "codex", target_node: "node-1", task: TASK, worker_cwd: "/work/app", idempotency_key: key,
+  const spawn = (client: Client, key: string, extra: Record<string, unknown> = {}) => client.callTool({ name: "spawn_relay_agent", arguments: {
+    name: "reviewer-1", cli: "codex", target_node: "node-1", task: TASK, worker_cwd: "/work/app", idempotency_key: key, ...extra,
   } });
 
   return { gate, world, store, database, introspect, count, audits, spawnsSent, connect, spawn, ownerId, orgId, workspaceId };
@@ -173,6 +174,31 @@ test("the launch-check session has no scopes, introspects active for the launchi
   assert.equal(await env.store.revoke(accessToken), true);
   assert.deepEqual((await env.introspect({ token: accessToken, aud: GATE })).body, { active: false, reason: "revoked" });
   assert.equal(await env.store.authenticateAccessToken(accessToken), null);
+});
+
+test("an unlinked gate-only requester is refused before reservation, while omission and saved receipt replay remain usable", async (t) => {
+  const env = await setup(t);
+  const { client } = await env.connect();
+  const rejected = await env.spawn(client, "requester-no-link", { approval_profile: "requester" });
+  assert.equal(rejected.isError, true);
+  assert.match(JSON.stringify(rejected.content), /verified Desktop chat/);
+  assert.match(JSON.stringify(rejected.content), /desktop_address/);
+  assert.equal(await env.count("relay_spawns"), 0);
+  assert.equal(env.spawnsSent(), 0);
+  assert.equal(env.gate.checks.length, 0);
+  const omitted = await env.spawn(client, "requester-old-key");
+  assert.notEqual(omitted.isError, true);
+  const id = (omitted.structuredContent as Record<string, any>).spawn_id;
+  // A receipt saved before the new requester precondition must remain recoverable after it.
+  const requestHash = ownerHash(JSON.stringify({ name: "reviewer-1", cli: "codex", task: TASK, target_node: "node-1",
+    worker_cwd: "/work/app", approval_profile: "requester" }));
+  await env.database.query("UPDATE relay_spawns SET request_hash = $1 WHERE id = $2", [requestHash, id]);
+  const replay = await env.spawn(client, "requester-old-key", { approval_profile: "requester" });
+  assert.notEqual(replay.isError, true, JSON.stringify(replay.content));
+  assert.equal((replay.structuredContent as Record<string, any>).spawn_id, id);
+  assert.equal(await env.count("relay_spawns"), 1);
+  assert.equal(env.spawnsSent(), 1);
+  assert.equal(env.gate.checks.length, 1);
 });
 
 test("an allowed check lets the launch proceed and revokes the check token", async (t) => {

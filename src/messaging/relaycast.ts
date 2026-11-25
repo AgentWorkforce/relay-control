@@ -119,7 +119,12 @@ export type RelaySpawnTarget = {
   stale: boolean;
   /** The raw node record, for the allowlisted placement reader. */
   raw: Record<string, unknown>;
+  approvalProfilesSupported?: boolean;
 };
+
+export const RELAY_APPROVAL_PROFILE_CAPABILITY = "relay:spawn-approval-profile:v1";
+export const RELAY_APPROVAL_PROFILES = ["interactive", "requester", "full_access"] as const;
+export type RelayApprovalProfile = typeof RELAY_APPROVAL_PROFILES[number];
 
 /** A native spawn or release action invocation. */
 export type RelaySpawnInvocation = {
@@ -230,6 +235,8 @@ function spawnTargetFrom(value: unknown): RelaySpawnTarget[] {
     maxAgents: node.max_agents as number,
     stale: node.live !== true || node.active_agents_stale === true || !reservedValid,
     raw: node,
+    ...(node.capabilities.some(item => (typeof item === "string" ? item : text(record(item)?.name)) === RELAY_APPROVAL_PROFILE_CAPABILITY)
+      ? { approvalProfilesSupported: true } : {}),
   }];
 }
 
@@ -1037,7 +1044,7 @@ export function createRelaycastClient(input: {
      * requester (sent beside `input`, not inside it) is the verified desktop chat behind the
      * launch: Relaycast echoes it next to the caller and the node treats its DMs as native input.
      */
-    async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string },
+    async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string; approval_profile?: RelayApprovalProfile },
       idempotencyKey: string, requester?: { agentId: string; name: string }): Promise<RelaySpawnInvocation> {
       const data = await labeled("spawn_agent", () => call("POST", "/v1/actions/spawn/invoke", token,
         { input: { ...input, verify_ready: true },
