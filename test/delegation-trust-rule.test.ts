@@ -313,7 +313,7 @@ test("a claimed assistant is covered through a system grant: every allowed class
   await env.enable({ delegation_enabled: true });
 
   const listed = await env.bearer("/delegates/trust-rule");
-  assert.deepEqual(listed.body.covered, [{ grant_id: grant!.id, delegate_agent_id: bot.id,
+  assert.deepEqual(listed.body.covered, [{ grant_id: grant!.id, chain: "proven", delegate_agent_id: bot.id,
     created_at: new Date(grant!.created_at).toISOString(), root_kind: "claim", connector: null, root_agent_id: bot.id,
     launched_by: null, hops: 0 }]);
   // A system grant is not edited: it is revoked to exclude the agent.
@@ -376,7 +376,8 @@ test("Tier O on the rule reaches its system grants in the same transaction; revo
   assert.equal(revoked.status, 200, revoked.raw);
   const [grant] = await env.grants(bot.id);
   assert.deepEqual(revoked.body.revoked, [grant!.id]);
-  assert.deepEqual([grant!.status, grant!.revoked_reason], ["revoked", "trust_rule_revoked"]);
+  // Revoke-all revokes system grants with every other grant of its scope, under its own reason.
+  assert.deepEqual([grant!.status, grant!.revoked_reason], ["revoked", "owner_revoke_all"]);
   const [ruleEvent] = await env.events("trust_rule.revoked");
   assert.deepEqual([ruleEvent!.reason, ruleEvent!.data.revoked_grants], ["owner_revoke_all", [grant!.id]]);
   assert.equal((await env.bearer("/delegates/trust-rule")).body.rule, null);
@@ -591,4 +592,102 @@ test("backfill: service-authenticated, dry run by default, pins only provable co
   assert.equal((await env.database.query("SELECT 1 FROM delegation_grants")).rows.length, 0);
   assert.equal((await call({ apply: true })).body.pinned, 0);
   assert.equal((await env.events("trust_root.backfilled")).length, 1);
+});
+
+/** The owner reconnects a connected assistant: the old OAuth grant is revoked and a new one (with a live session) is pinned to the same id. */
+async function reconnect(env: Awaited<ReturnType<typeof setup>>, agent: { id: string; name: string; grantId: string }, at?: string) {
+  await env.database.query("UPDATE mcp_oauth_grants SET revoked_at = now() WHERE id = $1", [agent.grantId]);
+  const client = (await env.database.query<{ client_id: string }>("SELECT client_id FROM mcp_oauth_grants WHERE id = $1",
+    [agent.grantId])).rows[0]!.client_id;
+  const grantId = randomUUID();
+  const family = randomUUID();
+  await env.database.query(
+    `INSERT INTO mcp_oauth_grants (id, client_id, client_name, user_id, organization_id, workspace_id, agent_name, agent_remote_id,
+       scopes, resource, token_family_id, created_at)
+     VALUES ($1, $2, 'ChatGPT', $3, $4, $5, $6, $7, ARRAY['relay:mcp'], 'https://control.test/mcp', $8, COALESCE($9::timestamptz, now()))`,
+    [grantId, client, env.ownerId, env.orgId, env.workspaceId, agent.name, agent.id, family, at ?? null]);
+  await env.database.query(
+    `INSERT INTO mcp_oauth_sessions (id, grant_id, token_family_id, user_id, organization_id, workspace_id, scopes,
+       access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, ARRAY['relay:mcp'], $7, $8, now() + interval '1 hour', now() + interval '30 days', now(), now())`,
+    [randomUUID(), grantId, family, env.ownerId, env.orgId, env.workspaceId, sha(randomUUID()), sha(randomUUID())]);
+  return grantId;
+}
+
+test("round 3 (1): a system grant covers only the chain it was created on; a reconnected root ends it with its approvals", async (t) => {
+  const { env, recipient } = await ready(t);
+  await turnOn(env);
+  const gpt = await env.connector("chatgpt-assistant");
+  const first = await env.verdict(recipient, env.send(gpt, recipient));
+  assert.equal(first.verdict, "delegate", JSON.stringify(first));
+  const [old] = await env.grants(gpt.id);
+  // Revoked and reconnected without any use in between: the chain proves out again, through a new OAuth grant.
+  await reconnect(env, gpt);
+  const after = await env.verdict(recipient, env.send(gpt, recipient));
+  assert.equal(after.reason, "revoked", JSON.stringify(after));
+  const ended = (await env.grants(gpt.id)).find(row => row.id === old!.id)!;
+  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "binding_changed"]);
+  // The old coverage's approval never redeems again.
+  assert.equal((await env.redeem(recipient, first.claims!.approval_id, MERGE[0])).body.reason, "revoked");
+  // The next message is covered by a fresh system grant, dated after the gap.
+  const fresh = await env.verdict(recipient, env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() + 3_000).toISOString() }));
+  assert.equal(fresh.verdict, "delegate", JSON.stringify(fresh));
+  const renewed = (await env.grants(gpt.id)).find(row => row.status === "active")!;
+  assert.notEqual(renewed.id, old!.id);
+  assert.ok(new Date(renewed.created_at).getTime() >= new Date(ended.revoked_at!).getTime());
+});
+
+test("round 3 (2): a grant that stands on a proof covers messages only from the proof's records on", async (t) => {
+  const { env, recipient } = await ready(t);
+  const gpt = await env.connector("chatgpt-assistant", { grantAt: new Date(Date.now() - 3_600_000).toISOString(),
+    participantAt: new Date(Date.now() - 3_600_000).toISOString() });
+  // An owner-made grant to the connected assistant.
+  const created = await env.browser("/delegates", "POST", { delegate_agent_id: gpt.id, scopes: [{ class: "merge", targets: ["AgentWorkforce/*"] }] });
+  assert.equal(created.status, 201, created.raw);
+  const sentBefore = env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() + 5_000).toISOString() });
+  // The connector is reconnected later: the new OAuth grant is the proof's record now.
+  await reconnect(env, gpt, new Date(Date.now() + 60_000).toISOString());
+  // Under the existing owner-made grant, a message sent before the reconnect predates it.
+  assert.equal((await env.verdict(recipient, sentBefore)).reason, "predates_grant");
+  const sentAfter = env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() + 61_000).toISOString() });
+  assert.equal((await env.verdict(recipient, sentAfter)).verdict, "delegate");
+});
+
+test("round 3 (6, 7): workers with a system grant are never prompt delegates; GET reports each chain without writing", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  await turnOn(env);
+  const worker = await env.spawn(bot.id, "worker-1");
+  // The worker carries an approval, so it has a materialized system grant.
+  assert.equal((await env.verdict(recipient, env.send(worker, recipient))).verdict, "delegate");
+  assert.equal((await env.grants(worker.id))[0]!.status, "active");
+  const listed = await request(env.origin, `${env.base}/messaging/delegation/prompt-delegates`, {
+    method: "POST", token: env.desktop.accessToken, body: { session_agent_id: recipient.id, session_token: recipient.token } });
+  assert.deepEqual(listed.body.delegates.map((row: { agent_id: string }) => row.agent_id), [bot.id]);
+
+  const chains = async () => Object.fromEntries((await env.bearer("/delegates/trust-rule")).body.covered
+    .map((row: { delegate_agent_id: string; chain: string }) => [row.delegate_agent_id, row.chain]));
+  assert.deepEqual(await chains(), { [bot.id]: "proven", [worker.id]: "proven" });
+  await env.database.query("UPDATE relay_spawns SET state = 'released' WHERE id = $1", [worker.spawnId]);
+  assert.deepEqual(await chains(), { [bot.id]: "proven", [worker.id]: "broken" });
+  // Reading wrote nothing: the worker's grant is still active until its next use revokes it.
+  assert.equal((await env.grants(worker.id))[0]!.status, "active");
+  assert.equal((await env.verdict(recipient, env.send(worker, recipient))).reason, "revoked");
+});
+
+test("round 3 (9): the backfill skips and counts connector grants with no live session", async (t) => {
+  const { env } = await ready(t);
+  const revoked = await env.connector("revoked-session", { pinned: false });
+  const expired = await env.connector("expired-session", { pinned: false });
+  const live = await env.connector("live-session", { pinned: false });
+  await env.database.query("UPDATE mcp_oauth_sessions SET revoked_at = now() WHERE grant_id = $1", [revoked.grantId]);
+  await env.database.query("UPDATE mcp_oauth_sessions SET refresh_token_expires_at = now() - interval '1 second' WHERE grant_id = $1",
+    [expired.grantId]);
+  const report = await backfillConnectorRoots(env.database, { apply: true });
+  assert.equal(report.skipped.no_live_session, 2);
+  assert.deepEqual(report.pins.map(pin => pin.agent_id), [live.id]);
+  const pinned = async (grantId: string) => (await env.database.query<{ agent_remote_id: string | null }>(
+    "SELECT agent_remote_id FROM mcp_oauth_grants WHERE id = $1", [grantId])).rows[0]!.agent_remote_id;
+  assert.equal(await pinned(revoked.grantId), null);
+  assert.equal(await pinned(expired.grantId), null);
+  assert.equal(await pinned(live.grantId), live.id);
 });

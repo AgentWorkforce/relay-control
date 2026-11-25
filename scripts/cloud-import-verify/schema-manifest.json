@@ -97,7 +97,7 @@
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"},
     {"name":"0096_organization_teams.sql","sha256":"b32bbd68c8522504be230286bc2c347e236f617e06e2f9fda6707e9452066883"},
     {"name":"0097_mcp_attestation_handoffs.sql","sha256":"54a58b53ed36773cce771e77d0397daed530cbdfba3fb2dc1ad9725e2fc28ff3"},
-    {"name":"0098_delegation_trust_rules.sql","sha256":"6009d3227cd191ce57c297c6a65994422cd425e4b444a5acef6dd63425f3e416"}
+    {"name":"0098_delegation_trust_rules.sql","sha256":"eaaf41053bb111574543596a2a94c6641e8e5525d924e7d971b751e2f2c006dc"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -1623,7 +1623,7 @@
     {"kind":"constraint","name":"public.delegation_gates.delegation_gates_ref","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((ref IS NULL) <> (ref_pattern IS NULL)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.delegation_gates.delegation_gates_workspace_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.delegation_gates","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.delegation_gates","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.delegation_grants.delegation_grants_auth_method","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((created_auth_method = ANY (ARRAY['session'::text, 'desktop_bearer'::text])) OR ((trust_rule_id IS NOT NULL) AND (created_auth_method = 'system'::text))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
-    {"kind":"constraint","name":"public.delegation_grants.delegation_grants_expiry_cap","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((trust_rule_id IS NOT NULL) OR (expires_at <= (created_at + '90 days 00:01:00'::interval))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
+    {"kind":"constraint","name":"public.delegation_grants.delegation_grants_expiry_cap","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((trust_rule_id IS NOT NULL) OR (expires_at <= (created_at + '2160:01:00'::interval))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.delegation_grants.delegation_grants_owner_user_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.delegation_grants","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.delegation_grants","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.users","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.users","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.delegation_grants.delegation_grants_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.delegation_grants.delegation_grants_status","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text, 'expired'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
@@ -2584,5 +2584,5 @@
   "optional":{
 
   },
-  "sha256":"f8b6a2a15c9991d574dc2f6dbdfe1efd6a017032b1c596101b3cb4f775d53459"
+  "sha256":"fdb6eccccd2861a5e442e8e896db51edff8edb6e0f542902314775cf3d6b5711"
 }

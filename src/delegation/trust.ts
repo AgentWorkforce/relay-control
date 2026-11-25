@@ -70,17 +70,26 @@ const at = (value: Date | string) => value instanceof Date ? value : new Date(va
  * The stored records, read on `executor`. Uniqueness counts look across the
  * whole Relaycast workspace (as anyBinding does), ownership rows are scoped to
  * the Control workspace.
+ *
+ * With `lock` (inside the caller's transaction), every row the chain stands on
+ * is share-locked until it ends: the claim and its binding, the OAuth grant,
+ * its live sessions and the participant, each launch, and each participant
+ * holding the id. A claim release, connector revoke or launch release that
+ * commits after the read waits for that transaction; one that committed
+ * before it is seen.
  */
-export function sqlTrustReader(executor: SqlExecutor): TrustReader {
+export function sqlTrustReader(executor: SqlExecutor, lock = false): TrustReader {
+  const share = (of?: string) => lock ? ` FOR SHARE${of ? ` OF ${of}` : ""}` : "";
   return {
     claims: async (_workspaceId, relaycastWorkspaceId, agentId) => (await executor.query<{ id: string; user_id: string;
       workspace_id: string; consumed_at: Date | string; agent_name: string }>(
       `SELECT c.id, b.user_id::text, b.workspace_id::text, c.consumed_at, b.agent_name
          FROM delegation_agent_bindings b JOIN delegation_claims c ON c.id = b.claim_id
         WHERE b.relaycast_workspace_id = $1 AND b.agent_id = $2 AND c.consumed_at IS NOT NULL AND c.released_at IS NULL
-        LIMIT 2`, [relaycastWorkspaceId, agentId])).rows.map(row => ({ id: row.id, ownerUserId: row.user_id,
+        ORDER BY c.id LIMIT 2${share("b, c")}`, [relaycastWorkspaceId, agentId])).rows.map(row => ({ id: row.id, ownerUserId: row.user_id,
       workspaceId: row.workspace_id, completedAt: at(row.consumed_at), agentName: row.agent_name })),
-    connectors: async (workspaceId, relaycastWorkspaceId, ownerUserId, agentId) => (await executor.query<{ id: string;
+    connectors: async (workspaceId, relaycastWorkspaceId, ownerUserId, agentId) => {
+      const rows = (await executor.query<{ id: string;
       client_name: string | null; redirect_uris: string[] | null; agent_name: string; created_at: Date | string;
       grant_created_at: Date | string }>(
       `SELECT g.id::text, COALESCE(c.client_name, g.client_name) AS client_name, c.redirect_uris, p.agent_name, p.created_at,
@@ -93,19 +102,28 @@ export function sqlTrustReader(executor: SqlExecutor): TrustReader {
           -- A live grant has a live session: unrevoked and still refreshable.
           AND EXISTS (SELECT 1 FROM mcp_oauth_sessions s WHERE s.grant_id = g.id AND s.revoked_at IS NULL
                         AND s.refresh_token_expires_at > now())
-        ORDER BY g.created_at, g.id LIMIT 20`, [workspaceId, relaycastWorkspaceId, ownerUserId, agentId])).rows.map(row => ({
-      grantId: row.id, clientName: row.client_name, redirectUris: row.redirect_uris ?? [], participantName: row.agent_name,
-      createdAt: at(row.created_at), grantCreatedAt: at(row.grant_created_at) })),
+        ORDER BY g.created_at, g.id LIMIT 20${share("g, p")}`, [workspaceId, relaycastWorkspaceId, ownerUserId, agentId])).rows;
+      // The live sessions the grants stand on, share-locked too (a revoke updates them).
+      if (lock && rows.length) {
+        await executor.query(
+          `SELECT 1 FROM mcp_oauth_sessions WHERE grant_id = ANY($1::uuid[]) AND revoked_at IS NULL
+              AND refresh_token_expires_at > now() ORDER BY id FOR SHARE`, [rows.map(row => row.id)]);
+      }
+      return rows.map(row => ({
+        grantId: row.id, clientName: row.client_name, redirectUris: row.redirect_uris ?? [], participantName: row.agent_name,
+        createdAt: at(row.created_at), grantCreatedAt: at(row.grant_created_at) }));
+    },
     participants: async (_workspaceId, relaycastWorkspaceId, agentId) => (await executor.query<{ user_id: string | null;
       workspace_id: string }>(
       `SELECT user_id::text, workspace_id::text FROM hosted_relay_participants
-        WHERE relaycast_workspace_id = $1 AND agent_remote_id = $2 LIMIT 2`, [relaycastWorkspaceId, agentId])).rows
+        WHERE relaycast_workspace_id = $1 AND agent_remote_id = $2 ORDER BY id LIMIT 2${share()}`, [relaycastWorkspaceId, agentId])).rows
       .map(row => ({ userId: row.user_id, workspaceId: row.workspace_id })),
     spawns: async (_workspaceId, relaycastWorkspaceId, agentId) => (await executor.query<{ id: string; user_id: string;
       workspace_id: string; actor_id: string; worker_id: string | null; agent_name: string; state: string;
       created_at: Date | string }>(
       `SELECT id::text, user_id::text, workspace_id::text, actor_id, worker_id, agent_name, state, created_at
-         FROM relay_spawns WHERE relaycast_workspace_id = $1 AND worker_id = $2 LIMIT 2`, [relaycastWorkspaceId, agentId]))
+         FROM relay_spawns WHERE relaycast_workspace_id = $1 AND worker_id = $2 ORDER BY id LIMIT 2${share()}`,
+      [relaycastWorkspaceId, agentId]))
       .rows.map(row => ({ id: row.id, userId: row.user_id, workspaceId: row.workspace_id, actorId: row.actor_id,
         workerId: row.worker_id, agentName: row.agent_name, state: row.state, createdAt: at(row.created_at) })),
     otherBindings: async (_workspaceId, relaycastWorkspaceId, agentId) => (await executor.query(
@@ -232,4 +250,17 @@ export const TRUST_RELATION_MODE: TrustRelationMode = "allow_all";
 export function trustRelationAllowed(relation: TrustRelation, mode: TrustRelationMode = TRUST_RELATION_MODE): boolean {
   if (mode === "allow_all") return true;
   return relation === "ancestor" || relation === "unrelated";
+}
+
+/**
+ * What a chain proves with: the root's own record (its claim or OAuth grant)
+ * and every launch, in order (as Cloud's trustPathFingerprint). Two proofs with
+ * the same fingerprint stand on the same records. A system grant keeps the
+ * fingerprint it was created on; a chain that now proves through other records
+ * (a claim released and reclaimed, a connector revoked and reconnected, a
+ * worker launched again under the id) is a new coverage, never a continuation.
+ */
+export function trustPathFingerprint(path: TrustPath): string {
+  const root = path.root.kind === "claim" ? `claim:${path.root.claim_id}` : `connector:${path.root.oauth_grant_id}`;
+  return [root, path.root.agent_id, ...path.hops.map(hop => `${hop.spawn_id}>${hop.worker_id}`)].join("|");
 }

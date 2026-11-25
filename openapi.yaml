@@ -3594,9 +3594,13 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [grant_id, delegate_agent_id, created_at, root_kind, connector, root_agent_id, launched_by, hops]
+                      required: [grant_id, chain, delegate_agent_id, created_at, root_kind, connector, root_agent_id, launched_by, hops]
                       properties:
                         grant_id: { type: string }
+                        chain:
+                          type: string
+                          enum: [proven, broken, unknown]
+                          description: The chain read now, writing nothing. `broken` when it no longer proves out on the records the grant was created on (its next use revokes it).
                         delegate_agent_id: { type: string }
                         created_at: { type: string, format: date-time }
                         root_kind: { type: [string, "null"], enum: [claim, connector, null] }

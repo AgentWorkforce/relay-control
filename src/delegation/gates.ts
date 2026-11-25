@@ -9,6 +9,9 @@ import {
   delegateStillBound,
   decideUnderLocks,
   getTrustRule,
+  chainUnderLock,
+  reliedProof,
+  trustProver,
   freshRefusal,
   legacySpentStamp,
   evaluateConditions,
@@ -323,6 +326,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
 
     // Tier D rests on a live grant and a still-bound delegate; both tiers on a current owner.
     let ruleId: string | null = null;
+    let chain: ReturnType<typeof chainUnderLock>;
+    let grantOwnerUserId: string | null = null;
     if (approval.tier === "D") {
       const grant = approval.grant_id ? (await deps.database.query<GrantRow>(
         "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [approval.grant_id, workspace.id],
@@ -337,6 +342,10 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       if (tierOClasses(policy, grant).has(action.class)) return await refuse("tier_o_required");
       // The rule behind the grant, locked with it in the deciding transaction.
       ruleId = grant.trust_rule_id ?? null;
+      grantOwnerUserId = grant.owner_user_id;
+      // The ownership chain the grant (rule-backed, or owner-made to a connected
+      // assistant) stands on, re-read in the deciding transaction under share locks.
+      chain = chainUnderLock(workspace, grant, await reliedProof(trustProver(deps, workspace, false), grant));
     } else {
       if (!await memberRole(deps.database, workspace.id, approval.owner_user_id)) return await refuse("revoked");
       if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return await refuse("out_of_scope");
@@ -407,7 +416,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     const oidc = claims;
     const outcome = await decideUnderLocks<{ refused: ReasonCode } | { consumed: "consumed" | "same_run" }>(deps.database, { workspaceId: workspace.id,
       memberUserIds: approval.tier === "O" ? [servingGate.owner_user_id, approval.owner_user_id] : [servingGate.owner_user_id],
-      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true, trustRuleId: ruleId },
+      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true, trustRuleId: ruleId, chain, grantOwnerUserId },
       async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action], tier: approval.tier, policy, recipientAgentId: "",
         nowMs: deps.now().getTime(), memberGone: approval.tier === "O" ? "revoked" : "recipient_policy",

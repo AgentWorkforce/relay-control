@@ -15,13 +15,14 @@ import { launcherName } from "./trust.js";
  * pins it now the same way, from stored rows only: the grant is live, exactly
  * one hosted participant of the same owner in the same workspace holds the
  * agent name the owner consented to, the agent id has no other Control
- * binding, and no retirement of that identity is in flight. Everything else
+ * binding, no retirement of that identity is in flight, and the grant has a
+ * live session (a revoked or refresh-expired one can never be a root). Everything else
  * is skipped and counted (fail closed). It creates no rule and no grant,
  * writes only the pin (one audited `trust_root.backfilled` event per grant,
  * actor system, reason backfill), and is idempotent: a pinned grant is never
  * touched again. It pages by grant id (`after`, `next_cursor`).
  */
-export type TrustBackfillSkip = "no_participant" | "ambiguous_participant" | "launcher" | "other_binding" | "retiring" | "raced";
+export type TrustBackfillSkip = "no_live_session" | "no_participant" | "ambiguous_participant" | "launcher" | "other_binding" | "retiring" | "raced";
 export type TrustBackfillReport = {
   dry_run: boolean;
   scanned: number;
@@ -38,7 +39,7 @@ export async function backfillConnectorRoots(database: Database, input: { apply:
   Promise<TrustBackfillReport> {
   const limit = Math.min(Math.max(input.limit ?? 500, 1), 2000);
   const report: TrustBackfillReport = { dry_run: !input.apply, scanned: 0, provable: 0, pinned: 0,
-    skipped: { no_participant: 0, ambiguous_participant: 0, launcher: 0, other_binding: 0, retiring: 0, raced: 0 }, pins: [],
+    skipped: { no_live_session: 0, no_participant: 0, ambiguous_participant: 0, launcher: 0, other_binding: 0, retiring: 0, raced: 0 }, pins: [],
     next_cursor: null };
   // Paged by id: skipped rows stay unpinned, so a rerun without the cursor
   // would see them again first; the cursor moves past them.
@@ -54,6 +55,16 @@ export async function backfillConnectorRoots(database: Database, input: { apply:
     report.scanned += 1;
     if (grant.agent_name === launcherName(grant.user_id)) {
       report.skipped.launcher += 1;
+      continue;
+    }
+    // A grant with no live session (all revoked, or no longer refreshable) can
+    // never be a trust-rule root: it is not pinned.
+    const live = (await database.query(
+      `SELECT 1 FROM mcp_oauth_sessions WHERE grant_id = $1 AND revoked_at IS NULL AND refresh_token_expires_at > now() LIMIT 1`,
+      [grant.id],
+    )).rows.length > 0;
+    if (!live) {
+      report.skipped.no_live_session += 1;
       continue;
     }
     const participants = (await database.query<{ agent_remote_id: string; relaycast_workspace_id: string }>(

@@ -79,6 +79,7 @@ import {
   connectorRootProven, trustProver,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
+import { trustPathFingerprint } from "./trust.js";
 import { secureEqual } from "../crypto.js";
 
 /**
@@ -1063,8 +1064,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           [workspace.id, ownerUserId, at],
         )).rows.map(grant => ({ grant_id: grant.id, delegate_agent_id: grant.delegate_agent_id,
           expires_at: new Date(grant.expires_at).toISOString() })) : [];
-        json(200, { rule: rule ? trustRuleView(rule) : null,
-          covered: rule ? (await ruleGrants(input.database, workspace.id, rule.id)).map(coveredView) : [], shadowed });
+        // Each covered agent's chain is read now, writing nothing: `broken` when
+        // it no longer proves out on the records its grant was created on (its
+        // next use revokes it), `unknown` when it cannot be read right now.
+        const prove = trustProver(deps, workspace, true);
+        const covered = rule ? await Promise.all((await ruleGrants(input.database, workspace.id, rule.id)).map(async grant => {
+          if (!grant.trust_path) return coveredView(grant, "unknown");
+          const proof = await prove(grant.owner_user_id, grant.delegate_agent_id).catch(() => undefined);
+          return coveredView(grant, proof === undefined ? "unknown" :
+            proof && trustPathFingerprint(proof.path) === trustPathFingerprint(grant.trust_path) ? "proven" : "broken");
+        })) : [];
+        json(200, { rule: rule ? trustRuleView(rule) : null, covered, shadowed });
         return true;
       }
       if (method === "PUT") {
@@ -1517,9 +1527,9 @@ function trustRuleView(rule: TrustRuleRow) {
 }
 
 /** An agent the rule covers now, with the root it was proven through, so revoking that connector or claim is easy to find. */
-function coveredView(grant: GrantRow) {
+function coveredView(grant: GrantRow, chain: "proven" | "broken" | "unknown") {
   const root = grant.trust_path?.root;
-  return { grant_id: grant.id, delegate_agent_id: grant.delegate_agent_id, created_at: new Date(grant.created_at).toISOString(),
+  return { grant_id: grant.id, chain, delegate_agent_id: grant.delegate_agent_id, created_at: new Date(grant.created_at).toISOString(),
     root_kind: root?.kind ?? null, connector: root?.kind === "connector" ? root.connector : null,
     root_agent_id: root?.agent_id ?? null, launched_by: grant.trust_path?.hops.at(-1)?.actor_id ?? null,
     hops: grant.trust_path?.hops.length ?? 0 };

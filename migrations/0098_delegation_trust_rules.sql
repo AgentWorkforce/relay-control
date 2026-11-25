@@ -45,13 +45,14 @@ ALTER TABLE delegation_grants ADD CONSTRAINT delegation_grants_auth_method CHECK
   created_auth_method IN ('session', 'desktop_bearer')
   OR (trust_rule_id IS NOT NULL AND created_auth_method = 'system'));
 
--- Only a rule-backed grant outlives the 90-day cap (GRANT_MAX_DAYS plus the
--- 60 s slack grantFitsPolicy allows); the exemption is keyed on the rule link,
+-- Only a rule-backed grant outlives the 90-day cap (GRANT_MAX_DAYS x 24 hours plus
+-- the 60 s slack grantFitsPolicy allows; hours, not days: a day across a DST
+-- change is not 24 hours, and grantFitsPolicy counts elapsed time); the exemption is keyed on the rule link,
 -- never on the date. Every stored grant already fits: grant routes cap expiry
 -- at 90 days. Added NOT VALID, then validated, so the check takes only a brief lock.
 DO $$ BEGIN
   ALTER TABLE delegation_grants ADD CONSTRAINT delegation_grants_expiry_cap
-    CHECK (trust_rule_id IS NOT NULL OR expires_at <= created_at + interval '90 days 60 seconds') NOT VALID;
+    CHECK (trust_rule_id IS NOT NULL OR expires_at <= created_at + interval '2160 hours 60 seconds') NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 ALTER TABLE delegation_grants VALIDATE CONSTRAINT delegation_grants_expiry_cap;

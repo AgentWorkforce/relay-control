@@ -735,13 +735,30 @@ grant may approve its own requests too. Trusted agents never register, own
 or edit release gates: those routes take a person's credential and an org
 owner or admin.
 
-Lock order, for every writer and decision: membership, policy, rule, grants
-by id, approvals.
+A system grant covers only the chain it was created on (its fingerprint: the
+root's claim or OAuth grant id, the agent ids and the launch ids). A chain
+that now proves through other records (a claim released and reclaimed, a
+connector revoked and reconnected, a relaunch) revokes the grant
+(`binding_changed`) with its approvals, and the rule creates a fresh one
+dated no earlier than the end of any earlier grant of the pair (owner-made
+included). A grant that stands on a proof (rule-backed, or owner-made to a
+connected assistant) covers messages only from the proof's records on
+(`predates_grant` otherwise). `GET /delegates/trust-rule` reports each
+covered agent's `chain` as `proven`, `broken` or `unknown`, read without
+writing. Launched workers are never prompt delegates.
+
+Lock order, for every writer and decision: the workspace row (decisions take
+FOR KEY SHARE, so a workspace deletion queues behind them), memberships (the
+caller's and the grant owner's, sorted), policy, rule, grants by id, the
+delegate's chain rows (re-read under share locks, after the grant and before
+the approval), approvals. Revoke-all locks the scope's rules, then every grant
+of the scope by id, owner-made included, before any approval.
 
 `POST /internal/v1/delegation/trust-backfill` (SELFHOST_INTERNAL_TOKEN; 404
 without it) pins existing unpinned MCP OAuth grants to their agent ids where
 stored rows prove it (exactly one hosted participant of the same owner holds
-the consented name, no other binding, no retirement in flight). It is a dry
+the consented name, no other binding, no retirement in flight, and a live
+session; grants without one are skipped and counted as `no_live_session`). It is a dry
 run unless `{"apply": true}`, idempotent, pages by grant id (`after`,
 `next_cursor`), creates no rule or grant, and audits each pin as
 `trust_root.backfilled` (actor system, reason backfill).
@@ -886,7 +903,8 @@ All of them are workspace-scoped and cascade on workspace delete.
 `delegation_grants.trust_rule_id` and `trust_path`, widens
 `delegation_grants_auth_method` to admit `system` for rule-backed rows only,
 and adds `delegation_grants_expiry_cap`: only a row with `trust_rule_id` may
-expire more than 90 days (and 60 s) after it was created.
+expire more than 2160 hours (90 days of 24 hours, counted in hours so a DST
+change never refuses a full-length grant) and 60 s after it was created.
 
 ## Not on relay-control yet
 
