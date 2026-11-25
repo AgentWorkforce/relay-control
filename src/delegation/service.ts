@@ -1155,11 +1155,6 @@ export async function delegateStillBound(deps: DelegationDeps, workspace: Delega
   return null;
 }
 
-/** The grant's delegate is the recipient itself: it would approve its own action (as Cloud's selfApproval). */
-export function selfApproval(grant: Pick<GrantRow, "delegate_agent_id">, recipientAgentId: string): boolean {
-  return grant.delegate_agent_id === recipientAgentId;
-}
-
 /** The one active, unexpired grant for (owner, delegate), or why there is none (Cloud's liveGrant). */
 function liveGrant(grants: GrantRow[], now: Date): GrantRow | ReasonCode {
   const active = grants.find(grant => grant.status === "active");
@@ -1329,9 +1324,6 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     const grant = found;
     context.grantId = grant.id;
     context.ownerUserId = approval.owner_id;
-    // A delegate never approves its own action: under a grant, the sender
-    // carrying the owner's approval must be another agent than the recipient.
-    if (selfApproval(grant, recipient.agentId)) refuse("not_delegate");
     const unbound = await delegateStillBound(deps, workspace, grant, true);
     if (unbound) refuse(unbound);
 
@@ -1584,8 +1576,6 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     )).rows[0];
     if (!grant || grant.status === "revoked") refuse("revoked");
     if (grant!.status === "expired" || time(grant!.expires_at) <= now.getTime()) refuse("expired");
-    // The same rule as attest: a delegate never redeems an approval it sent itself.
-    if (selfApproval(grant!, input.recipientAgentId)) refuse("not_delegate");
     const unbound = await delegateStillBound(deps, workspace, grant!, true);
     if (unbound) refuse(unbound);
     if (time(approval!.expires_at) <= now.getTime()) refuse("expired");

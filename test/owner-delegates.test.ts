@@ -2221,28 +2221,17 @@ test("review: a mixed approval stamped spent by the earlier rule is refused as r
   assert.notEqual((await row()).invalidated_at, null);
 });
 
-test("review: a delegate never approves its own action: attest and redeem refuse the grant's delegate as recipient", async (t) => {
-  const { env, recipient, bot, grantId } = await ready(t);
+test("a bot with its own grant may approve its own requests (#owner-decisions 251252958218768384)", async (t) => {
+  const { env, bot, grantId } = await ready(t);
   const merge = [{ class: "merge", target: "AgentWorkforce/relay#2250" }];
-  // The claimed bot is the owner's agent too, so it proves itself as a recipient;
-  // carrying the owner's approval to itself under its own grant is refused.
+  // The claimed bot is the owner's agent too, so it proves itself as a recipient
+  // and carries the owner's approval to itself under its own grant.
   const toItself = send(env, bot, bot, env.approval(merge));
   const self = await env.attest(bot, toItself);
   assert.equal(self.status, 200, self.raw);
-  assert.deepEqual([self.body.verdict, self.body.reason], ["none", "not_delegate"], self.raw);
-
-  // Redeem: an approval attested to the recipient, then (as if) to the delegate itself.
-  const messageId = send(env, bot, recipient, env.approval(merge));
-  const attested = await env.attest(recipient, messageId);
-  assert.equal(attested.body.verdict, "delegate", attested.raw);
-  const approvalId = attested.body.claims.approval_id as string;
-  await env.database.query(
-    `INSERT INTO delegation_attestations (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id,
-       delegate_agent_id, kid, accept, standing, issued_at, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $6, $7, 'code_owners', 'own_owner', now(), now() + interval '5 minutes')`,
-    [randomUUID(), env.workspaceId, approvalId, grantId, messageId, bot.id, KID]);
-  const redeemed = await env.redeem(bot, approvalId, merge[0]);
-  assert.deepEqual(redeemed.body, { ok: false, reason: "not_delegate" }, redeemed.raw);
-  // The recipient it was sent to still redeems it.
-  assert.deepEqual((await env.redeem(recipient, approvalId, merge[0])).body, { ok: true, consumed: false });
+  assert.equal(self.body.verdict, "delegate", self.raw);
+  assert.equal(self.body.claims.delegate_agent_id, bot.id);
+  assert.equal(self.body.claims.recipient_agent_id, bot.id);
+  assert.equal(self.body.claims.grant_id, grantId);
+  assert.deepEqual((await env.redeem(bot, self.body.claims.approval_id, merge[0])).body, { ok: true, consumed: false });
 });
