@@ -8,6 +8,7 @@ import {
   consumeAction,
   delegateStillBound,
   decideUnderLocks,
+  getTrustRule,
   freshRefusal,
   legacySpentStamp,
   evaluateConditions,
@@ -321,17 +322,21 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     }
 
     // Tier D rests on a live grant and a still-bound delegate; both tiers on a current owner.
+    let ruleId: string | null = null;
     if (approval.tier === "D") {
       const grant = approval.grant_id ? (await deps.database.query<GrantRow>(
         "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [approval.grant_id, workspace.id],
       )).rows[0] : undefined;
       if (!grant || grant.status === "revoked") return await refuse("revoked");
       if (grant.status === "expired" || time(grant.expires_at) <= now.getTime()) return await refuse("expired");
-      const unbound = await delegateStillBound(deps, workspace, grant, true);
+      // A dry run writes nothing: a delegate found unbound is refused, not revoked.
+      const unbound = await delegateStillBound(deps, workspace, grant, true, { durable: !dryRun });
       if (unbound) return await refuse(unbound);
       const outOfScope = scopeRefusal([action], grant, policy, "");
       if (outOfScope) return await refuse(outOfScope);
       if (tierOClasses(policy, grant).has(action.class)) return await refuse("tier_o_required");
+      // The rule behind the grant, locked with it in the deciding transaction.
+      ruleId = grant.trust_rule_id ?? null;
     } else {
       if (!await memberRole(deps.database, workspace.id, approval.owner_user_id)) return await refuse("revoked");
       if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return await refuse("out_of_scope");
@@ -374,8 +379,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
 
     // The relay and OIDC calls above take time: the policy, approval, grant,
     // memberships and clock as they are now decide, not the ones read before.
-    const fresh = await currentGateAuthority(deps.database, workspace.id, approval.id, action, standingGate.owner_user_id,
-      deps.now().getTime());
+    const fresh = await currentGateAuthority(deps, workspace, approval.id, action, standingGate.owner_user_id,
+      deps.now().getTime(), !dryRun);
     if (fresh) return await refuse(fresh);
 
     if (dryRun) {
@@ -402,7 +407,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     const oidc = claims;
     const outcome = await decideUnderLocks<{ refused: ReasonCode } | { consumed: "consumed" | "same_run" }>(deps.database, { workspaceId: workspace.id,
       memberUserIds: approval.tier === "O" ? [servingGate.owner_user_id, approval.owner_user_id] : [servingGate.owner_user_id],
-      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true },
+      grantId: approval.tier === "D" ? approval.grant_id : null, approvalId: approval.id, consuming: true, trustRuleId: ruleId },
       async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action], tier: approval.tier, policy, recipientAgentId: "",
         nowMs: deps.now().getTime(), memberGone: approval.tier === "O" ? "revoked" : "recipient_policy",
@@ -509,8 +514,10 @@ export async function consumeForGateRun(tx: SqlExecutor, input: { workspaceId: s
  * its tier O owner and the gate's owner still members, and the class still
  * allowed. Null when all hold.
  */
-async function currentGateAuthority(executor: SqlExecutor, workspaceId: string, approvalId: string, action: Action,
-  gateOwnerId: string, atMs: number): Promise<ReasonCode | null> {
+async function currentGateAuthority(deps: DelegationDeps, workspace: DelegationWorkspace, approvalId: string, action: Action,
+  gateOwnerId: string, atMs: number, durable: boolean): Promise<ReasonCode | null> {
+  const executor = deps.database;
+  const workspaceId = workspace.id;
   const policy = await loadPolicy(executor, workspaceId);
   if (!policy.delegation_enabled) return "not_enabled";
   const approval = (await executor.query<ApprovalRow>(
@@ -527,6 +534,16 @@ async function currentGateAuthority(executor: SqlExecutor, workspaceId: string, 
     const outOfScope = scopeRefusal([action], grant, policy, "");
     if (outOfScope) return outOfScope;
     if (tierOClasses(policy, grant).has(action.class)) return "tier_o_required";
+    // A rule-backed grant stands only while its rule is live and the delegate's
+    // ownership chain still proves out, read now (never from a cached walk): a
+    // dry run (which takes no lock) answers revoked the moment a hop drops,
+    // and writes nothing.
+    if (grant.trust_rule_id) {
+      const rule = await getTrustRule(executor, workspaceId, grant.trust_rule_id);
+      if (!rule || rule.revoked_at) return "revoked";
+      const unbound = await delegateStillBound(deps, workspace, grant, true, { durable });
+      if (unbound) return unbound;
+    }
   } else {
     if (!await memberRole(executor, workspaceId, approval.owner_user_id)) return "revoked";
     if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return "out_of_scope";

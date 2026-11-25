@@ -359,7 +359,10 @@ test("grants: create, narrow, refuse widening, revoke, revoke-all, policy limits
   assert.match(created.grant_id, /^grt_/);
   assert.equal(created.status, "active");
   assert.deepEqual(Object.keys(created).sort(), ["created_at", "delegate_agent_id", "expires_at", "grant_id", "owner_id",
-    "require_tier_o", "revoked_at", "revoked_reason", "scopes", "status", "updated_at"]);
+    "require_tier_o", "revoked_at", "revoked_reason", "scopes", "status", "trust_path", "trust_rule_id", "updated_at"]);
+  // An owner-made grant carries no trust rule (as Cloud's grantJson).
+  assert.equal(created.trust_rule_id, null);
+  assert.equal(created.trust_path, null);
   // One active grant per (owner, delegate): widening is a new grant after revoking.
   const twice = await env.browser("/delegates", "POST", { delegate_agent_id: bot.id, scopes: [{ class: "merge", targets: ["a/b"] }] });
   assert.equal(twice.status, 409, twice.raw);
@@ -1041,6 +1044,7 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/delegates": ["get", "post"],
     "/api/v1/workspaces/{workspaceId}/delegates/{grantId}": ["patch", "delete"],
     "/api/v1/workspaces/{workspaceId}/delegates/revoke-all": ["post"],
+    "/api/v1/workspaces/{workspaceId}/delegates/trust-rule": ["get", "put", "delete"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims/complete": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/approvals": ["post"],

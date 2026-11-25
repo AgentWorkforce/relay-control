@@ -6,6 +6,16 @@ import { drainBody } from "../drain-body.js";
 import { messageSentAt } from "./relaycast-ids.js";
 import { logAuditWriteFailed, logRefused, logRevokeFailed, logUnavailable } from "./observe.js";
 import {
+  resolveTrustPath,
+  sqlTrustReader,
+  trustPathProvenAt,
+  trustRelation,
+  trustRelationAllowed,
+  type TrustPath,
+  type TrustProof,
+  type TrustReader,
+} from "./trust.js";
+import {
   actionIsValid,
   actionsCovered,
   APPROVAL_DEFAULT_MS,
@@ -97,6 +107,8 @@ export type DelegationDeps = {
   /** Server-held key for quote digests (§8); never exported. */
   quoteKey: Buffer;
   now: () => Date;
+  /** The stored ownership records the trust rule's chain is walked over (default: SQL on `database`). */
+  trustReader?: TrustReader;
 };
 
 export type AgentBinding = { userId: string; agentId: string; name: string; address: string | null };
@@ -124,7 +136,27 @@ export type GrantRow = {
   revoked_at: Date | string | null;
   revoked_by: string | null;
   revoked_reason: string | null;
+  /** Set only on a system grant the owner's trust rule created; never on an owner-made grant. */
+  trust_rule_id?: string | null;
+  /** The ownership chain proven when the system grant was created, for audit. */
+  trust_path?: TrustPath | null;
 };
+
+/** An owner's set-once trust rule (docs/owner-delegates.md, "Trust rule"). */
+export type TrustRuleRow = {
+  id: string;
+  workspace_id: string;
+  owner_user_id: string;
+  require_tier_o: ActionClass[];
+  created_at: Date | string;
+  updated_at: Date | string;
+  revoked_at: Date | string | null;
+  revoked_reason: string | null;
+  revoked_by_user_id: string | null;
+};
+
+/** The expiry a rule-backed grant carries: never read as authority, only the live rule is. */
+export const TRUST_RULE_GRANT_EXPIRY = new Date("9999-12-31T00:00:00.000Z");
 
 export type ApprovalRow = {
   id: string;
@@ -160,11 +192,13 @@ export function grantView(row: GrantRow, now = new Date()) {
     updated_at: iso(row.updated_at),
     revoked_at: iso(row.revoked_at),
     revoked_reason: row.revoked_reason,
+    trust_rule_id: row.trust_rule_id ?? null,
+    trust_path: row.trust_path ?? null,
   };
 }
 
-/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`, `gate_`), as Cloud's mintId. */
-export function mintId(prefix: "grt" | "apv" | "clm" | "gate"): string {
+/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`, `gate_`, `dtr_`), as Cloud's mintId. */
+export function mintId(prefix: "grt" | "apv" | "clm" | "gate" | "dtr"): string {
   return `${prefix}_${base62(randomBytes(16))}`;
 }
 
@@ -198,8 +232,12 @@ export async function loadPolicy(executor: SqlExecutor, workspaceId: string, loc
 }
 
 /** Whether a grant still fits the workspace policy (§4.1: re-checked at every use), as Cloud. */
-export function grantFitsPolicy(grant: Pick<GrantRow, "scopes" | "expires_at" | "created_at">, policy: DelegationPolicy): boolean {
+export function grantFitsPolicy(grant: Pick<GrantRow, "scopes" | "expires_at" | "created_at" | "trust_rule_id">,
+  policy: DelegationPolicy): boolean {
   if (policy.allowed_classes && grant.scopes.some(scope => !policy.allowed_classes!.includes(scope.class))) return false;
+  // The 90-day cap does not apply to the owner's trust rule (#owner-decisions 251238934511685632): the
+  // exemption is keyed on the rule link, never on the far expiry date, and the rule is checked live at every use.
+  if (grant.trust_rule_id) return true;
   return time(grant.expires_at) - time(grant.created_at) <= policy.max_expiry_days * 86_400_000 + 60_000;
 }
 
@@ -908,6 +946,11 @@ export async function releaseClaim(database: Database, input: { workspaceId: str
 export async function revokeAllGrants(executor: SqlExecutor, input: {
   workspaceId: string; ownerUserId: string | null; actorUserId: string | null; reason: string; authMethod: string | null;
 }): Promise<string[]> {
+  // The scope's live trust rules go first, locked by id before any grant (the
+  // rule-then-grants order every rule writer uses), with their system grants,
+  // so no rule can create a grant once this has read the grants below.
+  const ruled = (await revokeTrustRulesTx(executor, { workspaceId: input.workspaceId, ownerUserId: input.ownerUserId,
+    actorUserId: input.actorUserId, authMethod: input.authMethod, reason: input.reason })).flatMap(rule => rule.revokedGrants);
   const ids = (await executor.query<{ id: string }>(
     `SELECT id FROM delegation_grants
       WHERE workspace_id = $1 AND status = 'active' AND ($2::uuid IS NULL OR owner_user_id = $2)
@@ -942,7 +985,7 @@ export async function revokeAllGrants(executor: SqlExecutor, input: {
       actorUserId: input.actorUserId, authMethod: input.authMethod, ownerUserId: input.ownerUserId, reason: input.reason,
       data: { scope: "revoke_all", count: approvals.length, approval_ids: approvals.map(row => row.id) } });
   }
-  return revoked.map(row => row.id);
+  return [...ruled, ...revoked.map(row => row.id)];
 }
 
 /** Marks a pair's lapsed active grants `expired` and logs `grant.expired` once for each. */
@@ -1125,6 +1168,36 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
 }
 
 /**
+ * The ownership-chain reader of one attest, redeem or prompt-delegates call
+ * (`cache`): an agent's chain is walked once per call, shared by the rule
+ * fallback, the binding re-check and the relation; a failed read is not kept.
+ * A gate's last authority check builds an uncached one, so it re-reads on
+ * purpose.
+ */
+export type TrustProver = (ownerUserId: string, agentId: string) => Promise<TrustProof | null>;
+
+export function trustProver(deps: DelegationDeps, workspace: DelegationWorkspace, cache: boolean): TrustProver {
+  const reader = deps.trustReader ?? sqlTrustReader(deps.database);
+  const read: TrustProver = (ownerUserId, agentId) => resolveTrustPath(reader, { workspaceId: workspace.id,
+    relaycastWorkspaceId: workspace.relaycastWorkspaceId, ownerUserId, agentId });
+  if (!cache) return read;
+  const seen = new Map<string, Promise<TrustProof | null>>();
+  return (ownerUserId, agentId) => {
+    const key = `${ownerUserId}\u0000${agentId}`;
+    let hit = seen.get(key);
+    if (!hit) {
+      hit = read(ownerUserId, agentId);
+      seen.set(key, hit);
+      hit.catch(() => seen.delete(key));
+    }
+    return hit;
+  };
+}
+
+/** The live roster's marker of a Control-hosted participant of this owner (src/mcp/relay-participants.ts ownsRemote). */
+const HOSTED_SOURCE = "cloud-hosted-mcp";
+
+/**
  * Re-proves the delegate (Cloud's delegateStillBound): it still has exactly
  * one Control binding, owned by the grant's owner, Relaycast still names the
  * same live agent, and the owner is still a member. A binding now owned by
@@ -1133,16 +1206,40 @@ async function proveRecipient(deps: DelegationDeps, input: RecipientInput): Prom
  * owner who left (`owner_left`) or a released agent (`agent_released`) also
  * revokes the grant durably here (§7 automatic revocation); the reason code
  * returned is `revoked` either way, as in Cloud.
+ *
+ * A rule-backed grant re-walks the whole ownership chain instead (trust.ts):
+ * a chain that no longer proves out revokes the system grant durably
+ * (`binding_changed`, or `delegate_released` for the live check); the rule
+ * stays, and covers the agent again only if it proves out again.
+ *
+ * `durable: false` (a gate dry run) gives the same answer but writes nothing:
+ * a delegate found unbound is refused, not revoked.
  */
 export async function delegateStillBound(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow,
-  live: boolean): Promise<ReasonCode | null> {
+  live: boolean, options: { durable?: boolean; prove?: TrustProver } = {}): Promise<ReasonCode | null> {
   const revoke = async (reason: string): Promise<ReasonCode> => {
+    if (options.durable === false) return "revoked";
     // A failed write still refuses this use; it is logged.
     await deps.database.transaction(tx => revokeGrants(tx, {
       workspaceId: workspace.id, grantIds: [grant.id], actorUserId: null, reason, authMethod: "system",
     })).catch((error: unknown) => logRevokeFailed("attest", error, { workspaceId: workspace.id, grantId: grant.id, reason }));
     return "revoked";
   };
+  if (grant.trust_rule_id) {
+    const proof = await (options.prove ?? trustProver(deps, workspace, false))(grant.owner_user_id, grant.delegate_agent_id);
+    if (!proof) return revoke("binding_changed");
+    if (live) {
+      const agent = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, proof.name);
+      // A connector root (not launched) must still carry Control's hosted participant marker for this owner.
+      const ownerMarked = proof.path.root.kind !== "connector" || proof.path.hops.length > 0 ||
+        (agent?.metadata?.source === HOSTED_SOURCE && agent.metadata.owner_hash === sha256Hex(grant.owner_user_id));
+      if (!agent || agent.id !== grant.delegate_agent_id || agent.status === "released" || !ownerMarked) {
+        return revoke("delegate_released");
+      }
+    }
+    if (!await memberRole(deps.database, workspace.id, grant.owner_user_id)) return revoke("owner_left");
+    return null;
+  }
   const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId,
     grant.delegate_agent_id, true);
   if (!binding) return "not_delegate";
@@ -1153,6 +1250,41 @@ export async function delegateStillBound(deps: DelegationDeps, workspace: Delega
   }
   if (!await memberRole(deps.database, workspace.id, grant.owner_user_id)) return revoke("owner_left");
   return null;
+}
+
+/**
+ * Whether a rule-backed approval may pass from its sender to this recipient
+ * (trustRelationAllowed, the one isolated predicate). The recipient's own
+ * chain is read only when it belongs to the same owner; otherwise it is
+ * outside the sender's tree. A bot may approve its own requests under an
+ * owner-made grant too (#owner-decisions 251252958218768384).
+ */
+async function ruleRelationRefusal(prove: TrustProver, grant: GrantRow, recipientAgentId: string,
+  recipientOwnerId: string): Promise<ReasonCode | null> {
+  if (!grant.trust_rule_id) return null;
+  const sender = await prove(grant.owner_user_id, grant.delegate_agent_id);
+  if (!sender) return "not_delegate";
+  const recipient = recipientOwnerId === grant.owner_user_id ? await prove(grant.owner_user_id, recipientAgentId) : null;
+  return trustRelationAllowed(trustRelation(sender.path, recipientAgentId, recipient?.path ?? null)) ? null : "not_delegate";
+}
+
+/**
+ * The owner's trust rule standing in for a missing grant: when the owner has a
+ * live rule and the sender's ownership chain proves out, the system grant
+ * that carries the rule (created now, or the existing one). Null when no rule
+ * covers the sender. An owner-made grant that is live always wins; this is
+ * reached only without one.
+ */
+async function ruleBackedGrant(deps: DelegationDeps, workspace: DelegationWorkspace, prove: TrustProver,
+  ownerUserId: string, agentId: string): Promise<GrantRow | null> {
+  const rule = await liveTrustRule(deps.database, workspace.id, ownerUserId);
+  if (!rule) return null;
+  const proof = await prove(ownerUserId, agentId);
+  if (!proof) return null;
+  const grant = await materializeRuleGrant(deps.database, { workspace, ruleId: rule.id, ownerUserId, delegateAgentId: agentId,
+    delegateAgentName: proof.name, trustPath: proof.path, provenAt: trustPathProvenAt(proof.path),
+    ...(proof.path.root.kind === "claim" && !proof.path.hops.length ? { claimId: proof.path.root.claim_id } : {}) });
+  return grant && grant.status === "active" ? grant : null;
 }
 
 /** The one active, unexpired grant for (owner, delegate), or why there is none (Cloud's liveGrant). */
@@ -1176,6 +1308,15 @@ export function tierOClasses(policy: DelegationPolicy, grant: GrantRow): Set<Act
   return new Set<ActionClass>([...DEFAULT_TIER_O_CLASSES, ...policy.require_tier_o, ...grant.require_tier_o]);
 }
 
+/**
+ * Whether a grant covers one action's class and target. A rule-backed grant
+ * covers every class (the policy's allowed classes still apply, in
+ * scopeRefusal); an owner-made grant covers what its scopes name.
+ */
+export function grantCovers(grant: Pick<GrantRow, "scopes" | "trust_rule_id">, action: Pick<Action, "class" | "target">): boolean {
+  return grant.trust_rule_id ? true : actionsCovered(grant.scopes, [action]);
+}
+
 /** Why an action list is outside the grant or the policy, or null (Cloud's scopeRefusal). */
 export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: DelegationPolicy,
   recipientAgentId: string): ReasonCode | null {
@@ -1183,7 +1324,7 @@ export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy
   for (const action of actions) {
     if (!actionIsValid(action)) return "out_of_scope";
     if (policy.allowed_classes && !policy.allowed_classes.includes(action.class)) return "out_of_scope";
-    if (!actionsCovered(grant.scopes, [action])) return "out_of_scope";
+    if (!grantCovers(grant, action)) return "out_of_scope";
     // A prompt_approval or config_change names exactly the session it
     // applies to: this recipient.
     if ((action.class === "prompt_approval" || action.class === "config_change") &&
@@ -1197,7 +1338,9 @@ export function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy
 }
 
 /** What the final decision reads under locks (Cloud's DecisionState). */
-export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: GrantRow | null; approval: ApprovalRow | null };
+export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: GrantRow | null; approval: ApprovalRow | null;
+  /** The trust rule behind a rule-backed grant, share-locked before the grant (absent for owner-made grants). */
+  trustRule?: TrustRuleRow | null };
 
 /**
  * The final re-check's transaction, as Cloud's decideUnderLocks: it share-
@@ -1212,7 +1355,15 @@ export type DecisionState = { member: boolean; policy: DelegationPolicy; grant: 
  * rows in the same order, so a change committing meanwhile decides the answer.
  */
 export async function decideUnderLocks<T>(database: Database, input: { workspaceId: string; memberUserIds: string[];
-  grantId: string | null; approvalId: string; consuming?: boolean },
+  grantId: string | null; approvalId: string; consuming?: boolean;
+  /**
+   * The trust rule of a rule-backed grant. A grant's rule never changes, so
+   * the caller reads it from the grant before the transaction. Locked after
+   * the policy and before the grant: the one order every rule writer uses
+   * (membership, policy, rule, then grants by id, then approvals), so a
+   * revoke never deadlocks against a decision.
+   */
+  trustRuleId?: string | null },
   decide: (state: DecisionState, tx: SqlExecutor) => Promise<T>): Promise<T> {
   return database.transaction(async (tx) => {
     let member = true;
@@ -1221,6 +1372,9 @@ export async function decideUnderLocks<T>(database: Database, input: { workspace
       if (!member) break;
     }
     const policy = await loadPolicy(tx, input.workspaceId, true);
+    const trustRule = input.trustRuleId ? (await tx.query<TrustRuleRow>(
+      "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.trustRuleId],
+    )).rows[0] ?? null : undefined;
     const grant = input.grantId ? (await tx.query<GrantRow>(
       "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.grantId],
     )).rows[0] ?? null : null;
@@ -1233,7 +1387,7 @@ export async function decideUnderLocks<T>(database: Database, input: { workspace
       `SELECT * FROM delegation_approvals WHERE workspace_id = $1 AND id = $2 ${input.consuming ? "FOR NO KEY UPDATE" : "FOR SHARE"}`,
       [input.workspaceId, input.approvalId],
     )).rows[0] ?? null;
-    return decide({ member, policy, grant, approval }, tx);
+    return decide({ member, policy, grant, approval, ...(trustRule !== undefined ? { trustRule } : {}) }, tx);
   });
 }
 
@@ -1261,6 +1415,9 @@ export function freshRefusal(state: DecisionState, input: { actions: readonly Ac
     return state.policy.code_owner_match !== input.policy.code_owner_match ? "unavailable" : null;
   }
   if (!state.grant || state.grant.status === "revoked") return "revoked";
+  // A rule-backed grant lives only while its rule does, read under the rule's share lock.
+  if (state.grant.trust_rule_id && (!state.trustRule || state.trustRule.id !== state.grant.trust_rule_id ||
+      state.trustRule.revoked_at)) return "revoked";
   if (state.grant.status === "expired" || time(state.grant.expires_at) <= input.nowMs) return "expired";
   if (time(state.approval.expires_at) <= input.nowMs) return "expired";
   const outOfScope = scopeRefusal(input.actions, state.grant, state.policy, input.recipientAgentId);
@@ -1319,13 +1476,19 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     context.claimedOwnerId = approval.owner_id;
     context.quote = approval.quote ?? null;
 
-    const found = liveGrant(await grantsFor(deps.database, workspace.id, approval.owner_id, senderId!), now);
+    const prove = trustProver(deps, workspace, true);
+    let found = liveGrant(await grantsFor(deps.database, workspace.id, approval.owner_id, senderId!), now);
+    // No live grant of the owner's own (an unexpired owner-made grant always
+    // wins): the owner's trust rule may cover the sender by ownership.
+    if (typeof found === "string") found = await ruleBackedGrant(deps, workspace, prove, approval.owner_id, senderId!) ?? found;
     if (typeof found === "string") return refuse(found);
     const grant = found;
     context.grantId = grant.id;
     context.ownerUserId = approval.owner_id;
-    const unbound = await delegateStillBound(deps, workspace, grant, true);
+    const unbound = await delegateStillBound(deps, workspace, grant, true, { prove });
     if (unbound) refuse(unbound);
+    const related = await ruleRelationRefusal(prove, grant, recipient.agentId, input.callerUserId);
+    if (related) refuse(related);
 
     // Notes are sender-chosen text; they never reach a signed claim.
     const messageActions = approval.actions.map(action => canonicalAction(action as Action));
@@ -1421,7 +1584,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // approval are re-checked under locks, and the attestation is recorded in
     // the same transaction, so a change committing meanwhile decides.
     const { attestation, claims } = await decideUnderLocks(deps.database, { workspaceId: workspace.id,
-      memberUserIds: [input.callerUserId], grantId: grant.id, approvalId: context.approvalId! }, async (state, tx) => {
+      memberUserIds: [input.callerUserId], grantId: grant.id, approvalId: context.approvalId!,
+      trustRuleId: grant.trust_rule_id ?? null }, async (state, tx) => {
       const stale = freshRefusal(state, { actions, tier, policy, recipientAgentId: recipient.agentId,
         nowMs: deps.now().getTime() });
       if (stale) refuse(stale);
@@ -1472,7 +1636,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         authMethod: input.authMethod, ownerUserId: approval.owner_id, grantId: grant.id, approvalId: claims.approval_id,
         actorAgentId: senderId, messageId: input.messageId, recipientAgentId: input.recipientAgentId,
         data: { actions: claims.actions, tier, standing, single_use: singleUse, jti: claims.jti, kid: deps.signer!.kid,
-          quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null },
+          quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null,
+          ...(grant.trust_rule_id ? { trust_rule_id: grant.trust_rule_id } : {}) },
         quote: approval.quote ?? null,
         quoteHash: approval.quote ? quoteDigest(deps.quoteKey, workspace.id, approval.quote) : null,
         quoteRedacted,
@@ -1576,8 +1741,11 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     )).rows[0];
     if (!grant || grant.status === "revoked") refuse("revoked");
     if (grant!.status === "expired" || time(grant!.expires_at) <= now.getTime()) refuse("expired");
-    const unbound = await delegateStillBound(deps, workspace, grant!, true);
+    const prove = trustProver(deps, workspace, true);
+    const unbound = await delegateStillBound(deps, workspace, grant!, true, { prove });
     if (unbound) refuse(unbound);
+    const related = await ruleRelationRefusal(prove, grant!, input.recipientAgentId, input.callerUserId);
+    if (related) refuse(related);
     if (time(approval!.expires_at) <= now.getTime()) refuse("expired");
     const action = approval!.actions.find(item => item.class === input.action.class && item.target === input.action.target);
     if (!action) refuse("out_of_scope");
@@ -1600,7 +1768,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     // are re-checked under locks, and a single-use action is consumed in the
     // same transaction.
     await decideUnderLocks(deps.database, { workspaceId: workspace.id, memberUserIds: [input.callerUserId],
-      grantId: grant!.id, approvalId: input.approvalId, consuming: true }, async (state, tx) => {
+      grantId: grant!.id, approvalId: input.approvalId, consuming: true, trustRuleId: grant!.trust_rule_id ?? null },
+      async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
       if (stale) refuse(stale);
@@ -1678,22 +1847,41 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
     if (error instanceof Refusal) return null;
     throw error;
   }
+  const prove = trustProver(deps, workspace, true);
+  // The owner's trust rule covers connected assistants that may not have a
+  // system grant yet (it is created at their first attested approval): prove
+  // and create one for each root now, so turning the rule on makes them prompt
+  // delegates at once. Roots only: agents they launch are workers, not
+  // approvers, and are not sent every prompt. One root that cannot be read is
+  // skipped (and logged), not the whole list.
+  if (await liveTrustRule(deps.database, workspace.id, session.userId)) {
+    for (const agentId of await listTrustRootAgents(deps.database, workspace, session.userId)) {
+      if (agentId === session.agentId) continue;
+      await ruleBackedGrant(deps, workspace, prove, session.userId, agentId).catch((error: unknown) => {
+        logUnavailable("prompt_delegates", error, { workspaceId: workspace.id });
+        return null;
+      });
+    }
+  }
   const grants = (await deps.database.query<GrantRow>(
     `SELECT * FROM delegation_grants
       WHERE workspace_id = $1 AND owner_user_id = $2 AND status = 'active' AND expires_at > now()
       ORDER BY created_at`,
     [workspace.id, session.userId],
-  )).rows.filter(grant => grant.scopes.some(scope => scope.class === "prompt_approval"));
+  )).rows.filter(grant => grant.trust_rule_id || grant.scopes.some(scope => scope.class === "prompt_approval"));
   const delegates: Array<{ agent_id: string; grant_id: string }> = [];
   for (const grant of grants) {
     if (!grantFitsPolicy(grant, policy)) continue;
     // Not the session's own agent: a delegate never answers its own prompts.
+    // This holds under the trust rule too, although it allows a bot to approve
+    // its own requests: this list only picks who is sent a session's approval
+    // DM, and a session asking itself would loop.
     if (grant.delegate_agent_id === session.agentId) continue;
-    if (!actionsCovered(grant.scopes, [{ class: "prompt_approval", target: `${session.agentId}:probe:approve` }])) continue;
+    if (!grantCovers(grant, { class: "prompt_approval", target: `${session.agentId}:probe:approve` })) continue;
     // A released or re-bound agent is never offered (its grant is revoked, as
     // at attestation). One grant whose binding cannot be read is skipped (and
     // logged), not the whole list, as Cloud.
-    const unbound = await delegateStillBound(deps, workspace, grant, true).catch((error: unknown) => {
+    const unbound = await delegateStillBound(deps, workspace, grant, true, { prove }).catch((error: unknown) => {
       logUnavailable("prompt_delegates", error, { workspaceId: workspace.id, grantId: grant.id });
       return "unavailable" as const;
     });
@@ -1747,4 +1935,262 @@ export function relaycastQuoteRedactor(input: { relaycastUrl: string; internalSe
       return { outcome: "retry", status: null };
     }
   };
+}
+
+// ---------------------------------------------------------------- trust rules
+
+/** Most roots one owner can have considered at once (prompt delegate discovery). */
+export const MAX_TRUST_ROOTS = 20;
+
+/**
+ * Candidate roots of an owner's trust rule: agents of the owner's completed,
+ * unreleased claims, and agents the owner's live connector grants are pinned
+ * to that the owner holds as a hosted participant here. Each is still only a
+ * candidate: coverage is decided by resolveTrustPath.
+ */
+export async function listTrustRootAgents(executor: SqlExecutor, workspace: DelegationWorkspace, ownerUserId: string):
+  Promise<string[]> {
+  const rows = (await executor.query<{ agent_id: string }>(
+    `(SELECT b.agent_id FROM delegation_agent_bindings b JOIN delegation_claims c ON c.id = b.claim_id
+       WHERE b.workspace_id = $1 AND b.relaycast_workspace_id = $2 AND b.user_id = $3
+         AND c.consumed_at IS NOT NULL AND c.released_at IS NULL
+       ORDER BY b.agent_id LIMIT $4)
+     UNION
+     (SELECT DISTINCT p.agent_remote_id FROM mcp_oauth_grants g
+        JOIN hosted_relay_participants p ON p.workspace_id = g.workspace_id AND p.user_id = g.user_id
+         AND p.agent_remote_id = g.agent_remote_id AND p.relaycast_workspace_id = $2
+       WHERE g.workspace_id = $1 AND g.user_id = $3 AND g.revoked_at IS NULL AND g.agent_remote_id IS NOT NULL
+       ORDER BY p.agent_remote_id LIMIT $4)`,
+    [workspace.id, workspace.relaycastWorkspaceId, ownerUserId, MAX_TRUST_ROOTS],
+  )).rows;
+  return [...new Set(rows.map(row => row.agent_id))].slice(0, MAX_TRUST_ROOTS);
+}
+
+/** The trust rule's owner is no longer a member of the workspace's organization. */
+export class TrustRuleMembershipGone extends Error {
+  constructor() {
+    super("forbidden");
+  }
+}
+
+/** Delegation is off for the workspace: a rule is never turned on then. */
+export class TrustRuleNotEnabled extends Error {
+  constructor() {
+    super("not_enabled");
+  }
+}
+
+/** The owner's live trust rule in this workspace, if any. */
+export async function liveTrustRule(executor: SqlExecutor, workspaceId: string, ownerUserId: string): Promise<TrustRuleRow | null> {
+  return (await executor.query<TrustRuleRow>(
+    "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL",
+    [workspaceId, ownerUserId],
+  )).rows[0] ?? null;
+}
+
+/** One rule by id (live or revoked). */
+export async function getTrustRule(executor: SqlExecutor, workspaceId: string, ruleId: string): Promise<TrustRuleRow | null> {
+  return (await executor.query<TrustRuleRow>(
+    "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2", [workspaceId, ruleId],
+  )).rows[0] ?? null;
+}
+
+/** The active system grants a rule created: the agents it covers now. */
+export async function ruleGrants(executor: SqlExecutor, workspaceId: string, ruleId: string): Promise<GrantRow[]> {
+  return (await executor.query<GrantRow>(
+    `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND trust_rule_id = $2 AND status = 'active'
+      ORDER BY created_at, id`, [workspaceId, ruleId],
+  )).rows;
+}
+
+const sameClasses = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every(item => b.includes(item));
+
+/**
+ * Turns the owner's trust rule on, or updates its Tier O list (PUT is
+ * idempotent), as Cloud's putTrustRule. Locks in the one order: the owner's
+ * membership (a departure either commits first and refuses this, or waits),
+ * the policy (delegation turned off meanwhile refuses this), then the rule.
+ * A Tier O change reaches every system grant of the rule in the same
+ * transaction (rule, then grants by id).
+ */
+export async function putTrustRule(database: Database, input: { workspaceId: string; ownerUserId: string;
+  requireTierO: ActionClass[]; authMethod: string }): Promise<{ rule: TrustRuleRow; created: boolean }> {
+  const run = () => database.transaction(async (tx) => {
+    if (!await memberRole(tx, input.workspaceId, input.ownerUserId, true)) throw new TrustRuleMembershipGone();
+    if (!(await loadPolicy(tx, input.workspaceId, true)).delegation_enabled) throw new TrustRuleNotEnabled();
+    const locked = (await tx.query<TrustRuleRow>(
+      `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL FOR UPDATE`,
+      [input.workspaceId, input.ownerUserId],
+    )).rows[0];
+    if (!locked) {
+      const row = (await tx.query<TrustRuleRow>(
+        `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, require_tier_o) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [mintId("dtr"), input.workspaceId, input.ownerUserId, input.requireTierO],
+      )).rows[0]!;
+      await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "trust_rule.created",
+        actorUserId: input.ownerUserId, authMethod: input.authMethod, ownerUserId: input.ownerUserId,
+        data: { trust_rule_id: row.id, require_tier_o: input.requireTierO } });
+      return { rule: row, created: true };
+    }
+    if (sameClasses(locked.require_tier_o, input.requireTierO)) return { rule: locked, created: false };
+    const row = (await tx.query<TrustRuleRow>(
+      "UPDATE delegation_trust_rules SET require_tier_o = $2, updated_at = now() WHERE id = $1 RETURNING *",
+      [locked.id, input.requireTierO],
+    )).rows[0]!;
+    const grants = (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_grants WHERE trust_rule_id = $1 AND status = 'active' ORDER BY id FOR UPDATE`, [locked.id],
+    )).rows.map(grant => grant.id);
+    if (grants.length) {
+      await tx.query("UPDATE delegation_grants SET require_tier_o = $2, updated_at = now() WHERE id = ANY($1::text[])",
+        [grants, input.requireTierO]);
+    }
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "trust_rule.updated",
+      actorUserId: input.ownerUserId, authMethod: input.authMethod, ownerUserId: input.ownerUserId,
+      data: { trust_rule_id: locked.id, require_tier_o: { before: locked.require_tier_o, after: input.requireTierO },
+        updated_grants: grants } });
+    return { rule: row, created: false };
+  });
+  try {
+    return await run();
+  } catch (error) {
+    // Two concurrent first PUTs: the live-owner index decides, and the loser reads the winner's rule.
+    if ((error as { code?: string })?.code === "23505") return run();
+    throw error;
+  }
+}
+
+/**
+ * Revokes live trust rules (one owner's, or every owner's for an admin
+ * revoke-all) and every active system grant they created, with those grants'
+ * unredeemed and gate-spent approvals (revokeGrants), in the caller's
+ * transaction. Rules are locked FOR UPDATE by id before any grant, so a
+ * decision or a materialize holding a rule share lock finishes first and is
+ * then revoked here, and one that starts later sees the revoked rule. Each
+ * rule carries the ids of the grants revoked here, under its lock.
+ */
+export async function revokeTrustRulesTx(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string | null;
+  actorUserId: string | null; authMethod: string | null; reason: string }): Promise<Array<TrustRuleRow & { revokedGrants: string[] }>> {
+  const rules = (await tx.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules
+      WHERE workspace_id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR owner_user_id = $2)
+      ORDER BY id FOR UPDATE`,
+    [input.workspaceId, input.ownerUserId],
+  )).rows;
+  if (!rules.length) return [];
+  const ids = rules.map(rule => rule.id);
+  const grantIds = (await tx.query<{ id: string }>(
+    `SELECT id FROM delegation_grants WHERE workspace_id = $1 AND trust_rule_id = ANY($2::text[]) AND status = 'active'
+      ORDER BY id FOR UPDATE`,
+    [input.workspaceId, ids],
+  )).rows.map(row => row.id);
+  const revoked = await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds, actorUserId: input.actorUserId,
+    reason: "trust_rule_revoked", authMethod: input.authMethod });
+  const byRule = new Map<string, string[]>();
+  for (const grant of revoked) byRule.set(grant.trust_rule_id!, [...(byRule.get(grant.trust_rule_id!) ?? []), grant.id]);
+  const updated = (await tx.query<TrustRuleRow>(
+    `UPDATE delegation_trust_rules SET revoked_at = now(), revoked_reason = $2, revoked_by_user_id = $3, updated_at = now()
+      WHERE id = ANY($1::text[]) RETURNING *`,
+    [ids, input.reason, input.actorUserId && UUID.test(input.actorUserId) ? input.actorUserId : null],
+  )).rows;
+  for (const rule of updated) {
+    const grants = byRule.get(rule.id) ?? [];
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "trust_rule.revoked",
+      actorUserId: input.actorUserId, authMethod: input.authMethod, ownerUserId: rule.owner_user_id, reason: input.reason,
+      data: { trust_rule_id: rule.id, revoked_grants: grants, count: grants.length } });
+  }
+  return updated.map(rule => ({ ...rule, revokedGrants: byRule.get(rule.id) ?? [] }));
+}
+
+/**
+ * One-click revoke of an owner's rule (the owner, or an admin for any owner):
+ * the rule, its system grants and their unredeemed and gate-spent approvals,
+ * in one transaction. Null when there is no live rule.
+ */
+export async function revokeTrustRule(database: Database, input: { workspaceId: string; ownerUserId: string;
+  actorUserId: string; authMethod: string; reason: string }): Promise<{ rule: TrustRuleRow; revokedGrants: string[] } | null> {
+  return database.transaction(async (tx) => {
+    const [rule] = await revokeTrustRulesTx(tx, input);
+    if (!rule) return null;
+    const { revokedGrants, ...record } = rule;
+    return { rule: record, revokedGrants };
+  });
+}
+
+/**
+ * Creates (or returns) the system grant through which the owner's live rule
+ * covers one proven agent, in one transaction, under the same lock order as a
+ * decision: the owner's membership, the policy, the RULE (share, re-read
+ * live), then the agent's creation lock and the pair's grants by id (as an
+ * owner-made grant and a claim release take them), then a claim root's claim.
+ * A revoke that holds the rule first makes this see it revoked and create
+ * nothing; one that comes later waits and then revokes the new grant.
+ * Lapsed owner-made grants of the pair expire here first (they never shadow
+ * the rule); a live owner-made grant wins and is returned instead. An agent
+ * the owner excluded (revoked its system grant by hand) is not covered again
+ * by the same rule. Concurrent first materializes converge on one grant
+ * through the active-pair unique index. Null when nothing covers it.
+ */
+export async function materializeRuleGrant(database: Database, input: { workspace: DelegationWorkspace; ruleId: string;
+  ownerUserId: string; delegateAgentId: string; delegateAgentName: string; trustPath: TrustPath; provenAt: Date;
+  claimId?: string;
+  /** Test hook: runs once the rule and grant locks are held. */
+  onLocked?: () => Promise<void> }): Promise<GrantRow | null> {
+  const { workspace } = input;
+  const pair = [workspace.id, input.ownerUserId, input.delegateAgentId];
+  const run = () => database.transaction(async (tx): Promise<GrantRow | null> => {
+    if (!await memberRole(tx, workspace.id, input.ownerUserId, true)) return null;
+    if (!(await loadPolicy(tx, workspace.id, true)).delegation_enabled) return null;
+    const rule = (await tx.query<TrustRuleRow>(
+      "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE", [workspace.id, input.ruleId],
+    )).rows[0];
+    if (!rule || rule.revoked_at || rule.owner_user_id !== input.ownerUserId) return null;
+    await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
+    if (input.claimId) {
+      // A claim root: its claim is re-read under its lock (releaseClaim's order).
+      const claim = (await tx.query<{ released_at: Date | null }>(
+        "SELECT released_at FROM delegation_claims WHERE workspace_id = $1 AND id = $2", [workspace.id, input.claimId],
+      )).rows[0];
+      if (!claim || claim.released_at) return null;
+    }
+    await input.onLocked?.();
+    await expireLapsed(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
+    const active = (await tx.query<GrantRow>(
+      `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
+          AND status = 'active' LIMIT 1`, pair,
+    )).rows[0];
+    if (active) return active;
+    const history = (await tx.query<{ excluded: boolean; ended: Date | string | null }>(
+      `SELECT bool_or(status = 'revoked' AND revoked_reason = 'owner_excluded') AS excluded, max(revoked_at) AS ended
+         FROM delegation_grants
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4`,
+      [...pair, rule.id],
+    )).rows[0];
+    if (history?.excluded) return null;
+    // Created no earlier than the rule, every record of the chain, and the
+    // last time this rule's coverage of the agent ended: a message the agent
+    // sent while it was uncovered (a broken chain, a revoked connector)
+    // predates this grant even when the chain proves out again from older records.
+    const createdAt = new Date(Math.max(time(rule.created_at), input.provenAt.getTime(),
+      history?.ended ? time(history.ended) : 0));
+    const row = (await tx.query<GrantRow>(
+      `INSERT INTO delegation_grants
+         (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name, scopes, require_tier_o,
+          expires_at, created_auth_method, created_at, trust_rule_id, trust_path)
+       VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, 'system', $9, $10, $11::jsonb) RETURNING *`,
+      [mintId("grt"), workspace.id, workspace.organizationId, input.ownerUserId, input.delegateAgentId, input.delegateAgentName,
+        rule.require_tier_o, TRUST_RULE_GRANT_EXPIRY, createdAt, rule.id, JSON.stringify(input.trustPath)],
+    )).rows[0]!;
+    await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "grant.created", actorUserId: null,
+      authMethod: "system", ownerUserId: input.ownerUserId, grantId: row.id, reason: "trust_rule",
+      data: { delegate_agent_id: input.delegateAgentId, trust_rule_id: rule.id, trust_path: input.trustPath,
+        require_tier_o: rule.require_tier_o } });
+    return row;
+  });
+  try {
+    return await run();
+  } catch (error) {
+    // Two concurrent first attests of one pair: the active-pair index decides; the loser reads the winner's grant.
+    if ((error as { code?: string })?.code === "23505") return run();
+    throw error;
+  }
 }
