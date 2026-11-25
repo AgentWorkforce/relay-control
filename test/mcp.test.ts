@@ -640,6 +640,35 @@ test("session reads go to RelayHistory for the bound workspace only", async (t) 
   assert(!env.history.paths.some((path) => path.includes(env.otherWorkspaceId)));
 });
 
+test("transcript searches default to 90 days on first and cursor pages and preserve explicit windows", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${CLOUD_MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const duration = 90 * 86_400_000;
+  for (const args of [{ query: "deploy" }, { query: "deploy", cursor: "next-page" }]) {
+    const before = Date.now();
+    structured(await client.callTool({ name: "search_shared_sessions", arguments: args }));
+    const after = Date.now();
+    const path = env.history.paths.filter(path => path.startsWith("/v1/events?")).at(-1)!;
+    const params = new URL(path, "http://fixture").searchParams;
+    const since = Date.parse(params.get("since")!);
+    assert(since >= before - duration && since <= after - duration);
+    assert.equal(params.get("cursor"), "cursor" in args ? args.cursor : null);
+  }
+  for (const args of [
+    { query: "deploy", until: "2025-04-01T00:00:00.000Z" },
+    { query: "deploy", since: "2024-01-01T00:00:00.000Z", until: "2025-04-01T00:00:00.000Z" },
+  ]) {
+    structured(await client.callTool({ name: "search_shared_sessions", arguments: args }));
+    const path = env.history.paths.filter(path => path.startsWith("/v1/events?")).at(-1)!;
+    const params = new URL(path, "http://fixture").searchParams;
+    assert.equal(params.get("since"), args.since ?? new Date(Date.parse(args.until) - duration).toISOString());
+    assert.equal(params.get("until"), args.until);
+  }
+  structured(await client.callTool({ name: "search_shared_sessions", arguments: { agent: "Builder" } }));
+  const listing = env.history.paths.filter(path => path.startsWith("/v1/sessions?")).at(-1)!;
+  assert.equal(new URL(listing, "http://fixture").searchParams.get("since"), null);
+});
+
 test("a failed transcript search is text, so clients do not check it against the success schema", async (t) => {
   const env = await setup(t);
   env.history.failEvents(500, { error: { code: "internal_error", message: "SECRET upstream failure" } });

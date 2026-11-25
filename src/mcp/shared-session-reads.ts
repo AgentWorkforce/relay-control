@@ -22,6 +22,7 @@ const MAX_CURSOR_LENGTH = 4_096;
 const MAX_CONTENT_LENGTH = 4_000;
 const SEARCH_TIMEOUT_MESSAGE =
   "This search took too long. Narrow it with a shorter `since` range, a `source` filter, or a more specific query, then try again.";
+const SEARCH_DEFAULT_SINCE_DAYS = 90;
 const UNSUPPORTED_MESSAGE = "Shared session history returned an unsupported response. Please try again later.";
 const SCOPE_MESSAGE = "Shared session history scope could not be verified. Please try again later.";
 const NOT_FOUND_MESSAGE = "No shared session was found with that session ID and source in this workspace.";
@@ -410,7 +411,7 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
   server.registerTool("search_shared_sessions", {
     title: "Search shared session transcripts",
     description:
-      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions. Narrowing with since makes searches markedly faster.",
+      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions. Transcript searches default to the last 90 days before until (or now); pass an earlier since to search older transcripts. Narrowing with since makes searches markedly faster.",
     inputSchema: {
       query: z.string().trim().min(1).max(500).optional().describe("Case-insensitive transcript text to find. Required unless agent is set."),
       agent: z.string().trim().min(1).max(MAX_AGENT_LENGTH).regex(AGENT_VALUE).optional().describe("One agent's Relay name, without a leading @, to list that agent's sessions. Exact and case-insensitive. Cannot be combined with query text."),
@@ -418,7 +419,7 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
       source: SourceSchema,
       project: z.string().trim().min(1).max(512).optional()
         .describe("Case-insensitive substring of the session's project id, such as relay-control."),
-      since: IsoDateSchema.optional(),
+      since: IsoDateSchema.optional().describe("Transcript search defaults to 90 days before until (or now). Pass an earlier timestamp to search older transcripts."),
       until: IsoDateSchema.optional(),
       limit: z.number().int().min(1).max(20).default(10),
       cursor: CursorSchema,
@@ -468,7 +469,11 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
       const params = new URLSearchParams({ q: input.query, limit: String(input.limit), order: "desc", maxContent: String(input.max_content) });
       if (input.source) params.set("source", input.source);
       if (input.project) params.set("projectContains", input.project);
-      if (input.since) params.set("since", input.since);
+      // History cursors carry a keyset position, not the original time range.
+      // Bound cursor pages too; an explicit caller window always takes priority.
+      params.set("since", input.since ?? new Date(
+        (input.until ? Date.parse(input.until) : Date.now()) - SEARCH_DEFAULT_SINCE_DAYS * 86_400_000,
+      ).toISOString());
       if (input.until) params.set("until", input.until);
       if (input.cursor) params.set("cursor", input.cursor);
       const searchStarted = performance.now();
