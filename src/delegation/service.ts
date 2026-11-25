@@ -160,6 +160,12 @@ export type TrustRuleRow = {
 
 /** The expiry a rule-backed grant carries: never read as authority, only the live rule is. */
 export const TRUST_RULE_GRANT_EXPIRY = new Date("9999-12-31T00:00:00.000Z");
+/**
+ * The revoke reason of a system grant retired because its delegate now proves
+ * out through other records. Its end is a hand-over to the new chain, not a
+ * gap in coverage, so it does not floor the replacement grant (Cloud's CHAIN_CHANGED).
+ */
+export const CHAIN_CHANGED = "chain_changed";
 
 export type ApprovalRow = {
   id: string;
@@ -1283,9 +1289,11 @@ export async function delegateStillBound(deps: DelegationDeps, workspace: Delega
     // A system grant covers the chain it was created on. One that now proves
     // through other records (a claim released and reclaimed, a connector
     // revoked and reconnected, a relaunch) is a new coverage: this grant ends,
-    // with its approvals, and the rule creates a fresh one dated after the gap.
+    // with its approvals, and the rule creates a fresh one dated from the new
+    // chain's records. CHAIN_CHANGED tells materializeRuleGrant this end is a
+    // hand-over, not a gap (as in Cloud).
     if (grant.trust_path && trustPathFingerprint(proof.path) !== trustPathFingerprint(grant.trust_path)) {
-      return revoke("binding_changed");
+      return revoke(CHAIN_CHANGED);
     }
     if (live) {
       const agent = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, proof.name);
@@ -1334,6 +1342,13 @@ async function ruleRelationRefusal(prove: TrustProver, grant: GrantRow, recipien
   if (!sender) return "not_delegate";
   const recipient = recipientOwnerId === grant.owner_user_id ? await prove(grant.owner_user_id, recipientAgentId) : null;
   return trustRelationAllowed(trustRelation(sender.path, recipientAgentId, recipient?.path ?? null)) ? null : "not_delegate";
+}
+
+/** Whether a system grant's delegate now proves out through records other than the grant's own (a hand-over, not a break). */
+async function chainChanged(prove: TrustProver, grant: GrantRow): Promise<boolean> {
+  if (!grant.trust_rule_id || !grant.trust_path) return false;
+  const proof = await prove(grant.owner_user_id, grant.delegate_agent_id);
+  return !!proof && trustPathFingerprint(proof.path) !== trustPathFingerprint(grant.trust_path);
 }
 
 /**
@@ -1584,10 +1599,20 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // wins): the owner's trust rule may cover the sender by ownership.
     if (typeof found === "string") found = await ruleBackedGrant(deps, workspace, prove, approval.owner_id, senderId!) ?? found;
     if (typeof found === "string") return refuse(found);
-    const grant = found;
+    let grant = found;
     context.grantId = grant.id;
     context.ownerUserId = approval.owner_id;
-    const unbound = await delegateStillBound(deps, workspace, grant, true, { prove });
+    let unbound = await delegateStillBound(deps, workspace, grant, true, { prove });
+    // A system grant whose chain changed was just retired: the rule covers the
+    // sender again through the chain proven now, in this same call (as in Cloud).
+    if (unbound === "revoked" && await chainChanged(prove, grant)) {
+      const replaced = await ruleBackedGrant(deps, workspace, prove, grant.owner_user_id, senderId!);
+      if (replaced && replaced.id !== grant.id) {
+        grant = replaced;
+        context.grantId = grant.id;
+        unbound = await delegateStillBound(deps, workspace, grant, true, { prove });
+      }
+    }
     if (unbound) refuse(unbound);
     const related = await ruleRelationRefusal(prove, grant, recipient.agentId, input.callerUserId);
     if (related) refuse(related);
@@ -2298,12 +2323,15 @@ export async function materializeRuleGrant(database: Database, input: { workspac
     if (excluded) return null;
     // Any earlier grant of the pair counts, owner-made ones too: while the
     // bot's own grant governed it (until it was revoked or lapsed), the rule did
-    // not, so a message refused under that grant's scope stays refused.
+    // not, so a message refused under that grant's scope stays refused. A
+    // system grant retired for a changed chain (CHAIN_CHANGED) is the one
+    // exception: the new chain's own records (provenAt) date the hand-over.
     const history = (await tx.query<{ ended: Date | string | null }>(
       `SELECT max(CASE WHEN status = 'revoked' THEN revoked_at ELSE expires_at END) AS ended
          FROM delegation_grants
-        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status <> 'active'`,
-      pair,
+        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status <> 'active'
+          AND NOT (trust_rule_id IS NOT NULL AND status = 'revoked' AND revoked_reason IS NOT DISTINCT FROM $4)`,
+      [...pair, CHAIN_CHANGED],
     )).rows[0];
     // Created no earlier than the rule, every record of the chain, and the
     // last time this rule's coverage of the agent ended: a message the agent

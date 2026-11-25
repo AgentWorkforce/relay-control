@@ -622,19 +622,38 @@ test("round 3 (1): a system grant covers only the chain it was created on; a rec
   assert.equal(first.verdict, "delegate", JSON.stringify(first));
   const [old] = await env.grants(gpt.id);
   // Revoked and reconnected without any use in between: the chain proves out again, through a new OAuth grant.
+  const beforeReconnect = env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() - 60_000).toISOString() });
   await reconnect(env, gpt);
-  const after = await env.verdict(recipient, env.send(gpt, recipient));
-  assert.equal(after.reason, "revoked", JSON.stringify(after));
+  // A message sent before the reconnect: the old grant ends (a hand-over), and the new one never covers it.
+  const stale = await env.verdict(recipient, beforeReconnect);
+  assert.equal(stale.reason, "predates_grant", JSON.stringify(stale));
   const ended = (await env.grants(gpt.id)).find(row => row.id === old!.id)!;
-  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "binding_changed"]);
+  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "chain_changed"]);
   // The old coverage's approval never redeems again.
   assert.equal((await env.redeem(recipient, first.claims!.approval_id, MERGE[0])).body.reason, "revoked");
-  // The next message is covered by a fresh system grant, dated after the gap.
-  const fresh = await env.verdict(recipient, env.send(gpt, recipient, MERGE, { createdAt: new Date(Date.now() + 3_000).toISOString() }));
+  // A message sent after the reconnect is covered by a fresh system grant dated
+  // from the new OAuth grant, not from when the change was noticed (Devin on cloud train #6652).
+  const fresh = await env.verdict(recipient, env.send(gpt, recipient, MERGE));
   assert.equal(fresh.verdict, "delegate", JSON.stringify(fresh));
   const renewed = (await env.grants(gpt.id)).find(row => row.status === "active")!;
   assert.notEqual(renewed.id, old!.id);
-  assert.ok(new Date(renewed.created_at).getTime() >= new Date(ended.revoked_at!).getTime());
+  assert.ok(new Date(renewed.created_at).getTime() <= new Date(ended.revoked_at!).getTime());
+});
+
+test("a reclaim noticed late: an approval sent after the new chain but attested later is covered, in the same call", async (t) => {
+  const { env, recipient } = await ready(t);
+  await turnOn(env);
+  const gpt = await env.connector("chatgpt-assistant");
+  assert.equal((await env.verdict(recipient, env.send(gpt, recipient))).verdict, "delegate");
+  const [old] = await env.grants(gpt.id);
+  await reconnect(env, gpt);
+  // Sent just after the reconnect; nothing attests it until later.
+  const sent = env.send(gpt, recipient, MERGE);
+  await new Promise(resolve => setTimeout(resolve, 2_500));
+  const late = await env.verdict(recipient, sent);
+  assert.equal(late.verdict, "delegate", JSON.stringify(late));
+  const ended = (await env.grants(gpt.id)).find(row => row.id === old!.id)!;
+  assert.deepEqual([ended.status, ended.revoked_reason], ["revoked", "chain_changed"]);
 });
 
 test("round 3 (2): a grant that stands on a proof covers messages only from the proof's records on", async (t) => {
