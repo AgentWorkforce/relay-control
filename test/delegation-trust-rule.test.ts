@@ -760,3 +760,32 @@ test("round 3 (9): the backfill skips and counts connector grants with no live s
   assert.equal(await pinned(expired.grantId), null);
   assert.equal(await pinned(live.grantId), live.id);
 });
+
+test("role-seed and role-quiesce answer the operator credential through the delegation handler", async (t) => {
+  const { env } = await ready(t);
+  for (const path of ["/internal/v1/delegation/role-seed", "/internal/v1/delegation/role-quiesce"]) {
+    const call = (body: unknown, token: string | null = INTERNAL) => request(env.origin, path, { method: "POST",
+      ...(token ? { token } : {}), body });
+    for (const [body, token, status, code] of [[{}, null, 401, "unauthorized"], [{}, env.desktop.accessToken, 401, "unauthorized"],
+      [{ apply: "yes" }, INTERNAL, 400, "invalid_request"]] as const) {
+      const refused = await call(body, token);
+      assert.equal(refused.status, status, `${path} ${refused.raw}`);
+      assert.match(refused.headers.get("content-type") ?? "", /application\/json/u, path);
+      assert.equal(refused.body.code, code, `${path} ${refused.raw}`);
+      assert.equal(typeof refused.body.error, "string", path);
+    }
+    const dry = await call({});
+    assert.equal(dry.status, 200, `${path} ${dry.raw}`);
+    assert.match(dry.headers.get("content-type") ?? "", /application\/json/u, path);
+    assert.equal(dry.headers.get("cache-control"), "no-store", path);
+    assert.equal(dry.body.dry_run, true, path);
+  }
+  // An apply through the handler: a legacy rule becomes Trusted for Relay agents, then the quiesce ends it.
+  await turnOn(env);
+  const seeded = await request(env.origin, "/internal/v1/delegation/role-seed", { method: "POST", token: INTERNAL, body: { apply: true } });
+  assert.deepEqual([seeded.status, seeded.body.converted], [200, 1], seeded.raw);
+  const quiesced = await request(env.origin, "/internal/v1/delegation/role-quiesce", { method: "POST", token: INTERNAL,
+    body: { apply: true } });
+  assert.deepEqual([quiesced.status, quiesced.body.bindings.length], [200, 1], quiesced.raw);
+  assert.equal((await env.bearer("/delegates/bindings")).body.bindings.length, 0);
+});
