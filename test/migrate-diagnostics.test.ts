@@ -32,7 +32,9 @@ test("a missing role (42704 from get_role_oid) prints one AR_DB_LOGIN line and t
 
 test("the message alone identifies a missing role", () => {
   assert.equal(missingDatabaseRole(new Error('role "control_owner" does not exist')), "control_owner");
-  assert.equal(missingDatabaseRole(new Error('role "a""b" does not exist')), 'a"b');
+  // Postgres does not escape quotes inside the name.
+  assert.equal(missingDatabaseRole(new Error('role "a"b" does not exist')), 'a"b');
+  assert.equal(missingDatabaseRole(new Error('role "a""b" does not exist')), 'a""b');
 });
 
 test("a login that does not exist (28000) is a missing role", () => {

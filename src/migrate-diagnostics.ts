@@ -12,7 +12,9 @@ export const DB_LOGIN_HELP =
 
 const UNDEFINED_OBJECT = "42704";
 const INVALID_AUTHORIZATION = "28000";
-const MISSING_ROLE = /role "((?:[^"]|"")+)" does not exist/;
+// Postgres formats the name verbatim (`role "%s" does not exist`), with no
+// quote doubling, so match greedily up to the last `" does not exist`.
+const MISSING_ROLE = /role "(.+)" does not exist/s;
 
 type PgErrorShape = { code?: unknown; routine?: unknown; message?: unknown };
 
@@ -30,7 +32,7 @@ export function missingDatabaseRole(error: unknown): string | undefined {
     return undefined;
   }
   const match = typeof message === "string" ? MISSING_ROLE.exec(message) : null;
-  if (match) return printable(match[1]!.replaceAll('""', '"'));
+  if (match) return printable(match[1]!);
   // Right SQLSTATE and routine but an unexpected (for example localized) message.
   if (code === UNDEFINED_OBJECT && routine === "get_role_oid") return "(unknown)";
   return undefined;
