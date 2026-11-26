@@ -182,6 +182,8 @@ export const TRUST_RULE_GRANT_EXPIRY = new Date("9999-12-31T00:00:00.000Z");
  * gap in coverage, so it does not floor the replacement grant (Cloud's CHAIN_CHANGED).
  */
 export const CHAIN_CHANGED = "chain_changed";
+/** The revoke reason of a system grant whose bindings no longer cover its delegate. */
+export const BINDING_CHANGED = "binding_changed";
 /** The revoke reason of a system grant a person revoked: the rule does not cover that agent again. */
 export const OWNER_EXCLUDED = "owner_excluded";
 
@@ -2798,7 +2800,24 @@ export async function materializeRuleGrant(database: Database, input: { workspac
     const state = await bindingState(tx, workspace.id, input.ownerUserId, "share");
     const decision = decideFor(state, input.delegateAgentId, input.trustPath, new Date());
     const shape = grantShape(decision);
-    if (!shape || (input.ruleId && shape.binding.id !== input.ruleId)) return null;
+    if (!shape) {
+      // Nothing covers the agent now, yet it may still hold a system grant
+      // from before resolution changed (a worker whose spawn default now
+      // leaves it no usable action): retire it with its approvals, so the
+      // binding no longer lists the agent as covered (Cloud, review of
+      // cloud#6676). An owner-made grant is left alone.
+      await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
+      const stale = (await tx.query<{ id: string }>(
+        `SELECT id FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
+            AND status = 'active' AND trust_rule_id IS NOT NULL ORDER BY id`, pair,
+      )).rows;
+      if (stale.length) {
+        await revokeGrants(tx, { workspaceId: workspace.id, grantIds: stale.map(row => row.id), actorUserId: null,
+          reason: BINDING_CHANGED, authMethod: "system" });
+      }
+      return null;
+    }
+    if (input.ruleId && shape.binding.id !== input.ruleId) return null;
     const rule = state.rows.find(row => row.id === shape.binding.id)!;
     await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
     if (input.claimId) {
