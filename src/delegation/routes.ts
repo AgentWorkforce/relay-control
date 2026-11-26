@@ -83,7 +83,7 @@ import {
 import { backfillConnectorRoots } from "./trust-backfill.js";
 import {
   CONNECTOR_KINDS, PR_OPS_OPS, PRESETS, PRESET_ROLES, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, bindingFields,
-  isValidBindingTarget, type BindingFields,
+  coversNothing, displayRole, isValidBindingTarget, type BindingFields,
 } from "./roles.js";
 import {
   BindingExists, GroupNotFound, bindingCoverage, bindingState, bindingViewOf, createBinding, createGroup, decideFor, getBinding,
@@ -1190,9 +1190,14 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const own = active.find(grant => grant.delegate_agent_id === agentId && !grant.trust_rule_id);
           const system = active.find(grant => grant.delegate_agent_id === agentId && grant.trust_rule_id);
           const decision = decideFor(state, agentId, proof.path, at);
+          // A combination of custom groups, or a launched agent's default, shows the authority it amounts to; one
+          // that grants nothing (disjoint groups) shows no access (as Cloud, review of cloud#6672).
+          const combined = decision.kind === "covered" && (decision.source === "group" || decision.source === "spawn_default");
           const effective = own ? { binding_id: null, role: "custom", source: "explicit_grant", grant_id: own.id } :
+            decision.kind === "covered" && coversNothing(decision.authority) ?
+              { binding_id: null, role: null, source: "none", grant_id: null } :
             decision.kind === "covered" ? { binding_id: decision.binding.id,
-              role: decision.source === "spawn_default" ? "read_only" : decision.binding.role ?? "legacy", source: decision.source,
+              role: combined ? displayRole(decision.authority) : decision.binding.role ?? "legacy", source: decision.source,
               grant_id: system?.trust_rule_id === decision.binding.id ? system.id : null } :
             decision.kind === "excluded" ? { binding_id: decision.binding.id, role: "excluded", source: "agent", grant_id: null } :
             { binding_id: null, role: null, source: "none", grant_id: null };

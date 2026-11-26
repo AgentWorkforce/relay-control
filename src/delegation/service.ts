@@ -48,7 +48,7 @@ import {
 } from "./scope.js";
 import { ACTION_CLASSES } from "./scope.js";
 import {
-  PR_OPS_OPS, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, coversNothing, decide, requiredConditionsOf, sameScopes,
+  PR_OPS_OPS, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, coversNothing, decide, grantedTierO, requiredConditionsOf, sameScopes,
   systemScopes, systemScopesCover, type Authority, type BindingFields, type BindingView, type Decision, type PrOp,
   type PrincipalKind, type RequiredCondition, type RequiredConditions, type Role,
 } from "./roles.js";
@@ -1468,6 +1468,22 @@ async function ruleBackedGrant(deps: DelegationDeps, workspace: DelegationWorksp
   return grant && grant.status === "active" ? grant : null;
 }
 
+/**
+ * A rule-backed grant as the bindings decide now (Cloud's currentSystemGrant,
+ * review of cloud#6674). A system grant is re-resolved when a binding or
+ * group changes, but not when resolution itself changes: a worker's grant
+ * materialized before its spawn default took its root binding's ask-first
+ * list would keep the looser authority. materializeRuleGrant returns the
+ * stored grant when it still matches, and otherwise supersedes it and returns
+ * the replacement, which covers nothing sent before it. An owner-made grant
+ * is returned as is.
+ */
+async function currentSystemGrant(deps: DelegationDeps, workspace: DelegationWorkspace, prove: TrustProver,
+  grant: GrantRow): Promise<GrantRow | ReasonCode> {
+  if (!grant.trust_rule_id) return grant;
+  return await ruleBackedGrant(deps, workspace, prove, grant.owner_user_id, grant.delegate_agent_id) ?? "revoked";
+}
+
 /** The one active, unexpired grant for (owner, delegate), or why there is none (Cloud's liveGrant). */
 function liveGrant(grants: GrantRow[], now: Date): GrantRow | ReasonCode {
   const active = grants.find(grant => grant.status === "active");
@@ -1565,7 +1581,16 @@ export async function decideUnderLocks<T>(database: Database, input: { workspace
    * before the approval lock: a claim release locks grants, then the claim,
    * then approvals, so taking the chain before the approval closes no cycle.
    */
-  chain?: (tx: SqlExecutor) => Promise<ReasonCode | null> },
+  chain?: (tx: SqlExecutor) => Promise<ReasonCode | null>;
+  /**
+   * The acting agent of a cross-owner decision (Cloud's actingGrants, review
+   * of cloud#6672): its active owner-made grants from its own owner are
+   * share-locked with `grantId` in one pass by grant id. Revoke-all locks
+   * grants by id too, so taking them later, inside `decide`, could close a
+   * cycle with a revoke-all that holds one of them and waits on `grantId`.
+   * actingAuthorityLocked reads them under this lock.
+   */
+  actingGrants?: { ownerUserId: string; agentId: string } | null },
   decide: (state: DecisionState, tx: SqlExecutor) => Promise<T>): Promise<T> {
   return database.transaction(async (tx) => {
     // The workspace row first (FOR KEY SHARE: policy writers' FOR NO KEY UPDATE
@@ -1585,9 +1610,13 @@ export async function decideUnderLocks<T>(database: Database, input: { workspace
     const trustRule = input.trustRuleId ? (await tx.query<TrustRuleRow>(
       "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.trustRuleId],
     )).rows[0] ?? null : undefined;
-    const grant = input.grantId ? (await tx.query<GrantRow>(
-      "SELECT * FROM delegation_grants WHERE workspace_id = $1 AND id = $2 FOR SHARE", [input.workspaceId, input.grantId],
-    )).rows[0] ?? null : null;
+    // One locking read, sorted by id: Postgres locks the rows in that order, the order revoke-all uses.
+    const grantRows = input.grantId || input.actingGrants ? (await tx.query<GrantRow>(
+      `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND (id = $2 OR (owner_user_id = $3 AND delegate_agent_id = $4
+          AND status = 'active' AND trust_rule_id IS NULL)) ORDER BY id FOR SHARE`,
+      [input.workspaceId, input.grantId, input.actingGrants?.ownerUserId ?? null, input.actingGrants?.agentId ?? null],
+    )).rows : [];
+    const grant = input.grantId ? grantRows.find(row => row.id === input.grantId) ?? null : null;
     const chainRefusal = input.chain ? await input.chain(tx) : undefined;
     // A consuming call (redeem, gate redeem) takes FOR NO KEY UPDATE, so
     // consumers of one approval serialize: two share holders that each insert
@@ -1713,6 +1742,12 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       }
     }
     if (unbound) refuse(unbound);
+    const current = await currentSystemGrant(deps, workspace, prove, grant);
+    if (typeof current === "string") refuse(current);
+    if ((current as GrantRow).id !== grant.id) {
+      grant = current as GrantRow;
+      context.grantId = grant.id;
+    }
     const related = await ruleRelationRefusal(prove, grant, recipient.agentId, input.callerUserId);
     if (related) refuse(related);
     // A grant that stands on a proof covers messages only from the proof's
@@ -1819,7 +1854,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     // the same transaction, so a change committing meanwhile decides.
     const { attestation, claims } = await decideUnderLocks(deps.database, { workspaceId: workspace.id,
       memberUserIds: [input.callerUserId], grantId: grant.id, approvalId: context.approvalId!,
-      trustRuleId: grant.trust_rule_id ?? null, grantOwnerUserId: grant.owner_user_id, chain: chainUnderLock(workspace, grant, proof) },
+      trustRuleId: grant.trust_rule_id ?? null, grantOwnerUserId: grant.owner_user_id, chain: chainUnderLock(workspace, grant, proof),
+      actingGrants: actingGrantsLock(input.callerUserId, recipient.agentId, grant, tier) },
       async (state, tx) => {
       const stale = freshRefusal(state, { actions, tier, policy, recipientAgentId: recipient.agentId,
         nowMs: deps.now().getTime() });
@@ -1982,6 +2018,9 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     const prove = trustProver(deps, workspace, true);
     const unbound = await delegateStillBound(deps, workspace, grant!, true, { prove });
     if (unbound) refuse(unbound);
+    // The attested grant must still be what the bindings decide now: a superseded one redeems nothing.
+    const current = await currentSystemGrant(deps, workspace, prove, grant!);
+    if (typeof current === "string" || current.id !== grant!.id) refuse("revoked");
     const related = await ruleRelationRefusal(prove, grant!, input.recipientAgentId, input.callerUserId);
     if (related) refuse(related);
     const proof = await reliedProof(prove, grant!);
@@ -2018,7 +2057,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     // same transaction.
     await decideUnderLocks(deps.database, { workspaceId: workspace.id, memberUserIds: [input.callerUserId],
       grantId: grant!.id, approvalId: input.approvalId, consuming: true, trustRuleId: grant!.trust_rule_id ?? null,
-      grantOwnerUserId: grant!.owner_user_id, chain: chainUnderLock(workspace, grant!, proof) },
+      grantOwnerUserId: grant!.owner_user_id, chain: chainUnderLock(workspace, grant!, proof),
+      actingGrants: actingGrantsLock(input.callerUserId, input.recipientAgentId, grant!, approval!.tier) },
       async (state, tx) => {
       const stale = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
@@ -2546,16 +2586,22 @@ export async function bindingState(executor: SqlExecutor, workspaceId: string, o
  * The acting agent's own authority, read inside a deciding transaction (as
  * Cloud's actingAuthorityLocked): the owner's binding lock (shared), so a
  * binding or group write either committed before this read or waits for the
- * decision, then a share lock on the agent's active owner-made grants from
- * that owner. The owner-made grant's Tier O list when there is one, else the
- * owner's binding state.
+ * decision. The agent's active owner-made grants from that owner are
+ * already share-locked: decideUnderLocks `actingGrants` takes them in its one
+ * id-ordered grant pass (review of cloud#6672). Waiting for a grant lock here,
+ * after the minter's grant, could deadlock with revoke-all, so this read locks
+ * FOR SHARE NOWAIT (Cloud's, review of cloud#6674): a grant the pass locked is
+ * taken again at once; one created since is locked now, so a Tier O change to
+ * it waits for this decision; one a writer holds fails the read with 55P03,
+ * answered `unavailable`. The owner-made grant's Tier O list when there is
+ * one, else the owner's binding state.
  */
 export async function actingAuthorityLocked(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string; agentId: string;
   now: Date }): Promise<{ own: ActionClass[] | null; state: BindingState }> {
   await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "shared");
   const rows = (await tx.query<GrantRow>(
     `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
-        AND status = 'active' AND trust_rule_id IS NULL ORDER BY id FOR SHARE`,
+        AND status = 'active' AND trust_rule_id IS NULL ORDER BY id FOR SHARE NOWAIT`,
     [input.workspaceId, input.ownerUserId, input.agentId],
   )).rows;
   const own = rows.find(grant => time(grant.expires_at) > input.now.getTime());
@@ -2617,6 +2663,43 @@ export function decideFor(state: BindingState, agentId: string, path: TrustPath,
   return decide(state.bindings, { agentId, path, groupIds: state.groupsOf(agentId) }, now);
 }
 
+/**
+ * Whether a legacy rule's pre-roles exclusion still stands for one agent. A
+ * pre-roles exclusion lives only on a revoked grant row (OWNER_EXCLUDED).
+ * Once the agent has had an agent binding (any exclusion since roles creates
+ * one, and a conversion carries the old ones), that binding decides: an owner
+ * who removed it lifted the exclusion, also under a legacy rule. Shared by
+ * materializeRuleGrant and the acting agent's ask-first reads, so an agent the
+ * legacy rule excludes never inherits its ask-first list (review of cloud#6672).
+ */
+async function legacyExcludedOn(db: SqlExecutor, input: { workspaceId: string; ownerUserId: string; agentId: string;
+  ruleId: string }): Promise<boolean> {
+  const ownBinding = (await db.query(
+    `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
+        AND principal_ref = $3 LIMIT 1`, [input.workspaceId, input.ownerUserId, input.agentId],
+  )).rows.length > 0;
+  if (ownBinding) return false;
+  return (await db.query(
+    `SELECT 1 FROM delegation_grants
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
+        AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
+    [input.workspaceId, input.ownerUserId, input.agentId, input.ruleId, OWNER_EXCLUDED],
+  )).rows.length > 0;
+}
+
+/**
+ * Which binding decides for one agent, with a legacy rule's pre-roles
+ * exclusion applied (Cloud's decideWithLegacyExclusion): an agent the legacy
+ * rule excluded reads as excluded.
+ */
+export async function decideWithLegacyExclusion(db: SqlExecutor, state: BindingState, input: { workspaceId: string;
+  ownerUserId: string; agentId: string; path: TrustPath; now: Date }): Promise<Decision> {
+  const decision = decideFor(state, input.agentId, input.path, input.now);
+  if (decision.kind !== "covered" || decision.source !== "legacy") return decision;
+  return await legacyExcludedOn(db, { workspaceId: input.workspaceId, ownerUserId: input.ownerUserId, agentId: input.agentId,
+    ruleId: decision.binding.id }) ? { kind: "excluded", binding: decision.binding } : decision;
+}
+
 type GrantShape = { binding: BindingView; authority: Authority; scopes: Scope[]; requireTierO: ActionClass[]; expiresAt: Date };
 
 /** The system grant a covering decision stands for. Null when it covers nothing (roles.ts coversNothing, review B1 on cloud#6665). */
@@ -2624,7 +2707,7 @@ function grantShape(decision: Decision): GrantShape | null {
   if (decision.kind !== "covered") return null;
   const { authority } = decision;
   if (coversNothing(authority)) return null;
-  return { binding: decision.binding, authority, scopes: systemScopes(authority), requireTierO: authority.requireTierO,
+  return { binding: decision.binding, authority, scopes: systemScopes(authority), requireTierO: grantedTierO(authority),
     expiresAt: authority.expiresAt ?? TRUST_RULE_GRANT_EXPIRY };
 }
 
@@ -2736,22 +2819,8 @@ export async function materializeRuleGrant(database: Database, input: { workspac
       await revokeGrants(tx, { workspaceId: workspace.id, grantIds: [active.id], actorUserId: null, reason: SUPERSEDED_BY_RULE,
         authMethod: "system" });
     }
-    if (shape.binding.role === null) {
-      // A pre-roles exclusion lives only on a revoked grant row. Once the agent has had an agent binding (any
-      // exclusion since roles creates one, and a conversion carries the old ones), that binding decides: an owner
-      // who removed it lifted the exclusion, also under a legacy rule.
-      const ownBinding = (await tx.query(
-        `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
-            AND principal_ref = $3 LIMIT 1`, [workspace.id, input.ownerUserId, input.delegateAgentId],
-      )).rows.length > 0;
-      const excluded = !ownBinding && (await tx.query(
-        `SELECT 1 FROM delegation_grants
-          WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
-            AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
-        [...pair, rule.id, OWNER_EXCLUDED],
-      )).rows.length > 0;
-      if (excluded) return null;
-    }
+    if (shape.binding.role === null && await legacyExcludedOn(tx, { workspaceId: workspace.id, ownerUserId: input.ownerUserId,
+      agentId: input.delegateAgentId, ruleId: rule.id })) return null;
     // Created no earlier than the binding (as last changed), every record of
     // the chain, and the last time any grant of the pair ended:
     // - owner-made grants count too;
@@ -3234,8 +3303,19 @@ async function actingAskFirst(deps: DelegationDeps, prove: TrustProver, workspac
   if (own) return new Set(own.require_tier_o);
   const proof = await prove(ownerUserId, agentId);
   if (!proof) return new Set();
-  const decision = decideFor(await bindingState(deps.database, workspace.id, ownerUserId), agentId, proof.path, now);
+  const decision = await decideWithLegacyExclusion(deps.database, await bindingState(deps.database, workspace.id, ownerUserId),
+    { workspaceId: workspace.id, ownerUserId, agentId, path: proof.path, now });
   return new Set(decision.kind === "covered" ? decision.authority.requireTierO : []);
+}
+
+/**
+ * The acting agent's own grants that actingRefusalLocked reads, for
+ * decideUnderLocks to lock with the minter's grant in one id-ordered pass.
+ * Null when the decision never reads them (Tier O, or the same owner).
+ */
+function actingGrantsLock(actingOwnerId: string, actingAgentId: string, grant: GrantRow, tier: "D" | "O"):
+  { ownerUserId: string; agentId: string } | null {
+  return tier === "D" && grant.owner_user_id !== actingOwnerId ? { ownerUserId: actingOwnerId, agentId: actingAgentId } : null;
 }
 
 /** Refuses a Tier D approval from another owner's grant for a class the acting agent must ask its own owner about. */
@@ -3264,7 +3344,8 @@ async function actingRefusalLocked(tx: SqlExecutor, input: { workspace: Delegati
   if (!own) {
     const proof = await resolveTrustPath(sqlTrustReader(tx, true), { workspaceId: input.workspace.id,
       relaycastWorkspaceId: input.workspace.relaycastWorkspaceId, ownerUserId: input.actingOwnerId, agentId: input.actingAgentId });
-    const decision = proof ? decideFor(state, input.actingAgentId, proof.path, input.now) : null;
+    const decision = proof ? await decideWithLegacyExclusion(tx, state, { workspaceId: input.workspace.id,
+      ownerUserId: input.actingOwnerId, agentId: input.actingAgentId, path: proof.path, now: input.now }) : null;
     askFirst = decision?.kind === "covered" ? decision.authority.requireTierO : [];
   }
   return input.actions.some(action => askFirst.includes(action.class)) ? "tier_o_required" : null;
