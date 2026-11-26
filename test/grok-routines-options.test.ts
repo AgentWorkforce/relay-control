@@ -11,7 +11,7 @@ const database = {} as Database;
 const client = createRelaycastClient({ internalOrigin: "https://relaycast.example.test" });
 
 function configWith(extra: Record<string, unknown>): SelfhostConfig {
-  return { publicBaseUrl: "https://relay.example.test/dashboard", encryptionKeyring: KEYRING, ...extra } as unknown as SelfhostConfig;
+  return { dashboardUrl: "https://dashboard.example.test/site", publicBaseUrl: "https://relay.example.test/dashboard", encryptionKeyring: KEYRING, ...extra } as unknown as SelfhostConfig;
 }
 const build = (config: SelfhostConfig, now?: () => Date) =>
   grokRoutinesOptions(config, { database, tenancyMode: "multi", client, ...(now ? { now } : {}) });
@@ -42,6 +42,7 @@ test("options carry the keyring, public origin, tenancy mode, client and clock",
   const now = () => new Date(0);
   const options = build(configWith({}), now);
   assert.equal(options.keyring, KEYRING);
+  assert.equal(options.dashboardOrigin, "https://dashboard.example.test");
   assert.equal(options.publicOrigin, "https://relay.example.test");
   assert.equal(options.tenancyMode, "multi");
   assert.equal(options.client, client);

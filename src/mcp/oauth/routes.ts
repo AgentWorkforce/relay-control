@@ -149,7 +149,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
         {...validated.error,state:validated.state}),302):json(validated.error,400);
     }
     if(principal instanceof Response) {
-      if(principal.status===401) return new Response(null,{status:302,headers:{location:`/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
+      if(principal.status===401) return new Response(null,{status:302,headers:{location:`${deps.grokRoutines.setupOrigin === origin ? "" : deps.grokRoutines.setupOrigin}/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
       return principal;
     }
     if(!await deps.workspaceAccess(principal)) return json({error:"invalid_workspace"},404);
