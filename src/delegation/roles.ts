@@ -190,8 +190,12 @@ export function strictest(a: Authority, b: Authority): Authority {
     a.classes.filter(item => b.classes!.includes(item));
   const classes = shared !== null && targets !== null && !targets.length ?
     shared.filter(item => OWN_OWNER_ONLY_CLASSES.includes(item)) : shared;
-  const requireTierO = [...new Set([...a.requireTierO, ...b.requireTierO])]
-    .filter(item => classes === null || classes.includes(item));
+  // Every ask-first of either side stays, also for a class the combination no
+  // longer grants (review of relay-control#345): the acting agent's own
+  // ask-first list is read from it, so two groups that both ask first for
+  // merges keep asking even when their repos do not overlap. A system grant
+  // stores only the granted ones (grantedTierO).
+  const requireTierO = [...new Set([...a.requireTierO, ...b.requireTierO])];
   const prOpsLimit = a.prOpsLimit === null ? b.prOpsLimit : b.prOpsLimit === null ? a.prOpsLimit :
     a.prOpsLimit.filter(op => b.prOpsLimit!.includes(op));
   const requiredConditions: RequiredConditions = {};
@@ -272,6 +276,17 @@ export function coversNothing(authority: Authority): boolean {
 }
 
 /**
+ * The ask-first classes an authority also grants: what a system grant stores
+ * and what the role display compares. An authority's own list may also hold
+ * classes a combination no longer grants (strictest); those still bind the
+ * acting agent's ask-first check, but a grant has no use for them.
+ */
+export function grantedTierO(authority: Pick<Authority, "classes" | "requireTierO">): ActionClass[] {
+  return authority.classes === null ? [...authority.requireTierO] :
+    authority.requireTierO.filter(item => authority.classes!.includes(item));
+}
+
+/**
  * The role an authority amounts to, for display (Cloud's displayRole): the
  * preset whose classes, ask-first list, pr_ops limit and required conditions
  * it matches (targets and expiry aside), else `custom`. A combination of
@@ -286,7 +301,7 @@ export function displayRole(authority: Authority): PresetRole | "custom" {
     (value[item] ?? []).map(condition => condition.type).sort()));
   return PRESET_ROLES.find(role => {
     const preset = PRESETS[role];
-    return same(authority.classes, preset.classes) && same(authority.requireTierO, preset.requireTierO) &&
+    return same(authority.classes, preset.classes) && same(grantedTierO(authority), preset.requireTierO) &&
       same(authority.prOpsLimit, preset.prOpsLimit) && conditions(authority.requiredConditions) === conditions(preset.requiredConditions);
   }) ?? "custom";
 }

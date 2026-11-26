@@ -48,7 +48,7 @@ import {
 } from "./scope.js";
 import { ACTION_CLASSES } from "./scope.js";
 import {
-  PR_OPS_OPS, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, coversNothing, decide, requiredConditionsOf, sameScopes,
+  PR_OPS_OPS, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, coversNothing, decide, grantedTierO, requiredConditionsOf, sameScopes,
   systemScopes, systemScopesCover, type Authority, type BindingFields, type BindingView, type Decision, type PrOp,
   type PrincipalKind, type RequiredCondition, type RequiredConditions, type Role,
 } from "./roles.js";
@@ -2707,7 +2707,7 @@ function grantShape(decision: Decision): GrantShape | null {
   if (decision.kind !== "covered") return null;
   const { authority } = decision;
   if (coversNothing(authority)) return null;
-  return { binding: decision.binding, authority, scopes: systemScopes(authority), requireTierO: authority.requireTierO,
+  return { binding: decision.binding, authority, scopes: systemScopes(authority), requireTierO: grantedTierO(authority),
     expiresAt: authority.expiresAt ?? TRUST_RULE_GRANT_EXPIRY };
 }
 

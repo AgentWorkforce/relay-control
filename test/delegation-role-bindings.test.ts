@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, isValidBindingTarget, type BindingFields, coversNothing, decide, displayRole, readOnlyAuthority, requiredConditionsOf, strictest,
+  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, isValidBindingTarget, type BindingFields, coversNothing, decide, displayRole, grantedTierO, readOnlyAuthority, requiredConditionsOf, strictest,
   systemScopes, systemScopesCover, type Authority, type BindingView,
 } from "../src/delegation/roles.js";
 import { CLASS_DESCRIPTIONS } from "../src/delegation/scope.js";
@@ -100,7 +100,9 @@ test("decide: a launched agent never inherits its spawner's role; the legacy rul
   const relay = preset("trusted", { id: "dtr_a_relay", principalKind: "relay_agents" });
   const decision = decide([relay], { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
   assert.equal(decision.kind === "covered" && decision.source, "spawn_default");
-  assert.deepEqual(decision.kind === "covered" && decision.authority, readOnlyAuthority());
+  // What it grants is the Read-only preset; the root's ask-first list stays on the authority (review of relay-control#345).
+  assert.ok(decision.kind === "covered");
+  assert.deepEqual({ ...decision.authority, requireTierO: grantedTierO(decision.authority) }, readOnlyAuthority());
   const legacy: BindingView = { id: "dtr_z_legacy", principalKind: "all_agents", principalRef: null, role: null, classes: null,
     requireTierO: [], prOpsLimit: null, requiredConditions: {}, targets: null, expiresAt: null };
   assert.equal((decide([legacy], { agentId: "worker-1", path: spawned, groupIds: [] }, NOW) as { source: string }).source, "legacy");
@@ -268,7 +270,9 @@ test("review of cloud#6672: a launched agent's default never drops its root bind
   // A Trusted root still gives exactly the Read-only preset.
   const trusted = decide([preset("trusted", { id: "dtr_s_trusted", principalKind: "relay_agents" })],
     { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
-  assert.deepEqual(trusted.kind === "covered" && trusted.authority, readOnlyAuthority());
+  assert.ok(trusted.kind === "covered");
+  assert.deepEqual({ ...trusted.authority, requireTierO: grantedTierO(trusted.authority) }, readOnlyAuthority());
+  assert.equal(displayRole(trusted.authority), "read_only");
 });
 
 test("review of cloud#6672: non-overlapping repos keep the session classes both allow and drop every repo-scoped class", () => {
@@ -277,7 +281,8 @@ test("review of cloud#6672: non-overlapping repos keep the session classes both 
   const both = strictest({ ...mixed, targets: ["acme/api"] }, { ...mixed, classes: ["config_change", "merge"], targets: ["acme/web"] });
   assert.deepEqual(both.classes, ["config_change"]);
   assert.deepEqual(both.targets, []);
-  assert.deepEqual(both.requireTierO, []);
+  assert.deepEqual(both.requireTierO, ["prompt_approval"]);
+  assert.deepEqual(grantedTierO(both), []);
   assert.deepEqual(both.requiredConditions, {});
   assert.equal(coversNothing(both), false);
   const scopes = systemScopes(both);
@@ -303,4 +308,23 @@ test("review of cloud#6672: displayRole names what combined groups amount to", (
     assert.equal(displayRole({ classes: [...PRESETS[role].classes], requireTierO: [...PRESETS[role].requireTierO],
       prOpsLimit: PRESETS[role].prOpsLimit, requiredConditions: PRESETS[role].requiredConditions, targets: ["acme/*"], expiresAt: null }), role);
   }
+});
+
+test("review of relay-control#345: two groups that both ask first for merges keep asking when their repos do not overlap", () => {
+  const a = custom({ id: "dtr_m_a", principalKind: "group", principalRef: "grp_a", classes: ["merge", "config_change"],
+    requireTierO: ["merge"], targets: ["acme/api"] });
+  const b = custom({ id: "dtr_m_b", principalKind: "group", principalRef: "grp_b", classes: ["merge", "config_change"],
+    requireTierO: ["merge"], targets: ["acme/web"] });
+  const decision = decide([a, b], { agentId: "grok-1", path: grokRoot, groupIds: ["grp_a", "grp_b"] }, NOW);
+  assert.ok(decision.kind === "covered");
+  // No merge is granted, but the acting agent's ask-first list (decision.authority.requireTierO) still holds merge.
+  assert.deepEqual(decision.authority.classes, ["config_change"]);
+  assert.deepEqual(decision.authority.requireTierO, ["merge"]);
+  // The system grant stores only what it grants.
+  assert.deepEqual(grantedTierO(decision.authority), []);
+  // Disjoint classes keep both ask-first lists too.
+  const both = strictest({ classes: ["merge"], requireTierO: ["merge"], prOpsLimit: null, requiredConditions: {}, targets: null, expiresAt: null },
+    { classes: ["deploy"], requireTierO: ["deploy"], prOpsLimit: null, requiredConditions: {}, targets: null, expiresAt: null });
+  assert.deepEqual(both.classes, []);
+  assert.deepEqual(both.requireTierO, ["merge", "deploy"]);
 });
