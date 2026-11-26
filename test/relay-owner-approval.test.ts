@@ -5,7 +5,7 @@ import { checkOwnerApproval, relayFailure } from "../src/mcp/relay-participants.
 
 // A delegate's owner_approval rides beside the text exactly as given (relay
 // client::send_with_owner_approval; Cloud's hosted MCP twin, cloud#6689).
-const approval = { v: 1, owner_id: "user-1", actions: [{ class: "merge", target: "acme/web#7", conditions: [{ type: "ci_green" }] }],
+const approval = { v: 1, owner_id: "0b6f3c1e-8f9a-4d2b-9c71-2e5a4f3d1b08", actions: [{ class: "merge", target: "acme/web#7", conditions: [{ type: "ci_green" }] }],
   quote: "merge it once green" };
 
 function fixture() {

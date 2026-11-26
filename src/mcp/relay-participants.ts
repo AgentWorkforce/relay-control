@@ -330,7 +330,7 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
   const message = error instanceof RelayToolError ? error.message
     : registrationConflict ? "That relay name is already taken. Choose another name."
     : upstream?.status === 400 && upstream.code === "invalid_owner_approval"
-    ? "Relay refused owner_approval as invalid, so nothing was sent. Check it against the owner_approval contract (v: 1, owner_id, 1 to 20 actions of a known class and target) and send again."
+    ? "Relay refused owner_approval as invalid, so nothing was sent. Check it against the owner_approval v1 contract and send again."
     : upstream?.status === 404 ? "The relay agent or address is no longer available. Refresh list_relay_agents."
     : operation === "leave" ? "Leaving the hosted relay participant failed. It is safe to retry leave_relay."
     : "Relay operation failed. If a send was attempted, its outcome may be unknown. Retry only with the same supplied idempotency_key; if you omitted it and received no receipt, check the conversation before retrying.";
