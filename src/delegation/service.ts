@@ -3279,42 +3279,54 @@ export type RoleQuiesceReport = { dry_run: boolean; bindings: Array<{ workspace_
  * from before roles reads any live row of delegation_trust_rules as an
  * owner's legacy rule (every class, the whole spawn tree), and any system
  * grant as covering every class. So before rolling back below the build that
- * added roles, every role binding must end. This revokes every live row that
- * is not a plain legacy rule (principal `all_agents` with no role), and with
- * each one its system grants and their approvals, with reason
- * `role_bindings_quiesced`, under the owner's exclusive binding lock.
+ * added roles, every owner who has a role binding loses ALL their live
+ * rules, their legacy rule included, with every system grant and its
+ * approvals, in one transaction per owner under the owner's exclusive
+ * binding lock (reason `role_bindings_quiesced`). A legacy rule left live
+ * under a revoked exclusion, Read-only group or connector binding would be
+ * what those agents fall through to: every class. An owner with only a
+ * plain legacy rule is left untouched.
  *
- * What it does and does not do:
- * - Agents lose the authority their role bindings gave them, never gain it.
- * - An owner whose rule the role seed converted is left with nothing, and
- *   turns the legacy rule on again after the rollback.
- * - Exclusions do NOT survive the rollback. The old build checks
- *   owner_excluded grant rows only for the rule's own id, an exclusion made
- *   since roles may have no grant row at all, and a legacy rule turned on
- *   again has a new id. That owner must revoke those agents' grants again.
- * - One call handles at most `limit` rows and does not say whether more
- *   remain: rerun until a dry run lists nothing.
- * - A row written after the call survives it. Stop writes first (delegation
- *   off, or a read-only window), and dry-run again right before cutover.
+ * It fails closed: agents lose authority, never gain it.
+ * - Exclusions made since roles do NOT survive a rollback. The old build
+ *   reads owner_excluded grant rows only for the rule's own id, an exclusion
+ *   may have none, and a re-enabled legacy rule has a new id. An owner who
+ *   re-enables the legacy rule must revoke those agents' grants again.
+ * - An owner whose rule the seed converted turns the legacy rule on again
+ *   after the rollback.
+ * - It pages by owner: at most `limit` owners per call, and the report does
+ *   not say whether more remain. Rerun until a dry run lists nothing.
+ * - A row written after the call survives it. Stop writes first, and
+ *   dry-run again right before cutover.
  *
- * A DRY RUN by default. See docs/owner-delegates.md, "Rolling back role
- * bindings".
+ * A DRY RUN by default: it lists every rule an apply would end, the legacy
+ * rules of affected owners included. See docs/owner-delegates.md, "Rolling
+ * back role bindings".
  */
 export async function quiesceRoleBindings(database: Database, input: { apply: boolean; limit: number }): Promise<RoleQuiesceReport> {
-  const live = (await database.query<TrustRuleRow>(
-    `SELECT * FROM delegation_trust_rules WHERE revoked_at IS NULL AND NOT (${LEGACY_RULE}) ORDER BY id LIMIT $1`, [input.limit],
+  const owners = (await database.query<{ workspace_id: string; owner_user_id: string }>(
+    `SELECT DISTINCT workspace_id::text AS workspace_id, owner_user_id::text AS owner_user_id FROM delegation_trust_rules
+      WHERE revoked_at IS NULL AND NOT (${LEGACY_RULE})
+      ORDER BY workspace_id, owner_user_id LIMIT $1`, [input.limit],
   )).rows;
-  const report: RoleQuiesceReport = { dry_run: !input.apply, revoked_grants: 0, bindings: live.map(row => ({
-    workspace_id: row.workspace_id, owner_id: row.owner_user_id, binding_id: row.id, principal_kind: row.principal_kind ?? "all_agents",
-    role: row.role ?? null })) };
-  if (!input.apply) return report;
-  for (const row of live) {
-    report.revoked_grants += await database.transaction(async (tx) => {
-      await lockOwnerBindings(tx, row.workspace_id, row.owner_user_id, "exclusive");
-      const [rule] = await revokeTrustRulesTx(tx, { workspaceId: row.workspace_id, ownerUserId: row.owner_user_id, ruleId: row.id,
-        actorUserId: null, authMethod: "system", reason: "role_bindings_quiesced" });
-      return rule?.revokedGrants.length ?? 0;
+  const report: RoleQuiesceReport = { dry_run: !input.apply, revoked_grants: 0, bindings: [] };
+  const view = (row: TrustRuleRow) => ({ workspace_id: row.workspace_id, owner_id: row.owner_user_id, binding_id: row.id,
+    principal_kind: row.principal_kind ?? "all_agents", role: row.role ?? null });
+  for (const owner of owners) {
+    if (!input.apply) {
+      // Every live rule of this owner, its legacy rule included, is what an apply ends.
+      report.bindings.push(...(await listBindings(database, owner.workspace_id, owner.owner_user_id)).map(view));
+      continue;
+    }
+    const revoked = await database.transaction(async (tx) => {
+      await lockOwnerBindings(tx, owner.workspace_id, owner.owner_user_id, "exclusive");
+      return revokeTrustRulesTx(tx, { workspaceId: owner.workspace_id, ownerUserId: owner.owner_user_id, actorUserId: null,
+        authMethod: "system", reason: "role_bindings_quiesced" });
     });
+    for (const rule of revoked) {
+      report.bindings.push(view(rule));
+      report.revoked_grants += rule.revokedGrants.length;
+    }
   }
   return report;
 }

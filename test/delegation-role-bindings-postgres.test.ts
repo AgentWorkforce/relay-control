@@ -396,3 +396,37 @@ test("review: the rollback quiesce ends every role binding with its grants, keep
   await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, requireTierO: [], authMethod: "session" });
   assert.equal((await quiesceRoleBindings(f.database, { apply: false, limit: 100 })).bindings.length, 0);
 });
+
+test("review: the quiesce ends a legacy rule that sits under role bindings; another owner's plain legacy rule stays", options, async (t) => {
+  const f = await fixture(t);
+  const legacy = (await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, requireTierO: [],
+    authMethod: "session" })).rule;
+  await f.bind("connector_kind", "grok-bot", "read_only");
+  await f.bind("agent", "relay-1", "excluded");
+  const readOnly = (await f.materialize("grok-1", grokPath("grok-1")))!;
+  const worker = (await f.materialize("worker-1", workerPath("worker-1")))!;
+  // Another owner in the same workspace with only a plain legacy rule.
+  const otherId = randomUUID();
+  await f.database.query("INSERT INTO users (id, email, name) VALUES ($1, $2, 'Other')", [otherId, `other-${otherId}@example.test`]);
+  await f.database.query(`INSERT INTO organization_memberships (organization_id, user_id, role)
+    SELECT organization_id, $2, 'member' FROM workspaces WHERE id = $1`, [f.workspaceId, otherId]);
+  const otherRule = (await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: otherId, requireTierO: [],
+    authMethod: "session" })).rule;
+
+  const dry = await quiesceRoleBindings(f.database, { apply: false, limit: 100 });
+  assert.equal(dry.bindings.length, 3);
+  assert.ok(dry.bindings.some(row => row.binding_id === legacy.id));
+  assert.equal(dry.bindings.some(row => row.binding_id === otherRule.id), false);
+  const applied = await quiesceRoleBindings(f.database, { apply: true, limit: 100 });
+  assert.deepEqual([applied.bindings.length, applied.revoked_grants], [3, 2]);
+  assert.deepEqual(await listBindings(f.database, f.workspaceId, f.ownerId), []);
+  assert.equal((await f.database.query(
+    "SELECT 1 FROM delegation_grants WHERE owner_user_id = $1 AND status = 'active'", [f.ownerId])).rows.length, 0);
+  assert.deepEqual([(await f.grant(readOnly.id)).status, (await f.grant(worker.id)).status], ["revoked", "revoked"]);
+  // Nothing left to fall through to.
+  for (const [agent, path] of [["grok-1", grokPath("grok-1")], ["relay-1", claimPath("relay-1")], ["worker-1", workerPath("worker-1")]] as const) {
+    assert.equal(await f.materialize(agent, path), null, agent);
+  }
+  assert.equal((await liveTrustRule(f.database, f.workspaceId, otherId))?.id, otherRule.id);
+  assert.equal((await quiesceRoleBindings(f.database, { apply: false, limit: 100 })).bindings.length, 0);
+});

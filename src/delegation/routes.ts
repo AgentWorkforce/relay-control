@@ -648,7 +648,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       // The rollback step for role bindings (docs/owner-delegates.md, "Rolling back role bindings"): before
       // rolling back below the build that added roles, every role binding ends with its grants. Service-
       // authenticated (SELFHOST_INTERNAL_TOKEN), off without it, and a DRY RUN unless `{"apply": true}`.
-      // At most `limit` rows per call: rerun until a dry run lists nothing, with writes stopped first.
+      // Every owner with a role binding loses all their rules, legacy included. At most `limit` owners per call:
+      // rerun until a dry run lists nothing, with writes stopped first.
       const token = bearer(request);
       if (!input.internalServiceToken) return fail("not_found", "Route not found", 404);
       if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);

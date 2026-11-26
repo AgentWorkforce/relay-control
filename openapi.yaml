@@ -4077,10 +4077,13 @@ paths:
       tags: [Owner delegates]
       description: |
         Operator only (SELFHOST_INTERNAL_TOKEN; 404 without it). The rollback step
-        for role bindings: revokes every live rule that is not a plain legacy rule,
-        with its system grants and their approvals (reason `role_bindings_quiesced`),
-        because a build from before roles would read it as an every-class rule. A
-        DRY RUN unless `{"apply": true}`; idempotent. At most `limit` rows per call,
+        for role bindings: every owner with a live role binding loses ALL their live
+        rules, the legacy rule included, with their system grants and approvals
+        (reason `role_bindings_quiesced`), one transaction per owner; an owner with
+        only a plain legacy rule is untouched. A build from before roles would read
+        a binding as an every-class rule, and a legacy rule left live would be what
+        restricted agents fall through to. A DRY RUN unless `{"apply": true}` (it
+        lists every rule an apply would end); idempotent. At most `limit` owners per call,
         and the report does not say whether more remain: stop writes first, rerun
         until a dry run lists nothing, and dry-run again right before cutover.
         Exclusions do not survive a rollback. See docs/owner-delegates.md,

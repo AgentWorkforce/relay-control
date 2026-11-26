@@ -867,15 +867,20 @@ The runbook:
    old build reads it as a legacy every-class rule.
 2. **Apply the quiesce.** `POST /internal/v1/delegation/role-quiesce` with
    the service token and `{"apply": true}`, with the operator's go. A dry run
-   (`{}`) first shows what it would revoke. It revokes each live binding that
-   is not a plain legacy rule, with its system grants and their approvals,
-   under the owner's binding lock, with reason `role_bindings_quiesced`.
+   (`{}`) first lists every rule an apply would end. Every owner who has a
+   live role binding loses ALL their live rules, the legacy rule included,
+   with their system grants and approvals, in one transaction under the
+   owner's binding lock, with reason `role_bindings_quiesced`. A legacy rule
+   left live under a revoked exclusion, Read-only group or connector binding
+   would be what those agents fall through to: every class. An owner with
+   only a plain legacy rule is untouched.
 3. **Rerun until a dry run lists nothing.** One call handles at most `limit`
-   rows (default 1000), and the report does not say whether more remain.
+   owners (default 1000), and the report does not say whether more remain.
 4. **Dry-run again right before cutover, and require an empty list.** Any row
    written in between survives and reads as a legacy every-class rule on the
    old build.
-5. Roll back. Agents have lost the authority their role bindings gave them.
+5. Roll back. Any owner who had a role binding has no rule at all now; their
+   agents lost the authority their bindings and their legacy rule gave them.
 
 **Exclusions do not survive a rollback.** The old build checks
 `owner_excluded` grant rows only for the rule's own id. An exclusion made

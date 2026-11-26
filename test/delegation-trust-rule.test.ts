@@ -766,11 +766,18 @@ test("role-seed and role-quiesce answer the operator credential through the dele
   for (const path of ["/internal/v1/delegation/role-seed", "/internal/v1/delegation/role-quiesce"]) {
     const call = (body: unknown, token: string | null = INTERNAL) => request(env.origin, path, { method: "POST",
       ...(token ? { token } : {}), body });
-    assert.equal((await call({}, null)).status, 401, path);
-    assert.equal((await call({}, env.desktop.accessToken)).status, 401, path);
-    assert.equal((await call({ apply: "yes" })).status, 400, path);
+    for (const [body, token, status, code] of [[{}, null, 401, "unauthorized"], [{}, env.desktop.accessToken, 401, "unauthorized"],
+      [{ apply: "yes" }, INTERNAL, 400, "invalid_request"]] as const) {
+      const refused = await call(body, token);
+      assert.equal(refused.status, status, `${path} ${refused.raw}`);
+      assert.match(refused.headers.get("content-type") ?? "", /application\/json/u, path);
+      assert.equal(refused.body.code, code, `${path} ${refused.raw}`);
+      assert.equal(typeof refused.body.error, "string", path);
+    }
     const dry = await call({});
     assert.equal(dry.status, 200, `${path} ${dry.raw}`);
+    assert.match(dry.headers.get("content-type") ?? "", /application\/json/u, path);
+    assert.equal(dry.headers.get("cache-control"), "no-store", path);
     assert.equal(dry.body.dry_run, true, path);
   }
   // An apply through the handler: a legacy rule becomes Trusted for Relay agents, then the quiesce ends it.
