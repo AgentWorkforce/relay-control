@@ -2554,8 +2554,38 @@ export async function actingAuthorityLocked(tx: SqlExecutor, input: { workspaceI
  * latest creation or change of every binding that contributed. For a custom
  * group that also includes the moment the agent joined each deciding group.
  * A system grant is never dated before it. A legacy rule counts only its
- * creation: its Tier O PUT updates its grants in place, as before roles.
+ * creation: its Tier O PUT updates its grants in place and never re-dated
+ * them before roles, so it does not date a new grant now.
  */
+/**
+ * The latest change to anything that decides for one owner's agents (Cloud's
+ * ownerChangeFloor): a role binding created, changed, revoked or expired; a
+ * group revoked; a member added or removed. A legacy rule's own Tier O change
+ * is left out, as in decisionSince. A new system grant is never dated before
+ * it. Removing or outliving a more specific, restrictive binding (an
+ * exclusion, a Read-only group) must not cover an approval the agent sent
+ * while that restriction still decided, even when the agent had no grant yet.
+ * Owner-wide on purpose: it never needs to know which binding decided before.
+ */
+async function ownerChangeFloor(tx: SqlExecutor, workspaceId: string, ownerUserId: string, now: Date): Promise<number> {
+  const rules = (await tx.query<{ changed: Date | string | null }>(
+    `SELECT max(greatest(
+        CASE WHEN role IS NULL AND principal_kind = 'all_agents' THEN created_at ELSE updated_at END,
+        revoked_at,
+        CASE WHEN expires_at <= $3::timestamptz THEN expires_at END)) AS changed
+       FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2`,
+    [workspaceId, ownerUserId, now],
+  )).rows[0];
+  const groups = (await tx.query<{ changed: Date | string | null }>(
+    `SELECT max(greatest(g.revoked_at, m.added_at, m.removed_at)) AS changed
+       FROM delegation_groups g LEFT JOIN delegation_group_members m ON m.group_id = g.id
+      WHERE g.workspace_id = $1 AND g.owner_user_id = $2`,
+    [workspaceId, ownerUserId],
+  )).rows[0];
+  const at = (value: Date | string | null | undefined) => value ? new Date(value).getTime() : 0;
+  return Math.max(at(rules?.changed), at(groups?.changed));
+}
+
 function decisionSince(state: BindingState, decision: Decision, agentId: string): number {
   if (decision.kind !== "covered") return 0;
   const now = Date.now();
@@ -2694,7 +2724,14 @@ export async function materializeRuleGrant(database: Database, input: { workspac
         authMethod: "system" });
     }
     if (shape.binding.role === null) {
-      const excluded = (await tx.query(
+      // A pre-roles exclusion lives only on a revoked grant row. Once the agent has had an agent binding (any
+      // exclusion since roles creates one, and a conversion carries the old ones), that binding decides: an owner
+      // who removed it lifted the exclusion, also under a legacy rule.
+      const ownBinding = (await tx.query(
+        `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
+            AND principal_ref = $3 LIMIT 1`, [workspace.id, input.ownerUserId, input.delegateAgentId],
+      )).rows.length > 0;
+      const excluded = !ownBinding && (await tx.query(
         `SELECT 1 FROM delegation_grants
           WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
             AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
@@ -2722,7 +2759,10 @@ export async function materializeRuleGrant(database: Database, input: { workspac
       time(row.status === "revoked" ? row.revoked_at ?? row.expires_at : row.expires_at))) : 0;
     // No earlier than every contributing binding's creation and last change,
     // and a group member's joining (decisionSince): new authority is never retroactive.
-    const createdAt = new Date(Math.max(decisionSince(state, decision, input.delegateAgentId), input.provenAt.getTime(), endedAt));
+    // Nor before the owner's latest change to anything that decides (ownerChangeFloor): removing or outliving a
+    // restrictive binding never covers an approval sent while it decided, even for an agent with no grant yet.
+    const createdAt = new Date(Math.max(decisionSince(state, decision, input.delegateAgentId),
+      await ownerChangeFloor(tx, workspace.id, input.ownerUserId, new Date()), input.provenAt.getTime(), endedAt));
     const row = (await tx.query<GrantRow>(
       `INSERT INTO delegation_grants
          (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name, scopes, require_tier_o,
@@ -2910,9 +2950,10 @@ async function carryLegacyExclusions(tx: SqlExecutor, rule: TrustRuleRow, actorU
   )).rows.map(row => row.delegate_agent_id))];
   const carried: string[] = [];
   for (const agentId of agents) {
+    // Any agent binding, live or revoked, already decides for it: a removed exclusion is not brought back.
     const own = (await tx.query(
       `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
-          AND principal_ref = $3 AND revoked_at IS NULL LIMIT 1`, [rule.workspace_id, rule.owner_user_id, agentId],
+          AND principal_ref = $3 LIMIT 1`, [rule.workspace_id, rule.owner_user_id, agentId],
     )).rows[0];
     if (own) continue;
     const row = (await tx.query<TrustRuleRow>(
@@ -3212,4 +3253,53 @@ async function actingRefusalLocked(tx: SqlExecutor, input: { workspace: Delegati
     askFirst = decision?.kind === "covered" ? decision.authority.requireTierO : [];
   }
   return input.actions.some(action => askFirst.includes(action.class)) ? "tier_o_required" : null;
+}
+
+
+export type RoleQuiesceReport = { dry_run: boolean; bindings: Array<{ workspace_id: string; owner_id: string; binding_id: string;
+  principal_kind: string; role: string | null }>; revoked_grants: number };
+
+/**
+ * The rollback step for role bindings (Cloud's quiesceRoleBindings). A build
+ * from before roles reads any live row of delegation_trust_rules as an
+ * owner's legacy rule (every class, the whole spawn tree), and any system
+ * grant as covering every class. So before rolling back below the build that
+ * added roles, every role binding must end. This revokes every live row that
+ * is not a plain legacy rule (principal `all_agents` with no role), and with
+ * each one its system grants and their approvals, with reason
+ * `role_bindings_quiesced`, under the owner's exclusive binding lock.
+ *
+ * What it does and does not do:
+ * - Agents lose the authority their role bindings gave them, never gain it.
+ * - An owner whose rule the role seed converted is left with nothing, and
+ *   turns the legacy rule on again after the rollback.
+ * - Exclusions do NOT survive the rollback. The old build checks
+ *   owner_excluded grant rows only for the rule's own id, an exclusion made
+ *   since roles may have no grant row at all, and a legacy rule turned on
+ *   again has a new id. That owner must revoke those agents' grants again.
+ * - One call handles at most `limit` rows and does not say whether more
+ *   remain: rerun until a dry run lists nothing.
+ * - A row written after the call survives it. Stop writes first (delegation
+ *   off, or a read-only window), and dry-run again right before cutover.
+ *
+ * A DRY RUN by default. See docs/owner-delegates.md, "Rolling back role
+ * bindings".
+ */
+export async function quiesceRoleBindings(database: Database, input: { apply: boolean; limit: number }): Promise<RoleQuiesceReport> {
+  const live = (await database.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules WHERE revoked_at IS NULL AND NOT (${LEGACY_RULE}) ORDER BY id LIMIT $1`, [input.limit],
+  )).rows;
+  const report: RoleQuiesceReport = { dry_run: !input.apply, revoked_grants: 0, bindings: live.map(row => ({
+    workspace_id: row.workspace_id, owner_id: row.owner_user_id, binding_id: row.id, principal_kind: row.principal_kind ?? "all_agents",
+    role: row.role ?? null })) };
+  if (!input.apply) return report;
+  for (const row of live) {
+    report.revoked_grants += await database.transaction(async (tx) => {
+      await lockOwnerBindings(tx, row.workspace_id, row.owner_user_id, "exclusive");
+      const [rule] = await revokeTrustRulesTx(tx, { workspaceId: row.workspace_id, ownerUserId: row.owner_user_id, ruleId: row.id,
+        actorUserId: null, authMethod: "system", reason: "role_bindings_quiesced" });
+      return rule?.revokedGrants.length ?? 0;
+    });
+  }
+  return report;
 }

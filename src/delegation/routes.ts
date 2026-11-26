@@ -87,7 +87,7 @@ import {
 } from "./roles.js";
 import {
   BindingExists, GroupNotFound, bindingCoverage, bindingState, bindingViewOf, createBinding, createGroup, decideFor, getBinding,
-  listBindings, listGroups, listOwnerAgentCandidates, revokeBinding, revokeGroup, seedTrustedBindings, updateBinding, updateGroup,
+  listBindings, listGroups, listOwnerAgentCandidates, quiesceRoleBindings, revokeBinding, revokeGroup, seedTrustedBindings, updateBinding, updateGroup,
   type GroupRecord, type TrustRuleRow as BindingRow,
 } from "./service.js";
 import { trustPathFingerprint } from "./trust.js";
@@ -222,6 +222,9 @@ const trustBackfillBody = z.object({
 export const TRUST_BACKFILL_PATH = "/internal/v1/delegation/trust-backfill";
 /** POST /internal/v1/delegation/role-seed: a dry run unless `apply` is true; pages by rule id. */
 export const ROLE_SEED_PATH = "/internal/v1/delegation/role-seed";
+/** POST /internal/v1/delegation/role-quiesce: the rollback step; a dry run unless `apply` is true. */
+export const ROLE_QUIESCE_PATH = "/internal/v1/delegation/role-quiesce";
+const roleQuiesceBody = z.object({ apply: z.boolean().optional(), limit: z.number().int().min(1).max(5000).optional() }).strict();
 const roleSeedBody = z.object({
   apply: z.boolean().optional(),
   limit: z.number().int().min(1).max(500).optional(),
@@ -444,7 +447,7 @@ function policyRefusal(classes: readonly ActionClass[], policy: DelegationPolicy
 
 export function isDelegationPath(path: string): boolean {
   return path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}` || ORG_POLICY_PATH.test(path)
-    || path === TRUST_BACKFILL_PATH
+    || path === TRUST_BACKFILL_PATH || path === ROLE_SEED_PATH || path === ROLE_QUIESCE_PATH
     || /^\/api\/v1\/workspaces\/[^/]+\/(delegates(\/.*)?|messaging\/delegation(\/redeem|\/prompt-delegates|\/withdraw)?)$/.test(path);
 }
 
@@ -636,6 +639,27 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         report = await backfillConnectorRoots(input.database, { apply: body.apply === true, limit: body.limit, after: body.after });
       } catch (error) {
         logUnavailable("trust_backfill", error, {});
+        return UNAVAILABLE();
+      }
+      input.json(response, 200, report, true);
+      return true;
+    }
+    if (path === ROLE_QUIESCE_PATH) {
+      // The rollback step for role bindings (docs/owner-delegates.md, "Rolling back role bindings"): before
+      // rolling back below the build that added roles, every role binding ends with its grants. Service-
+      // authenticated (SELFHOST_INTERNAL_TOKEN), off without it, and a DRY RUN unless `{"apply": true}`.
+      // At most `limit` rows per call: rerun until a dry run lists nothing, with writes stopped first.
+      const token = bearer(request);
+      if (!input.internalServiceToken) return fail("not_found", "Route not found", 404);
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      if (!token || !secureEqual(token, input.internalServiceToken)) return fail("unauthorized", "Unauthorized", 401);
+      const raw = await readJson(request);
+      const body = parse(roleQuiesceBody, raw === undefined ? {} : raw, "Invalid request");
+      let report;
+      try {
+        report = await quiesceRoleBindings(input.database, { apply: body.apply === true, limit: body.limit ?? 1000 });
+      } catch (error) {
+        logUnavailable("role_quiesce", error, {});
         return UNAVAILABLE();
       }
       input.json(response, 200, report, true);
@@ -1249,9 +1273,12 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const relayAgents = bindings.some(binding => binding.principal_kind === "relay_agents");
           json(200, {
             bindings: bindings.map(binding => bindingView(binding, { covered: coverage.get(binding.id) ?? 0, policy, groupNames: names })),
-            // One click: Trusted for every Relay agent, offered while none is set and delegation is on.
+            // One click: Trusted for every Relay agent, offered while none is set and delegation is on. With a
+            // legacy rule, `binding_id` names it: apply with PATCH {role: "trusted"} on it, not with POST.
             recommendation: !relayAgents && policy.delegation_enabled ? { principal: { kind: "relay_agents", ref: null },
-              role: "trusted", label: "Give your Relay agents Trusted" } : null,
+              role: "trusted", label: "Give your Relay agents Trusted",
+              binding_id: bindings.find(binding => (binding.principal_kind ?? "all_agents") === "all_agents" &&
+                (binding.role ?? null) === null)?.id ?? null } : null,
           });
           return true;
         }
@@ -1273,7 +1300,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           fail("invalid_request", "Only built-in groups can be bound in every workspace", 400);
         }
         const create = async (targetWorkspaceId: string): Promise<TrustRuleRow | { skipped: string }> => {
-          if (!(await loadPolicy(input.database, targetWorkspaceId)).delegation_enabled) return { skipped: "not_enabled" };
+          // An exclusion only removes authority: allowed while delegation is off, as revoking is.
+          if ((fields as BindingFields).role !== "excluded" &&
+              !(await loadPolicy(input.database, targetWorkspaceId)).delegation_enabled) return { skipped: "not_enabled" };
           // An agent principal must prove out as the caller's, by ownership chain, never by name.
           if (target.kind === "agent" && !await prove(ownerUserId, target.ref)) return { skipped: "not_owned" };
           try {
@@ -1301,12 +1330,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           json(409, { error: "A binding for this principal already exists", code: "binding_exists", binding_id: existing });
           return true;
         }
-        // "All workspaces" is one binding per workspace (Khaliq, answer 11): every workspace the caller belongs to.
+        // "All workspaces" is one binding per workspace (Khaliq, answer 11): the caller's workspaces in this
+        // workspace's organization only. A bearer is proven for one workspace, so it never writes to others:
+        // every workspace needs a browser session.
+        if (caller.authMethod !== "session") fail("invalid_request", "Every workspace needs a browser session", 400);
         const workspaces = (await input.database.query<{ id: string }>(
           `SELECT w.id::text AS id FROM workspaces w
              JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $1
+            WHERE w.organization_id = $3
             ORDER BY (w.id = $2) DESC, w.id`,
-          [principal.userId, workspace.id],
+          [principal.userId, workspace.id, workspace.organizationId],
         )).rows.map(row => row.id);
         const bindings: unknown[] = [];
         const skipped: Array<{ workspace_id: string; reason: string }> = [];

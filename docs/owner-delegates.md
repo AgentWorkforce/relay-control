@@ -843,6 +843,37 @@ legacy rule into a Relay agents Trusted binding. It is a dry run unless
 into `excluded` agent bindings, and it skips an owner who already has a Relay
 agents binding.
 
+### Rolling back role bindings
+
+A build from before role bindings reads every live row of
+`delegation_trust_rules` as a legacy every-class rule, and every system grant
+as covering every class. That includes an exclusion or a Read-only binding.
+Never roll back below the build that added roles while a role binding is live.
+The runbook:
+
+1. **Stop writes first.** Turn delegation off for the affected workspaces
+   (`PUT /delegates/policy {"delegation_enabled": false}`), or hold a
+   read-only window. A binding written after the quiesce survives it, and the
+   old build reads it as a legacy every-class rule.
+2. **Apply the quiesce.** `POST /internal/v1/delegation/role-quiesce` with
+   the service token and `{"apply": true}`, with the operator's go. A dry run
+   (`{}`) first shows what it would revoke. It revokes each live binding that
+   is not a plain legacy rule, with its system grants and their approvals,
+   under the owner's binding lock, with reason `role_bindings_quiesced`.
+3. **Rerun until a dry run lists nothing.** One call handles at most `limit`
+   rows (default 1000), and the report does not say whether more remain.
+4. **Dry-run again right before cutover, and require an empty list.** Any row
+   written in between survives and reads as a legacy every-class rule on the
+   old build.
+5. Roll back. Agents have lost the authority their role bindings gave them.
+
+**Exclusions do not survive a rollback.** The old build checks
+`owner_excluded` grant rows only for the rule's own id. An exclusion made
+since roles may have no grant row at all. An owner who turns the legacy rule
+on again after the rollback gets a new rule id, so none of those exclusions
+apply to it. That owner must revoke the excluded agents' grants again (`DELETE
+/delegates/{grant_id}`) once they reappear under the new rule.
+
 ## Revocation
 
 Revocation happens in these cases:

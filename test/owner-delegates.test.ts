@@ -1047,6 +1047,7 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/delegates/trust-rule": ["get", "put", "delete"],
     "/internal/v1/delegation/trust-backfill": ["post"],
     "/internal/v1/delegation/role-seed": ["post"],
+    "/internal/v1/delegation/role-quiesce": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/roles": ["get"],
     "/api/v1/workspaces/{workspaceId}/delegates/bindings": ["get", "post"],
     "/api/v1/workspaces/{workspaceId}/delegates/bindings/{bindingId}": ["get", "patch", "delete"],
@@ -2265,7 +2266,7 @@ test("role bindings: roles, bindings, groups and agents answer Cloud's contract"
   const before = await env.bearer("/delegates/bindings");
   assert.equal(before.status, 200, before.raw);
   assert.deepEqual(before.body, { bindings: [], recommendation: { principal: { kind: "relay_agents", ref: null }, role: "trusted",
-    label: "Give your Relay agents Trusted" } });
+    label: "Give your Relay agents Trusted", binding_id: null } });
   const created = await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "trusted" });
   assert.equal(created.status, 201, created.raw);
   const binding = created.body.binding;
@@ -2443,4 +2444,27 @@ test("role bindings: the legacy rule and a Relay agents binding never stand toge
   const again = await env.browser("/delegates/trust-rule", "PUT", {});
   assert.equal(again.status, 409, again.raw);
   assert.deepEqual([again.body.code, again.body.binding_id], ["binding_exists", legacy.body.rule.trust_rule_id]);
+});
+
+test("role bindings (review): an exclusion is allowed while delegation is off; the recommendation names a legacy rule; every workspace needs a session", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const helper = await env.claim("helper");
+  const legacy = await env.browser("/delegates/trust-rule", "PUT", {});
+  assert.equal(legacy.status, 201, legacy.raw);
+  // The one-click recommendation names the legacy rule: the UI PATCHes it instead of POSTing a binding that would conflict.
+  assert.equal((await env.bearer("/delegates/bindings")).body.recommendation.binding_id, legacy.body.rule.trust_rule_id);
+  const upgraded = await env.browser(`/delegates/bindings/${legacy.body.rule.trust_rule_id}`, "PATCH", { role: "trusted" });
+  assert.equal(upgraded.status, 200, upgraded.raw);
+  assert.equal((await env.bearer("/delegates/bindings")).body.recommendation, null);
+  // A bearer is proven for one workspace: never every workspace.
+  const bearerBulk = await env.bearer("/delegates/bindings", "POST", { principal: { kind: "connector_kind", ref: "grok-bot" },
+    role: "standard", all_workspaces: true });
+  assert.equal(bearerBulk.status, 400, bearerBulk.raw);
+  // Delegation off: granting is refused, an exclusion is allowed.
+  assert.equal((await env.browser("/delegates/policy", "PUT", { delegation_enabled: false })).status, 200);
+  assert.equal((await env.browser("/delegates/bindings", "POST", { principal: { kind: "connector_kind", ref: "chatgpt" },
+    role: "trusted" })).status, 403);
+  const excluded = await env.browser("/delegates/bindings", "POST", { principal: { kind: "agent", ref: helper.id }, role: "excluded" });
+  assert.equal(excluded.status, 201, excluded.raw);
 });

@@ -5,7 +5,10 @@ import {
   systemScopes, systemScopesCover, type Authority, type BindingView,
 } from "../src/delegation/roles.js";
 import { CLASS_DESCRIPTIONS } from "../src/delegation/scope.js";
-import { attestDelegation, redeemApproval } from "../src/delegation/service.js";
+import { attestDelegation, grantView, redeemApproval } from "../src/delegation/service.js";
+import { readFileSync } from "node:fs";
+import { parse as parseYaml } from "yaml";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import type { TrustPath } from "../src/delegation/trust.js";
 
 // Role bindings, pure: the self-hosted twin of Cloud's lib/delegation/roles.test.ts (cloud#6665).
@@ -199,4 +202,24 @@ test("review N1: a thrown error, a 40P01 deadlock included, answers `unavailable
     { verdict: "none", reason: "unavailable" });
   assert.deepEqual(await redeemApproval(deps, { ...common, approvalId: "apv_abcdefgh", action: { class: "merge", target: "a/b#1" },
     authMethod: "desktop_bearer" }), { ok: false, reason: "unavailable" });
+});
+
+test("review: a role binding's system grant validates against the published grant response schema", () => {
+  const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8"));
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  ajv.addSchema({ $id: "openapi", components: spec.components });
+  const validate = ajv.compile({ $ref: "openapi#/components/schemas/DelegateGrant" });
+  const now = new Date("2026-11-26T00:00:00Z");
+  const row = (scopes: unknown) => ({ id: "grt_x", workspace_id: "ws", organization_id: "org", owner_user_id: "owner",
+    delegate_agent_id: "grok-1", delegate_agent_name: "grok", scopes, require_tier_o: [], status: "active",
+    expires_at: "9999-12-31T00:00:00.000Z", created_auth_method: "system", created_at: now, updated_at: now, revoked_at: null,
+    revoked_by: null, revoked_reason: null, trust_rule_id: "dtr_x", trust_path: null });
+  const scopes = [
+    ...systemScopes(readOnlyAuthority()),
+    ...systemScopes({ classes: [...PRESETS.trusted.classes], requireTierO: [], prOpsLimit: null,
+      requiredConditions: PRESETS.trusted.requiredConditions, targets: ["acme/*"], expiresAt: null }),
+  ];
+  const view = grantView(row(scopes) as never, now);
+  assert.equal(validate(view), true, JSON.stringify(validate.errors));
+  assert.ok(scopes.some(scope => scope.targets.length === 0 && scope.ops) && scopes.some(scope => scope.conditions));
 });

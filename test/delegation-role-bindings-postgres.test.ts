@@ -5,7 +5,7 @@ import pg from "pg";
 import { PostgresDatabase } from "../src/database.js";
 import { bindingFields, type BindingFields } from "../src/delegation/roles.js";
 import {
-  BindingExists, OWNER_EXCLUDED, SUPERSEDED_BY_RULE, actingAuthorityLocked, createBinding, createGroup, excludeFromRule, grantCovers, listBindings,
+  BindingExists, OWNER_EXCLUDED, SUPERSEDED_BY_RULE, actingAuthorityLocked, createBinding, quiesceRoleBindings, createGroup, excludeFromRule, grantCovers, listBindings,
   listGroups, liveTrustRule, materializeRuleGrant, putTrustRule, revokeBinding, revokeGroup, seedTrustedBindings, updateBinding,
   updateGroup, type DelegationWorkspace, type GrantRow,
 } from "../src/delegation/service.js";
@@ -327,4 +327,72 @@ test("parity c1de4d1f1: the acting agent's authority is read under its owner's b
   } finally {
     client.release();
   }
+});
+
+test("review: removing or outliving a restrictive binding never covers an approval sent while it decided", options, async (t) => {
+  const f = await fixture(t);
+  await f.bind("relay_agents", null, "trusted");
+  // An override on an agent that has no grant yet, then removed before its first use.
+  const override = await f.bind("agent", "grok-1", "read_only");
+  await new Promise(resolve => setTimeout(resolve, 30));
+  await revokeBinding(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, bindingId: override.id, ...f.actor,
+    reason: "owner_revoked" });
+  const [removed] = (await f.database.query<{ revoked_at: Date }>("SELECT revoked_at FROM delegation_trust_rules WHERE id = $1",
+    [override.id])).rows;
+  const fallback = (await f.materialize("grok-1", grokPath("grok-1")))!;
+  assert.ok(new Date(fallback.created_at).getTime() >= new Date(removed!.revoked_at).getTime());
+  // An override that expires unused: the fallback grant starts no earlier than its expiry.
+  const until = new Date(Date.now() + 300);
+  await f.bind("agent", "grok-2", "read_only", { expires_at: until.toISOString() });
+  await new Promise(resolve => setTimeout(resolve, 400));
+  const afterExpiry = (await f.materialize("grok-2", grokPath("grok-2")))!;
+  assert.ok(new Date(afterExpiry.created_at).getTime() >= until.getTime());
+  // A member removed from a Read-only group: the fallback grant starts no earlier than the removal.
+  const group = await f.group("ro", ["grok-3"]);
+  await f.bind("group", group.id, "read_only");
+  await updateGroup(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, groupId: group.id, ...f.actor, remove: ["grok-3"] });
+  const [member] = (await f.database.query<{ removed_at: Date }>(
+    "SELECT removed_at FROM delegation_group_members WHERE agent_id = 'grok-3'")).rows;
+  const afterRemoval = (await f.materialize("grok-3", grokPath("grok-3")))!;
+  assert.ok(new Date(afterRemoval.created_at).getTime() >= new Date(member!.removed_at).getTime());
+});
+
+test("review: a deleted exclusion stops blocking the agent under a legacy rule, and a conversion does not bring it back", options, async (t) => {
+  const f = await fixture(t);
+  const rule = (await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, requireTierO: [],
+    authMethod: "session" })).rule;
+  const grant = (await f.materialize("grok-1", grokPath("grok-1")))!;
+  await f.database.transaction(tx => excludeFromRule(tx, { workspaceId: f.workspaceId, grant, actorUserId: f.ownerId,
+    authMethod: "session" }));
+  assert.equal(await f.materialize("grok-1", grokPath("grok-1")), null);
+  const exclusion = (await listBindings(f.database, f.workspaceId, f.ownerId)).find(row => row.principal_kind === "agent")!;
+  await revokeBinding(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, bindingId: exclusion.id, ...f.actor,
+    reason: "owner_revoked" });
+  assert.equal((await f.materialize("grok-1", grokPath("grok-1")))?.trust_rule_id, rule.id);
+  await seedTrustedBindings(f.database, { apply: true, limit: 10, trusted: f.fields("trusted") });
+  assert.equal((await listBindings(f.database, f.workspaceId, f.ownerId)).some(row => row.principal_kind === "agent"), false);
+});
+
+test("review: the rollback quiesce ends every role binding with its grants, keeps a plain legacy rule, dry run first", options, async (t) => {
+  const f = await fixture(t);
+  await f.bind("connector_kind", "grok-bot", "trusted");
+  const excluded = await f.bind("agent", "grok-2", "excluded");
+  const group = await f.group("bots", ["relay-1"]);
+  const groupBinding = await f.bind("group", group.id, "read_only");
+  const grokGrant = (await f.materialize("grok-1", grokPath("grok-1")))!;
+  const dry = await quiesceRoleBindings(f.database, { apply: false, limit: 100 });
+  assert.equal(dry.dry_run, true);
+  assert.equal(dry.bindings.length, 3);
+  assert.equal((await f.grant(grokGrant.id)).status, "active");
+  const applied = await quiesceRoleBindings(f.database, { apply: true, limit: 100 });
+  assert.deepEqual([applied.dry_run, applied.bindings.length, applied.revoked_grants], [false, 3, 1]);
+  assert.equal((await f.grant(grokGrant.id)).revoked_reason, "trust_rule_revoked");
+  assert.deepEqual(await listBindings(f.database, f.workspaceId, f.ownerId), []);
+  const reasons = (await f.database.query<{ revoked_reason: string }>(
+    "SELECT revoked_reason FROM delegation_trust_rules WHERE id = ANY($1::text[])", [[excluded.id, groupBinding.id]])).rows;
+  assert.ok(reasons.every(row => row.revoked_reason === "role_bindings_quiesced"));
+  assert.equal((await quiesceRoleBindings(f.database, { apply: true, limit: 100 })).bindings.length, 0);
+  // A plain legacy rule is what the old build understands: left alone.
+  await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, requireTierO: [], authMethod: "session" });
+  assert.equal((await quiesceRoleBindings(f.database, { apply: false, limit: 100 })).bindings.length, 0);
 });

@@ -760,3 +760,25 @@ test("round 3 (9): the backfill skips and counts connector grants with no live s
   assert.equal(await pinned(expired.grantId), null);
   assert.equal(await pinned(live.grantId), live.id);
 });
+
+test("role-seed and role-quiesce answer the operator credential through the delegation handler", async (t) => {
+  const { env } = await ready(t);
+  for (const path of ["/internal/v1/delegation/role-seed", "/internal/v1/delegation/role-quiesce"]) {
+    const call = (body: unknown, token: string | null = INTERNAL) => request(env.origin, path, { method: "POST",
+      ...(token ? { token } : {}), body });
+    assert.equal((await call({}, null)).status, 401, path);
+    assert.equal((await call({}, env.desktop.accessToken)).status, 401, path);
+    assert.equal((await call({ apply: "yes" })).status, 400, path);
+    const dry = await call({});
+    assert.equal(dry.status, 200, `${path} ${dry.raw}`);
+    assert.equal(dry.body.dry_run, true, path);
+  }
+  // An apply through the handler: a legacy rule becomes Trusted for Relay agents, then the quiesce ends it.
+  await turnOn(env);
+  const seeded = await request(env.origin, "/internal/v1/delegation/role-seed", { method: "POST", token: INTERNAL, body: { apply: true } });
+  assert.deepEqual([seeded.status, seeded.body.converted], [200, 1], seeded.raw);
+  const quiesced = await request(env.origin, "/internal/v1/delegation/role-quiesce", { method: "POST", token: INTERNAL,
+    body: { apply: true } });
+  assert.deepEqual([quiesced.status, quiesced.body.bindings.length], [200, 1], quiesced.raw);
+  assert.equal((await env.bearer("/delegates/bindings")).body.bindings.length, 0);
+});
