@@ -302,6 +302,22 @@ function safeDiagnostic(error: unknown) {
  * and an allow-listed error code: upstream bodies can echo credentials, so
  * no other upstream text reaches the log or the caller.
  */
+/** Above the largest valid v1 owner_approval (the desktop core's limit). */
+export const OWNER_APPROVAL_MAX_BYTES = 192 * 1024;
+
+/**
+ * An owner_approval goes to Relaycast exactly as given, on a new message or
+ * post only (as the desktop core sends it). Relaycast validates its content;
+ * only what never reaches it is refused here.
+ */
+export function checkOwnerApproval(ownerApproval: Record<string, unknown> | undefined, reply: "reply_to" | "thread_id" | null) {
+  if (ownerApproval === undefined) return;
+  if (reply) throw new RelayToolError(`owner_approval goes on a new ${reply === "reply_to" ? "message" : "post"}, never with ${reply}. Send it without ${reply}.`);
+  if (Buffer.byteLength(JSON.stringify(ownerApproval), "utf8") > OWNER_APPROVAL_MAX_BYTES) {
+    throw new RelayToolError("owner_approval is larger than 192 KiB, above any valid approval. Nothing was sent.");
+  }
+}
+
 export function relayFailure(error: unknown, operation?: RelayToolOperation) {
   const upstream = error instanceof RelaycastCallError ? error : null;
   const diagnostic = safeDiagnostic(error);
@@ -313,6 +329,8 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
     && upstream.operation === "register_hosted";
   const message = error instanceof RelayToolError ? error.message
     : registrationConflict ? "That relay name is already taken. Choose another name."
+    : upstream?.status === 400 && upstream.code === "invalid_owner_approval"
+    ? "Relay refused owner_approval as invalid, so nothing was sent. Check it against the owner_approval v1 contract and send again."
     : upstream?.status === 404 ? "The relay agent or address is no longer available. Refresh list_relay_agents."
     : operation === "leave" ? "Leaving the hosted relay participant failed. It is safe to retry leave_relay."
     : "Relay operation failed. If a send was attempted, its outcome may be unknown. Retry only with the same supplied idempotency_key; if you omitted it and received no receipt, check the conversation before retrying.";
@@ -1797,8 +1815,9 @@ function createRelayService(context: McpContext) {
         acknowledged: requested, has_more: messages.length === 100 };
     },
 
-    async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string },
-      serverIdempotencyKey: string = randomUUID()) {
+    async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string;
+      owner_approval?: Record<string, unknown> }, serverIdempotencyKey: string = randomUUID()) {
+      checkOwnerApproval(input.owner_approval, input.reply_to ? "reply_to" : null);
       if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
       await managedActorOnly(input.as, Boolean(input.as_person));
       if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
@@ -1842,7 +1861,8 @@ function createRelayService(context: McpContext) {
           }
         } else {
           sent = await clientFor(identity).sendDirectMessage({ token: identity.token, to: peer.name,
-            ...(input.to === peer.address ? { address: input.to } : {}), text: input.text, idempotencyKey });
+            ...(input.to === peer.address ? { address: input.to } : {}), text: input.text, idempotencyKey,
+            ...(input.owner_approval ? { ownerApproval: input.owner_approval } : {}) });
         }
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
@@ -1962,8 +1982,9 @@ function createRelayService(context: McpContext) {
       }) ?? { subscribed: false, channel, you: null, already_unsubscribed: true };
     },
 
-    async postChannel(input: ChannelInput & { channel: string; text: string; thread_id?: string; idempotency_key?: string },
-      serverIdempotencyKey: string = randomUUID()) {
+    async postChannel(input: ChannelInput & { channel: string; text: string; thread_id?: string; idempotency_key?: string;
+      owner_approval?: Record<string, unknown> }, serverIdempotencyKey: string = randomUUID()) {
+      checkOwnerApproval(input.owner_approval, input.thread_id ? "thread_id" : null);
       const channel = normalizeChannelName(input.channel);
       // Posting requires a subscription, so no identity is created here.
       return (await channelActor(input, false, async (identity) => {
@@ -1981,7 +2002,8 @@ function createRelayService(context: McpContext) {
           messageId = reply.id;
           threadId = reply.threadId;
         } else {
-          messageId = (await clientFor(identity).postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
+          messageId = (await clientFor(identity).postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey,
+            ...(input.owner_approval ? { ownerApproval: input.owner_approval } : {}) })).id;
         }
         return { from: identity.name, channel, linked: linkedKind(identity), message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,

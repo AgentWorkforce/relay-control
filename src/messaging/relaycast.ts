@@ -498,15 +498,19 @@ export function createRelaycastClient(input: {
       address?: string;
       text: string;
       idempotencyKey: string;
+      /** A delegate's owner_approval, sent beside the text exactly as given; Relaycast validates it. */
+      ownerApproval?: Record<string, unknown>;
     }): Promise<{ conversationId: string; message: DirectMessage }> {
       const data = record(await labeled("send_dm", () => call(
         "POST",
         "/v1/dm",
         input.token,
         // Presence selects the exact-address contract, including invalid/empty addresses.
-        input.address !== undefined
-          ? { address: input.address, text: input.text }
-          : { to: input.to, text: input.text },
+        {
+          ...(input.address !== undefined ? { address: input.address } : { to: input.to }),
+          text: input.text,
+          ...(input.ownerApproval ? { owner_approval: input.ownerApproval } : {}),
+        },
         input.idempotencyKey,
       )));
       const message = record(data?.message);
@@ -932,10 +936,13 @@ export function createRelaycastClient(input: {
       await labeled("leave_channel", () => call("POST", `/v1/channels/${encodeURIComponent(name)}/leave`, token, {}));
     },
 
-    async postChannelMessage(input: { token: string; channel: string; text: string; idempotencyKey: string }):
+    async postChannelMessage(input: { token: string; channel: string; text: string; idempotencyKey: string;
+      /** A delegate's owner_approval, sent beside the text exactly as given; Relaycast validates it. */
+      ownerApproval?: Record<string, unknown> }):
       Promise<{ id: string; createdAt: string | null }> {
       const data = record(await labeled("post_channel", () => call(
-        "POST", `/v1/channels/${encodeURIComponent(input.channel)}/messages`, input.token, { text: input.text }, input.idempotencyKey,
+        "POST", `/v1/channels/${encodeURIComponent(input.channel)}/messages`, input.token,
+        { text: input.text, ...(input.ownerApproval ? { owner_approval: input.ownerApproval } : {}) }, input.idempotencyKey,
       )));
       const id = text(data?.id);
       if (!id) throw new RelaycastCallError(200, "", true);
