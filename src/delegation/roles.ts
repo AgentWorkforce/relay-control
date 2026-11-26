@@ -143,14 +143,18 @@ export function authorityOf(binding: BindingView): Authority {
 }
 
 /**
- * The Read-only preset as an authority: a spawned agent's default. It keeps
- * the covering binding's repo targets and expiry, so a launched agent never
- * reaches beyond the binding that covers its root (as Cloud).
+ * The Read-only preset as an authority: a spawned agent's default. Combined
+ * with the covering binding's authority by strictest(), so a launched agent
+ * never reaches beyond the binding that covers its root: its repo targets and
+ * expiry, and its ask-first list, pr_ops limit and classes (as Cloud, review
+ * of cloud#6672). A root binding that asks first for pr_ops makes the
+ * launched agent ask first too; one without pr_ops gives it nothing.
  */
-export function readOnlyAuthority(within: Pick<Authority, "expiresAt" | "targets"> = { expiresAt: null, targets: null }): Authority {
+export function readOnlyAuthority(within?: Authority): Authority {
   const preset = PRESETS.read_only;
-  return { classes: [...preset.classes], requireTierO: [...preset.requireTierO], prOpsLimit: preset.prOpsLimit && [...preset.prOpsLimit],
-    requiredConditions: {}, targets: within.targets && [...within.targets], expiresAt: within.expiresAt };
+  const own: Authority = { classes: [...preset.classes], requireTierO: [...preset.requireTierO],
+    prOpsLimit: preset.prOpsLimit && [...preset.prOpsLimit], requiredConditions: {}, targets: null, expiresAt: null };
+  return within ? strictest(own, within) : own;
 }
 
 function unionConditions(a: RequiredCondition[] = [], b: RequiredCondition[] = []): RequiredCondition[] {
@@ -177,8 +181,15 @@ function intersectTargets(a: string[] | null, b: string[] | null): string[] | nu
  * than either one.
  */
 export function strictest(a: Authority, b: Authority): Authority {
-  const classes = a.classes === null ? b.classes : b.classes === null ? a.classes :
+  const targets = intersectTargets(a.targets, b.targets);
+  // Repo targets that do not overlap leave no repo-scoped class, but a
+  // session class (OWN_OWNER_ONLY_CLASSES) takes no repo and stays when both
+  // allow it (as Cloud, review of cloud#6672). coversNothing then sees an
+  // empty target list with only session classes, stored without targets.
+  const shared = a.classes === null ? b.classes : b.classes === null ? a.classes :
     a.classes.filter(item => b.classes!.includes(item));
+  const classes = shared !== null && targets !== null && !targets.length ?
+    shared.filter(item => OWN_OWNER_ONLY_CLASSES.includes(item)) : shared;
   const requireTierO = [...new Set([...a.requireTierO, ...b.requireTierO])]
     .filter(item => classes === null || classes.includes(item));
   const prOpsLimit = a.prOpsLimit === null ? b.prOpsLimit : b.prOpsLimit === null ? a.prOpsLimit :
@@ -191,7 +202,7 @@ export function strictest(a: Authority, b: Authority): Authority {
   const expiresAt = a.expiresAt && b.expiresAt ? new Date(Math.min(a.expiresAt.getTime(), b.expiresAt.getTime())) :
     a.expiresAt ?? b.expiresAt;
   return { classes, requireTierO: ACTION_CLASSES.filter(item => requireTierO.includes(item)), prOpsLimit, requiredConditions,
-    targets: intersectTargets(a.targets, b.targets), expiresAt };
+    targets, expiresAt };
 }
 
 /**
@@ -243,14 +254,41 @@ export function decide(bindings: readonly BindingView[], agent: { agentId: strin
  * Whether an authority grants nothing, so no system grant may stand for it.
  * Either of these covers nothing:
  * - no class: two custom groups with disjoint classes;
- * - no target: two groups whose repo targets do not overlap. A system scope's
- *   empty `targets` means every target, so an empty intersection must never
- *   reach systemScopes (review B1 on cloud#6665).
+ * - no target for a repo-scoped class: two groups whose repo targets do not
+ *   overlap. A system scope's empty `targets` means every target, so an empty
+ *   intersection must never reach systemScopes with a repo-scoped class
+ *   (review B1 on cloud#6665). Session classes (OWN_OWNER_ONLY_CLASSES) take
+ *   no repo, so they alone still grant (review of cloud#6672).
+ * - pr_ops alone with an empty op list: a launched agent under a root that
+ *   allows only other ops, or two groups with disjoint op lists.
  * A legacy authority (`classes: null`) always grants.
  */
 export function coversNothing(authority: Authority): boolean {
   if (authority.classes === null) return false;
-  return !authority.classes.length || (authority.targets !== null && !authority.targets.length);
+  // pr_ops with an empty op list allows no PR operation (review of cloud#6674).
+  const usable = authority.classes.filter(item => !(item === "pr_ops" && authority.prOpsLimit !== null && !authority.prOpsLimit.length));
+  return !usable.length || (authority.targets !== null && !authority.targets.length &&
+    usable.some(item => !OWN_OWNER_ONLY_CLASSES.includes(item)));
+}
+
+/**
+ * The role an authority amounts to, for display (Cloud's displayRole): the
+ * preset whose classes, ask-first list, pr_ops limit and required conditions
+ * it matches (targets and expiry aside), else `custom`. A combination of
+ * custom groups, or a launched agent's default narrowed by its root binding,
+ * is shown as what it allows, not as the first binding's role (review of
+ * cloud#6672).
+ */
+export function displayRole(authority: Authority): PresetRole | "custom" {
+  const same = <T>(a: readonly T[] | null, b: readonly T[] | null) =>
+    a === null || b === null ? a === b : a.length === b.length && a.every(item => b.includes(item));
+  const conditions = (value: RequiredConditions) => JSON.stringify(ACTION_CLASSES.map(item =>
+    (value[item] ?? []).map(condition => condition.type).sort()));
+  return PRESET_ROLES.find(role => {
+    const preset = PRESETS[role];
+    return same(authority.classes, preset.classes) && same(authority.requireTierO, preset.requireTierO) &&
+      same(authority.prOpsLimit, preset.prOpsLimit) && conditions(authority.requiredConditions) === conditions(preset.requiredConditions);
+  }) ?? "custom";
 }
 
 /**

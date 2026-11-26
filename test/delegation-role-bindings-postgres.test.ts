@@ -5,7 +5,8 @@ import pg from "pg";
 import { PostgresDatabase } from "../src/database.js";
 import { bindingFields, type BindingFields } from "../src/delegation/roles.js";
 import {
-  BindingExists, OWNER_EXCLUDED, SUPERSEDED_BY_RULE, actingAuthorityLocked, createBinding, quiesceRoleBindings, createGroup, excludeFromRule, grantCovers, listBindings,
+  BindingExists, OWNER_EXCLUDED, SUPERSEDED_BY_RULE, actingAuthorityLocked, bindingState, createBinding, decideUnderLocks,
+  decideWithLegacyExclusion, revokeAllGrants, quiesceRoleBindings, createGroup, excludeFromRule, grantCovers, listBindings,
   listGroups, liveTrustRule, materializeRuleGrant, putTrustRule, revokeBinding, revokeGroup, seedTrustedBindings, updateBinding,
   updateGroup, type DelegationWorkspace, type GrantRow,
 } from "../src/delegation/service.js";
@@ -429,4 +430,126 @@ test("review: the quiesce ends a legacy rule that sits under role bindings; anot
   }
   assert.equal((await liveTrustRule(f.database, f.workspaceId, otherId))?.id, otherRule.id);
   assert.equal((await quiesceRoleBindings(f.database, { apply: false, limit: 100 })).bindings.length, 0);
+});
+
+test("review of cloud#6672: a cross-owner redeem's acting check and a workspace revoke-all never deadlock, whichever grant sorts first", options, async (t) => {
+  const f = await fixture(t);
+  const minterOwner = randomUUID();
+  await f.database.query("INSERT INTO users (id, email, name) VALUES ($1, $2, 'Minter')", [minterOwner, `minter-${minterOwner}@example.test`]);
+  await f.database.query(`INSERT INTO organization_memberships (organization_id, user_id, role)
+    SELECT organization_id, $2, 'member' FROM workspaces WHERE id = $1`, [f.workspaceId, minterOwner]);
+  const insertGrant = (id: string, ownerUserId: string, agentId: string) => f.database.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, require_tier_o, expires_at, created_auth_method)
+     SELECT $2, $1, w.organization_id, $3, $4, $4, '[{"class":"merge","targets":["acme/web"]}]'::jsonb, ARRAY['merge'],
+       now() + interval '1 day', 'session' FROM workspaces w WHERE w.id = $1`, [f.workspaceId, id, ownerUserId, agentId]);
+  for (const [actingId, minterId] of [["grt_0acting", "grt_9minter"], ["grt_9acting", "grt_0minter"]] as const) {
+    await f.database.query("DELETE FROM delegation_grants");
+    await insertGrant(actingId, f.ownerId, "acting-bot");
+    await insertGrant(minterId, minterOwner, "minter-bot");
+    let entered!: () => void;
+    let release!: () => void;
+    const inDecision = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    // The redeem's shape: the minter's grant (another owner's) and the acting agent's own grants, then the acting check.
+    const decision = decideUnderLocks(f.database, { workspaceId: f.workspaceId, memberUserIds: [f.ownerId], grantId: minterId,
+      approvalId: "apr_none", grantOwnerUserId: minterOwner, actingGrants: { ownerUserId: f.ownerId, agentId: "acting-bot" } },
+    async (state, tx) => {
+      assert.equal(state.grant?.id, minterId);
+      entered();
+      await held;
+      return actingAuthorityLocked(tx, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, agentId: "acting-bot", now: new Date() });
+    });
+    await inDecision;
+    const revoke = f.database.transaction(tx => revokeAllGrants(tx, { workspaceId: f.workspaceId, ownerUserId: null,
+      actorUserId: f.ownerId, reason: "admin_revoke_all", authMethod: "session" }));
+    await untilBlocked(f.admin);
+    release();
+    const [decided, revoked] = await Promise.allSettled([decision, revoke]);
+    assert.equal(decided.status, "fulfilled", `${actingId}: ${decided.status === "rejected" ? String(decided.reason?.code ?? decided.reason) : ""}`);
+    assert.equal(revoked.status, "fulfilled", `${actingId}: ${revoked.status === "rejected" ? String(revoked.reason?.code ?? revoked.reason) : ""}`);
+    assert.deepEqual((decided as PromiseFulfilledResult<{ own: string[] | null }>).value.own, ["merge"], actingId);
+    assert.deepEqual([...(revoked as PromiseFulfilledResult<string[]>).value].sort(), [actingId, minterId].sort(), actingId);
+  }
+});
+
+test("review of cloud#6672: an agent a legacy rule excluded before roles never inherits the rule's ask-first list", options, async (t) => {
+  const f = await fixture(t);
+  const rule = (await putTrustRule(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, requireTierO: ["merge"], ...f.actor })).rule;
+  const grant = (await f.materialize("grok-1", grokPath("grok-1")))!;
+  // A pre-roles exclusion: only the revoked grant row records it, with no agent binding.
+  await f.database.query("UPDATE delegation_grants SET status = 'revoked', revoked_at = now(), revoked_reason = $1 WHERE id = $2",
+    [OWNER_EXCLUDED, grant.id]);
+  const decideNow = async (agentId: string) => decideWithLegacyExclusion(f.database, await bindingState(f.database, f.workspaceId, f.ownerId),
+    { workspaceId: f.workspaceId, ownerUserId: f.ownerId, agentId, path: grokPath(agentId), now: new Date() });
+  const excluded = await decideNow("grok-1");
+  assert.equal(excluded.kind, "excluded");
+  const other = await decideNow("grok-2");
+  assert.ok(other.kind === "covered" && other.source === "legacy");
+  assert.deepEqual(other.authority.requireTierO, ["merge"]);
+  // A direct binding since roles supersedes the old marker, even once removed.
+  const own = await f.bind("agent", "grok-1", "excluded");
+  await revokeBinding(f.database, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, bindingId: own.id, ...f.actor, reason: "owner_revoked" });
+  const lifted = await decideNow("grok-1");
+  assert.ok(lifted.kind === "covered" && lifted.source === "legacy");
+  assert.equal(rule.id, lifted.binding.id);
+});
+
+test("review of cloud#6674: an acting grant created after the lock pass is locked by the acting read; a held one fails closed", options, async (t) => {
+  const f = await fixture(t);
+  const minterOwner = randomUUID();
+  await f.database.query("INSERT INTO users (id, email, name) VALUES ($1, $2, 'Minter')", [minterOwner, `minter-${minterOwner}@example.test`]);
+  await f.database.query(`INSERT INTO organization_memberships (organization_id, user_id, role)
+    SELECT organization_id, $2, 'member' FROM workspaces WHERE id = $1`, [f.workspaceId, minterOwner]);
+  const insertGrant = (id: string, ownerUserId: string, agentId: string) => f.database.query(
+    `INSERT INTO delegation_grants (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
+       scopes, require_tier_o, expires_at, created_auth_method)
+     SELECT $2, $1, w.organization_id, $3, $4, $4, '[{"class":"merge","targets":["acme/web"]}]'::jsonb, '{}',
+       now() + interval '1 day', 'session' FROM workspaces w WHERE w.id = $1`, [f.workspaceId, id, ownerUserId, agentId]);
+  await insertGrant("grt_minter0001", minterOwner, "minter-bot");
+  const decideWith = (between: () => Promise<void>, after: () => Promise<void> = async () => {}) => decideUnderLocks(f.database, {
+    workspaceId: f.workspaceId, memberUserIds: [f.ownerId], grantId: "grt_minter0001", approvalId: "apr_none",
+    grantOwnerUserId: minterOwner, actingGrants: { ownerUserId: f.ownerId, agentId: "acting-bot" } }, async (_state, tx) => {
+    await between();
+    const read = await actingAuthorityLocked(tx, { workspaceId: f.workspaceId, ownerUserId: f.ownerId, agentId: "acting-bot", now: new Date() });
+    await after();
+    return read;
+  });
+  // Created after the pass: the read locks it, so a Tier O change waits for the decision.
+  let tierChange: Promise<unknown> | null = null;
+  const read = await decideWith(async () => { await insertGrant("grt_acting0001", f.ownerId, "acting-bot"); }, async () => {
+    tierChange = f.database.query("UPDATE delegation_grants SET require_tier_o = '{merge}' WHERE id = 'grt_acting0001'");
+    await untilBlocked(f.admin);
+  });
+  assert.deepEqual(read.own, []);
+  await tierChange;
+  // Held by a writer when the read runs: 55P03 at once, never a stale read or a wait.
+  await f.database.query("DELETE FROM delegation_grants WHERE id = 'grt_acting0001'");
+  const writer = await f.pool.connect();
+  try {
+    const failure = await decideWith(async () => {
+      await insertGrant("grt_acting0002", f.ownerId, "acting-bot");
+      await writer.query("BEGIN");
+      await writer.query("SELECT 1 FROM delegation_grants WHERE id = 'grt_acting0002' FOR UPDATE");
+    }).then(() => null, (error: unknown) => error as { code?: string });
+    assert.equal(failure?.code, "55P03");
+  } finally {
+    await writer.query("ROLLBACK").catch(() => {});
+    writer.release();
+  }
+});
+
+test("review of cloud#6674: a worker grant made under an older resolution is superseded when re-resolved, never reused", options, async (t) => {
+  const f = await fixture(t);
+  const relay = await f.bind("relay_agents", null, "trusted");
+  const stale = (await f.materialize("worker-1", workerPath("worker-1")))!;
+  // As made before the spawn default took the root's ask-first list: the binding now asks first for pr_ops,
+  // written without the eager re-resolution a binding write does.
+  await f.database.query("UPDATE delegation_trust_rules SET require_tier_o = array_append(require_tier_o, 'pr_ops') WHERE id = $1", [relay.id]);
+  const current = (await f.materialize("worker-1", workerPath("worker-1")))!;
+  assert.notEqual(current.id, stale.id);
+  assert.deepEqual(current.require_tier_o, ["pr_ops"]);
+  const retired = await f.grant(stale.id);
+  assert.equal(retired.status, "revoked");
+  assert.equal(retired.revoked_reason, SUPERSEDED_BY_RULE);
 });

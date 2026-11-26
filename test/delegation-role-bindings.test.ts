@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, isValidBindingTarget, type BindingFields, coversNothing, decide, readOnlyAuthority, requiredConditionsOf, strictest,
+  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, isValidBindingTarget, type BindingFields, coversNothing, decide, displayRole, readOnlyAuthority, requiredConditionsOf, strictest,
   systemScopes, systemScopesCover, type Authority, type BindingView,
 } from "../src/delegation/roles.js";
 import { CLASS_DESCRIPTIONS } from "../src/delegation/scope.js";
@@ -132,8 +132,12 @@ test("review B1: two groups whose repo targets do not overlap cover nothing, nev
     expiresAt: null };
   const noOps = strictest(base, { ...base, prOpsLimit: ["label"] });
   assert.deepEqual(noOps.prOpsLimit, []);
+  // pr_ops alone with no op covers nothing (review of cloud#6674); beside another class it stays closed.
+  assert.equal(coversNothing(noOps), true);
+  const mixed = strictest({ ...base, classes: ["pr_ops", "merge"] }, { ...base, classes: ["pr_ops", "merge"], prOpsLimit: ["label"] });
+  assert.equal(coversNothing(mixed), false);
   for (const op of ["comment", "label=bug", "close"]) {
-    assert.equal(systemScopesCover(systemScopes(noOps), { class: "pr_ops", target: `acme/web#7:${op}` }), false, op);
+    assert.equal(systemScopesCover(systemScopes(mixed), { class: "pr_ops", target: `acme/web#7:${op}` }), false, op);
   }
 });
 
@@ -236,4 +240,67 @@ test("review: a binding target needs a concrete owner; a PATCH that keeps the ro
   assert.deepEqual([kept.classes, kept.requireTierO, kept.targets], [saved.classes, [], ["acme/*"]]);
   const chosen = bindingFields({ role: "trusted" }, "relay_agents", saved, NOW) as BindingFields;
   assert.deepEqual(chosen.classes, PRESETS.trusted.classes);
+});
+
+function custom(over: Partial<BindingView> & Pick<BindingView, "id" | "principalKind">): BindingView {
+  return { principalRef: null, role: "custom", classes: [], requireTierO: [], prOpsLimit: null, requiredConditions: {}, targets: null,
+    expiresAt: null, ...over };
+}
+
+test("review of cloud#6672: a launched agent's default never drops its root binding's pr_ops ask-first, limit or absence", () => {
+  for (const principalKind of ["relay_agents", "connector_kind"] as const) {
+    const asks = custom({ id: `dtr_s_${principalKind}`, principalKind, principalRef: principalKind === "connector_kind" ? "grok-bot" : null,
+      classes: ["pr_ops", "merge"], requireTierO: ["pr_ops"] });
+    const decision = decide([asks], { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
+    assert.equal(decision.kind === "covered" && decision.source, "spawn_default", principalKind);
+    assert.ok(decision.kind === "covered");
+    assert.deepEqual(decision.authority.classes, ["pr_ops"], principalKind);
+    assert.deepEqual(decision.authority.requireTierO, ["pr_ops"], principalKind);
+    assert.deepEqual(decision.authority.prOpsLimit, ["comment"], principalKind);
+  }
+  const labels = decide([custom({ id: "dtr_s_labels", principalKind: "relay_agents", classes: ["pr_ops"], prOpsLimit: ["label"] })],
+    { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
+  assert.deepEqual(labels.kind === "covered" && labels.authority.prOpsLimit, []);
+  assert.equal(labels.kind === "covered" && coversNothing(labels.authority), true);
+  const mergeOnly = decide([custom({ id: "dtr_s_merge", principalKind: "relay_agents", classes: ["merge"] })],
+    { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
+  assert.equal(mergeOnly.kind === "covered" && coversNothing(mergeOnly.authority), true);
+  // A Trusted root still gives exactly the Read-only preset.
+  const trusted = decide([preset("trusted", { id: "dtr_s_trusted", principalKind: "relay_agents" })],
+    { agentId: "worker-1", path: spawned, groupIds: [] }, NOW);
+  assert.deepEqual(trusted.kind === "covered" && trusted.authority, readOnlyAuthority());
+});
+
+test("review of cloud#6672: non-overlapping repos keep the session classes both allow and drop every repo-scoped class", () => {
+  const mixed: Authority = { classes: ["config_change", "prompt_approval", "merge", "pr_ops"], requireTierO: ["prompt_approval"],
+    prOpsLimit: null, requiredConditions: { merge: [{ type: "ci_green" }] }, targets: null, expiresAt: null };
+  const both = strictest({ ...mixed, targets: ["acme/api"] }, { ...mixed, classes: ["config_change", "merge"], targets: ["acme/web"] });
+  assert.deepEqual(both.classes, ["config_change"]);
+  assert.deepEqual(both.targets, []);
+  assert.deepEqual(both.requireTierO, []);
+  assert.deepEqual(both.requiredConditions, {});
+  assert.equal(coversNothing(both), false);
+  const scopes = systemScopes(both);
+  assert.deepEqual(scopes, [{ class: "config_change", targets: [] }]);
+  assert.equal(systemScopesCover(scopes, { class: "config_change", target: "session-1" }), true);
+  for (const action of [{ class: "merge" as const, target: "acme/api#1" }, { class: "pr_ops" as const, target: "acme/web#1:comment" }]) {
+    assert.equal(systemScopesCover(scopes, action), false, action.target);
+  }
+  assert.equal(coversNothing(strictest({ ...mixed, classes: ["merge"], targets: ["acme/api"] },
+    { ...mixed, classes: ["merge", "config_change"], targets: ["acme/web"] })), true);
+  assert.equal(coversNothing({ ...mixed, targets: [] }), true);
+});
+
+test("review of cloud#6672: displayRole names what combined groups amount to", () => {
+  const a = preset("trusted", { id: "dtr_a_t", principalKind: "group", principalRef: "grp_a" });
+  const b = preset("read_only", { id: "dtr_b_r", principalKind: "group", principalRef: "grp_b" });
+  const decision = decide([a, b], { agentId: "grok-1", path: grokRoot, groupIds: ["grp_a", "grp_b"] }, NOW);
+  assert.ok(decision.kind === "covered");
+  assert.equal(decision.binding.role, "trusted");
+  assert.equal(displayRole(decision.authority), "read_only");
+  assert.equal(displayRole({ ...readOnlyAuthority(), requireTierO: ["pr_ops"] }), "custom");
+  for (const role of ["trusted", "standard", "read_only"] as const) {
+    assert.equal(displayRole({ classes: [...PRESETS[role].classes], requireTierO: [...PRESETS[role].requireTierO],
+      prOpsLimit: PRESETS[role].prOpsLimit, requiredConditions: PRESETS[role].requiredConditions, targets: ["acme/*"], expiresAt: null }), role);
+  }
 });
