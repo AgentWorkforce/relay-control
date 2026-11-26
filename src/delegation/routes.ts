@@ -1344,7 +1344,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         const bindings: unknown[] = [];
         const skipped: Array<{ workspace_id: string; reason: string }> = [];
         for (const targetWorkspaceId of workspaces) {
-          const made = await create(targetWorkspaceId);
+          // One workspace that cannot be written to (`unavailable`, outcome unknown: retry it) never hides the
+          // bindings already created in the others.
+          let made: Awaited<ReturnType<typeof create>>;
+          try {
+            made = await create(targetWorkspaceId);
+          } catch (error) {
+            logUnavailable("bindings", error, { workspaceId: targetWorkspaceId });
+            skipped.push({ workspace_id: targetWorkspaceId, reason: "unavailable" });
+            continue;
+          }
           if ("skipped" in made) skipped.push({ workspace_id: targetWorkspaceId, reason: made.skipped.split(":")[0]! });
           else bindings.push({ workspace_id: targetWorkspaceId, ...bindingView(made, { covered: 0,
             policy: await loadPolicy(input.database, targetWorkspaceId), groupNames: new Map() }) });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, coversNothing, decide, readOnlyAuthority, requiredConditionsOf, strictest,
+  CONNECTOR_KINDS, PRESETS, actionRepo, bindingFields, isValidBindingTarget, type BindingFields, coversNothing, decide, readOnlyAuthority, requiredConditionsOf, strictest,
   systemScopes, systemScopesCover, type Authority, type BindingView,
 } from "../src/delegation/roles.js";
 import { CLASS_DESCRIPTIONS } from "../src/delegation/scope.js";
@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { TrustPath } from "../src/delegation/trust.js";
+import type { ActionClass } from "../src/delegation/scope.js";
 
 // Role bindings, pure: the self-hosted twin of Cloud's lib/delegation/roles.test.ts (cloud#6665).
 
@@ -222,4 +223,17 @@ test("review: a role binding's system grant validates against the published gran
   const view = grantView(row(scopes) as never, now);
   assert.equal(validate(view), true, JSON.stringify(validate.errors));
   assert.ok(scopes.some(scope => scope.targets.length === 0 && scope.ops) && scopes.some(scope => scope.conditions));
+});
+
+test("review: a binding target needs a concrete owner; a PATCH that keeps the role keeps the authority saved with it", () => {
+  for (const ok of ["acme/web", "acme/*", "Acme-1/web.app"]) assert.equal(isValidBindingTarget(ok), true, ok);
+  for (const bad of ["*/web", "*/*", "acme", "acme/web#1", "acme/web:x", "acme/we*"]) assert.equal(isValidBindingTarget(bad), false, bad);
+  // A binding saved under an older Trusted preset (here: deploy not asked first) keeps that authority on a
+  // targets-only PATCH; choosing the role again resolves today's preset.
+  const saved = { role: "trusted" as const, classes: ["merge", "pr_ops", "deploy"] as ActionClass[], requireTierO: [] as ActionClass[],
+    prOpsLimit: null, requiredConditions: {}, targets: null, expiresAt: null };
+  const kept = bindingFields({ targets: ["acme/*"] }, "relay_agents", saved, NOW) as BindingFields;
+  assert.deepEqual([kept.classes, kept.requireTierO, kept.targets], [saved.classes, [], ["acme/*"]]);
+  const chosen = bindingFields({ role: "trusted" }, "relay_agents", saved, NOW) as BindingFields;
+  assert.deepEqual(chosen.classes, PRESETS.trusted.classes);
 });

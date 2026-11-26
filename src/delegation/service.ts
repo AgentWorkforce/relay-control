@@ -228,13 +228,14 @@ export async function excludeFromRule(tx: SqlExecutor, input: { workspaceId: str
   let binding: TrustRuleRow | null = null;
   if (!own) {
     binding = (await tx.query<TrustRuleRow>(
-      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
-       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS},
+         created_at, updated_at)
+       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), clock_timestamp()) RETURNING *`,
       [mintId("dtr"), input.workspaceId, ownerUserId, agentId, ...bindingValues(excluded)],
     )).rows[0]!;
   } else if (own.role !== "excluded") {
     binding = (await tx.query<TrustRuleRow>(
-      `UPDATE delegation_trust_rules SET (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8), updated_at = now()
+      `UPDATE delegation_trust_rules SET (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8), updated_at = clock_timestamp()
         WHERE id = $1 RETURNING *`,
       [own.id, ...bindingValues(excluded)],
     )).rows[0]!;
@@ -935,7 +936,7 @@ export async function revokeGrants(executor: SqlExecutor, input: {
   if (!input.grantIds.length) return [];
   const revoked = (await executor.query<GrantRow>(
     `UPDATE delegation_grants
-        SET status = 'revoked', revoked_at = now(), revoked_by = $3, revoked_reason = $4, updated_at = now()
+        SET status = 'revoked', revoked_at = clock_timestamp(), revoked_by = $3, revoked_reason = $4, updated_at = clock_timestamp()
       WHERE workspace_id = $1 AND id = ANY($2::text[]) AND status = 'active'
       RETURNING *`,
     [input.workspaceId, input.grantIds, input.actorUserId, input.reason],
@@ -2033,6 +2034,11 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       const late = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
       if (late) refuse(late);
+      // The acting agent's own authority again, at the time read by this final check: an explicit grant that
+      // expired, or an ask-first change, while the bearer check waited decides the answer too.
+      const actingLate = await actingRefusalLocked(tx, { workspace, actingOwnerId: input.callerUserId,
+        actingAgentId: input.recipientAgentId, grant: grant!, tier: approval!.tier, actions: [action!], now: deps.now() });
+      if (actingLate) refuse(actingLate);
       // Single use is per action (§5.1): one atomic insert per action.
       if (singleUse && !await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
         consumedBy: input.recipientAgentId })) refuse("consumed");
@@ -2389,7 +2395,8 @@ async function stampRulesRevoked(tx: SqlExecutor, rules: TrustRuleRow[], revoked
     if (grant.trust_rule_id) byRule.set(grant.trust_rule_id, [...(byRule.get(grant.trust_rule_id) ?? []), grant.id]);
   }
   const updated = (await tx.query<TrustRuleRow>(
-    `UPDATE delegation_trust_rules SET revoked_at = now(), revoked_reason = $2, revoked_by_user_id = $3, updated_at = now()
+    `UPDATE delegation_trust_rules SET revoked_at = clock_timestamp(), revoked_reason = $2, revoked_by_user_id = $3,
+        updated_at = clock_timestamp()
       WHERE id = ANY($1::text[]) RETURNING *`,
     [rules.map(rule => rule.id), input.reason, input.actorUserId && UUID.test(input.actorUserId) ? input.actorUserId : null],
   )).rows;
@@ -2430,7 +2437,13 @@ export const SUPERSEDED_BY_RULE = "superseded_by_rule";
 const EXCLUDED_FIELDS: BindingFields = { role: "excluded", classes: [], requireTierO: [], prOpsLimit: null, requiredConditions: {},
   targets: null, expiresAt: null };
 
-/** The binding columns a write sets, in bindingValues' order. */
+/**
+ * The binding columns a write sets, in bindingValues' order. Every write
+ * that changes authority stamps its time with clock_timestamp(), read after
+ * the owner's binding lock, never now() (the transaction's start): a
+ * message sent while the write waited on the lock is never newer than the
+ * change that first authorized it.
+ */
 const BINDING_COLUMNS = "role, classes, require_tier_o, pr_ops_limit, required_conditions, targets, expires_at";
 
 function bindingValues(fields: BindingFields): unknown[] {
@@ -2868,8 +2881,9 @@ export async function createBinding(database: Database, input: { workspaceId: st
         if (!group) throw new GroupNotFound();
       }
       const row = (await tx.query<TrustRuleRow>(
-        `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+        `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS},
+           created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, clock_timestamp(), clock_timestamp()) RETURNING *`,
         [mintId("dtr"), input.workspaceId, input.ownerUserId, input.principalKind, input.principalRef, ...bindingValues(input.fields)],
       )).rows[0]!;
       await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "binding.created", actorUserId: input.actorUserId,
@@ -2921,7 +2935,7 @@ export async function updateBinding(database: Database, input: { workspaceId: st
     }
     const row = (await tx.query<TrustRuleRow>(
       `UPDATE delegation_trust_rules SET (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8),
-          principal_kind = CASE WHEN $9::boolean THEN 'relay_agents' ELSE principal_kind END, updated_at = now()
+          principal_kind = CASE WHEN $9::boolean THEN 'relay_agents' ELSE principal_kind END, updated_at = clock_timestamp()
         WHERE id = $1 RETURNING *`,
       [before.id, ...bindingValues(fields), legacy],
     )).rows[0]!;
@@ -2957,8 +2971,9 @@ async function carryLegacyExclusions(tx: SqlExecutor, rule: TrustRuleRow, actorU
     )).rows[0];
     if (own) continue;
     const row = (await tx.query<TrustRuleRow>(
-      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
-       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS},
+         created_at, updated_at)
+       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), clock_timestamp()) RETURNING *`,
       [mintId("dtr"), rule.workspace_id, rule.owner_user_id, agentId, ...bindingValues(EXCLUDED_FIELDS)],
     )).rows[0]!;
     await recordDelegationAudit(tx, { workspaceId: rule.workspace_id, event: "binding.created", actorUserId, authMethod,
@@ -3028,7 +3043,7 @@ export async function createGroup(database: Database, input: { workspaceId: stri
       [id, input.workspaceId, input.ownerUserId, input.name]);
     const agentIds = [...new Set(input.agentIds)];
     if (agentIds.length) {
-      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id) SELECT $1, unnest($2::text[])", [id, agentIds]);
+      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id, added_at) SELECT $1, unnest($2::text[]), clock_timestamp()", [id, agentIds]);
     }
     await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "group.created", actorUserId: input.actorUserId,
       authMethod: input.authMethod, ownerUserId: input.ownerUserId, data: { group_id: id, name: input.name, agent_ids: agentIds } });
@@ -3061,11 +3076,11 @@ export async function updateGroup(database: Database, input: { workspaceId: stri
     const add = [...new Set(input.add ?? [])].filter(agentId => !live.has(agentId) && !remove.includes(agentId));
     if (remove.length) {
       await tx.query(
-        "UPDATE delegation_group_members SET removed_at = now() WHERE group_id = $1 AND agent_id = ANY($2::text[]) AND removed_at IS NULL",
+        "UPDATE delegation_group_members SET removed_at = clock_timestamp() WHERE group_id = $1 AND agent_id = ANY($2::text[]) AND removed_at IS NULL",
         [group.id, remove]);
     }
     if (add.length) {
-      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id) SELECT $1, unnest($2::text[])", [group.id, add]);
+      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id, added_at) SELECT $1, unnest($2::text[]), clock_timestamp()", [group.id, add]);
     }
     const audit = { workspaceId: input.workspaceId, actorUserId: input.actorUserId, authMethod: input.authMethod,
       ownerUserId: input.ownerUserId };
@@ -3103,7 +3118,7 @@ export async function revokeGroup(database: Database, input: { workspaceId: stri
         ruleId: binding.id, actorUserId: input.actorUserId, authMethod: input.authMethod, reason: "group_revoked" });
       revokedGrants += rule?.revokedGrants.length ?? 0;
     }
-    await tx.query("UPDATE delegation_groups SET revoked_at = now(), updated_at = now() WHERE id = $1", [group.id]);
+    await tx.query("UPDATE delegation_groups SET revoked_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = $1", [group.id]);
     await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "group.revoked", actorUserId: input.actorUserId,
       authMethod: input.authMethod, ownerUserId: input.ownerUserId,
       data: { group_id: group.id, revoked_bindings: bindings.map(binding => binding.id) } });
@@ -3156,7 +3171,7 @@ export async function seedTrustedBindings(database: Database, input: { apply: bo
       await carryLegacyExclusions(tx, locked, null, "system");
       const row = (await tx.query<TrustRuleRow>(
         `UPDATE delegation_trust_rules SET principal_kind = 'relay_agents', (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8),
-            updated_at = now() WHERE id = $1 RETURNING *`,
+            updated_at = clock_timestamp() WHERE id = $1 RETURNING *`,
         [rule.id, ...bindingValues(input.trusted)],
       )).rows[0]!;
       await recordDelegationAudit(tx, { workspaceId: rule.workspace_id, event: "binding.updated", actorUserId: null,

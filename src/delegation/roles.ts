@@ -317,7 +317,10 @@ export function requiredConditionsOf(scopes: readonly GrantScope[], actionClass:
 
 /** Whether a binding's repo target is valid: `owner/repo` or `owner/*` (no `#N`, no `:`). */
 export function isValidBindingTarget(pattern: string): boolean {
-  return isValidTargetPattern(pattern) && !/[#:]/u.test(pattern) && /^[^/]+\/[^/]+$/u.test(pattern);
+  // A concrete owner (the action repository's owner grammar); `*` only as the whole repo segment. `*/repo` would
+  // cover that repo name under every owner.
+  return isValidTargetPattern(pattern) && !/[#:]/u.test(pattern) &&
+    /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/(?:\*|[A-Za-z0-9_.-]{1,100})$/u.test(pattern);
 }
 
 /** Two authorities grant exactly the same thing (a system grant then needs no re-resolution). */
@@ -372,6 +375,13 @@ export function bindingFields(body: BindingBody, principalKind: PrincipalKind, c
   }
   if (role !== "custom") {
     if (named) return "a preset role sets its own classes; use role custom to choose them";
+    // A PATCH that keeps the role (omits it) keeps the authority saved with it: a preset changed in a later
+    // build never re-copies into, widens or narrows a binding nobody edited.
+    if (body.role === undefined && current && current.role === role) {
+      return { role, classes: [...current.classes], requireTierO: [...current.requireTierO],
+        prOpsLimit: current.prOpsLimit && [...current.prOpsLimit], requiredConditions: structuredClone(current.requiredConditions),
+        targets, expiresAt };
+    }
     const preset = PRESETS[role];
     return { role, classes: [...preset.classes], requireTierO: [...preset.requireTierO],
       prOpsLimit: preset.prOpsLimit && [...preset.prOpsLimit], requiredConditions: structuredClone(preset.requiredConditions),

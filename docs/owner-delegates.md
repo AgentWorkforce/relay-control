@@ -843,6 +843,16 @@ legacy rule into a Relay agents Trusted binding. It is a dry run unless
 into `excluded` agent bindings, and it skips an owner who already has a Relay
 agents binding.
 
+### Rolling out role bindings
+
+A build from before role bindings reads any live row of
+`delegation_trust_rules` as the owner's legacy every-class rule. Create no
+binding, and do not apply the role seed, until every instance runs a build
+with role bindings. During a rolling deploy, an older instance could serve a
+delegation request from a binding row as if it were a legacy rule. Until a
+person creates a binding, nothing is written: the migration itself changes
+no data.
+
 ### Rolling back role bindings
 
 A build from before role bindings reads every live row of
