@@ -17,6 +17,7 @@ import {
   APPROVAL_DEFAULT_MS,
   APPROVAL_MAX_MS,
   canonicalAction,
+  CLASS_DESCRIPTIONS,
   classTargetCovered,
   configTarget,
   isUndelegableSetting,
@@ -80,6 +81,15 @@ import {
   connectorRootProven, trustProver,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
+import {
+  CONNECTOR_KINDS, PR_OPS_OPS, PRESETS, PRESET_ROLES, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, bindingFields,
+  isValidBindingTarget, type BindingFields,
+} from "./roles.js";
+import {
+  BindingExists, GroupNotFound, bindingCoverage, bindingState, bindingViewOf, createBinding, createGroup, decideFor, getBinding,
+  listBindings, listGroups, listOwnerAgentCandidates, revokeBinding, revokeGroup, seedTrustedBindings, updateBinding, updateGroup,
+  type GroupRecord, type TrustRuleRow as BindingRow,
+} from "./service.js";
 import { trustPathFingerprint } from "./trust.js";
 import { secureEqual } from "../crypto.js";
 
@@ -210,6 +220,42 @@ const trustBackfillBody = z.object({
   after: z.string().uuid().optional(),
 }).strict();
 export const TRUST_BACKFILL_PATH = "/internal/v1/delegation/trust-backfill";
+/** POST /internal/v1/delegation/role-seed: a dry run unless `apply` is true; pages by rule id. */
+export const ROLE_SEED_PATH = "/internal/v1/delegation/role-seed";
+const roleSeedBody = z.object({
+  apply: z.boolean().optional(),
+  limit: z.number().int().min(1).max(500).optional(),
+  after: z.string().regex(/^dtr_[A-Za-z0-9]{8,64}$/u).optional(),
+}).strict();
+const BINDING_ID = /^dtr_[A-Za-z0-9]{8,64}$/u;
+const GROUP_ID = /^grp_[A-Za-z0-9]{8,64}$/u;
+// Role bindings and groups, the same bodies as Cloud's requests.ts (cloud#6665).
+const agentIdField = z.string().min(1).max(200).regex(/^[^\s]+$/u, "an agent id, not a name");
+const principalBody = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("relay_agents"), ref: z.null().optional() }).strict(),
+  z.object({ kind: z.literal("connector_kind"), ref: z.enum(CONNECTOR_KINDS) }).strict(),
+  z.object({ kind: z.literal("group"), ref: z.string().regex(/^grp_[A-Za-z0-9]{8,64}$/u) }).strict(),
+  z.object({ kind: z.literal("agent"), ref: agentIdField }).strict(),
+]);
+const bindingBodyFields = {
+  classes: z.array(actionClass).min(1).max(ACTION_CLASSES.length).optional(),
+  require_tier_o: classList.optional(),
+  pr_ops_limit: z.array(z.enum(PR_OPS_OPS)).min(1).max(PR_OPS_OPS.length).nullable().optional(),
+  // Partial: a role names conditions only for the classes it conditions (zod's record over an enum needs every key).
+  required_conditions: z.partialRecord(actionClass, z.array(z.object({ type: z.enum(REQUIRED_CONDITION_TYPES) }).strict())
+    .max(REQUIRED_CONDITION_TYPES.length)).optional(),
+  targets: z.array(z.string().max(256).refine(isValidBindingTarget, "a repo target is `owner/repo` or `owner/*`"))
+    .min(1).max(50).nullable().optional(),
+  expires_at: rfc3339.nullable().optional(),
+};
+const createBindingBody = z.object({ principal: principalBody, role: z.enum(ROLES), ...bindingBodyFields,
+  all_workspaces: z.boolean().optional() }).strict();
+const patchBindingBody = z.object({ role: z.enum(ROLES).optional(), ...bindingBodyFields }).strict()
+  .refine(body => Object.keys(body).length > 0, "nothing to change");
+const createGroupBody = z.object({ name: z.string().trim().min(1).max(80), agent_ids: z.array(agentIdField).max(200).optional() })
+  .strict();
+const patchGroupBody = z.object({ name: z.string().trim().min(1).max(80).optional(), add: z.array(agentIdField).max(200).optional(),
+  remove: z.array(agentIdField).max(200).optional() }).strict().refine(body => Object.keys(body).length > 0, "nothing to change");
 const mintBody = z.object({
   actions: mintActionsSchema,
   expires_at: rfc3339.optional(),
@@ -590,6 +636,28 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         report = await backfillConnectorRoots(input.database, { apply: body.apply === true, limit: body.limit, after: body.after });
       } catch (error) {
         logUnavailable("trust_backfill", error, {});
+        return UNAVAILABLE();
+      }
+      input.json(response, 200, report, true);
+      return true;
+    }
+    if (path === ROLE_SEED_PATH) {
+      // The role seed (Khaliq, answer 9): every live legacy trust rule becomes
+      // a Relay agents binding with the Trusted preset. Service-authenticated
+      // (SELFHOST_INTERNAL_TOKEN), off without it, and a DRY RUN unless the
+      // body says `{"apply": true}`. Idempotent.
+      const token = bearer(request);
+      if (!input.internalServiceToken) return fail("not_found", "Route not found", 404);
+      if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      if (!token || !secureEqual(token, input.internalServiceToken)) return fail("unauthorized", "Unauthorized", 401);
+      const raw = await readJson(request);
+      const body = parse(roleSeedBody, raw === undefined ? {} : raw, "Invalid request");
+      let report;
+      try {
+        report = await seedTrustedBindings(input.database, { apply: body.apply === true, limit: body.limit ?? 100,
+          after: body.after ?? null, trusted: bindingFields({ role: "trusted" }, "relay_agents", null, now()) as BindingFields });
+      } catch (error) {
+        logUnavailable("role_seed", error, {});
         return UNAVAILABLE();
       }
       input.json(response, 200, report, true);
@@ -1043,6 +1111,284 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return fail("method_not_allowed", "Method not allowed", 405);
     }
 
+    // Role bindings, groups, the agents picker and the presets (Cloud's
+    // delegates/bindings, groups, agents and roles routes, cloud#6665;
+    // #owner-decisions 251526750352171008). People only, like every route
+    // here. An admin may act on another owner's bindings and groups with
+    // `?owner=<user id>`; a POST is always the caller's own.
+    if (sub === "roles" || sub === "bindings" || sub === "groups" || sub === "agents" ||
+        sub?.startsWith("bindings/") || sub?.startsWith("groups/")) {
+      const requested = new URL(request.url ?? "/", "http://localhost").searchParams.get("owner");
+      let ownerUserId = principal.userId;
+      if (requested && requested.toLowerCase() !== principal.userId.toLowerCase()) {
+        if (!UUID.test(requested)) fail("invalid_request", "Invalid owner", 400);
+        if (!caller.admin) fail("forbidden", "Only org owners and admins can manage another owner's delegates", 403);
+        ownerUserId = requested.toLowerCase();
+      }
+      const prove = trustProver(deps, workspace, true);
+      const groupNames = async () => new Map((await listGroups(input.database, workspace.id, ownerUserId))
+        .map(group => [group.id, group.name] as const));
+      const proveAll = async (agentIds: readonly string[]) => new Map(await Promise.all([...new Set(agentIds)]
+        .map(async agentId => [agentId, await prove(ownerUserId, agentId)] as const)));
+
+      if (sub === "roles") {
+        if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
+        json(200, {
+          presets: PRESET_ROLES.map(role => {
+            const preset = PRESETS[role];
+            return { role, label: preset.label, description: preset.description, classes: preset.classes,
+              require_tier_o: preset.requireTierO, pr_ops_limit: preset.prOpsLimit, required_conditions: preset.requiredConditions };
+          }),
+          classes: ACTION_CLASSES.map(item => ({ class: item, description: CLASS_DESCRIPTIONS[item] })), pr_ops_ops: PR_OPS_OPS, required_condition_types: REQUIRED_CONDITION_TYPES,
+          principal_kinds: PRINCIPAL_KINDS.filter(kind => kind !== "all_agents"), connector_kinds: CONNECTOR_KINDS,
+        });
+        return true;
+      }
+
+      if (sub === "agents") {
+        if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
+        // The owner's agents by immutable id, each proven by ownership chain, never by name, with who decides for it now.
+        const candidates = await listOwnerAgentCandidates(input.database, workspace, ownerUserId);
+        const proofs = await proveAll(candidates);
+        const state = await bindingState(input.database, workspace.id, ownerUserId);
+        const at = now();
+        const active = (await input.database.query<GrantRow>(
+          `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND status = 'active' AND expires_at > $3`,
+          [workspace.id, ownerUserId, at],
+        )).rows;
+        const agents = candidates.flatMap(agentId => {
+          const proof = proofs.get(agentId);
+          if (!proof) return [];
+          const root = proof.path.root;
+          const groups = [...(proof.path.hops.length ? [] : ["relay_agents",
+            ...(root.kind === "connector" ? [`connector:${root.connector}`] : [])]), ...state.groupsOf(agentId)];
+          const own = active.find(grant => grant.delegate_agent_id === agentId && !grant.trust_rule_id);
+          const system = active.find(grant => grant.delegate_agent_id === agentId && grant.trust_rule_id);
+          const decision = decideFor(state, agentId, proof.path, at);
+          const effective = own ? { binding_id: null, role: "custom", source: "explicit_grant", grant_id: own.id } :
+            decision.kind === "covered" ? { binding_id: decision.binding.id,
+              role: decision.source === "spawn_default" ? "read_only" : decision.binding.role ?? "legacy", source: decision.source,
+              grant_id: system?.trust_rule_id === decision.binding.id ? system.id : null } :
+            decision.kind === "excluded" ? { binding_id: decision.binding.id, role: "excluded", source: "agent", grant_id: null } :
+            { binding_id: null, role: null, source: "none", grant_id: null };
+          return [{ agent_id: agentId, name: proof.name, root_kind: root.kind,
+            connector: root.kind === "connector" ? root.connector : null, spawned: proof.path.hops.length > 0,
+            launched_by: proof.path.hops.at(-1)?.actor_id ?? null, groups, effective }];
+        });
+        json(200, { agents });
+        return true;
+      }
+
+      if (sub === "groups") {
+        if (method === "GET") {
+          const groups = await listGroups(input.database, workspace.id, ownerUserId);
+          const proofs = await proveAll(groups.flatMap(group => group.members.map(member => member.agent_id))).catch(() => null);
+          json(200, { groups: [...builtinGroupsView(), ...groups.map(group => groupView(group, proofs))] });
+          return true;
+        }
+        if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+        // A group only ever grants through a binding, but creating one in another owner's name is still theirs to do.
+        if (ownerUserId !== principal.userId) fail("forbidden", "An admin cannot create a group in another owner's name", 403);
+        const body = parse(createGroupBody, await readJson(request), "Invalid group");
+        await requireEnabled(workspace.id);
+        const agentIds = [...new Set(body.agent_ids ?? [])];
+        const proofs = await proveAll(agentIds);
+        const notOwned = agentIds.filter(agentId => !proofs.get(agentId));
+        if (notOwned.length) {
+          json(422, { error: "These agents are not proven to be yours", code: "not_owned", agent_ids: notOwned });
+          return true;
+        }
+        let group;
+        try {
+          group = await createGroup(input.database, { workspaceId: workspace.id, ownerUserId, ...actor, name: body.name, agentIds });
+        } catch (error) {
+          if (error instanceof TrustRuleMembershipGone) fail("forbidden", "Forbidden", 403);
+          throw error;
+        }
+        json(201, { group: groupView(group!, proofs) });
+        return true;
+      }
+
+      if (sub.startsWith("groups/")) {
+        const groupId = sub.slice("groups/".length);
+        if (!GROUP_ID.test(groupId)) fail("not_found", "Group not found", 404);
+        // Acting for another owner, an admin never changes their groups: removing a member or a group can
+        // widen an agent's authority through precedence (review on cloud#6665).
+        if (ownerUserId !== principal.userId) fail("forbidden", "An admin can only exclude another owner's agent", 403);
+        if (method === "DELETE") {
+          const revoked = await revokeGroup(input.database, { workspaceId: workspace.id, ownerUserId, groupId, ...actor });
+          if (!revoked) fail("not_found", "Group not found", 404);
+          json(200, { revoked: groupId, revoked_bindings: revoked!.revokedBindings, revoked_grants: revoked!.revokedGrants });
+          return true;
+        }
+        if (method !== "PATCH") fail("method_not_allowed", "Method not allowed", 405);
+        const body = parse(patchGroupBody, await readJson(request), "Invalid group change");
+        const add = [...new Set(body.add ?? [])];
+        let proofs: Map<string, Awaited<ReturnType<typeof prove>>> | undefined;
+        if (add.length) {
+          // Adding grants authority: delegation must be on, and every new member must prove out as the owner's.
+          await requireEnabled(workspace.id);
+          proofs = await proveAll(add);
+          const notOwned = add.filter(agentId => !proofs!.get(agentId));
+          if (notOwned.length) {
+            json(422, { error: "These agents are not proven to be yours", code: "not_owned", agent_ids: notOwned });
+            return true;
+          }
+        }
+        const group = await updateGroup(input.database, { workspaceId: workspace.id, ownerUserId, groupId, ...actor,
+          ...(body.name !== undefined ? { name: body.name } : {}), add, remove: body.remove ?? [] });
+        if (!group) fail("not_found", "Group not found", 404);
+        json(200, { group: groupView(group!, proofs ?? null) });
+        return true;
+      }
+
+      if (sub === "bindings") {
+        if (method === "GET") {
+          const [bindings, names, coverage, policy] = await Promise.all([listBindings(input.database, workspace.id, ownerUserId),
+            groupNames(), bindingCoverage(input.database, workspace.id, ownerUserId), loadPolicy(input.database, workspace.id)]);
+          const relayAgents = bindings.some(binding => binding.principal_kind === "relay_agents");
+          json(200, {
+            bindings: bindings.map(binding => bindingView(binding, { covered: coverage.get(binding.id) ?? 0, policy, groupNames: names })),
+            // One click: Trusted for every Relay agent, offered while none is set and delegation is on.
+            recommendation: !relayAgents && policy.delegation_enabled ? { principal: { kind: "relay_agents", ref: null },
+              role: "trusted", label: "Give your Relay agents Trusted" } : null,
+          });
+          return true;
+        }
+        if (method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+        // An admin may create for another owner with ?owner=; the binding is that owner's, and the admin is the actor.
+        const { principal: target, all_workspaces: everywhere, ...body } = parse(createBindingBody, await readJson(request),
+          "Invalid binding");
+        if (everywhere && ownerUserId !== principal.userId) {
+          fail("invalid_request", "Every workspace applies only to your own bindings", 400);
+        }
+        // Delegation is the owner's own consent: an admin acting for another owner (?owner=) may only narrow it,
+        // here by excluding one of that owner's agents. Nothing that grants is created in someone else's name (review B1 on cloud#6665).
+        if (ownerUserId !== principal.userId && body.role !== "excluded") {
+          fail("forbidden", "An admin can only exclude another owner's agent, never grant in their name", 403);
+        }
+        const fields = bindingFields(body, target.kind, null, now());
+        if (typeof fields === "string") fail("invalid_request", fields, 400);
+        if (everywhere && (target.kind === "group" || target.kind === "agent")) {
+          fail("invalid_request", "Only built-in groups can be bound in every workspace", 400);
+        }
+        const create = async (targetWorkspaceId: string): Promise<TrustRuleRow | { skipped: string }> => {
+          if (!(await loadPolicy(input.database, targetWorkspaceId)).delegation_enabled) return { skipped: "not_enabled" };
+          // An agent principal must prove out as the caller's, by ownership chain, never by name.
+          if (target.kind === "agent" && !await prove(ownerUserId, target.ref)) return { skipped: "not_owned" };
+          try {
+            return await createBinding(input.database, { workspaceId: targetWorkspaceId, ownerUserId, ...actor,
+              principalKind: target.kind, principalRef: target.ref ?? null, fields: fields as BindingFields });
+          } catch (error) {
+            if (error instanceof BindingExists) return { skipped: `binding_exists:${error.bindingId}` };
+            if (error instanceof GroupNotFound) return { skipped: "group_not_found" };
+            if (error instanceof TrustRuleMembershipGone) return { skipped: "forbidden" };
+            throw error;
+          }
+        };
+        if (!everywhere) {
+          const made = await create(workspace.id);
+          if (!("skipped" in made)) {
+            json(201, { binding: bindingView(made, { covered: 0, policy: await loadPolicy(input.database, workspace.id),
+              groupNames: await groupNames() }) });
+            return true;
+          }
+          const [code, existing] = made.skipped.split(":");
+          if (code === "not_enabled") NOT_ENABLED();
+          if (code === "not_owned") fail("not_owned", "That agent is not proven to be yours", 422);
+          if (code === "group_not_found") fail("not_found", "Group not found", 404);
+          if (code === "forbidden") fail("forbidden", "Forbidden", 403);
+          json(409, { error: "A binding for this principal already exists", code: "binding_exists", binding_id: existing });
+          return true;
+        }
+        // "All workspaces" is one binding per workspace (Khaliq, answer 11): every workspace the caller belongs to.
+        const workspaces = (await input.database.query<{ id: string }>(
+          `SELECT w.id::text AS id FROM workspaces w
+             JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $1
+            ORDER BY (w.id = $2) DESC, w.id`,
+          [principal.userId, workspace.id],
+        )).rows.map(row => row.id);
+        const bindings: unknown[] = [];
+        const skipped: Array<{ workspace_id: string; reason: string }> = [];
+        for (const targetWorkspaceId of workspaces) {
+          const made = await create(targetWorkspaceId);
+          if ("skipped" in made) skipped.push({ workspace_id: targetWorkspaceId, reason: made.skipped.split(":")[0]! });
+          else bindings.push({ workspace_id: targetWorkspaceId, ...bindingView(made, { covered: 0,
+            policy: await loadPolicy(input.database, targetWorkspaceId), groupNames: new Map() }) });
+        }
+        json(201, { bindings, skipped });
+        return true;
+      }
+
+      // bindings/{binding_id}
+      const bindingId = sub.slice("bindings/".length);
+      if (!BINDING_ID.test(bindingId)) fail("not_found", "Binding not found", 404);
+      if (method === "GET") {
+        const binding = await getBinding(input.database, workspace.id, ownerUserId, bindingId);
+        if (!binding) fail("not_found", "Binding not found", 404);
+        // Each agent it decides for now, its chain read now (writing nothing).
+        const covered = await Promise.all((await ruleGrants(input.database, workspace.id, bindingId)).map(async grant => {
+          let chain: "proven" | "broken" | "unknown" = "unknown";
+          if (grant.trust_path) {
+            const proof = await prove(grant.owner_user_id, grant.delegate_agent_id).catch(() => undefined);
+            chain = proof === undefined ? "unknown" :
+              proof && trustPathFingerprint(proof.path) === trustPathFingerprint(grant.trust_path) ? "proven" : "broken";
+          }
+          const root = grant.trust_path?.root;
+          return { grant_id: grant.id, delegate_agent_id: grant.delegate_agent_id, chain, root_kind: root?.kind ?? null,
+            connector: root?.kind === "connector" ? root.connector : null, spawned: (grant.trust_path?.hops.length ?? 0) > 0,
+            created_at: new Date(grant.created_at).toISOString() };
+        }));
+        json(200, { binding: bindingView(binding!, { covered: covered.length, policy: await loadPolicy(input.database, workspace.id),
+          groupNames: await groupNames() }), covered });
+        return true;
+      }
+      if (method === "DELETE") {
+        // Removing a binding can widen through precedence (an agent falls to a broader binding), so an admin
+        // acting for another owner cannot; they exclude the agent instead (review on cloud#6665).
+        if (ownerUserId !== principal.userId) fail("forbidden", "An admin can only exclude another owner's agent", 403);
+        // Allowed while delegation is off.
+        const revoked = await revokeBinding(input.database, { workspaceId: workspace.id, ownerUserId, bindingId, ...actor,
+          reason: ownerUserId === principal.userId ? "owner_revoked" : "admin_revoked" });
+        if (!revoked) fail("not_found", "Binding not found", 404);
+        json(200, { revoked: revoked!.binding.id, revoked_grants: revoked!.revokedGrants.length });
+        return true;
+      }
+      if (method !== "PATCH") fail("method_not_allowed", "Method not allowed", 405);
+      const body = parse(patchBindingBody, await readJson(request), "Invalid binding change");
+      // An admin acting for another owner may only narrow: an exclusion, with nothing else in the body.
+      if (ownerUserId !== principal.userId && (body.role !== "excluded" || Object.keys(body).length !== 1)) {
+        fail("forbidden", "An admin can only exclude another owner's agent or remove their binding", 403);
+      }
+      // Narrowing to an exclusion is always allowed; anything that can grant needs delegation on.
+      if (body.role !== "excluded") await requireEnabled(workspace.id);
+      // Fields the body omits are taken from the binding as locked inside the update, never from an earlier read.
+      const at = now();
+      let updated: BindingRow | string | null;
+      try {
+        updated = await updateBinding(input.database, { workspaceId: workspace.id, ownerUserId, bindingId, ...actor,
+          resolve: current => {
+            const view = bindingViewOf(current);
+            const stored: BindingFields | null = view.role === null ? null : { role: view.role, classes: view.classes ?? [],
+              requireTierO: view.requireTierO, prOpsLimit: view.prOpsLimit, requiredConditions: view.requiredConditions,
+              targets: view.targets, expiresAt: view.expiresAt };
+            return bindingFields(body, view.principalKind, stored, at);
+          } });
+      } catch (error) {
+        // A legacy rule becomes the Relay agents binding: refused while the owner already has one.
+        if (error instanceof BindingExists) {
+          json(409, { error: "A binding for this principal already exists", code: "binding_exists", binding_id: error.bindingId });
+          return true;
+        }
+        throw error;
+      }
+      if (!updated) fail("not_found", "Binding not found", 404);
+      if (typeof updated === "string") fail("invalid_request", updated, 400);
+      json(200, { binding: bindingView(updated as BindingRow, { covered: (await ruleGrants(input.database, workspace.id, bindingId)).length,
+        policy: await loadPolicy(input.database, workspace.id), groupNames: await groupNames() }) });
+      return true;
+    }
+
     if (sub === "trust-rule") {
       // The owner's set-once trust rule (docs/owner-delegates.md, "Trust rule"):
       // people only, like every route here. An admin may read or revoke another
@@ -1088,6 +1434,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         } catch (error) {
           if (error instanceof TrustRuleNotEnabled) NOT_ENABLED();
           if (error instanceof TrustRuleMembershipGone) fail("forbidden", "Forbidden", 403);
+          if (error instanceof BindingExists) {
+            json(409, { error: "A Relay agents binding already replaces the trust rule", code: "binding_exists",
+              binding_id: error.bindingId });
+            return true;
+          }
           throw error;
         }
         return true;
@@ -1561,4 +1912,63 @@ function narrowingRefusal(grant: GrantRow, patch: { scopes?: Scope[]; expiresAt?
   if (patch.requireTierO && grant.require_tier_o.some(item => !patch.requireTierO!.includes(item))) {
     widen("require_tier_o may only gain classes");
   }
+}
+
+/** The built-in principals' display names (Cloud's PRINCIPAL_NAMES). */
+const PRINCIPAL_NAMES: Record<string, string> = {
+  all_agents: "All my agents",
+  relay_agents: "Relay agents",
+  "connector:grok-bot": "Grok bots",
+  "connector:chatgpt": "ChatGPT",
+  "connector:cursor-cloud": "Cursor cloud agents",
+  "connector:muse": "Muse",
+  "connector:mcp": "Other MCP clients",
+};
+
+function principalName(binding: ReturnType<typeof bindingViewOf>, groupNames: Map<string, string>): string {
+  switch (binding.principalKind) {
+    case "connector_kind": return PRINCIPAL_NAMES[`connector:${binding.principalRef}`] ?? binding.principalRef ?? "";
+    case "group": return groupNames.get(binding.principalRef ?? "") ?? "Removed group";
+    case "agent": return binding.principalRef ?? "";
+    default: return PRINCIPAL_NAMES[binding.principalKind] ?? binding.principalKind;
+  }
+}
+
+/**
+ * A binding as the API shows it (Cloud's bindingJson). A legacy rule (no
+ * role) reads as role `legacy` with every class, until the role seed or a
+ * PATCH makes it a role binding.
+ */
+function bindingView(row: BindingRow, input: { covered: number; policy: DelegationPolicy; groupNames: Map<string, string> }) {
+  const binding = bindingViewOf(row);
+  const classes: ActionClass[] = binding.role === null ? [...ACTION_CLASSES] : binding.classes ?? [];
+  return {
+    binding_id: binding.id, owner_id: row.owner_user_id,
+    principal: { kind: binding.principalKind, ref: binding.principalRef, name: principalName(binding, input.groupNames) },
+    role: binding.role ?? "legacy", classes, require_tier_o: binding.requireTierO, pr_ops_limit: binding.prOpsLimit,
+    required_conditions: binding.requiredConditions, targets: binding.targets,
+    expires_at: binding.expiresAt?.toISOString() ?? null, created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(), covered: input.covered,
+    clipped_by_policy: input.policy.allowed_classes ? classes.filter(item => !input.policy.allowed_classes!.includes(item)) : [],
+  };
+}
+
+function groupView(group: GroupRecord, proofs: Map<string, { name: string } | null> | null) {
+  return {
+    group_id: group.id, kind: "custom" as const, name: group.name, created_at: new Date(group.created_at).toISOString(),
+    members: group.members.map(member => {
+      const proof = proofs?.get(member.agent_id);
+      return { agent_id: member.agent_id, name: proof?.name ?? null,
+        proven: proofs && proofs.has(member.agent_id) ? Boolean(proof) : null, added_at: new Date(member.added_at).toISOString() };
+    }),
+  };
+}
+
+/** The built-in groups, always listed: membership is proven per agent, so they carry no member list. */
+function builtinGroupsView() {
+  return [
+    { group_id: "relay_agents", kind: "builtin" as const, name: PRINCIPAL_NAMES.relay_agents, members: null },
+    ...CONNECTOR_KINDS.map(kind => ({ group_id: `connector:${kind}`, kind: "builtin" as const,
+      name: PRINCIPAL_NAMES[`connector:${kind}`], members: null })),
+  ];
 }

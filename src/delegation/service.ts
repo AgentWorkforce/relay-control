@@ -46,6 +46,12 @@ import {
   type ReasonCode,
   type Scope,
 } from "./scope.js";
+import { ACTION_CLASSES } from "./scope.js";
+import {
+  PR_OPS_OPS, PRINCIPAL_KINDS, REQUIRED_CONDITION_TYPES, ROLES, coversNothing, decide, requiredConditionsOf, sameScopes,
+  systemScopes, systemScopesCover, type Authority, type BindingFields, type BindingView, type Decision, type PrOp,
+  type PrincipalKind, type RequiredCondition, type RequiredConditions, type Role,
+} from "./roles.js";
 
 /**
  * Owner-named trusted delegates: grants, claims, attestation and redeem
@@ -156,6 +162,16 @@ export type TrustRuleRow = {
   revoked_at: Date | string | null;
   revoked_reason: string | null;
   revoked_by_user_id: string | null;
+  /** `all_agents` (legacy), `relay_agents`, `connector_kind`, `group` or `agent` (migration 0099). */
+  principal_kind?: string;
+  principal_ref?: string | null;
+  /** Null on a legacy rule: every class, spawn tree included. */
+  role?: string | null;
+  classes?: ActionClass[] | null;
+  pr_ops_limit?: string[] | null;
+  required_conditions?: Record<string, Array<{ type: string }>> | null;
+  targets?: string[] | null;
+  expires_at?: Date | string | null;
 };
 
 /** The expiry a rule-backed grant carries: never read as authority, only the live rule is. */
@@ -185,27 +201,51 @@ export function handOverDated(previous: TrustPath | null, next: TrustPath): bool
 }
 
 /**
- * A person revoking one system grant excludes that agent from the rule, not
- * just that row (Cloud's excludeFromRule): the grant they saw may already have
- * been replaced by a hand-over, so every active system grant of the rule for
- * that agent is revoked as owner_excluded, and when none is left the retired
- * one is re-recorded as the exclusion. Rule (share), then the delegate's lock
- * and the pair's grants by id: materializeRuleGrant's order.
+ * A person revoking one system grant excludes that agent (Khaliq, answer 8;
+ * Cloud's excludeFromRule): the owner gets an `excluded` binding for the
+ * agent, which beats every group and gives nothing, until someone gives the
+ * agent a direct setting (PATCH that binding). The exclusion is of the agent,
+ * not the row: every active system grant of the owner for that agent is
+ * revoked as owner_excluded, and when none is left the retired one the
+ * person saw is re-recorded as the exclusion. Runs in the caller's
+ * transaction. The owner's binding lock is taken exclusively first, then the
+ * owner's live rules FOR UPDATE, then the grants by id. That serializes with
+ * every materialization for the owner.
  */
 export async function excludeFromRule(tx: SqlExecutor, input: { workspaceId: string; grant: GrantRow; actorUserId: string;
   authMethod: string | null }): Promise<boolean> {
   const { grant } = input;
-  await tx.query("SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE",
-    [input.workspaceId, grant.trust_rule_id]);
-  await lockDelegateAgent(tx, input.workspaceId, grant.delegate_agent_id);
-  const active = (await tx.query<{ id: string }>(
-    `SELECT id FROM delegation_grants
-      WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4 AND status = 'active'
-      ORDER BY id FOR UPDATE`,
-    [input.workspaceId, grant.owner_user_id, grant.delegate_agent_id, grant.trust_rule_id],
-  )).rows.map(row => row.id);
-  const revoked = await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds: active, actorUserId: input.actorUserId,
-    reason: OWNER_EXCLUDED, authMethod: input.authMethod });
+  const ownerUserId = grant.owner_user_id;
+  const agentId = grant.delegate_agent_id;
+  await lockOwnerBindings(tx, input.workspaceId, ownerUserId, "exclusive");
+  await lockLiveRules(tx, { workspaceId: input.workspaceId, ownerUserId });
+  const own = (await tx.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
+        AND principal_ref = $3 AND revoked_at IS NULL`,
+    [input.workspaceId, ownerUserId, agentId],
+  )).rows[0];
+  const excluded = EXCLUDED_FIELDS;
+  let binding: TrustRuleRow | null = null;
+  if (!own) {
+    binding = (await tx.query<TrustRuleRow>(
+      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
+       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [mintId("dtr"), input.workspaceId, ownerUserId, agentId, ...bindingValues(excluded)],
+    )).rows[0]!;
+  } else if (own.role !== "excluded") {
+    binding = (await tx.query<TrustRuleRow>(
+      `UPDATE delegation_trust_rules SET (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8), updated_at = now()
+        WHERE id = $1 RETURNING *`,
+      [own.id, ...bindingValues(excluded)],
+    )).rows[0]!;
+  }
+  if (binding) {
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: own ? "binding.updated" : "binding.created",
+      actorUserId: input.actorUserId, authMethod: input.authMethod, ownerUserId, reason: OWNER_EXCLUDED,
+      data: { ...bindingAudit(binding), delegate_agent_id: agentId, grant_id: grant.id } });
+  }
+  const revoked = await reresolveOwnerGrants(tx, { workspaceId: input.workspaceId, ownerUserId,
+    actorUserId: input.actorUserId, authMethod: input.authMethod, onlyAgent: agentId });
   if (revoked.length) return true;
   // Nothing active: the grant shown had already ended. Its end is re-recorded as the person's exclusion.
   const marked = (await tx.query(
@@ -213,10 +253,10 @@ export async function excludeFromRule(tx: SqlExecutor, input: { workspaceId: str
       WHERE workspace_id = $1 AND id = $2 AND status = 'revoked' AND revoked_reason IS DISTINCT FROM $3 RETURNING id`,
     [input.workspaceId, grant.id, OWNER_EXCLUDED, input.actorUserId],
   )).rows.length > 0;
-  if (!marked) return false;
+  if (!marked) return Boolean(binding);
   await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "grant.revoked", actorUserId: input.actorUserId,
-    authMethod: input.authMethod, ownerUserId: grant.owner_user_id, grantId: grant.id, reason: OWNER_EXCLUDED,
-    data: { delegate_agent_id: grant.delegate_agent_id, already_ended: true } });
+    authMethod: input.authMethod, ownerUserId, grantId: grant.id, reason: OWNER_EXCLUDED,
+    data: { delegate_agent_id: agentId, already_ended: true } });
   return true;
 }
 
@@ -260,7 +300,7 @@ export function grantView(row: GrantRow, now = new Date()) {
 }
 
 /** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`, `gate_`, `dtr_`), as Cloud's mintId. */
-export function mintId(prefix: "grt" | "apv" | "clm" | "gate" | "dtr"): string {
+export function mintId(prefix: "grt" | "apv" | "clm" | "gate" | "dtr" | "grp"): string {
   return `${prefix}_${base62(randomBytes(16))}`;
 }
 
@@ -296,7 +336,11 @@ export async function loadPolicy(executor: SqlExecutor, workspaceId: string, loc
 /** Whether a grant still fits the workspace policy (§4.1: re-checked at every use), as Cloud. */
 export function grantFitsPolicy(grant: Pick<GrantRow, "scopes" | "expires_at" | "created_at" | "trust_rule_id">,
   policy: DelegationPolicy): boolean {
-  if (policy.allowed_classes && grant.scopes.some(scope => !policy.allowed_classes!.includes(scope.class))) return false;
+  // A system grant follows its binding's preset, which may name classes the
+  // policy does not allow: those are refused per action (scopeRefusal), so the
+  // policy clips the grant instead of refusing all of it (as Cloud).
+  if (!grant.trust_rule_id && policy.allowed_classes &&
+      grant.scopes.some(scope => !policy.allowed_classes!.includes(scope.class))) return false;
   // The 90-day cap does not apply to the owner's trust rule (#owner-decisions 251238934511685632): the
   // exemption is keyed on the rule link, never on the far expiry date, and the rule is checked live at every use.
   if (grant.trust_rule_id) return true;
@@ -1413,11 +1457,11 @@ async function chainChanged(prove: TrustProver, grant: GrantRow): Promise<boolea
  */
 async function ruleBackedGrant(deps: DelegationDeps, workspace: DelegationWorkspace, prove: TrustProver,
   ownerUserId: string, agentId: string): Promise<GrantRow | null> {
-  const rule = await liveTrustRule(deps.database, workspace.id, ownerUserId);
-  if (!rule) return null;
+  // Any live binding of the owner may decide (roles.ts decide), under the materialization's locks.
+  if (!await hasLiveBindings(deps.database, workspace.id, ownerUserId)) return null;
   const proof = await prove(ownerUserId, agentId);
   if (!proof) return null;
-  const grant = await materializeRuleGrant(deps.database, { workspace, ruleId: rule.id, ownerUserId, delegateAgentId: agentId,
+  const grant = await materializeRuleGrant(deps.database, { workspace, ownerUserId, delegateAgentId: agentId,
     delegateAgentName: proof.name, trustPath: proof.path, provenAt: trustPathProvenAt(proof.path),
     ...(proof.path.root.kind === "claim" && !proof.path.hops.length ? { claimId: proof.path.root.claim_id } : {}) });
   return grant && grant.status === "active" ? grant : null;
@@ -1445,12 +1489,13 @@ export function tierOClasses(policy: DelegationPolicy, grant: GrantRow): Set<Act
 }
 
 /**
- * Whether a grant covers one action's class and target. A rule-backed grant
- * covers every class (the policy's allowed classes still apply, in
- * scopeRefusal); an owner-made grant covers what its scopes name.
+ * Whether a grant covers one action's class and target. A system grant covers
+ * what its binding's scopes say (roles.ts systemScopesCover). A legacy rule's
+ * grant has no scopes and covers every class. The policy's allowed classes
+ * still apply, in scopeRefusal. An owner-made grant covers what its scopes name.
  */
 export function grantCovers(grant: Pick<GrantRow, "scopes" | "trust_rule_id">, action: Pick<Action, "class" | "target">): boolean {
-  return grant.trust_rule_id ? true : actionsCovered(grant.scopes, [action]);
+  return grant.trust_rule_id ? systemScopesCover(grant.scopes, action) : actionsCovered(grant.scopes, [action]);
 }
 
 /** Why an action list is outside the grant or the policy, or null (Cloud's scopeRefusal). */
@@ -1733,6 +1778,9 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       const required = tierOClasses(policy, grant);
       if (actions.some(action => required.has(action.class))) refuse("tier_o_required");
     }
+    const acting = await actingRefusal(deps, prove, { workspace, actingOwnerId: input.callerUserId,
+      actingAgentId: recipient.agentId, grant, tier, actions, now });
+    if (acting) refuse(acting);
     // §5.4: the owner needs standing over every action's target.
     const standing = await standingFor(deps.database, workspace.id, {
       approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId, accept: input.accept, actions,
@@ -1775,6 +1823,9 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       const stale = freshRefusal(state, { actions, tier, policy, recipientAgentId: recipient.agentId,
         nowMs: deps.now().getTime() });
       if (stale) refuse(stale);
+      const actingNow = await actingRefusalLocked(tx, { workspace, actingOwnerId: input.callerUserId,
+        actingAgentId: recipient.agentId, grant, tier, actions, now: deps.now() });
+      if (actingNow) refuse(actingNow);
       if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       // Standing against the target owners as committed now (relay-control
       // reads them locally, so this costs no external call).
@@ -1939,6 +1990,16 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     const outOfScope = scopeRefusal([action!], grant!, policy, input.recipientAgentId);
     if (outOfScope) refuse(outOfScope);
     if (approval!.tier === "D" && tierOClasses(policy, grant!).has(action!.class)) refuse("tier_o_required");
+    const acting = await actingRefusal(deps, prove, { workspace, actingOwnerId: input.callerUserId,
+      actingAgentId: input.recipientAgentId, grant: grant!, tier: approval!.tier, actions: [action!], now });
+    if (acting) refuse(acting);
+    // A binding's required conditions (Trusted: ci_green and mergeable on a
+    // merge) are checked with the action's own conditions, whatever the
+    // approval named. relay-control reads no GitHub state, so they answer
+    // condition_unavailable here: a binding that requires them fails closed.
+    const required: RequiredCondition[] = grant!.trust_rule_id ? requiredConditionsOf(grant!.scopes, action!.class) : [];
+    const checkedConditions: Condition[] = [...(action!.conditions ?? []),
+      ...required.filter(condition => !(action!.conditions ?? []).some(own => own.type === condition.type)) as Condition[]];
     const standingInput = {
       approvalOwnerId: approval!.owner_user_id, recipientOwnerId: input.callerUserId,
       accept: attested!.accept === "own_owner" ? "own_owner" as const : "code_owners" as const, actions: [action!],
@@ -1946,7 +2007,7 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     if (!await standingFor(deps.database, workspace.id, standingInput)) refuse("recipient_policy");
     const singleUse = approval!.single_use || highRisk(action!);
     if (singleUse && await actionConsumed(deps.database, approval!.id, action!)) refuse("consumed");
-    const conditions = evaluateConditions(action!.conditions ?? [], now);
+    const conditions = evaluateConditions(checkedConditions, now);
     if (conditions.kind === "unavailable") refuse("condition_unavailable");
     if (conditions.kind === "unmet") throw new ConditionUnmet(conditions.unmet);
     if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
@@ -1961,6 +2022,9 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       const stale = freshRefusal(state, { actions: [action!], tier: approval!.tier, policy,
         recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
       if (stale) refuse(stale);
+      const actingNow = await actingRefusalLocked(tx, { workspace, actingOwnerId: input.callerUserId,
+        actingAgentId: input.recipientAgentId, grant: grant!, tier: approval!.tier, actions: [action!], now: deps.now() });
+      if (actingNow) refuse(actingNow);
       if (input.stillAuthorized && !await input.stillAuthorized(tx)) refuse("not_pending");
       if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
       // The bearer check can itself wait on a session lock (cloud#6603
@@ -1979,7 +2043,10 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
         workspaceId: workspace.id, event: "approval.redeemed", actorUserId: input.callerUserId,
         authMethod: input.authMethod, ownerUserId: approval!.owner_user_id, grantId: grant!.id,
         approvalId: input.approvalId, recipientAgentId: input.recipientAgentId,
-        data: { action: input.action, consumed: singleUse, conditions: action!.conditions ?? [] },
+        data: { action: input.action, consumed: singleUse, conditions: checkedConditions,
+          // Who minted the approval: a delegated (Tier D) approval is traceable to its grant and delegate.
+          tier: approval!.tier, minter: { grant_id: grant!.id, delegate_agent_id: grant!.delegate_agent_id,
+            owner_id: grant!.owner_user_id, ...(grant!.trust_rule_id ? { binding_id: grant!.trust_rule_id } : {}) } },
       });
     });
     return { ok: true, consumed: singleUse };
@@ -2042,7 +2109,7 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
   // delegates at once. Roots only: agents they launch are workers, not
   // approvers, and are not sent every prompt. One root that cannot be read is
   // skipped (and logged), not the whole list.
-  if (await liveTrustRule(deps.database, workspace.id, session.userId)) {
+  if (await hasLiveBindings(deps.database, workspace.id, session.userId)) {
     for (const agentId of await listTrustRootAgents(deps.database, workspace, session.userId)) {
       if (agentId === session.agentId) continue;
       await ruleBackedGrant(deps, workspace, prove, session.userId, agentId).catch((error: unknown) => {
@@ -2056,7 +2123,8 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
       WHERE workspace_id = $1 AND owner_user_id = $2 AND status = 'active' AND expires_at > now()
       ORDER BY created_at`,
     [workspace.id, session.userId],
-  )).rows.filter(grant => grant.trust_rule_id || grant.scopes.some(scope => scope.class === "prompt_approval"));
+  )).rows.filter(grant => grant.scopes.some(scope => scope.class === "prompt_approval") ||
+    (grant.trust_rule_id && !grant.scopes.length));
   const delegates: Array<{ agent_id: string; grant_id: string }> = [];
   for (const grant of grants) {
     if (!grantFitsPolicy(grant, policy)) continue;
@@ -2171,12 +2239,23 @@ export class TrustRuleNotEnabled extends Error {
   }
 }
 
-/** The owner's live trust rule in this workspace, if any. */
+/** A legacy rule: the set-once trust rule from before roles (`all_agents`, no role). */
+const LEGACY_RULE = "principal_kind = 'all_agents' AND role IS NULL";
+
+/** The owner's live legacy trust rule in this workspace, if any (role bindings are listed by listBindings). */
 export async function liveTrustRule(executor: SqlExecutor, workspaceId: string, ownerUserId: string): Promise<TrustRuleRow | null> {
   return (await executor.query<TrustRuleRow>(
-    "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL",
+    `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL AND ${LEGACY_RULE}`,
     [workspaceId, ownerUserId],
   )).rows[0] ?? null;
+}
+
+/** Whether the owner has any live binding, so the trust rule may cover one of their agents. */
+export async function hasLiveBindings(executor: SqlExecutor, workspaceId: string, ownerUserId: string): Promise<boolean> {
+  return (await executor.query(
+    "SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL LIMIT 1",
+    [workspaceId, ownerUserId],
+  )).rows.length > 0;
 }
 
 /** One rule by id (live or revoked). */
@@ -2208,9 +2287,20 @@ export async function putTrustRule(database: Database, input: { workspaceId: str
   requireTierO: ActionClass[]; authMethod: string }): Promise<{ rule: TrustRuleRow; created: boolean }> {
   const run = () => database.transaction(async (tx) => {
     if (!await memberRole(tx, input.workspaceId, input.ownerUserId, true)) throw new TrustRuleMembershipGone();
+    // The owner's binding lock, after membership (as every binding write): serializes with createBinding.
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
     if (!(await loadPolicy(tx, input.workspaceId, true)).delegation_enabled) throw new TrustRuleNotEnabled();
+    // The legacy rule and a Relay agents binding never stand together: the
+    // binding replaced the rule, and a new legacy rule would cover the spawn
+    // tree again at the lowest precedence (as Cloud).
+    const relay = (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'relay_agents'
+          AND revoked_at IS NULL LIMIT 1`, [input.workspaceId, input.ownerUserId],
+    )).rows[0];
+    if (relay) throw new BindingExists(relay.id);
     const locked = (await tx.query<TrustRuleRow>(
-      `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL FOR UPDATE`,
+      `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL AND ${LEGACY_RULE}
+        FOR UPDATE`,
       [input.workspaceId, input.ownerUserId],
     )).rows[0];
     if (!locked) {
@@ -2260,7 +2350,8 @@ export async function putTrustRule(database: Database, input: { workspaceId: str
  * rule carries the ids of the grants revoked here, under its lock.
  */
 export async function revokeTrustRulesTx(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string | null;
-  actorUserId: string | null; authMethod: string | null; reason: string }): Promise<Array<TrustRuleRow & { revokedGrants: string[] }>> {
+  ruleId?: string; actorUserId: string | null; authMethod: string | null; reason: string }):
+  Promise<Array<TrustRuleRow & { revokedGrants: string[] }>> {
   const rules = await lockLiveRules(tx, input);
   if (!rules.length) return [];
   const grantIds = (await tx.query<{ id: string }>(
@@ -2274,12 +2365,14 @@ export async function revokeTrustRulesTx(tx: SqlExecutor, input: { workspaceId: 
 }
 
 /** Locks the live rules of a scope FOR UPDATE, by id: always before any grant. */
-async function lockLiveRules(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string | null }): Promise<TrustRuleRow[]> {
+async function lockLiveRules(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string | null; ruleId?: string }):
+  Promise<TrustRuleRow[]> {
   return (await tx.query<TrustRuleRow>(
     `SELECT * FROM delegation_trust_rules
       WHERE workspace_id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR owner_user_id = $2)
+        AND ($3::text IS NULL OR id = $3)
       ORDER BY id FOR UPDATE`,
-    [input.workspaceId, input.ownerUserId],
+    [input.workspaceId, input.ownerUserId, input.ruleId ?? null],
   )).rows;
 }
 
@@ -2302,9 +2395,10 @@ async function stampRulesRevoked(tx: SqlExecutor, rules: TrustRuleRow[], revoked
   )).rows;
   for (const rule of updated) {
     const grants = byRule.get(rule.id) ?? [];
-    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "trust_rule.revoked",
+    const legacy = rule.role === null || rule.role === undefined;
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: legacy ? "trust_rule.revoked" : "binding.revoked",
       actorUserId: input.actorUserId, authMethod: input.authMethod, ownerUserId: rule.owner_user_id, reason: input.reason,
-      data: { trust_rule_id: rule.id, revoked_grants: grants, count: grants.length } });
+      data: { trust_rule_id: rule.id, ...(legacy ? {} : bindingAudit(rule)), revoked_grants: grants, count: grants.length } });
   }
   return updated.map(rule => ({ ...rule, revokedGrants: byRule.get(rule.id) ?? [] }));
 }
@@ -2317,41 +2411,269 @@ async function stampRulesRevoked(tx: SqlExecutor, rules: TrustRuleRow[], revoked
 export async function revokeTrustRule(database: Database, input: { workspaceId: string; ownerUserId: string;
   actorUserId: string; authMethod: string; reason: string }): Promise<{ rule: TrustRuleRow; revokedGrants: string[] } | null> {
   return database.transaction(async (tx) => {
-    const [rule] = await revokeTrustRulesTx(tx, input);
+    // Only the legacy rule: the owner's role bindings are revoked one by one (revokeBinding).
+    const legacy = await liveTrustRule(tx, input.workspaceId, input.ownerUserId);
+    if (!legacy) return null;
+    const [rule] = await revokeTrustRulesTx(tx, { ...input, ruleId: legacy.id });
     if (!rule) return null;
     const { revokedGrants, ...record } = rule;
     return { rule: record, revokedGrants };
   });
 }
 
+// ---------------------------------------------------------------- role bindings
+
+/** The revoke reason of a system grant whose deciding binding or authority changed: the binding re-resolves it. */
+export const SUPERSEDED_BY_RULE = "superseded_by_rule";
+
+/** An exclusion's fields: nothing. */
+const EXCLUDED_FIELDS: BindingFields = { role: "excluded", classes: [], requireTierO: [], prOpsLimit: null, requiredConditions: {},
+  targets: null, expiresAt: null };
+
+/** The binding columns a write sets, in bindingValues' order. */
+const BINDING_COLUMNS = "role, classes, require_tier_o, pr_ops_limit, required_conditions, targets, expires_at";
+
+function bindingValues(fields: BindingFields): unknown[] {
+  return [fields.role, fields.classes, fields.requireTierO, fields.prOpsLimit, JSON.stringify(fields.requiredConditions),
+    fields.targets, fields.expiresAt];
+}
+
+const PRINCIPAL_SET = new Set<string>(PRINCIPAL_KINDS);
+const ROLE_SET = new Set<string>(ROLES);
+const OP_SET = new Set<string>(PR_OPS_OPS);
+const CONDITION_SET = new Set<string>(REQUIRED_CONDITION_TYPES);
+const CLASS_SET = new Set<string>(ACTION_CLASSES);
+
+function requiredConditionsFrom(value: Record<string, Array<{ type: string }>> | null | undefined): RequiredConditions {
+  const result: RequiredConditions = {};
+  for (const [key, list] of Object.entries(value ?? {})) {
+    if (!CLASS_SET.has(key) || !Array.isArray(list)) continue;
+    const kept = list.filter(item => CONDITION_SET.has(item?.type)).map(item => ({ type: item.type })) as RequiredCondition[];
+    if (kept.length) result[key as ActionClass] = kept;
+  }
+  return result;
+}
+
 /**
- * Creates (or returns) the system grant through which the owner's live rule
- * covers one proven agent, in one transaction, under the same lock order as a
- * decision: the owner's membership, the policy, the RULE (share, re-read
- * live), then the agent's creation lock and the pair's grants by id (as an
- * owner-made grant and a claim release take them), then a claim root's claim.
- * A revoke that holds the rule first makes this see it revoked and create
- * nothing; one that comes later waits and then revokes the new grant.
- * Lapsed owner-made grants of the pair expire here first (they never shadow
- * the rule); a live owner-made grant wins and is returned instead. An agent
- * the owner excluded (revoked its system grant by hand) is not covered again
- * by the same rule. Concurrent first materializes converge on one grant
- * through the active-pair unique index. Null when nothing covers it.
+ * A stored binding as resolution reads it (Cloud's trustRuleFrom). An unknown
+ * principal kind or role reads as a binding that covers nothing: principal
+ * `agent` with no ref, role `excluded`. A newer build's row never widens an
+ * older build.
  */
-export async function materializeRuleGrant(database: Database, input: { workspace: DelegationWorkspace; ruleId: string;
+export function bindingViewOf(row: TrustRuleRow): BindingView {
+  const kind = row.principal_kind ?? "all_agents";
+  const role = row.role ?? null;
+  const known = PRINCIPAL_SET.has(kind) && (role === null || ROLE_SET.has(role));
+  const classes = row.classes === null || row.classes === undefined ? null :
+    row.classes.filter(item => CLASS_SET.has(item)) as ActionClass[];
+  return {
+    id: row.id, principalKind: known ? kind as PrincipalKind : "agent", principalRef: known ? row.principal_ref ?? null : null,
+    role: known ? role as Role | null : "excluded", classes,
+    requireTierO: (row.require_tier_o ?? []).filter(item => CLASS_SET.has(item)) as ActionClass[],
+    prOpsLimit: row.pr_ops_limit === null || row.pr_ops_limit === undefined ? null : row.pr_ops_limit.filter(op => OP_SET.has(op)) as PrOp[],
+    requiredConditions: requiredConditionsFrom(row.required_conditions), targets: row.targets ?? null,
+    expiresAt: row.expires_at ? new Date(row.expires_at) : null,
+  };
+}
+
+/** Audit data for a binding: its principal and what it grants. */
+function bindingAudit(row: TrustRuleRow) {
+  const binding = bindingViewOf(row);
+  return { binding_id: binding.id, principal_kind: binding.principalKind, principal_ref: binding.principalRef, role: binding.role,
+    classes: binding.classes, require_tier_o: binding.requireTierO, pr_ops_limit: binding.prOpsLimit,
+    required_conditions: binding.requiredConditions, targets: binding.targets, expires_at: binding.expiresAt?.toISOString() ?? null };
+}
+
+/**
+ * Serializes one owner's binding writes (exclusive) with every
+ * materialization for that owner (shared), as Cloud's lockOwnerBindings: a
+ * transaction-scoped advisory lock. The lock order is:
+ * 1. the owner's membership (share), when there is one;
+ * 2. this lock;
+ * 3. the policy, the owner's binding rows, the delegate's creation lock
+ *    (lockDelegateAgent), then grant rows by id.
+ * A materialization therefore decides on the bindings and groups as they
+ * stand once every earlier write committed, and a write that starts later
+ * re-resolves the grant it created.
+ */
+async function lockOwnerBindings(tx: SqlExecutor, workspaceId: string, ownerUserId: string, mode: "shared" | "exclusive"):
+  Promise<void> {
+  await tx.query(mode === "shared" ? "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))" :
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`delegation-bindings:${workspaceId}:${ownerUserId}`]);
+}
+
+/** One owner's live bindings and which of their custom groups each agent is a live member of. */
+export type BindingState = { rows: TrustRuleRow[]; bindings: BindingView[]; groupsOf(agentId: string): string[];
+  /** When the agent joined one of the owner's groups (null when it is not a live member). */
+  memberSince(agentId: string, groupId: string): Date | null };
+
+export async function bindingState(executor: SqlExecutor, workspaceId: string, ownerUserId: string,
+  lock?: "share" | "update"): Promise<BindingState> {
+  const rows = (await executor.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL
+      ORDER BY id${lock === "share" ? " FOR SHARE" : lock === "update" ? " FOR UPDATE" : ""}`,
+    [workspaceId, ownerUserId],
+  )).rows;
+  const members = (await executor.query<{ group_id: string; agent_id: string; added_at: Date | string }>(
+    `SELECT m.group_id, m.agent_id, m.added_at FROM delegation_group_members m JOIN delegation_groups g ON g.id = m.group_id
+      WHERE g.workspace_id = $1 AND g.owner_user_id = $2 AND g.revoked_at IS NULL AND m.removed_at IS NULL`,
+    [workspaceId, ownerUserId],
+  )).rows;
+  const byAgent = new Map<string, string[]>();
+  const since = new Map<string, Date>();
+  for (const row of members) {
+    byAgent.set(row.agent_id, [...(byAgent.get(row.agent_id) ?? []), row.group_id]);
+    since.set(`${row.agent_id}\u0000${row.group_id}`, new Date(row.added_at));
+  }
+  return { rows, bindings: rows.map(bindingViewOf), groupsOf: agentId => byAgent.get(agentId) ?? [],
+    memberSince: (agentId, groupId) => since.get(`${agentId}\u0000${groupId}`) ?? null };
+}
+
+/**
+ * The acting agent's own authority, read inside a deciding transaction (as
+ * Cloud's actingAuthorityLocked): the owner's binding lock (shared), so a
+ * binding or group write either committed before this read or waits for the
+ * decision, then a share lock on the agent's active owner-made grants from
+ * that owner. The owner-made grant's Tier O list when there is one, else the
+ * owner's binding state.
+ */
+export async function actingAuthorityLocked(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string; agentId: string;
+  now: Date }): Promise<{ own: ActionClass[] | null; state: BindingState }> {
+  await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "shared");
+  const rows = (await tx.query<GrantRow>(
+    `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
+        AND status = 'active' AND trust_rule_id IS NULL ORDER BY id FOR SHARE`,
+    [input.workspaceId, input.ownerUserId, input.agentId],
+  )).rows;
+  const own = rows.find(grant => time(grant.expires_at) > input.now.getTime());
+  return { own: own ? own.require_tier_o : null, state: await bindingState(tx, input.workspaceId, input.ownerUserId) };
+}
+
+/**
+ * When a covering decision's authority began (Cloud's decisionSince): the
+ * latest creation or change of every binding that contributed. For a custom
+ * group that also includes the moment the agent joined each deciding group.
+ * A system grant is never dated before it. A legacy rule counts only its
+ * creation: its Tier O PUT updates its grants in place, as before roles.
+ */
+function decisionSince(state: BindingState, decision: Decision, agentId: string): number {
+  if (decision.kind !== "covered") return 0;
+  const now = Date.now();
+  const contributing = decision.source === "group" ? state.rows.filter(row => {
+    const view = bindingViewOf(row);
+    return view.principalKind === "group" && view.principalRef !== null && state.groupsOf(agentId).includes(view.principalRef) &&
+      (!view.expiresAt || view.expiresAt.getTime() > now);
+  }) : state.rows.filter(row => row.id === decision.binding.id);
+  return Math.max(0, ...contributing.flatMap(row => [time(row.created_at),
+    ...(decision.binding.role === null ? [] : [time(row.updated_at)]),
+    ...(decision.source === "group" ? [state.memberSince(agentId, row.principal_ref!)?.getTime() ?? Number.MAX_SAFE_INTEGER] : [])]));
+}
+
+/** Which binding decides for one agent of the owner whose chain is `path` (roles.ts decide). */
+export function decideFor(state: BindingState, agentId: string, path: TrustPath, now: Date): Decision {
+  return decide(state.bindings, { agentId, path, groupIds: state.groupsOf(agentId) }, now);
+}
+
+type GrantShape = { binding: BindingView; authority: Authority; scopes: Scope[]; requireTierO: ActionClass[]; expiresAt: Date };
+
+/** The system grant a covering decision stands for. Null when it covers nothing (roles.ts coversNothing, review B1 on cloud#6665). */
+function grantShape(decision: Decision): GrantShape | null {
+  if (decision.kind !== "covered") return null;
+  const { authority } = decision;
+  if (coversNothing(authority)) return null;
+  return { binding: decision.binding, authority, scopes: systemScopes(authority), requireTierO: authority.requireTierO,
+    expiresAt: authority.expiresAt ?? TRUST_RULE_GRANT_EXPIRY };
+}
+
+/** Whether a system grant is exactly what a decision stands for now (binding, scopes, Tier O and expiry). */
+function grantMatches(grant: GrantRow, shape: GrantShape): boolean {
+  return grant.trust_rule_id === shape.binding.id && sameScopes(grant.scopes, shape.scopes) &&
+    grant.require_tier_o.length === shape.requireTierO.length && shape.requireTierO.every(item => grant.require_tier_o.includes(item)) &&
+    time(grant.expires_at) === shape.expiresAt.getTime();
+}
+
+/**
+ * Re-resolves every active system grant of one owner against the bindings as
+ * they now stand, in the caller's transaction, which already holds the
+ * owner's exclusive binding lock (Cloud's reresolveOwnerGrants). A grant whose
+ * deciding binding, scopes, Tier O list or expiry would change is revoked
+ * with its approvals:
+ * - an agent now excluded ends as owner_excluded;
+ * - any other change ends as superseded_by_rule, and the agent's next use
+ *   materializes the new grant.
+ * Only stored rows are read (each grant keeps its proven chain), so a
+ * narrowing takes effect at once.
+ */
+async function reresolveOwnerGrants(tx: SqlExecutor, input: { workspaceId: string; ownerUserId: string;
+  actorUserId: string | null; authMethod: string | null; onlyAgent?: string }): Promise<string[]> {
+  const now = new Date();
+  const state = await bindingState(tx, input.workspaceId, input.ownerUserId);
+  const grants = (await tx.query<GrantRow>(
+    `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND status = 'active'
+        AND trust_rule_id IS NOT NULL AND ($3::text IS NULL OR delegate_agent_id = $3)
+      ORDER BY id FOR UPDATE`,
+    [input.workspaceId, input.ownerUserId, input.onlyAgent ?? null],
+  )).rows;
+  const byReason = new Map<string, string[]>();
+  for (const grant of grants) {
+    const decision: Decision = grant.trust_path ? decideFor(state, grant.delegate_agent_id, grant.trust_path, now) : { kind: "none" };
+    const shape = grantShape(decision);
+    if (shape && grantMatches(grant, shape)) continue;
+    const reason = decision.kind === "excluded" ? OWNER_EXCLUDED : SUPERSEDED_BY_RULE;
+    byReason.set(reason, [...(byReason.get(reason) ?? []), grant.id]);
+  }
+  const revoked: string[] = [];
+  for (const [reason, grantIds] of byReason) {
+    for (const row of await revokeGrants(tx, { workspaceId: input.workspaceId, grantIds, actorUserId: input.actorUserId,
+      reason, authMethod: input.authMethod })) revoked.push(row.id);
+  }
+  return revoked;
+}
+
+/**
+ * Creates (or returns) the system grant through which one of the owner's
+ * bindings covers one proven agent, in one transaction (Cloud's
+ * materializeRuleGrant).
+ *
+ * The lock order is:
+ * 1. the owner's membership (share);
+ * 2. the owner's binding lock (shared);
+ * 3. the policy;
+ * 4. every live binding of the owner (share);
+ * 5. the agent's creation lock and the pair's grants by id (as an owner-made
+ *    grant and a claim release take them);
+ * 6. a claim root's claim.
+ * Under those locks the deciding binding is chosen (roles.ts decide).
+ * `ruleId`, when given, must be the binding that decides.
+ *
+ * - A live owner-made grant wins and is returned instead.
+ * - An active system grant that no longer matches the decision is retired
+ *   (superseded_by_rule) and replaced.
+ * - Lapsed owner-made grants of the pair expire here first.
+ * - An agent a person excluded from a legacy rule before bindings existed is
+ *   not covered again by that rule.
+ * - Concurrent first materializes converge on one grant through the
+ *   active-pair unique index.
+ *
+ * Null when nothing covers the agent: an `excluded` binding, no binding, or
+ * a binding that covers nothing.
+ */
+export async function materializeRuleGrant(database: Database, input: { workspace: DelegationWorkspace; ruleId?: string;
   ownerUserId: string; delegateAgentId: string; delegateAgentName: string; trustPath: TrustPath; provenAt: Date;
   claimId?: string;
-  /** Test hook: runs once the rule and grant locks are held. */
+  /** Test hook: runs once the binding and grant locks are held. */
   onLocked?: () => Promise<void> }): Promise<GrantRow | null> {
   const { workspace } = input;
   const pair = [workspace.id, input.ownerUserId, input.delegateAgentId];
   const run = () => database.transaction(async (tx): Promise<GrantRow | null> => {
     if (!await memberRole(tx, workspace.id, input.ownerUserId, true)) return null;
+    await lockOwnerBindings(tx, workspace.id, input.ownerUserId, "shared");
     if (!(await loadPolicy(tx, workspace.id, true)).delegation_enabled) return null;
-    const rule = (await tx.query<TrustRuleRow>(
-      "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND id = $2 FOR SHARE", [workspace.id, input.ruleId],
-    )).rows[0];
-    if (!rule || rule.revoked_at || rule.owner_user_id !== input.ownerUserId) return null;
+    const state = await bindingState(tx, workspace.id, input.ownerUserId, "share");
+    const decision = decideFor(state, input.delegateAgentId, input.trustPath, new Date());
+    const shape = grantShape(decision);
+    if (!shape || (input.ruleId && shape.binding.id !== input.ruleId)) return null;
+    const rule = state.rows.find(row => row.id === shape.binding.id)!;
     await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
     if (input.claimId) {
       // A claim root: its claim is re-read under its lock (releaseClaim's order).
@@ -2366,18 +2688,26 @@ export async function materializeRuleGrant(database: Database, input: { workspac
       `SELECT * FROM delegation_grants WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3
           AND status = 'active' LIMIT 1`, pair,
     )).rows[0];
-    if (active) return active;
-    const excluded = (await tx.query(
-      `SELECT 1 FROM delegation_grants
-        WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
-          AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
-      [...pair, rule.id, OWNER_EXCLUDED],
-    )).rows.length > 0;
-    if (excluded) return null;
-    // Any earlier grant of the pair counts, owner-made ones too: while the
-    // bot's own grant governed it (until it was revoked or lapsed), the rule did
-    // not, so a message refused under that grant's scope stays refused. A
-    // system grant retired for a changed chain (CHAIN_CHANGED) is the one
+    if (active) {
+      if (!active.trust_rule_id || grantMatches(active, shape)) return active;
+      await revokeGrants(tx, { workspaceId: workspace.id, grantIds: [active.id], actorUserId: null, reason: SUPERSEDED_BY_RULE,
+        authMethod: "system" });
+    }
+    if (shape.binding.role === null) {
+      const excluded = (await tx.query(
+        `SELECT 1 FROM delegation_grants
+          WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND trust_rule_id = $4
+            AND status = 'revoked' AND revoked_reason = $5 LIMIT 1`,
+        [...pair, rule.id, OWNER_EXCLUDED],
+      )).rows.length > 0;
+      if (excluded) return null;
+    }
+    // Created no earlier than the binding (as last changed), every record of
+    // the chain, and the last time any grant of the pair ended:
+    // - owner-made grants count too;
+    // - so does a grant superseded because its binding changed, since new
+    //   authority is never retroactive.
+    // A system grant retired for a changed chain (CHAIN_CHANGED) is the one
     // exception, when the new chain's own records date the hand-over
     // (handOverDated, as Cloud).
     const ended = (await tx.query<{ status: string; revoked_at: Date | string | null; expires_at: Date | string;
@@ -2388,22 +2718,24 @@ export async function materializeRuleGrant(database: Database, input: { workspac
       pair,
     )).rows.filter(row => !(row.trust_rule_id && row.status === "revoked" && row.revoked_reason === CHAIN_CHANGED &&
       handOverDated(row.trust_path, input.trustPath)));
-    const history = { ended: ended.length ? new Date(Math.max(...ended.map(row =>
-      time(row.status === "revoked" ? row.revoked_at ?? row.expires_at : row.expires_at)))) : null };
-    const createdAt = new Date(Math.max(time(rule.created_at), input.provenAt.getTime(),
-      history?.ended ? time(history.ended) : 0));
+    const endedAt = ended.length ? Math.max(...ended.map(row =>
+      time(row.status === "revoked" ? row.revoked_at ?? row.expires_at : row.expires_at))) : 0;
+    // No earlier than every contributing binding's creation and last change,
+    // and a group member's joining (decisionSince): new authority is never retroactive.
+    const createdAt = new Date(Math.max(decisionSince(state, decision, input.delegateAgentId), input.provenAt.getTime(), endedAt));
     const row = (await tx.query<GrantRow>(
       `INSERT INTO delegation_grants
          (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name, scopes, require_tier_o,
           expires_at, created_auth_method, created_at, trust_rule_id, trust_path)
-       VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, 'system', $9, $10, $11::jsonb) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'system', $10, $11, $12::jsonb) RETURNING *`,
       [mintId("grt"), workspace.id, workspace.organizationId, input.ownerUserId, input.delegateAgentId, input.delegateAgentName,
-        rule.require_tier_o, TRUST_RULE_GRANT_EXPIRY, createdAt, rule.id, JSON.stringify(input.trustPath)],
+        JSON.stringify(shape.scopes), shape.requireTierO, shape.expiresAt, createdAt, rule.id, JSON.stringify(input.trustPath)],
     )).rows[0]!;
     await recordDelegationAudit(tx, { workspaceId: workspace.id, event: "grant.created", actorUserId: null,
       authMethod: "system", ownerUserId: input.ownerUserId, grantId: row.id, reason: "trust_rule",
       data: { delegate_agent_id: input.delegateAgentId, trust_rule_id: rule.id, trust_path: input.trustPath,
-        require_tier_o: rule.require_tier_o } });
+        require_tier_o: shape.requireTierO, binding_id: rule.id, principal_kind: shape.binding.principalKind,
+        role: shape.binding.role, source: decision.kind === "covered" ? decision.source : null, scopes: shape.scopes } });
     return row;
   });
   try {
@@ -2413,4 +2745,471 @@ export async function materializeRuleGrant(database: Database, input: { workspac
     if ((error as { code?: string })?.code === "23505") return run();
     throw error;
   }
+}
+
+/** A second live binding for the same (owner, principal); carries the first one's id. */
+export class BindingExists extends Error {
+  constructor(readonly bindingId: string) {
+    super("binding_exists");
+  }
+}
+
+/** The group a `group` principal names is not the owner's live group. */
+export class GroupNotFound extends Error {
+  constructor() {
+    super("group_not_found");
+  }
+}
+
+/** Every live binding (one owner's, or every owner's), oldest first. */
+export async function listBindings(executor: SqlExecutor, workspaceId: string, ownerUserId: string | null): Promise<TrustRuleRow[]> {
+  return (await executor.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR owner_user_id = $2)
+      ORDER BY created_at, id`,
+    [workspaceId, ownerUserId],
+  )).rows;
+}
+
+/** One live binding of one owner. */
+export async function getBinding(executor: SqlExecutor, workspaceId: string, ownerUserId: string, bindingId: string):
+  Promise<TrustRuleRow | null> {
+  return (await executor.query<TrustRuleRow>(
+    "SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND id = $3 AND revoked_at IS NULL",
+    [workspaceId, ownerUserId, bindingId],
+  )).rows[0] ?? null;
+}
+
+/** How many active system grants each binding of one owner decides now. */
+export async function bindingCoverage(executor: SqlExecutor, workspaceId: string, ownerUserId: string | null):
+  Promise<Map<string, number>> {
+  const rows = (await executor.query<{ trust_rule_id: string; count: number }>(
+    `SELECT trust_rule_id, count(*)::int AS count FROM delegation_grants
+      WHERE workspace_id = $1 AND status = 'active' AND trust_rule_id IS NOT NULL AND ($2::uuid IS NULL OR owner_user_id = $2)
+      GROUP BY trust_rule_id`,
+    [workspaceId, ownerUserId],
+  )).rows;
+  return new Map(rows.map(row => [row.trust_rule_id, Number(row.count)]));
+}
+
+/**
+ * Creates one binding (Cloud's createBinding). The owner must be a member, and
+ * a `group` principal must be the owner's live group. One live binding exists
+ * per (owner, principal); a second is refused with the first one's id. The
+ * owner's system grants are re-resolved, so a more specific binding takes
+ * over at once.
+ */
+export async function createBinding(database: Database, input: { workspaceId: string; ownerUserId: string; actorUserId: string;
+  authMethod: string; principalKind: Exclude<PrincipalKind, "all_agents">; principalRef: string | null;
+  fields: BindingFields }): Promise<TrustRuleRow> {
+  const existing = (executor: SqlExecutor) => executor.query<{ id: string }>(
+    `SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = $3
+        AND coalesce(principal_ref, '') = coalesce($4::text, '') AND revoked_at IS NULL LIMIT 1`,
+    [input.workspaceId, input.ownerUserId, input.principalKind, input.principalRef]);
+  try {
+    return await database.transaction(async (tx) => {
+      if (!await memberRole(tx, input.workspaceId, input.ownerUserId, true)) throw new TrustRuleMembershipGone();
+      await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+      const found = (await existing(tx)).rows[0];
+      if (found) throw new BindingExists(found.id);
+      if (input.principalKind === "relay_agents") {
+        // A live legacy rule is the owner's Relay agents binding until it is converted (PATCH it, or the role seed).
+        const legacy = (await tx.query<{ id: string }>(
+          `SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL AND ${LEGACY_RULE}
+            LIMIT 1`, [input.workspaceId, input.ownerUserId],
+        )).rows[0];
+        if (legacy) throw new BindingExists(legacy.id);
+      }
+      if (input.principalKind === "group") {
+        const group = (await tx.query(
+          `SELECT 1 FROM delegation_groups WHERE workspace_id = $1 AND owner_user_id = $2 AND id = $3 AND revoked_at IS NULL
+            FOR SHARE`,
+          [input.workspaceId, input.ownerUserId, input.principalRef ?? ""],
+        )).rows[0];
+        if (!group) throw new GroupNotFound();
+      }
+      const row = (await tx.query<TrustRuleRow>(
+        `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+        [mintId("dtr"), input.workspaceId, input.ownerUserId, input.principalKind, input.principalRef, ...bindingValues(input.fields)],
+      )).rows[0]!;
+      await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "binding.created", actorUserId: input.actorUserId,
+        authMethod: input.authMethod, ownerUserId: input.ownerUserId, data: bindingAudit(row) });
+      await reresolveOwnerGrants(tx, input);
+      return row;
+    });
+  } catch (error) {
+    if ((error as { code?: string })?.code !== "23505") throw error;
+    // A concurrent create of the same principal won the live-principal index.
+    const winner = (await existing(database)).rows[0];
+    if (winner) throw new BindingExists(winner.id);
+    throw error;
+  }
+}
+
+/**
+ * Replaces what one live binding grants (Cloud's updateBinding). Its principal
+ * is fixed, but a legacy rule becomes a Relay agents binding the first time
+ * it is set. Every system grant of the owner is then re-resolved.
+ */
+export async function updateBinding(database: Database, input: { workspaceId: string; ownerUserId: string; bindingId: string;
+  actorUserId: string; authMethod: string;
+  /**
+   * The new fields, from the binding as locked here: fields a PATCH omits keep
+   * their locked values, never an earlier read's, so two concurrent PATCHes
+   * never undo each other's narrowing. A string refuses.
+   */
+  resolve: (current: TrustRuleRow) => BindingFields | string }): Promise<TrustRuleRow | string | null> {
+  return database.transaction(async (tx) => {
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+    const before = (await tx.query<TrustRuleRow>(
+      `SELECT * FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND id = $3 AND revoked_at IS NULL
+        FOR UPDATE`,
+      [input.workspaceId, input.ownerUserId, input.bindingId],
+    )).rows[0];
+    if (!before) return null;
+    const fields = input.resolve(before);
+    if (typeof fields === "string") return fields;
+    const legacy = (before.principal_kind ?? "all_agents") === "all_agents";
+    if (legacy) {
+      // The legacy rule becomes the Relay agents binding: refused while the owner already has one.
+      const existing = (await tx.query<{ id: string }>(
+        `SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'relay_agents'
+            AND revoked_at IS NULL LIMIT 1`, [input.workspaceId, input.ownerUserId],
+      )).rows[0];
+      if (existing) throw new BindingExists(existing.id);
+      await carryLegacyExclusions(tx, before, input.actorUserId, input.authMethod);
+    }
+    const row = (await tx.query<TrustRuleRow>(
+      `UPDATE delegation_trust_rules SET (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8),
+          principal_kind = CASE WHEN $9::boolean THEN 'relay_agents' ELSE principal_kind END, updated_at = now()
+        WHERE id = $1 RETURNING *`,
+      [before.id, ...bindingValues(fields), legacy],
+    )).rows[0]!;
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "binding.updated", actorUserId: input.actorUserId,
+      authMethod: input.authMethod, ownerUserId: input.ownerUserId,
+      data: { binding_id: row.id, before: bindingAudit(before), after: bindingAudit(row) } });
+    await reresolveOwnerGrants(tx, input);
+    return row;
+  });
+}
+
+/**
+ * Keeps the exclusions a legacy rule recorded when it stops being legacy (as
+ * Cloud's carryLegacyExclusions). Before roles, an exclusion was only a
+ * system grant of the rule revoked as owner_excluded, and only a legacy rule
+ * reads those (materializeRuleGrant). Each such agent gets an `excluded` agent
+ * binding, unless it already has an agent binding of its own. Otherwise
+ * converting the rule (role seed or PATCH) would cover it again. Runs under
+ * the owner's exclusive binding lock.
+ */
+async function carryLegacyExclusions(tx: SqlExecutor, rule: TrustRuleRow, actorUserId: string | null,
+  authMethod: string | null): Promise<string[]> {
+  const agents = [...new Set((await tx.query<{ delegate_agent_id: string }>(
+    `SELECT delegate_agent_id FROM delegation_grants WHERE trust_rule_id = $1 AND status = 'revoked' AND revoked_reason = $2
+      ORDER BY delegate_agent_id`, [rule.id, OWNER_EXCLUDED],
+  )).rows.map(row => row.delegate_agent_id))];
+  const carried: string[] = [];
+  for (const agentId of agents) {
+    const own = (await tx.query(
+      `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'agent'
+          AND principal_ref = $3 AND revoked_at IS NULL LIMIT 1`, [rule.workspace_id, rule.owner_user_id, agentId],
+    )).rows[0];
+    if (own) continue;
+    const row = (await tx.query<TrustRuleRow>(
+      `INSERT INTO delegation_trust_rules (id, workspace_id, owner_user_id, principal_kind, principal_ref, ${BINDING_COLUMNS})
+       VALUES ($1, $2, $3, 'agent', $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [mintId("dtr"), rule.workspace_id, rule.owner_user_id, agentId, ...bindingValues(EXCLUDED_FIELDS)],
+    )).rows[0]!;
+    await recordDelegationAudit(tx, { workspaceId: rule.workspace_id, event: "binding.created", actorUserId, authMethod,
+      ownerUserId: rule.owner_user_id, reason: OWNER_EXCLUDED,
+      data: { ...bindingAudit(row), delegate_agent_id: agentId, carried_from: rule.id } });
+    carried.push(agentId);
+  }
+  return carried;
+}
+
+/**
+ * Revokes one binding and every system grant it created, with their
+ * approvals (Cloud's revokeBinding). The owner's binding lock is taken first,
+ * then the binding (FOR UPDATE), then its grants by id. The owner's other
+ * system grants are re-resolved after that: an agent the binding decided for
+ * may fall to a less specific binding at its next use. A removed binding
+ * allows that fall-through; an exclusion never does.
+ */
+export async function revokeBinding(database: Database, input: { workspaceId: string; ownerUserId: string; bindingId: string;
+  actorUserId: string; authMethod: string; reason: string }): Promise<{ binding: TrustRuleRow; revokedGrants: string[] } | null> {
+  return database.transaction(async (tx) => {
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+    const [rule] = await revokeTrustRulesTx(tx, { workspaceId: input.workspaceId, ownerUserId: input.ownerUserId,
+      ruleId: input.bindingId, actorUserId: input.actorUserId, authMethod: input.authMethod, reason: input.reason });
+    if (!rule) return null;
+    const more = await reresolveOwnerGrants(tx, input);
+    const { revokedGrants, ...binding } = rule;
+    return { binding, revokedGrants: [...revokedGrants, ...more] };
+  });
+}
+
+// ---------------------------------------------------------------- groups
+
+export type GroupRecord = { id: string; workspace_id: string; owner_user_id: string; name: string;
+  created_at: Date | string; updated_at: Date | string; members: Array<{ agent_id: string; added_at: Date | string }> };
+
+async function readGroups(executor: SqlExecutor, workspaceId: string, ownerUserId: string, groupId?: string): Promise<GroupRecord[]> {
+  const groups = (await executor.query<Omit<GroupRecord, "members">>(
+    `SELECT id, workspace_id, owner_user_id, name, created_at, updated_at FROM delegation_groups
+      WHERE workspace_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3)
+      ORDER BY created_at, id`,
+    [workspaceId, ownerUserId, groupId ?? null],
+  )).rows;
+  if (!groups.length) return [];
+  const members = (await executor.query<{ group_id: string; agent_id: string; added_at: Date | string }>(
+    `SELECT group_id, agent_id, added_at FROM delegation_group_members
+      WHERE group_id = ANY($1::text[]) AND removed_at IS NULL ORDER BY added_at, agent_id`,
+    [groups.map(group => group.id)],
+  )).rows;
+  return groups.map(group => ({ ...group, members: members.filter(member => member.group_id === group.id)
+    .map(member => ({ agent_id: member.agent_id, added_at: member.added_at })) }));
+}
+
+/** One owner's live custom groups with their live members. */
+export function listGroups(executor: SqlExecutor, workspaceId: string, ownerUserId: string): Promise<GroupRecord[]> {
+  return readGroups(executor, workspaceId, ownerUserId);
+}
+
+/** Creates a custom group. Members are agent ids the caller already proved are the owner's; each is re-proved at every use. */
+export async function createGroup(database: Database, input: { workspaceId: string; ownerUserId: string; actorUserId: string;
+  authMethod: string; name: string; agentIds: string[] }): Promise<GroupRecord> {
+  return database.transaction(async (tx) => {
+    if (!await memberRole(tx, input.workspaceId, input.ownerUserId, true)) throw new TrustRuleMembershipGone();
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+    const id = mintId("grp");
+    await tx.query("INSERT INTO delegation_groups (id, workspace_id, owner_user_id, name) VALUES ($1, $2, $3, $4)",
+      [id, input.workspaceId, input.ownerUserId, input.name]);
+    const agentIds = [...new Set(input.agentIds)];
+    if (agentIds.length) {
+      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id) SELECT $1, unnest($2::text[])", [id, agentIds]);
+    }
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "group.created", actorUserId: input.actorUserId,
+      authMethod: input.authMethod, ownerUserId: input.ownerUserId, data: { group_id: id, name: input.name, agent_ids: agentIds } });
+    return (await readGroups(tx, input.workspaceId, input.ownerUserId, id))[0]!;
+  });
+}
+
+/**
+ * Renames a group and adds or removes members (Cloud's updateGroup). A member
+ * change re-resolves the owner's system grants at once.
+ */
+export async function updateGroup(database: Database, input: { workspaceId: string; ownerUserId: string; groupId: string;
+  actorUserId: string; authMethod: string; name?: string; add?: string[]; remove?: string[] }): Promise<GroupRecord | null> {
+  return database.transaction(async (tx) => {
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+    const group = (await tx.query<{ id: string; name: string }>(
+      `SELECT id, name FROM delegation_groups WHERE workspace_id = $1 AND owner_user_id = $2 AND id = $3 AND revoked_at IS NULL
+        FOR UPDATE`,
+      [input.workspaceId, input.ownerUserId, input.groupId],
+    )).rows[0];
+    if (!group) return null;
+    const renamed = input.name !== undefined && input.name !== group.name;
+    if (renamed) {
+      await tx.query("UPDATE delegation_groups SET name = $2, updated_at = now() WHERE id = $1", [group.id, input.name]);
+    }
+    const live = new Set((await tx.query<{ agent_id: string }>(
+      "SELECT agent_id FROM delegation_group_members WHERE group_id = $1 AND removed_at IS NULL", [group.id],
+    )).rows.map(row => row.agent_id));
+    const remove = [...new Set(input.remove ?? [])].filter(agentId => live.has(agentId));
+    const add = [...new Set(input.add ?? [])].filter(agentId => !live.has(agentId) && !remove.includes(agentId));
+    if (remove.length) {
+      await tx.query(
+        "UPDATE delegation_group_members SET removed_at = now() WHERE group_id = $1 AND agent_id = ANY($2::text[]) AND removed_at IS NULL",
+        [group.id, remove]);
+    }
+    if (add.length) {
+      await tx.query("INSERT INTO delegation_group_members (group_id, agent_id) SELECT $1, unnest($2::text[])", [group.id, add]);
+    }
+    const audit = { workspaceId: input.workspaceId, actorUserId: input.actorUserId, authMethod: input.authMethod,
+      ownerUserId: input.ownerUserId };
+    if (renamed && !add.length && !remove.length) {
+      await recordDelegationAudit(tx, { ...audit, event: "group.updated", data: { group_id: group.id, name: input.name } });
+    }
+    if (add.length) await recordDelegationAudit(tx, { ...audit, event: "group.member_added", data: { group_id: group.id, agent_ids: add } });
+    if (remove.length) {
+      await recordDelegationAudit(tx, { ...audit, event: "group.member_removed", data: { group_id: group.id, agent_ids: remove } });
+    }
+    if (add.length || remove.length) await reresolveOwnerGrants(tx, input);
+    return (await readGroups(tx, input.workspaceId, input.ownerUserId, group.id))[0]!;
+  });
+}
+
+/** Revokes a group and every binding naming it (with their grants), then re-resolves the owner's other grants. */
+export async function revokeGroup(database: Database, input: { workspaceId: string; ownerUserId: string; groupId: string;
+  actorUserId: string; authMethod: string }): Promise<{ revokedBindings: number; revokedGrants: number } | null> {
+  return database.transaction(async (tx) => {
+    await lockOwnerBindings(tx, input.workspaceId, input.ownerUserId, "exclusive");
+    const group = (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_groups WHERE workspace_id = $1 AND owner_user_id = $2 AND id = $3 AND revoked_at IS NULL
+        FOR UPDATE`,
+      [input.workspaceId, input.ownerUserId, input.groupId],
+    )).rows[0];
+    if (!group) return null;
+    const bindings = (await tx.query<{ id: string }>(
+      `SELECT id FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'group'
+          AND principal_ref = $3 AND revoked_at IS NULL ORDER BY id`,
+      [input.workspaceId, input.ownerUserId, group.id],
+    )).rows;
+    let revokedGrants = 0;
+    for (const binding of bindings) {
+      const [rule] = await revokeTrustRulesTx(tx, { workspaceId: input.workspaceId, ownerUserId: input.ownerUserId,
+        ruleId: binding.id, actorUserId: input.actorUserId, authMethod: input.authMethod, reason: "group_revoked" });
+      revokedGrants += rule?.revokedGrants.length ?? 0;
+    }
+    await tx.query("UPDATE delegation_groups SET revoked_at = now(), updated_at = now() WHERE id = $1", [group.id]);
+    await recordDelegationAudit(tx, { workspaceId: input.workspaceId, event: "group.revoked", actorUserId: input.actorUserId,
+      authMethod: input.authMethod, ownerUserId: input.ownerUserId,
+      data: { group_id: group.id, revoked_bindings: bindings.map(binding => binding.id) } });
+    revokedGrants += (await reresolveOwnerGrants(tx, input)).length;
+    return { revokedBindings: bindings.length, revokedGrants };
+  });
+}
+
+// ---------------------------------------------------------------- role seed
+
+export type RoleSeedReport = { dry_run: boolean; scanned: number; converted: number;
+  skipped: { has_relay_agents: number; raced: number };
+  rules: Array<{ workspace_id: string; owner_id: string; trust_rule_id: string }>; next_cursor: string | null };
+
+/**
+ * Seeds Trusted for the agents owners already work with (Khaliq, answer 9;
+ * Cloud's seedTrustedBindings): every live legacy rule becomes a
+ * `relay_agents` binding with the Trusted preset.
+ * - A dry run (the default) reads and writes nothing.
+ * - An apply converts each rule in its own transaction, under the owner's
+ *   exclusive binding lock, and re-resolves that owner's system grants.
+ * - Idempotent: only legacy rules are converted. An owner who already has a
+ *   Relay agents binding is skipped and left for a person to decide.
+ * Pages by rule id.
+ */
+export async function seedTrustedBindings(database: Database, input: { apply: boolean; limit: number; after?: string | null;
+  trusted: BindingFields }): Promise<RoleSeedReport> {
+  const rules = (await database.query<TrustRuleRow>(
+    `SELECT * FROM delegation_trust_rules WHERE revoked_at IS NULL AND ${LEGACY_RULE} AND ($1::text IS NULL OR id > $1)
+      ORDER BY id LIMIT $2`,
+    [input.after ?? null, input.limit],
+  )).rows;
+  const report: RoleSeedReport = { dry_run: !input.apply, scanned: rules.length, converted: 0,
+    skipped: { has_relay_agents: 0, raced: 0 }, rules: [], next_cursor: rules.length === input.limit ? rules.at(-1)!.id : null };
+  for (const rule of rules) {
+    const outcome = await database.transaction(async (tx) => {
+      if (input.apply) await lockOwnerBindings(tx, rule.workspace_id, rule.owner_user_id, "exclusive");
+      const locked = (await tx.query<TrustRuleRow>(
+        `SELECT * FROM delegation_trust_rules WHERE id = $1 AND revoked_at IS NULL AND ${LEGACY_RULE}${input.apply ? " FOR UPDATE" : ""}`,
+        [rule.id],
+      )).rows[0];
+      if (!locked) return "raced" as const;
+      const relay = (await tx.query(
+        `SELECT 1 FROM delegation_trust_rules WHERE workspace_id = $1 AND owner_user_id = $2 AND principal_kind = 'relay_agents'
+            AND revoked_at IS NULL LIMIT 1`,
+        [rule.workspace_id, rule.owner_user_id],
+      )).rows[0];
+      if (relay) return "has_relay_agents" as const;
+      if (!input.apply) return "convertible" as const;
+      await carryLegacyExclusions(tx, locked, null, "system");
+      const row = (await tx.query<TrustRuleRow>(
+        `UPDATE delegation_trust_rules SET principal_kind = 'relay_agents', (${BINDING_COLUMNS}) = ($2, $3, $4, $5, $6, $7, $8),
+            updated_at = now() WHERE id = $1 RETURNING *`,
+        [rule.id, ...bindingValues(input.trusted)],
+      )).rows[0]!;
+      await recordDelegationAudit(tx, { workspaceId: rule.workspace_id, event: "binding.updated", actorUserId: null,
+        authMethod: "system", ownerUserId: rule.owner_user_id, reason: "role_seed",
+        data: { binding_id: rule.id, before: bindingAudit(locked), after: bindingAudit(row) } });
+      await reresolveOwnerGrants(tx, { workspaceId: rule.workspace_id, ownerUserId: rule.owner_user_id, actorUserId: null,
+        authMethod: "system" });
+      return "converted" as const;
+    });
+    if (outcome === "raced" || outcome === "has_relay_agents") {
+      report.skipped[outcome] += 1;
+      continue;
+    }
+    if (outcome === "converted") report.converted += 1;
+    report.rules.push({ workspace_id: rule.workspace_id, owner_id: rule.owner_user_id, trust_rule_id: rule.id });
+  }
+  return report;
+}
+
+/** Most launched agents the agents picker considers for one owner. */
+export const MAX_LISTED_WORKERS = 100;
+
+/**
+ * Candidates for the owner's agents picker (GET /delegates/agents): the roots
+ * (listTrustRootAgents) plus workers the owner launched through Control that
+ * reached `ready`, newest first. Each is still only a candidate: the caller
+ * proves it with resolveTrustPath and drops the ones that do not prove out.
+ */
+export async function listOwnerAgentCandidates(executor: SqlExecutor, workspace: DelegationWorkspace, ownerUserId: string):
+  Promise<string[]> {
+  const roots = await listTrustRootAgents(executor, workspace, ownerUserId);
+  const workers = (await executor.query<{ worker_id: string }>(
+    `SELECT worker_id FROM relay_spawns
+      WHERE relaycast_workspace_id = $1 AND user_id::text = $2 AND state = 'ready' AND worker_id IS NOT NULL
+      ORDER BY created_at DESC LIMIT $3`,
+    [workspace.relaycastWorkspaceId, ownerUserId, MAX_LISTED_WORKERS],
+  )).rows.map(row => row.worker_id);
+  return [...new Set([...roots, ...workers])];
+}
+
+/**
+ * The classes the ACTING agent itself must ask its owner about first (Khaliq,
+ * answer 3; Cloud's actingAskFirst). An agent whose own grant or binding puts
+ * a class under "ask me first" may act on an approval of that class only when
+ * one of these holds:
+ * - its owner minted it (Tier O);
+ * - another delegate minted it (Tier D) under a live, recorded grant of the
+ *   SAME owner, in this workspace, whose own Tier O list does not hold the
+ *   class.
+ * A Tier D approval minted under another owner's grant never satisfies the
+ * acting agent's own ask-first list. The class set comes from:
+ * - the acting agent's live owner-made grant from its owner;
+ * - otherwise the owner's binding that decides for it.
+ * The presets alone never open the delegated path.
+ */
+async function actingAskFirst(deps: DelegationDeps, prove: TrustProver, workspace: DelegationWorkspace, ownerUserId: string,
+  agentId: string, now: Date): Promise<Set<ActionClass>> {
+  const own = (await grantsFor(deps.database, workspace.id, ownerUserId, agentId))
+    .find(grant => grant.status === "active" && time(grant.expires_at) > now.getTime() && !grant.trust_rule_id);
+  if (own) return new Set(own.require_tier_o);
+  const proof = await prove(ownerUserId, agentId);
+  if (!proof) return new Set();
+  const decision = decideFor(await bindingState(deps.database, workspace.id, ownerUserId), agentId, proof.path, now);
+  return new Set(decision.kind === "covered" ? decision.authority.requireTierO : []);
+}
+
+/** Refuses a Tier D approval from another owner's grant for a class the acting agent must ask its own owner about. */
+async function actingRefusal(deps: DelegationDeps, prove: TrustProver, input: { workspace: DelegationWorkspace;
+  actingOwnerId: string; actingAgentId: string; grant: GrantRow; tier: "D" | "O"; actions: readonly Pick<Action, "class">[];
+  now: Date }): Promise<ReasonCode | null> {
+  if (input.tier !== "D" || input.grant.owner_user_id === input.actingOwnerId) return null;
+  const askFirst = await actingAskFirst(deps, prove, input.workspace, input.actingOwnerId, input.actingAgentId, input.now);
+  return input.actions.some(action => askFirst.has(action.class)) ? "tier_o_required" : null;
+}
+
+/**
+ * actingRefusal again, on the deciding transaction (Cloud's
+ * actingRefusalLocked): under the acting owner's binding lock and a share
+ * lock on the acting agent's own grants, with its chain re-proved on the
+ * transaction. An ask-first change committed while the attest or redeem ran
+ * decides the answer, and one that starts later waits for this decision.
+ */
+async function actingRefusalLocked(tx: SqlExecutor, input: { workspace: DelegationWorkspace; actingOwnerId: string;
+  actingAgentId: string; grant: GrantRow; tier: "D" | "O"; actions: readonly Pick<Action, "class">[]; now: Date }):
+  Promise<ReasonCode | null> {
+  if (input.tier !== "D" || input.grant.owner_user_id === input.actingOwnerId) return null;
+  const { own, state } = await actingAuthorityLocked(tx, { workspaceId: input.workspace.id, ownerUserId: input.actingOwnerId,
+    agentId: input.actingAgentId, now: input.now });
+  let askFirst: readonly ActionClass[] = own ?? [];
+  if (!own) {
+    const proof = await resolveTrustPath(sqlTrustReader(tx, true), { workspaceId: input.workspace.id,
+      relaycastWorkspaceId: input.workspace.relaycastWorkspaceId, ownerUserId: input.actingOwnerId, agentId: input.actingAgentId });
+    const decision = proof ? decideFor(state, input.actingAgentId, proof.path, input.now) : null;
+    askFirst = decision?.kind === "covered" ? decision.authority.requireTierO : [];
+  }
+  return input.actions.some(action => askFirst.includes(action.class)) ? "tier_o_required" : null;
 }

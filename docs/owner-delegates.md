@@ -763,6 +763,86 @@ run unless `{"apply": true}`, idempotent, pages by grant id (`after`,
 `next_cursor`), creates no rule or grant, and audits each pin as
 `trust_root.backfilled` (actor system, reason backfill).
 
+## Role bindings
+
+The self-hosted twin of Cloud's role bindings (cloud#6665; #owner-decisions
+251526750352171008). A trust rule becomes a **binding**. A binding has:
+- a principal: one agent, a custom group, a connector kind, or every Relay agent;
+- a role: Trusted, Standard, Read-only, a custom role, or `excluded`;
+- an optional repo scope (`owner/repo`, `owner/*`);
+- an optional expiry.
+A binding acts through system grants, exactly like the legacy rule did.
+
+| Preset | Classes | Ask me first | Limits |
+|---|---|---|---|
+| Trusted | merge, pr_ops, external_comms, deploy, release, destructive, secret_change, spend | deploy, release, destructive, secret_change, spend | merge requires `ci_green` and `mergeable` |
+| Standard | pr_ops, merge, deploy, destructive, secret_change | merge, deploy, destructive, secret_change | none |
+| Read-only | pr_ops | none | pr_ops `comment` only |
+
+**Required conditions fail closed here.** relay-control reads no GitHub
+state, so `ci_green` and `mergeable` answer `condition_unavailable` at
+redeem. A Trusted merge therefore cannot be redeemed through relay-control.
+
+**Precedence.** The most specific binding wins, and nothing is unioned:
+1. an explicit grant;
+2. an `agent` binding (`excluded` gives nothing and never falls through);
+3. a custom `group` binding (the strictest of two, and nothing when their
+   classes or repos do not overlap);
+4. the root's `connector_kind` binding, then `relay_agents`.
+
+A launched agent never inherits its spawner's role. It gets Read-only within
+its root binding's repos and expiry, unless its own group or binding says
+otherwise. A legacy rule (no role) keeps its old meaning, every class across
+the whole spawn tree, until the role seed or a PATCH converts it. A legacy
+rule and a Relay agents binding never stand together; each refuses the other
+with 409 `binding_exists`.
+
+**Locks.** Every binding, group or exclusion write takes the owner's binding
+lock exclusively. That is a transaction advisory lock, taken after the
+owner's membership lock. The write then re-resolves the owner's active system
+grants from stored rows:
+- a narrowed grant is revoked as `superseded_by_rule`;
+- an excluded agent's grant is revoked as `owner_excluded`.
+
+A materialization takes the same lock shared. Its order is:
+1. membership;
+2. the binding lock;
+3. the policy;
+4. the owner's bindings (share);
+5. the delegate's creation lock;
+6. the pair's grants;
+7. a claim root's claim.
+
+A new system grant is dated no earlier than:
+- every contributing binding's creation and change;
+- a group member's joining;
+- any earlier grant's end.
+
+**Answer 3.** An acting agent whose own grant or binding asks first for a
+class takes a Tier D approval of that class only from a grant of its own
+owner. This is checked before the deciding transaction and again inside it,
+under the acting owner's binding lock. `approval.redeemed` records `tier` and
+`minter {grant_id, delegate_agent_id, owner_id, binding_id?}`.
+
+**Admins.** An admin acting for another owner (`?owner=`) may only:
+- exclude one agent (POST or PATCH with exactly `{"role": "excluded"}`);
+- revoke one grant;
+- revoke all.
+Deleting a binding or a group, and every group change, is refused with 403.
+Removing one can widen an agent's authority through precedence.
+
+Routes are under `/api/v1/workspaces/{workspaceId}/delegates/`:
+- `roles`
+- `bindings`, `bindings/{id}`
+- `groups`, `groups/{id}`
+- `agents`
+
+The service-token `POST /internal/v1/delegation/role-seed` turns each live
+legacy rule into a Relay agents Trusted binding. It is a dry run unless
+`{"apply": true}`, and it is idempotent. It carries each rule's exclusions
+into `excluded` agent bindings, and it skips an owner who already has a Relay
+agents binding.
+
 ## Revocation
 
 Revocation happens in these cases:
@@ -905,6 +985,13 @@ All of them are workspace-scoped and cascade on workspace delete.
 and adds `delegation_grants_expiry_cap`: only a row with `trust_rule_id` may
 expire more than 2160 hours (90 days of 24 hours, counted in hours so a DST
 change never refuses a full-length grant) and 60 s after it was created.
+
+`0099_delegation_role_bindings.sql` (additive) adds the binding columns to
+`delegation_trust_rules` (`principal_kind` default `all_agents`, `principal_ref`,
+`role`, `classes`, `pr_ops_limit`, `required_conditions`, `targets`,
+`expires_at`). It adds `delegation_groups` and `delegation_group_members`. It
+replaces the one-live-rule-per-owner index with one live binding per
+(owner, principal), a superset for legacy rows.
 
 ## Not on relay-control yet
 

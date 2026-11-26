@@ -3779,6 +3779,324 @@ paths:
                   revoked_grant_ids: { type: array, items: { type: string } }
         "403": { description: "`forbidden` or `csrf_rejected`" }
         "404": { description: "`not_found`: no trust rule is on" }
+  /api/v1/workspaces/{workspaceId}/delegates/roles:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationRoles
+      tags: [Owner delegates]
+      description: |
+        Human-only. The preset roles (Trusted, Standard, Read-only) with their
+        classes, ask-first list, pr_ops limit and required conditions, plus the
+        building blocks of a custom role: each class with a one-line
+        description, the pr_ops operations, required condition types,
+        principal kinds and connector kinds. Static. See docs/owner-delegates.md,
+        "Role bindings".
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Presets and building blocks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [presets, classes, pr_ops_ops, required_condition_types, principal_kinds, connector_kinds]
+                properties:
+                  presets: { type: array, items: { type: object } }
+                  classes:
+                    type: array
+                    items:
+                      type: object
+                      required: [class, description]
+                      properties:
+                        class: { $ref: "#/components/schemas/DelegationActionClass" }
+                        description: { type: string }
+                  pr_ops_ops: { type: array, items: { type: string } }
+                  required_condition_types: { type: array, items: { type: string } }
+                  principal_kinds: { type: array, items: { type: string } }
+                  connector_kinds: { type: array, items: { type: string } }
+  /api/v1/workspaces/{workspaceId}/delegates/bindings:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: owner
+        in: query
+        required: false
+        description: GET only. An org owner or admin may read another owner's bindings by user id.
+        schema: { type: string, format: uuid }
+    get:
+      operationId: listDelegationBindings
+      tags: [Owner delegates]
+      description: |
+        Human-only. The owner's role bindings (a legacy trust rule reads as role
+        `legacy`), each with how many agents it decides for now, and a
+        one-click recommendation (Trusted for every Relay agent) while no Relay
+        agents binding exists and delegation is on.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Bindings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bindings, recommendation]
+                properties:
+                  bindings: { type: array, items: { $ref: "#/components/schemas/DelegationBinding" } }
+                  recommendation: { type: [object, "null"] }
+    post:
+      operationId: createDelegationBinding
+      tags: [Owner delegates]
+      description: |
+        Human-only, delegation on. Creates the caller's own binding: a principal
+        (`relay_agents`, `connector_kind`, `group` or `agent`) gets a role
+        (`trusted`, `standard`, `read_only`, `custom` or `excluded`). A preset
+        resolves its classes once, when saved; `custom` names them. `targets`
+        (repo patterns) and `expires_at` are optional; omitted means every target
+        the owner has standing over, with no expiry. `all_workspaces` creates one
+        binding per workspace the caller belongs to (built-in principals only).
+        An agent principal must prove out as the caller's by ownership chain.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal, role]
+              properties:
+                principal:
+                  type: object
+                  required: [kind]
+                  properties:
+                    kind: { type: string, enum: [relay_agents, connector_kind, group, agent] }
+                    ref: { type: [string, "null"] }
+                role: { type: string, enum: [trusted, standard, read_only, custom, excluded] }
+                classes: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+                require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+                pr_ops_limit: { type: [array, "null"], items: { type: string } }
+                required_conditions: { type: object }
+                targets: { type: [array, "null"], items: { type: string } }
+                expires_at: { type: [string, "null"], format: date-time }
+                all_workspaces: { type: boolean }
+      responses:
+        "201":
+          description: Created (`{binding}`, or `{bindings, skipped}` with `all_workspaces`)
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled`, `forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`: the group is not the caller's" }
+        "409": { description: "`binding_exists`, with the existing `binding_id`" }
+        "422": { description: "`not_owned`: the agent is not proven to be the caller's" }
+  /api/v1/workspaces/{workspaceId}/delegates/bindings/{bindingId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: bindingId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: owner
+        in: query
+        required: false
+        description: An org owner or admin may act on another owner's binding by user id.
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getDelegationBinding
+      tags: [Owner delegates]
+      description: Human-only. One binding and the agents it decides for now, each with its chain read now (writing nothing).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The binding
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [binding, covered]
+                properties:
+                  binding: { $ref: "#/components/schemas/DelegationBinding" }
+                  covered: { type: array, items: { type: object } }
+        "404": { description: "`not_found`" }
+    patch:
+      operationId: updateDelegationBinding
+      tags: [Owner delegates]
+      description: |
+        Human-only. Changes what a binding grants; its principal is fixed. Every
+        system grant of the owner is re-resolved in the same transaction, so a
+        narrowing takes effect at once. Anything but `excluded` needs delegation on.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { type: object, required: [binding], properties: { binding: { $ref: "#/components/schemas/DelegationBinding" } } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled`, `forbidden` or `csrf_rejected`" }
+        "404": { description: "`not_found`" }
+    delete:
+      operationId: revokeDelegationBinding
+      tags: [Owner delegates]
+      description: Human-only, allowed while delegation is off. Removes the binding and every system grant it created, with their approvals.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, revoked_grants]
+                properties:
+                  revoked: { type: string }
+                  revoked_grants: { type: integer, minimum: 0 }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/groups:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationGroups
+      tags: [Owner delegates]
+      description: |
+        Human-only. The built-in groups (members null: proven per agent) and the
+        owner's custom groups, each member re-proven now (`proven` null when the
+        chain cannot be read).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Groups
+          content:
+            application/json:
+              schema: { type: object, required: [groups], properties: { groups: { type: array, items: { type: object } } } }
+    post:
+      operationId: createDelegationGroup
+      tags: [Owner delegates]
+      description: Human-only, delegation on. Creates a custom group of the caller's own agents; every member must prove out now.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                agent_ids: { type: array, items: { type: string } }
+      responses:
+        "201": { description: "`{group}`" }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`not_enabled`, `forbidden` or `csrf_rejected`" }
+        "422": { description: "`not_owned`, with the `agent_ids` that did not prove out" }
+  /api/v1/workspaces/{workspaceId}/delegates/groups/{groupId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: groupId
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      operationId: updateDelegationGroup
+      tags: [Owner delegates]
+      description: |
+        Human-only. Renames a group, or adds and removes members (an added member
+        must prove out now; adding needs delegation on). Re-resolves the owner's
+        system grants at once.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                add: { type: array, items: { type: string } }
+                remove: { type: array, items: { type: string } }
+      responses:
+        "200": { description: "`{group}`" }
+        "404": { description: "`not_found`" }
+        "422": { description: "`not_owned`, with `agent_ids`" }
+    delete:
+      operationId: revokeDelegationGroup
+      tags: [Owner delegates]
+      description: Human-only. Removes a group, every binding naming it and their system grants.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200": { description: "`{revoked, revoked_bindings, revoked_grants}`" }
+        "404": { description: "`not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/agents:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationAgents
+      tags: [Owner delegates]
+      description: |
+        Human-only. The owner's agents by immutable id (connected roots and the
+        workers they launched), each proven by ownership chain, never by name,
+        with who decides for it now: the owner's own grant, the most specific
+        binding, `excluded`, or nothing.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Agents
+          content:
+            application/json:
+              schema: { type: object, required: [agents], properties: { agents: { type: array, items: { type: object } } } }
+  /internal/v1/delegation/role-seed:
+    post:
+      operationId: delegationRoleSeed
+      tags: [Owner delegates]
+      description: |
+        Operator only (SELFHOST_INTERNAL_TOKEN; 404 without it). Turns every live
+        legacy trust rule into a Relay agents binding with the Trusted preset. A
+        DRY RUN unless the body says `{"apply": true}`; idempotent; an owner who
+        already has a Relay agents binding is skipped. Pages by rule id.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                apply: { type: boolean }
+                limit: { type: integer, minimum: 1, maximum: 500 }
+                after: { type: string }
+      responses:
+        "200": { description: "`{dry_run, scanned, converted, skipped, rules, next_cursor}`" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: "`unauthorized`" }
   /api/v1/workspaces/{workspaceId}/delegates/claims:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -11008,6 +11326,31 @@ components:
         trust_path:
           type: [object, "null"]
           description: The ownership chain proven when the system grant was created (root, then each launch down to the delegate).
+    DelegationBinding:
+      type: object
+      required: [binding_id, owner_id, principal, role, classes, require_tier_o, pr_ops_limit, required_conditions, targets,
+        expires_at, created_at, updated_at, covered, clipped_by_policy]
+      properties:
+        binding_id: { type: string }
+        owner_id: { type: string, format: uuid }
+        principal:
+          type: object
+          required: [kind, ref, name]
+          properties:
+            kind: { type: string, enum: [all_agents, relay_agents, connector_kind, group, agent] }
+            ref: { type: [string, "null"] }
+            name: { type: string }
+        role: { type: string, enum: [trusted, standard, read_only, custom, excluded, legacy] }
+        classes: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        pr_ops_limit: { type: [array, "null"], items: { type: string } }
+        required_conditions: { type: object }
+        targets: { type: [array, "null"], items: { type: string } }
+        expires_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        covered: { type: integer, minimum: 0 }
+        clipped_by_policy: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
     DelegationTrustRule:
       type: object
       required: [trust_rule_id, owner_id, require_tier_o, created_at, updated_at]

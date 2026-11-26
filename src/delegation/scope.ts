@@ -14,6 +14,20 @@ export const ACTION_CLASSES = [
 ] as const;
 export type ActionClass = typeof ACTION_CLASSES[number];
 
+/** One plain-language line per class, for the Delegates panel (GET delegates/roles), as Cloud's DELEGATION_CLASS_DESCRIPTIONS. */
+export const CLASS_DESCRIPTIONS: Record<ActionClass, string> = {
+  merge: "Merge a pull request.",
+  pr_ops: "Routine pull request work: comment, label, request a review, re-run CI, close or reopen.",
+  deploy: "Deploy to an environment.",
+  release: "Publish a release, or land a branch for one.",
+  secret_change: "Change secrets, credentials or access.",
+  destructive: "Delete, or change something that cannot be undone.",
+  spend: "Spend money or buy resources.",
+  external_comms: "Send messages outside the workspace, such as Slack or email.",
+  prompt_approval: "Answer permission prompts in your own sessions.",
+  config_change: "Change one setting of your own agent session.",
+};
+
 /**
  * §16.1, §15 (Khaliq, 7:43): no class needs an owner-minted (tier O) approval
  * by default. An org can still require it with `require_tier_o`.
@@ -100,7 +114,13 @@ export type Condition = z.infer<typeof conditionSchema>;
 export const GITHUB_CONDITIONS: ReadonlySet<string> = new Set(["ci_green", "head_sha", "reviews_approved", "mergeable"]);
 
 export type Action = { class: ActionClass; target: string; conditions?: Condition[]; note?: string | null };
-export type Scope = { class: ActionClass; targets: string[] };
+/**
+ * One class a grant covers. `ops` and `conditions` appear only on system
+ * grants a role binding created (roles.ts): `ops` limits pr_ops operations,
+ * and `conditions` are checked at every redeem. On those grants an empty
+ * `targets` means every target.
+ */
+export type Scope = { class: ActionClass; targets: string[]; ops?: string[]; conditions?: Array<{ type: string }> };
 
 const rfc3339 = z.string().max(64).refine(validRfc3339, { message: "must be RFC 3339 with a real date" });
 export const APPROVAL_REF = /^apv_[A-Za-z0-9]{8,64}$/;

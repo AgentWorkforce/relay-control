@@ -1046,6 +1046,13 @@ test("every delegation route is documented in openapi.yaml", () => {
     "/api/v1/workspaces/{workspaceId}/delegates/revoke-all": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/trust-rule": ["get", "put", "delete"],
     "/internal/v1/delegation/trust-backfill": ["post"],
+    "/internal/v1/delegation/role-seed": ["post"],
+    "/api/v1/workspaces/{workspaceId}/delegates/roles": ["get"],
+    "/api/v1/workspaces/{workspaceId}/delegates/bindings": ["get", "post"],
+    "/api/v1/workspaces/{workspaceId}/delegates/bindings/{bindingId}": ["get", "patch", "delete"],
+    "/api/v1/workspaces/{workspaceId}/delegates/groups": ["get", "post"],
+    "/api/v1/workspaces/{workspaceId}/delegates/groups/{groupId}": ["patch", "delete"],
+    "/api/v1/workspaces/{workspaceId}/delegates/agents": ["get"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/claims/complete": ["post"],
     "/api/v1/workspaces/{workspaceId}/delegates/approvals": ["post"],
@@ -2239,4 +2246,201 @@ test("a bot with its own grant may approve its own requests (#owner-decisions 25
   assert.equal(self.body.claims.recipient_agent_id, bot.id);
   assert.equal(self.body.claims.grant_id, grantId);
   assert.deepEqual((await env.redeem(bot, self.body.claims.approval_id, merge[0])).body, { ok: true, consumed: false });
+});
+
+// ---------------------------------------------------------------------------
+// Role bindings (cloud#6665 twin; #owner-decisions 251526750352171008)
+
+test("role bindings: roles, bindings, groups and agents answer Cloud's contract", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const helper = await env.claim("helper");
+  const roles = await env.bearer("/delegates/roles");
+  assert.equal(roles.status, 200, roles.raw);
+  assert.deepEqual(roles.body.presets.map((preset: { role: string }) => preset.role), ["trusted", "standard", "read_only"]);
+  assert.deepEqual(roles.body.classes[0], { class: "merge", description: "Merge a pull request." });
+  assert.ok(roles.body.classes.every((item: { class: string; description: string }) => item.class && item.description));
+  assert.equal(roles.body.principal_kinds.includes("all_agents"), false);
+
+  const before = await env.bearer("/delegates/bindings");
+  assert.equal(before.status, 200, before.raw);
+  assert.deepEqual(before.body, { bindings: [], recommendation: { principal: { kind: "relay_agents", ref: null }, role: "trusted",
+    label: "Give your Relay agents Trusted" } });
+  const created = await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "trusted" });
+  assert.equal(created.status, 201, created.raw);
+  const binding = created.body.binding;
+  assert.equal(binding.role, "trusted");
+  assert.deepEqual(binding.principal, { kind: "relay_agents", ref: null, name: "Relay agents" });
+  assert.deepEqual(binding.required_conditions, { merge: [{ type: "ci_green" }, { type: "mergeable" }] });
+  const duplicate = await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "standard" });
+  assert.equal(duplicate.status, 409, duplicate.raw);
+  assert.equal(duplicate.body.code, "binding_exists");
+  assert.equal(duplicate.body.binding_id, binding.binding_id);
+  assert.equal((await env.browser("/delegates/bindings", "POST", { principal: { kind: "connector_kind", ref: "grok-bot" },
+    role: "trusted", classes: ["merge"] })).status, 400);
+  const stranger = await env.browser("/delegates/bindings", "POST", { principal: { kind: "agent", ref: "ag_stranger" }, role: "trusted" });
+  assert.equal(stranger.status, 422, stranger.raw);
+  assert.equal(stranger.body.code, "not_owned");
+  assert.equal((await env.bearer("/delegates/bindings")).body.recommendation, null);
+
+  const notMine = await env.browser("/delegates/groups", "POST", { name: "bots", agent_ids: [helper.id, "ag_stranger"] });
+  assert.equal(notMine.status, 422, notMine.raw);
+  assert.deepEqual([notMine.body.code, notMine.body.agent_ids], ["not_owned", ["ag_stranger"]]);
+  const group = await env.browser("/delegates/groups", "POST", { name: "bots", agent_ids: [helper.id] });
+  assert.equal(group.status, 201, group.raw);
+  assert.deepEqual(group.body.group.members.map((member: { agent_id: string; proven: boolean }) => [member.agent_id, member.proven]),
+    [[helper.id, true]]);
+  const groupId = group.body.group.group_id as string;
+  const groupBinding = await env.browser("/delegates/bindings", "POST", { principal: { kind: "group", ref: groupId }, role: "read_only" });
+  assert.equal(groupBinding.status, 201, groupBinding.raw);
+  assert.deepEqual([groupBinding.body.binding.classes, groupBinding.body.binding.pr_ops_limit, groupBinding.body.binding.principal.name],
+    [["pr_ops"], ["comment"], "bots"]);
+  const groups = await env.bearer("/delegates/groups");
+  assert.ok(["relay_agents", "connector:grok-bot", groupId].every(id =>
+    groups.body.groups.some((item: { group_id: string }) => item.group_id === id)), groups.raw);
+  const agents = await env.bearer("/delegates/agents");
+  assert.equal(agents.status, 200, agents.raw);
+  const listed = agents.body.agents.find((agent: { agent_id: string }) => agent.agent_id === helper.id);
+  assert.deepEqual(listed.effective, { binding_id: groupBinding.body.binding.binding_id, role: "read_only", source: "group", grant_id: null });
+
+  const narrowed = await env.browser(`/delegates/bindings/${binding.binding_id}`, "PATCH", { role: "standard", targets: ["acme/*"] });
+  assert.equal(narrowed.status, 200, narrowed.raw);
+  assert.deepEqual([narrowed.body.binding.role, narrowed.body.binding.targets], ["standard", ["acme/*"]]);
+  const one = await env.bearer(`/delegates/bindings/${binding.binding_id}`);
+  assert.equal(one.status, 200, one.raw);
+  assert.deepEqual(one.body.covered, []);
+  const groupGone = await env.browser(`/delegates/groups/${groupId}`, "DELETE");
+  assert.deepEqual(groupGone.body, { revoked: groupId, revoked_bindings: 1, revoked_grants: 0 });
+  const gone = await env.browser(`/delegates/bindings/${binding.binding_id}`, "DELETE");
+  assert.deepEqual(gone.body, { revoked: binding.binding_id, revoked_grants: 0 });
+  assert.equal((await env.browser(`/delegates/bindings/${binding.binding_id}`, "DELETE")).status, 404);
+});
+
+test("role bindings: revoking a rule-backed grant excludes the agent with an `excluded` binding, no fall-through", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const recipient = await env.desktopIdentity("relay-coder");
+  const helper = await env.claim("helper");
+  assert.equal((await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "trusted" })).status, 201);
+  const merge = [{ class: "merge", target: "AgentWorkforce/relay#2250" }];
+  const first = await env.attest(recipient, send(env, helper, recipient, env.approval(merge)));
+  assert.equal(first.body.verdict, "delegate", first.raw);
+  const grantId = first.body.claims.grant_id as string;
+  const revoked = await env.browser(`/delegates/${grantId}`, "DELETE");
+  assert.equal(revoked.status, 200, revoked.raw);
+  assert.equal(revoked.body.revoked_reason, "owner_excluded");
+  const bindings = (await env.bearer("/delegates/bindings")).body.bindings as Array<{ principal: { kind: string; ref: string }; role: string }>;
+  assert.ok(bindings.some(item => item.principal.kind === "agent" && item.principal.ref === helper.id && item.role === "excluded"));
+  const again = await env.attest(recipient, send(env, helper, recipient, env.approval(merge)));
+  // Refused (its last grant was revoked) and no new system grant is created for it.
+  assert.equal(again.body.reason, "revoked", again.raw);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_grants WHERE delegate_agent_id = $1 AND status = 'active'", [helper.id])).rows.length, 0);
+});
+
+test("role bindings: the redeem audit names who minted a delegated approval", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  const staging = [{ class: "deploy", target: "web:staging" }];
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval(staging)));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, staging[0]);
+  assert.equal(redeemed.body.ok, true, redeemed.raw);
+  const [row] = (await env.database.query<{ data: Record<string, any> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'approval.redeemed' ORDER BY id DESC LIMIT 1")).rows;
+  assert.equal(row!.data.tier, "D");
+  assert.deepEqual(row!.data.minter, { grant_id: grantId, delegate_agent_id: bot.id, owner_id: env.ownerId });
+});
+
+test("role bindings (answer 3): a Tier D approval from another owner's grant is refused for a class the acting agent must ask about", async (t) => {
+  const { env, bot } = await ready(t);
+  const bobId = await env.addMember("bob@acme.test");
+  const bobsAgent = await env.desktopIdentity("bob-coder", bobId);
+  const bobDesktop = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
+  assert.equal((await env.browser("/delegates/target-owners", "PUT", [{ pattern: "*:staging", owner_ids: [env.ownerId] }])).status, 200);
+  const staging = { class: "deploy", target: "web:staging" };
+  const forBob = send(env, bot, bobsAgent, env.approval([staging]));
+  const accepted = await env.attest(bobsAgent, forBob, "code_owners", bobDesktop.accessToken);
+  assert.equal(accepted.body.verdict, "delegate", accepted.raw);
+  // Bob puts deploys under "ask me first" for his own agent: the owner's delegate can no longer stand in for Bob.
+  const bobsGrant = await env.bearer("/delegates", "POST", { delegate_agent_id: bobsAgent.id,
+    scopes: [{ class: "deploy", targets: ["*:staging"] }], require_tier_o: ["deploy"] }, bobDesktop.accessToken);
+  assert.equal(bobsGrant.status, 201, bobsGrant.raw);
+  const redeemed = await env.redeem(bobsAgent, accepted.body.claims.approval_id, staging, bobDesktop.accessToken);
+  assert.deepEqual(redeemed.body, { ok: false, reason: "tier_o_required" });
+  const again = await env.attest(bobsAgent, send(env, bot, bobsAgent, env.approval([staging])), "code_owners", bobDesktop.accessToken);
+  assert.equal(again.body.reason, "tier_o_required", again.raw);
+});
+
+test("role bindings (review B1): an admin acting for another owner may only narrow; every workspace is own-only", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const bobId = await env.addMember("bob@acme.test");
+  const bobDesktop = await env.desktopSignIn({ hostName: "bob-box", userId: bobId });
+  const bobsAgent = await env.desktopIdentity("bob-coder", bobId);
+  const as = `?owner=${bobId}`;
+  // A member cannot act for another owner at all.
+  assert.equal((await env.bearer(`/delegates/bindings?owner=${env.ownerId}`, "POST", { principal: { kind: "relay_agents" },
+    role: "trusted" }, bobDesktop.accessToken)).status, 403);
+  // Bob's own binding and group, made by Bob.
+  const bobs = await env.bearer("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "standard" },
+    bobDesktop.accessToken);
+  assert.equal(bobs.status, 201, bobs.raw);
+  const bobsGroup = await env.bearer("/delegates/groups", "POST", { name: "bob's bots" }, bobDesktop.accessToken);
+  assert.equal(bobsGroup.status, 201, bobsGroup.raw);
+  const groupId = bobsGroup.body.group.group_id as string;
+  // The owner (an org owner) acting for Bob: everything that can grant is refused, before any write.
+  for (const role of ["trusted", "standard", "read_only"]) {
+    assert.equal((await env.browser(`/delegates/bindings${as}`, "POST", { principal: { kind: "connector_kind", ref: "grok-bot" }, role }))
+      .status, 403, role);
+  }
+  assert.equal((await env.browser(`/delegates/bindings${as}`, "POST", { principal: { kind: "agent", ref: "ag_x" }, role: "custom",
+    classes: ["merge"] })).status, 403);
+  const bindingPath = `/delegates/bindings/${bobs.body.binding.binding_id}${as}`;
+  assert.equal((await env.browser(bindingPath, "PATCH", { role: "trusted" })).status, 403);
+  assert.equal((await env.browser(bindingPath, "PATCH", { targets: ["acme/*"] })).status, 403);
+  assert.equal((await env.browser(bindingPath, "PATCH", { role: "excluded", expires_at: null })).status, 403);
+  assert.equal((await env.browser(`/delegates/groups${as}`, "POST", { name: "theirs" })).status, 403);
+  assert.equal((await env.browser(`/delegates/groups/${groupId}${as}`, "PATCH", { add: ["ag_x"] })).status, 403);
+  assert.equal((await env.browser(`/delegates/groups/${groupId}${as}`, "PATCH", { name: "x" })).status, 403);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_trust_rules WHERE owner_user_id = $1", [bobId])).rows.length, 1);
+  // Narrowing works: excluding one of Bob's agents (proven against Bob), removing a member, revoking.
+  // A Desktop identity is not a chain-proven agent, so excluding one that is not Bob's proves nothing: 422.
+  assert.equal((await env.browser(`/delegates/bindings${as}`, "POST", { principal: { kind: "agent", ref: bobsAgent.id },
+    role: "excluded" })).status, 422);
+  // Removing a member, a group or a binding can widen through precedence: refused too.
+  assert.equal((await env.browser(`/delegates/groups/${groupId}${as}`, "PATCH", { remove: ["ag_x"] })).status, 403);
+  assert.equal((await env.browser(`/delegates/groups/${groupId}${as}`, "DELETE")).status, 403);
+  assert.equal((await env.browser(bindingPath, "DELETE")).status, 403);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_trust_rules WHERE owner_user_id = $1 AND revoked_at IS NULL", [bobId]))
+    .rows.length, 1);
+  // Reading another owner's bindings stays allowed.
+  assert.equal((await env.bearer(`/delegates/bindings${as}`)).status, 200);
+  // all_workspaces stays own-only, and the bulk response names each workspace.
+  assert.equal((await env.browser(`/delegates/bindings${as}`, "POST", { principal: { kind: "relay_agents" }, role: "excluded",
+    all_workspaces: true })).status, 400);
+  const everywhere = await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "trusted",
+    all_workspaces: true });
+  assert.equal(everywhere.status, 201, everywhere.raw);
+  assert.equal(everywhere.body.bindings[0].workspace_id, env.workspaceId);
+  // required_conditions are a partial record, and only merge and pr_ops take them.
+  assert.equal((await env.browser("/delegates/bindings", "POST", { principal: { kind: "connector_kind", ref: "grok-bot" }, role: "custom",
+    classes: ["merge", "deploy"], required_conditions: { merge: [{ type: "ci_green" }] } })).status, 201);
+  assert.equal((await env.browser("/delegates/bindings", "POST", { principal: { kind: "connector_kind", ref: "chatgpt" }, role: "custom",
+    classes: ["deploy"], required_conditions: { deploy: [{ type: "ci_green" }] } })).status, 400);
+});
+
+test("role bindings: the legacy rule and a Relay agents binding never stand together (409 binding_exists both ways)", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  const legacy = await env.browser("/delegates/trust-rule", "PUT", {});
+  assert.equal(legacy.status, 201, legacy.raw);
+  const relay = await env.browser("/delegates/bindings", "POST", { principal: { kind: "relay_agents" }, role: "trusted" });
+  assert.equal(relay.status, 409, relay.raw);
+  assert.deepEqual([relay.body.code, relay.body.binding_id], ["binding_exists", legacy.body.rule.trust_rule_id]);
+  // Converting the legacy rule makes it the Relay agents binding; a new legacy PUT is then refused.
+  const converted = await env.browser(`/delegates/bindings/${legacy.body.rule.trust_rule_id}`, "PATCH", { role: "standard" });
+  assert.equal(converted.status, 200, converted.raw);
+  assert.equal(converted.body.binding.principal.kind, "relay_agents");
+  const again = await env.browser("/delegates/trust-rule", "PUT", {});
+  assert.equal(again.status, 409, again.raw);
+  assert.deepEqual([again.body.code, again.body.binding_id], ["binding_exists", legacy.body.rule.trust_rule_id]);
 });
