@@ -19,6 +19,8 @@ import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oa
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
 import * as approvalRequests from "../delegation/approval-requests.js";
+import type { z } from "zod";
+import { ownerApprovalSchema } from "../delegation/scope.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 import {
   CursorIdentityError, cursorCloudParticipantName, cursorIdentityNonces, cursorMintCommand, verifyCursorIdentityToken,
@@ -307,16 +309,63 @@ function safeDiagnostic(error: unknown) {
 export const OWNER_APPROVAL_MAX_BYTES = 192 * 1024;
 
 /**
- * An owner_approval goes to Relaycast exactly as given, on a new message or
- * post only (as the desktop core sends it). Relaycast validates its content;
- * only what never reaches it is refused here.
+ * A delegate's owner_approval, ready to send on a new message or post only
+ * (as the desktop core sends it), as Cloud's prepareOwnerApproval
+ * (cloud#6699). `ownerUserId` is the person this connection signs in as:
+ * every identity a person's MCP session sends as (linked desktop, hosted
+ * participant, Factory or Capy binding) is bound to that user, and attest
+ * only finds a grant whose owner is the delegate's binding owner
+ * (delegateStillBound). So `owner_id` (and `v`) are filled in when omitted,
+ * and an `owner_id` naming anyone else is refused. A workspace agent identity
+ * token has no person behind it (null): its hosted participant has no owning
+ * user, so no approval it sends could ever attest, and owner_approval is
+ * refused there (as Cloud withdrew owner approval tools from agent identity
+ * tokens, cloud#6704). The result is checked against the
+ * schema attest uses (delegation/scope.ts ownerApprovalSchema), so a mistake
+ * names its field here instead of costing a send. What is returned is passed
+ * to Relaycast exactly, byte for byte: the caller's object, plus `v` and
+ * `owner_id` when omitted; nothing parsed or normalized is substituted.
  */
-export function checkOwnerApproval(ownerApproval: Record<string, unknown> | undefined, reply: "reply_to" | "thread_id" | null) {
-  if (ownerApproval === undefined) return;
+export function prepareOwnerApproval(ownerApproval: Record<string, unknown> | undefined, reply: "reply_to" | "thread_id" | null,
+  ownerUserId: string | null): Record<string, unknown> | undefined {
+  if (ownerApproval === undefined) return undefined;
   if (reply) throw new RelayToolError(`owner_approval goes on a new ${reply === "reply_to" ? "message" : "post"}, never with ${reply}. Send it without ${reply}.`);
   if (Buffer.byteLength(JSON.stringify(ownerApproval), "utf8") > OWNER_APPROVAL_MAX_BYTES) {
     throw new RelayToolError("owner_approval is larger than 192 KiB, above any valid approval. Nothing was sent.");
   }
+  if (ownerUserId === null) {
+    throw new RelayToolError("invalid_owner_approval: a workspace agent identity token has no owner, so it cannot relay an owner approval. Send it from a session signed in as the delegate's owner. Nothing was sent.");
+  }
+  if (ownerApproval.owner_id !== undefined && !sameOwner(ownerApproval.owner_id, ownerUserId)) {
+    throw new RelayToolError("invalid_owner_approval: owner_id must be your owner's user id, the one this connection signs in as. Omit owner_id and it is filled in. Nothing was sent.");
+  }
+  const built = { ...(ownerApproval.v === undefined ? { v: 1 } : {}), ...ownerApproval,
+    ...(ownerApproval.owner_id === undefined ? { owner_id: ownerUserId } : {}) };
+  const parsed = ownerApprovalSchema.safeParse(built);
+  if (!parsed.success) throw new RelayToolError(`invalid_owner_approval: ${ownerApprovalIssue(parsed.error.issues[0], built)} Nothing was sent.`);
+  return built;
+}
+
+const UUID_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The schema canonicalizes a UUID owner_id to lowercase, so a case-only difference is the same owner. */
+function sameOwner(given: unknown, ownerUserId: string): boolean {
+  if (typeof given !== "string") return false;
+  return given === ownerUserId || (UUID_ID.test(given) && given.toLowerCase() === ownerUserId.toLowerCase());
+}
+
+/** The first schema issue, as the field it names and what that field needs. */
+function ownerApprovalIssue(issue: z.core.$ZodIssue | undefined, built: Record<string, unknown>): string {
+  if (!issue) return "it does not match the owner_approval v1 contract.";
+  const field = ["owner_approval", ...issue.path.map(part => typeof part === "number" ? `[${part}]` : `.${String(part)}`)].join("");
+  if (issue.code === "unrecognized_keys") return `${field} has unknown field${issue.keys.length > 1 ? "s" : ""} ${issue.keys.join(", ")}.`;
+  // An action that parsed field by field but failed actionIsValid: its target
+  // does not fit its class, or a condition does not fit that target.
+  const [first, index] = issue.path;
+  if (first === "actions" && typeof index === "number" && issue.path.length === 2 && issue.code === "custom") {
+    const action = (built.actions as Array<{ class?: unknown }>)[index];
+    return `${field} is not a valid ${String(action?.class)} action: its target is not one ${String(action?.class)} accepts, or a condition does not fit that target (see the tool description).`;
+  }
+  return `${field}: ${issue.message}.`;
 }
 
 export function relayFailure(error: unknown, operation?: RelayToolOperation) {
@@ -455,6 +504,8 @@ function createRelayService(context: McpContext) {
   const agentMissing = context.authMode === "agent_identity" && !agent;
   const userId = agent ? agent.id : context.principal.userId;
   const ownerKey: Owner = { userId, agentIdentity: agent !== null };
+  /** The owner a delegate's owner_approval names: the signed-in person, none for an agent identity token. */
+  const approvalOwner = agent || agentMissing ? null : context.principal.userId;
   const key = context.workspace.relaycastApiKey;
   const relayWorkspaceId = context.workspace.relaycastWorkspaceId;
   const sessionHash = !oauth && !agent && sessionId ? ownerHash(sessionId) : null;
@@ -1880,7 +1931,7 @@ function createRelayService(context: McpContext) {
 
     async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string;
       owner_approval?: Record<string, unknown> }, serverIdempotencyKey: string = randomUUID()) {
-      checkOwnerApproval(input.owner_approval, input.reply_to ? "reply_to" : null);
+      const ownerApproval = prepareOwnerApproval(input.owner_approval, input.reply_to ? "reply_to" : null, approvalOwner);
       if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
       await managedActorOnly(input.as, Boolean(input.as_person));
       if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
@@ -1925,7 +1976,7 @@ function createRelayService(context: McpContext) {
         } else {
           sent = await clientFor(identity).sendDirectMessage({ token: identity.token, to: peer.name,
             ...(input.to === peer.address ? { address: input.to } : {}), text: input.text, idempotencyKey,
-            ...(input.owner_approval ? { ownerApproval: input.owner_approval } : {}) });
+            ...(ownerApproval ? { ownerApproval } : {}) });
         }
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
@@ -2047,7 +2098,7 @@ function createRelayService(context: McpContext) {
 
     async postChannel(input: ChannelInput & { channel: string; text: string; thread_id?: string; idempotency_key?: string;
       owner_approval?: Record<string, unknown> }, serverIdempotencyKey: string = randomUUID()) {
-      checkOwnerApproval(input.owner_approval, input.thread_id ? "thread_id" : null);
+      const ownerApproval = prepareOwnerApproval(input.owner_approval, input.thread_id ? "thread_id" : null, approvalOwner);
       const channel = normalizeChannelName(input.channel);
       // Posting requires a subscription, so no identity is created here.
       return (await channelActor(input, false, async (identity) => {
@@ -2066,7 +2117,7 @@ function createRelayService(context: McpContext) {
           threadId = reply.threadId;
         } else {
           messageId = (await clientFor(identity).postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey,
-            ...(input.owner_approval ? { ownerApproval: input.owner_approval } : {}) })).id;
+            ...(ownerApproval ? { ownerApproval } : {}) })).id;
         }
         return { from: identity.name, channel, linked: linkedKind(identity), message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,
