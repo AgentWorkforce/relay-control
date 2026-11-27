@@ -100,16 +100,16 @@ pin to its agent id). There is no relay provisioning to trigger on a
 self-hosted server. No MCP Events pump consumes a self-hosted Slashy inbox,
 because Grok routines are never mounted for a Slashy grant.
 
-## Classification (assumption)
+## Classification
 
 A Slashy grant is one with a registered **https** redirect URI whose host is
-`slashy.com` or a subdomain. The client name never decides. The exact URI
-Slashy registers was not verified against stored registrations: Slashy's web
-app starts MCP connections server-side (`POST /integrations/mcp/connect` with
-`frontend_url`, completed at `/integrations/mcp/complete`), so the callback is
-on a Slashy-owned origin. If it is elsewhere, the grant stays `mcp` and the
-tools do not appear. Read the stored `mcp_oauth_clients.redirect_uris` for the
-Slashy client to confirm.
+`slashy.com`, a subdomain of it, or exactly `slashy.ctrlcenter.ai`. The
+client name never decides. The Agent Relay consent screen for a real Slashy
+connection (2026-11-27) showed "Returns to slashy.ctrlcenter.ai", Slashy's
+original MCP host, so its callback is not under slashy.com. Other
+`ctrlcenter.ai` hosts are not Slashy. If Slashy moves its callback elsewhere,
+the grant stays `mcp` and the tools do not appear. Read the stored
+`mcp_oauth_clients.redirect_uris` for the Slashy client to confirm.
 
 A Slashy grant keeps the generic `mcp` delegation connector kind and relaygate
 client kind it had before it was classified. Its agent card kind is `slashy`.
