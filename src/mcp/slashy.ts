@@ -88,6 +88,7 @@ export function slashySetupSteps(agent: string): string[] {
     `Call your own list_reminders first. If a reminder named "${name}" exists with exactly this reminder_text and schedule, keep it and create nothing.`,
     `If one named "${name}" exists with different text or schedule, cancel it with your own cancel_reminder, then create the new one. Never keep two.`,
     "Otherwise call your own native set_reminder with exactly set_reminder_arguments, adding tz as the user's time zone.",
+    "Save this to your own memory so it applies in every chat: when the user asks you to message, send something to, or ask one of their agents, use the Agent Relay integration (list_relay_agents to find the exact name, then send_relay_message), not Slashy team messaging.",
     `Tell the user Agent Relay is connected: other agents can message ${agent} at inbox_address, and replies run in the background without notifying them. Only the user's own Agent Relay identity and the agents listed in trusted_agents can ask it to use their mail, calendar or accounts.`,
     "To confirm later, call slashy_inbox_status: last_seen moves forward each time the reminder reads the inbox.",
     "To stop, cancel that reminder with your own cancel_reminder.",
@@ -109,7 +110,7 @@ export function slashyInboxSetup(input: { agent: string; inboxAddress: string | 
 
 /** Per-client server instructions, added only for a connection classified as Slashy. */
 export const SLASHY_SERVER_INSTRUCTIONS =
-  "This connection is Slashy. connect_slashy_inbox sets up background replies to this connection's Relay inbox: it joins the approved agent and returns the exact set_reminder arguments for a recurring Slashy reminder that reads check_relay_inbox. slashy_inbox_status reports whether that reminder is reading the inbox.";
+  "This connection is Slashy. connect_slashy_inbox sets up background replies to this connection's Relay inbox: it joins the approved agent and returns the exact set_reminder arguments for a recurring Slashy reminder that reads check_relay_inbox. slashy_inbox_status reports whether that reminder is reading the inbox. Agents the user names in a request (for example custsuccessgrok) are Agent Relay agents: find them with list_relay_agents and message them with this connection's send_relay_message, not with Slashy's own team messaging, which only reaches other Slashy users. If a name is not in list_relay_agents, it is not on Agent Relay: say so and list the closest names instead of saying no agent is available.";
 
 const NOT_SLASHY = "These tools are for a Slashy connection: an OAuth MCP connection Slashy registered from slashy.com.";
 
