@@ -1,4 +1,4 @@
-import type { SqlExecutor } from "../database.js";
+import type { Database, SqlExecutor } from "../database.js";
 
 export type RoutineWakeReceipt = {
   state: "queued" | "wake_sent" | "backoff" | "failed" | "replied";
@@ -13,9 +13,8 @@ type WakeRow = {
   event_id: string | null;
   notified_at: Date | string | null;
   wake_sent_at: Date | string | null;
-  wake_attempts: number;
+  wake_attempts: number | null;
   answered_at: Date | string | null;
-  failures: number;
   last_error: string | null;
   next_attempt_at: Date | string;
 };
@@ -41,7 +40,7 @@ export async function routineWakeStatus(executor: SqlExecutor, input: {
   const recipientIds = [...new Set(input.recipientAgentIds)];
   if (!recipientIds.length) return null;
   const rows = (await executor.query<WakeRow>(`SELECT e.event_id,e.notified_at,e.wake_sent_at,e.wake_attempts,e.answered_at,
-        r.failures,r.last_error,r.next_attempt_at
+        r.last_error,r.next_attempt_at
       FROM mcp_oauth_grants g JOIN grok_bot_routines r ON r.grant_id=g.id
       LEFT JOIN grok_bot_events e ON e.grant_id=r.grant_id AND e.message_id=$3
       WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.agent_remote_id=ANY($4::text[])
@@ -69,7 +68,7 @@ export async function routineWakeStatus(executor: SqlExecutor, input: {
     wake_sent_at: wakeSentAt,
     replied_at: repliedAt,
     next_attempt_at: nextAttemptAt,
-    attempts: Math.max(wakeSentAt ? 1 : 0, ...eligible.map(row => Math.max(row.wake_attempts, row.failures))),
+    attempts: Math.max(0, ...eligible.map(row => row.wake_attempts ?? 0)),
     hint: "wake_sent means the routine endpoint accepted the trigger; it does not prove the client woke. Allow time for a reply.",
   };
 }
@@ -79,25 +78,37 @@ export async function routineWakeStatus(executor: SqlExecutor, input: {
  * signal returned by get_event. The reply already succeeded upstream, so a
  * bookkeeping outage is deliberately best-effort at the call site.
  */
-export async function markRoutineMessageAnswered(executor: SqlExecutor, input: {
+export async function markRoutineMessageAnswered(database: Database, input: {
   organizationId: string;
   workspaceId: string;
   agentRemoteId: string;
   messageId: string;
   replyMessageId: string;
 }): Promise<void> {
-  await executor.query(`WITH matching AS (
-      SELECT g.id AS grant_id FROM mcp_oauth_grants g JOIN grok_bot_routines r ON r.grant_id=g.id
-      WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.agent_remote_id=$3 AND g.revoked_at IS NULL AND r.cloud_copy
-    ), answered AS (
-      INSERT INTO grok_bot_answered_messages(grant_id,message_id,reply_message_id)
-      SELECT grant_id,$4,$5 FROM matching
-      ON CONFLICT (grant_id,message_id) DO UPDATE SET
-        answered_at=LEAST(grok_bot_answered_messages.answered_at,EXCLUDED.answered_at),
-        reply_message_id=COALESCE(grok_bot_answered_messages.reply_message_id,EXCLUDED.reply_message_id)
-      RETURNING grant_id,message_id,answered_at,reply_message_id
-    )
-    UPDATE grok_bot_events e SET answered_at=a.answered_at,reply_message_id=a.reply_message_id
-      FROM answered a WHERE e.grant_id=a.grant_id AND e.message_id=a.message_id`,
-  [input.organizationId, input.workspaceId, input.agentRemoteId, input.messageId, input.replyMessageId]);
+  await database.transaction(async tx => {
+    // The scanner holds the same grant-row fence while inserting events. This
+    // separate statement deliberately waits before the bookkeeping statement
+    // takes its READ COMMITTED snapshot: either the scan sees the ledger, or
+    // this transaction sees and updates the event the scan just committed.
+    const matching = (await tx.query<{ id: string }>(`SELECT g.id
+        FROM mcp_oauth_grants g JOIN grok_bot_routines r ON r.grant_id=g.id
+        WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.agent_remote_id=$3
+          AND g.revoked_at IS NULL AND r.cloud_copy
+        FOR UPDATE OF g`, [input.organizationId, input.workspaceId, input.agentRemoteId])).rows;
+    if (!matching.length) return;
+    await tx.query(`WITH matching AS (
+        SELECT g.id AS grant_id FROM mcp_oauth_grants g JOIN grok_bot_routines r ON r.grant_id=g.id
+        WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.agent_remote_id=$3 AND g.revoked_at IS NULL AND r.cloud_copy
+      ), answered AS (
+        INSERT INTO grok_bot_answered_messages(grant_id,message_id,reply_message_id)
+        SELECT grant_id,$4,$5 FROM matching
+        ON CONFLICT (grant_id,message_id) DO UPDATE SET
+          answered_at=LEAST(grok_bot_answered_messages.answered_at,EXCLUDED.answered_at),
+          reply_message_id=COALESCE(grok_bot_answered_messages.reply_message_id,EXCLUDED.reply_message_id)
+        RETURNING grant_id,message_id,answered_at,reply_message_id
+      )
+      UPDATE grok_bot_events e SET answered_at=a.answered_at,reply_message_id=a.reply_message_id
+        FROM answered a WHERE e.grant_id=a.grant_id AND e.message_id=a.message_id`,
+    [input.organizationId, input.workspaceId, input.agentRemoteId, input.messageId, input.replyMessageId]);
+  });
 }

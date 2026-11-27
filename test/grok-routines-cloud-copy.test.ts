@@ -9,7 +9,7 @@ import {
   GrokRoutines, GROK_SETUP_PATH, grokRoutinesOptions, isDuplicateRoutine, runGrokRoutineTasks,
 } from "../src/mcp/grok-routines.js";
 import { grokRoutinePrompt, parseGrokRoutineDetails } from "../src/mcp/grok-routine.js";
-import { routineWakeStatus } from "../src/mcp/grok-receipts.js";
+import { markRoutineMessageAnswered, routineWakeStatus } from "../src/mcp/grok-receipts.js";
 import { eventSteps, grantEventsSettings } from "../src/mcp/grok-events-policy.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
 import { revokeMcpOAuthGrantRows } from "../src/mcp/oauth/revocations.js";
@@ -79,6 +79,9 @@ test("Cloud copy: send and verified status expose Cloud's top-level recipient_wa
   await f.database.query("UPDATE mcp_oauth_grants SET agent_remote_id=$2 WHERE id=$1", [grantId, recipient.id]);
   await f.database.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,cloud_copy,delivery_mode)
     VALUES ($1,$2,true,'webhook')`, [grantId, encryptSecret(JSON.stringify({ url: URL, key: KEY }), KEYRING.active)]);
+  // Routine-level failures can belong to an earlier message; attempts are
+  // always the count recorded on this message's event.
+  await f.database.query("UPDATE grok_bot_routines SET failures=7,last_error='webhook_unavailable' WHERE grant_id=$1", [grantId]);
 
   const sent = (await f.tool("send_relay_message", { to: recipient.name, text: "wake status" })).structuredContent as any;
   assert.deepEqual(sent.recipient_wake, {
@@ -88,6 +91,26 @@ test("Cloud copy: send and verified status expose Cloud's top-level recipient_wa
   const status = (await f.tool("get_relay_message_status", { message_id: sent.message_id })).structuredContent as any;
   assert.equal(status.confirmation, "available");
   assert.deepEqual(status.recipient_wake, sent.recipient_wake);
+});
+
+test("reply bookkeeping takes the scanner's grant fence before its fresh-snapshot update", async () => {
+  const queries: string[] = [];
+  const database = {
+    transaction: async (run: (tx: any) => Promise<void>) => run({
+      query: async (sql: string) => {
+        queries.push(sql);
+        return { rows: queries.length === 1 ? [{ id: randomUUID() }] : [] };
+      },
+      exec: async () => {},
+    }),
+  } as any;
+  await markRoutineMessageAnswered(database, {
+    organizationId: randomUUID(), workspaceId: randomUUID(), agentRemoteId: randomUUID(),
+    messageId: "msg-race", replyMessageId: "msg-reply",
+  });
+  assert.equal(queries.length, 2);
+  assert.match(queries[0]!, /FOR UPDATE OF g/);
+  assert.match(queries[1]!, /UPDATE grok_bot_events/);
 });
 
 test("Cloud copy: a manual inbox reply recorded before event ingestion makes the delayed wake already answered", async t => {
