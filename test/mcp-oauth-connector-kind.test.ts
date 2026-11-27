@@ -48,6 +48,10 @@ test("mixed registrations retain Cursor, Grok, then ChatGPT then Muse precedence
     assert.equal(connectorKind({ clientName: "fake-muse", redirectUris: uris }), "cursor-cloud");
   }
   assert.equal(connectorKind({ clientName: null, redirectUris: ["https://x.ai/callback", "https://chatgpt.com/callback"] }), "grok-bot");
+  // slashy turns on owner-data behaviour, so a registration mixing in any non-Slashy callback is not Slashy.
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/cb", "https://attacker.example/cb"] }), "mcp");
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/cb", "http://localhost:3000/cb"] }), "mcp");
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/a", "https://app.slashy.com/b"] }), "slashy");
   for (const uris of [[chatgpt, muse], [muse, chatgpt]]) {
     assert.equal(connectorKind({ clientName: "fake-grok", redirectUris: uris }), "chatgpt");
   }

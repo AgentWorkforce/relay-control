@@ -52,7 +52,11 @@ export function connectorKind(client: { clientName: string | null; redirectUris:
   if (hosts.some(({ host }) => under(host, "x.ai"))) return "grok-bot";
   if (hosts.some(({ host }) => under(host, "chatgpt.com") || under(host, "openai.com"))) return "chatgpt";
   if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "muse.ai") || under(host, "agent.meta.ai")))) return "muse";
-  if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "slashy.com") || host === "slashy.ctrlcenter.ai"))) return "slashy";
+  // slashy turns on owner-data behaviour (sender_is_owner), so every
+  // registered callback must be a Slashy https host, not just one of them.
+  const slashyHost = ({ scheme, host }: { scheme: string; host: string }) =>
+    scheme === "https" && (under(host, "slashy.com") || host === "slashy.ctrlcenter.ai");
+  if (hosts.length > 0 && hosts.length === client.redirectUris.length && hosts.every(slashyHost)) return "slashy";
   return "mcp";
 }
 

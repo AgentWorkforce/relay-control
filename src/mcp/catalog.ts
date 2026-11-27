@@ -299,7 +299,7 @@ export function describeCapabilities(input: {
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
     if (id === "slashy_inbox" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
-      reason: "Only an OAuth connection registered by Slashy (slashy.com) gets the Slashy inbox reminder.",
+      reason: "Only an OAuth connection registered by Slashy (a slashy.com or slashy.ctrlcenter.ai callback) gets the Slashy inbox reminder.",
       how_to_enable: "Add this server's MCP URL in Slashy (Settings > Integrations > Add MCP, authentication Automatic) and approve the agent at sign-in." };
     if (id === "webhook_inbox" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: input.authMode === "oauth"

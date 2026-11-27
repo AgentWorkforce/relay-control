@@ -85,7 +85,7 @@ test("Slashy reminder text uses the tools' real shapes and the narrow owner gate
   assert.ok(text.includes('post a public-safe line in its thread ("Sent you the details by DM") and send the private answer with send_relay_message to the message\'s sender_address'));
   assert.match(slashyReminderText("a", [{ name: "kjgdot", id: "42" }]), /kjgdot \(sender_id 42\)/);
   assert.equal(slashyReminderArguments("a1", 1).schedule_expression, "rate(5 minutes)");
-  assert.equal(slashyReminderArguments("a1", 90).schedule_expression, "rate(60 minutes)");
+  assert.equal(slashyReminderArguments("a1", 90).schedule_expression, "rate(15 minutes)");
 });
 
 test("the Slashy group is planned only for Slashy connections", () => {
