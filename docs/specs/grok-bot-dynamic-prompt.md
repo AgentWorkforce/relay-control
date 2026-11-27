@@ -81,7 +81,7 @@ and data exist in relay-control:
 
 | Needed by the copied prompt | relay-control work |
 |---|---|
-| `get_event(eventId)` returning the full message plus an Agent Relay app block with `Sender check: trustedSender …` and `Reply setting: replyMode …` | New tool on Grok connections, backed by the Relaycast inbox (`eventId` = delivery id). The trusted-sender check uses the person's own agents and workspace members, as in Cloud's `trustedAgentNames` |
+| `get_event(eventId)` returning the full message plus an Agent Relay app block with `Sender check: trustedSender …`, `Reply setting: replyMode …` and `alreadyAnswered` | New tool on Grok connections, backed by the Relaycast inbox (`eventId` is stable per delivery). The trusted-sender check uses the person's own agents and workspace members, as in Cloud's `trustedAgentNames`; replies sent through the connection set the durable dedupe signal |
 | `get_recent_events(agent, since, scheduled, limit)` with `cursor`, `polling_active` and `delivery_paused` (polling mode) | New tool on Grok connections; the cursor is the Relaycast inbox position |
 | A reply mode setting (`notes-only` / `acknowledge` / `answer`) and reply consent | A small per-grant settings row (new migration `grok_bot_routines` columns: `delivery_mode`, `reply_mode`, `from_filter`, `polling_since`). Set on the setup page; defaults to `notes-only`, which keeps relay-control's current "ask first" behaviour unless the person opts in |
 | Polling mode with no credential | `delivery_mode='polling'` row with no ciphertext; the worker skips it |
