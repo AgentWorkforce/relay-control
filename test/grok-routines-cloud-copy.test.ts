@@ -125,6 +125,13 @@ test("Cloud copy: a manual inbox reply recorded before event ingestion makes the
   const ledger = (await f.database.query<{ message_id: string; reply_message_id: string }>(
     "SELECT message_id,reply_message_id FROM grok_bot_answered_messages")).rows[0]!;
   assert.deepEqual(ledger, { message_id: sent.message.id, reply_message_id: reply.message_id });
+  const repliedBeforeIngest = await routineWakeStatus(f.database, {
+    organizationId: f.owner.organizationId, workspaceId: f.owner.workspaceId,
+    messageId: sent.message.id, recipientAgentIds: [f.world.agents.get("fake-grok")!.id],
+  });
+  assert.equal(repliedBeforeIngest!.state, "replied");
+  assert.match(repliedBeforeIngest!.replied_at!, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(repliedBeforeIngest!.attempts, 0);
 
   await f.routines.tick();
   assert.equal(f.calls.length, 1, "the delayed webhook still wakes once");

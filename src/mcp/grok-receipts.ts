@@ -39,10 +39,12 @@ export async function routineWakeStatus(executor: SqlExecutor, input: {
 }): Promise<RoutineWakeReceipt | null> {
   const recipientIds = [...new Set(input.recipientAgentIds)];
   if (!recipientIds.length) return null;
-  const rows = (await executor.query<WakeRow>(`SELECT e.event_id,e.notified_at,e.wake_sent_at,e.wake_attempts,e.answered_at,
+  const rows = (await executor.query<WakeRow>(`SELECT e.event_id,e.notified_at,e.wake_sent_at,e.wake_attempts,
+        COALESCE(e.answered_at,a.answered_at) AS answered_at,
         r.last_error,r.next_attempt_at
       FROM mcp_oauth_grants g JOIN grok_bot_routines r ON r.grant_id=g.id
       LEFT JOIN grok_bot_events e ON e.grant_id=r.grant_id AND e.message_id=$3
+      LEFT JOIN grok_bot_answered_messages a ON a.grant_id=r.grant_id AND a.message_id=$3
       WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.agent_remote_id=ANY($4::text[])
         AND g.revoked_at IS NULL AND r.cloud_copy AND r.delivery_mode='webhook'`,
   [input.organizationId, input.workspaceId, input.messageId, recipientIds])).rows;
