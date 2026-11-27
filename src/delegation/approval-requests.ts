@@ -209,10 +209,11 @@ export async function getApprovalRequest(database: Database, workspaceId: string
   return getApprovalRequest(database, workspaceId, requestId, now);
 }
 
-/** The requester's read: only requests addressed to the caller's own user. */
-export async function readApprovalRequest(database: Database, input: { workspaceId: string; ownerUserId: string; requestId: string }) {
+/** The requester's read: only its own requests, addressed to the caller's own user. */
+export async function readApprovalRequest(database: Database, input: { workspaceId: string; ownerUserId: string; requestId: string;
+  requesterAgentId: string }) {
   const request = await getApprovalRequest(database, input.workspaceId, input.requestId);
-  if (!request || request.ownerUserId !== input.ownerUserId) return null;
+  if (!request || request.ownerUserId !== input.ownerUserId || request.requesterAgentId !== input.requesterAgentId) return null;
   return approvalRequestView(request);
 }
 

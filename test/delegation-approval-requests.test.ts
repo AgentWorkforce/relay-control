@@ -174,3 +174,25 @@ test("two racing approves mint once", async (t) => {
   assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
   assert.equal((await f.approvals()).length, 1);
 });
+
+test("a request is read only by the identity that made it; as selects the caller's own participant", async (t) => {
+  const f = await setup(t);
+  await f.call("join_relay", { name: "owner-bot" });
+  const asked = await f.ask({ actions: [MERGE] });
+  // Another session of the same owner, with its own hosted participant.
+  const other = new Client({ name: "approval-requests-other", version: "1.0.0" });
+  await other.connect(new StreamableHTTPClientTransport(new URL(`${f.env.origin}${MCP_PATH}`),
+    { requestInit: { headers: { authorization: `Bearer ${f.cliToken}` } } }));
+  t.after(() => other.close());
+  structured(await other.callTool({ name: "join_relay", arguments: { name: "second-bot" } }));
+  assert.match(toolError(await other.callTool({ name: "get_owner_approval_request", arguments: { request_id: asked.request_id } })),
+    /No approval request with that id was made by you/);
+  // Naming its own participant by `as` still sees only that participant's requests.
+  const mine = structured(await other.callTool({ name: "request_owner_approval", arguments: { actions: [MERGE], as: "second-bot" } }));
+  assert.equal(mine.requester.name, "second-bot");
+  assert.equal(structured(await other.callTool({ name: "get_owner_approval_request",
+    arguments: { request_id: mine.request_id, as: "second-bot" } })).status, "pending");
+  assert.match(toolError(await f.call("get_owner_approval_request", { request_id: mine.request_id })), /made by you/);
+  // Another person's participant is never selectable.
+  assert.equal((await other.callTool({ name: "request_owner_approval", arguments: { actions: [MERGE], as: "nobody-else" } })).isError, true);
+});

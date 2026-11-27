@@ -199,13 +199,15 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
       note: z.string().optional().describe("Why you need it, shown to your owner (at most 500 characters). Never put your owner's words here."),
       single_use: z.boolean().optional().describe("Make every action usable once. High-risk actions are single use anyway."),
       expires_in_minutes: z.number().int().optional().describe("How long your owner has to decide: 1 to 1440 minutes, default 60. An approval, once given, has its own 1-hour window."),
+      as: as.describe("Request as your own hosted participant by name (e.g. a Cursor cloud agent run); omitted, your session's own identity."),
     },
     annotations: { ...annotations, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, input => run(service => service.requestOwnerApproval(input)));
 
   server.registerTool("get_owner_approval_request", {
-    description: "Read one of your approval requests: status pending, approved, denied or expired, and the approval_id once your owner approved. Only requests made to your own owner are visible. Poll it; Agent Relay does not message you when it changes.",
-    inputSchema: { request_id: z.string().regex(/^apq_[A-Za-z0-9]{8,64}$/u) },
+    description: "Read one of your approval requests: status pending, approved, denied or expired, and the approval_id once your owner approved. Only requests this identity made to your own owner are visible. Poll it; Agent Relay does not message you when it changes.",
+    inputSchema: { request_id: z.string().regex(/^apq_[A-Za-z0-9]{8,64}$/u),
+      as: as.describe("Read as the hosted participant that made the request; omitted, your session's own identity.") },
     annotations,
-  }, input => run(service => service.ownerApprovalRequest(input.request_id)));
+  }, input => run(service => service.ownerApprovalRequest(input.request_id, input.as)));
 }

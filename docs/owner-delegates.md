@@ -455,7 +455,11 @@ Rules:
   `set_relay_agent_card` writes: the managed or linked Desktop identity, or
   the session's hosted participant) to the caller's own user. Cross-user
   requests are not supported, so no member can push approval prompts at
-  someone else. A workspace agent identity token has no person behind it,
+  someone else. `as` selects the caller's own participant (for example a
+  joined Cursor cloud agent run), as on `set_relay_agent_card`. A request is
+  read back only by the identity that made it: another of the owner's agents
+  (another OAuth grant's approved agent, say) cannot read its note, actions
+  or approval id. A workspace agent identity token has no person behind it,
   so it is not offered either tool, as in Cloud (the service also refuses
   one).
 - Actions are checked before anything is recorded: the mint body's action
