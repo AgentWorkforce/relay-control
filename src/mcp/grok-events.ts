@@ -145,7 +145,15 @@ export function assertOwnIdentity(approved: string, declared: string | undefined
 export async function getEvent(tx: SqlExecutor, keyring: EncryptionKeyring, grant: { id: string; agent_name: string },
   replyMode: ReplyMode, eventId: string, retainedSince: Date,
   owner: { userId: string; workspaceId: string; relaycastWorkspaceId: string }) {
-  const row = (await tx.query<EventRow>(`SELECT ${COLUMNS} FROM grok_bot_events WHERE grant_id=$1 AND event_id=$2 AND created_at>=$3`,
+  // The answer ledger is durable even when a reply races event ingestion. The
+  // grant-row fence normally copies it onto the event, while this join also
+  // makes reads safe for an event left stale by an interrupted older writer.
+  const row = (await tx.query<EventRow>(`SELECT e.event_id,e.grant_seq,e.name,e.sender,e.occurred_at,e.payload_ciphertext,
+      COALESCE(e.answered_at,a.answered_at) AS answered_at,
+      COALESCE(e.reply_message_id,a.reply_message_id) AS reply_message_id
+    FROM grok_bot_events e
+    LEFT JOIN grok_bot_answered_messages a ON a.grant_id=e.grant_id AND a.message_id=e.message_id
+    WHERE e.grant_id=$1 AND e.event_id=$2 AND e.created_at>=$3`,
     [grant.id, eventId, retainedSince])).rows[0];
   const event = row ? view(row, keyring, grant.agent_name) : null;
   if (!row || !event) return null;

@@ -58,7 +58,9 @@ export async function runGrokRoutineTasks<T>(values: readonly T[], concurrency: 
       if (value !== undefined) await visit(value);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  const results = await Promise.allSettled(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failure) throw failure.reason;
 }
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });

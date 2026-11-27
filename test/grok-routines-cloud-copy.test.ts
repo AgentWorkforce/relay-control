@@ -141,6 +141,10 @@ test("Cloud copy: a manual inbox reply recorded before event ingestion makes the
   assert.equal(event.noteToUser, false);
   assert.equal(event.reply, undefined);
   assert.match(event.nextSteps, /Stop: do not reply or post another note/);
+  await f.database.query("UPDATE grok_bot_events SET answered_at=NULL,reply_message_id=NULL WHERE event_id=$1", [f.calls[0]!.body.eventId]);
+  const ledgerBacked = (await f.tool("get_event", { eventId: f.calls[0]!.body.eventId })).structuredContent as any;
+  assert.equal(ledgerBacked.alreadyAnswered, true, "the durable ledger repairs a stale event read");
+  assert.equal(ledgerBacked.replyMessageId, reply.message_id);
 });
 
 test("routine scan work is bounded, covers more than the old 20-row page, and uses a sub-five-second cadence", async () => {
@@ -156,6 +160,28 @@ test("routine scan work is bounded, covers more than the old 20-row page, and us
   assert.equal(GROK_ROUTINE_MAX_BACKOFF_MS, 30_000);
   assert.equal(visited.length, 25);
   assert.equal(maximum, GROK_ROUTINE_SCAN_CONCURRENCY);
+});
+
+test("bounded routine work waits for every active worker before rethrowing a failure", async () => {
+  let releaseSlow!: () => void;
+  let slowStarted!: () => void;
+  const started = new Promise<void>(resolve => { slowStarted = resolve; });
+  const slow = new Promise<void>(resolve => { releaseSlow = resolve; });
+  const finished: number[] = [];
+  const rejected = assert.rejects(runGrokRoutineTasks([0, 1], 2, async value => {
+    if (value === 0) throw new Error("first worker failed");
+    slowStarted();
+    await slow;
+    finished.push(value);
+  }), /first worker failed/);
+  await started;
+  let settled = false;
+  void rejected.then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "the rejected worker does not let tick finish around another active worker");
+  releaseSlow();
+  await rejected;
+  assert.deepEqual(finished, [1]);
 });
 
 test("Cloud copy: one-paste setup, one Cloud-shaped wake per message, acknowledgement after commit, get_event app block", async t => {
