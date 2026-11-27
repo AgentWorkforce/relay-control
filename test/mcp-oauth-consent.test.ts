@@ -141,7 +141,7 @@ test("Grok hint correlation never supplies identity and consumes only the matchi
   const cookie = `relay_grok_name_hint=${encodeURIComponent(JSON.stringify({ id, agentName: "fake-hint", expiresAt: Date.parse("2026-01-01T00:05:00Z") }))}`;
   for (const matches of [true, false]) {
     const { handlers, calls } = harness({ grok: true });
-    const response = await handlers.authorize(request(grokBody({ name_handoff_id: matches ? id : "another-tab" }), { cookie }));
+    const response = await handlers.authorize(request(grokBody({ confirm_name_change: true, name_handoff_id: matches ? id : "another-tab" }), { cookie }));
     assert.equal(Boolean(response.headers.get("set-cookie")), matches);
     const payload = await response.json();
     assert.equal(Object.hasOwn(payload, "setup_url"), false);
@@ -197,4 +197,15 @@ test("an unknown name check fails closed and an explicit continuation skips it",
   const continued = harness({ availability: "yours" });
   assert.equal((await continued.handlers.authorize(request({ ...body, continue_grant_id: "fake-existing-grant" }))).status, 200);
   assert.equal(continued.calls.some(call => call.operation === "name"), false);
+});
+
+test("a Grok name hint cannot be changed silently", async () => {
+  const { handlers, calls } = harness({grok:true});
+  const hinted = grokBody();
+  const params = {...hinted.params, agent_name:"original-bot"};
+  const declined = await handlers.authorize(request({...hinted, params}));
+  assert.equal(declined.status,400);
+  assert.ok(!calls.some(call=>call.operation==="code"));
+  const approved = await handlers.authorize(request({...hinted, params, confirm_name_change:true}));
+  assert.equal(approved.status,200);
 });

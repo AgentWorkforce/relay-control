@@ -25,7 +25,7 @@ export interface McpOAuthConsentStore {
 }
 
 const AUTHORIZATION_PARAMS = ["response_type", "client_id", "redirect_uri", "code_challenge", "code_challenge_method",
-  "state", "scope", "nonce", "resource"] as const;
+  "state", "scope", "nonce", "resource", "agent_name"] as const;
 const GROK_NAME_COOKIE = "relay_grok_name_hint";
 const GROK_NAME_MAX_AGE_MS = 10 * 60 * 1_000;
 
@@ -34,7 +34,7 @@ function oauthJson(body: unknown, status = 200): Response {
 }
 
 /** Source grok-name-handoff validation: correlation only, never a principal. */
-function readNameHint(request: Request, now: number): { id: string } | null {
+function readNameHint(request: Request, now: number): { id: string; agentName: string } | null {
   const raw = (request.headers.get("cookie") ?? "").split(";")
     .map(part => part.trim()).find(part => part.startsWith(`${GROK_NAME_COOKIE}=`))?.slice(GROK_NAME_COOKIE.length + 1);
   if (!raw || raw.length > 3 * 1024) return null;
@@ -45,8 +45,18 @@ function readNameHint(request: Request, now: number): { id: string } | null {
     if (!hint || typeof hint.id !== "string" || !/^[a-f0-9-]{36}$/u.test(hint.id) ||
         typeof hint.agentName !== "string" || hint.agentName !== hint.agentName.trim() || agentNameError(hint.agentName) ||
         !Number.isFinite(hint.expiresAt) || hint.expiresAt <= now || hint.expiresAt > now + GROK_NAME_MAX_AGE_MS) return null;
-    return { id: hint.id };
+    return { id: hint.id, agentName: hint.agentName };
   } catch { return null; }
+}
+
+/** Consent suggestions are never proof of control of an agent. */
+export function grokConsentName(request: Request, authorization: AuthorizationRequest, client: ConsentClient,
+  parameter: string | undefined, now: number) {
+  const kind = connectorKind({ clientName: client.clientName, redirectUris: [authorization.redirectUri] });
+  if (!isGrokRoutineKind(kind)) return null;
+  const hint = readNameHint(request, now);
+  const supplied = parameter && !agentNameError(parameter) ? parameter.trim() : null;
+  return { name: authorization.requestedAgentName ?? supplied ?? hint?.agentName, hintId: hint?.id };
 }
 
 /** Shared account admission for the consent API and its server-rendered page. */
@@ -112,6 +122,10 @@ export function createMcpOAuthConsentHandlers(deps: {
       return oauthJson({ error: "invalid_workspace", error_description: "Switch to an accessible workspace before granting consent." }, 400);
     }
     const agentName = typeof body.agent_name === "string" ? body.agent_name.trim() : "";
+    const suggestion = grokConsentName(request, authorization, client!, params.agent_name, now());
+    if (suggestion?.name && suggestion.name !== agentName && body.confirm_name_change !== true) {
+      return oauthJson({ error: "invalid_request", error_description: "Confirm that you want to use a different agent name." }, 400);
+    }
     const invalidName = agentNameError(agentName);
     if (invalidName) return oauthJson({ error: "invalid_agent_name", error_description: invalidName }, 400);
     if (body.continue_grant_id !== undefined && typeof body.continue_grant_id !== "string") {
