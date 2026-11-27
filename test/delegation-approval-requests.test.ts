@@ -4,6 +4,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { copilotDesktopSetup, MCP_PATH } from "./support/copilot-desktop.js";
 import { request } from "./support/harness.js";
+import { setDelegationLogSinkForTesting } from "../src/delegation/observe.js";
+import { APPROVAL_REQUEST_NOT_FOUND } from "../src/mcp/relay-participants.js";
 
 // One-tap Tier O approval requests (Cloud's twin, cloud#6704): a delegate asks
 // its own owner; only the owner's decision in a human session mints.
@@ -195,4 +197,39 @@ test("a request is read only by the identity that made it; as selects the caller
   assert.match(toolError(await f.call("get_owner_approval_request", { request_id: mine.request_id })), /made by you/);
   // Another person's participant is never selectable.
   assert.equal((await other.callTool({ name: "request_owner_approval", arguments: { actions: [MERGE], as: "nobody-else" } })).isError, true);
+});
+
+test("a reconnected agent polls read-only with as; every not-found case answers the same, and a denied read logs ids only", async (t) => {
+  const f = await setup(t);
+  await f.call("join_relay", { name: "owner-bot" });
+  const asked = await f.ask({ actions: [MERGE], note: "private reason" });
+  const participants = async () => (await f.env.database.query(
+    "SELECT id, agent_name, agent_remote_id, session_hash, token_ciphertext, relaygate_agent_id, admitted_clients FROM hosted_relay_participants ORDER BY id")).rows;
+  const before = await participants();
+  const lines: string[] = [];
+  setDelegationLogSinkForTesting((_level, line) => { lines.push(line); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  // A new MCP session of the same owner that has joined nothing: its participant is still bound to the old session.
+  const reconnected = new Client({ name: "approval-requests-reconnected", version: "1.0.0" });
+  await reconnected.connect(new StreamableHTTPClientTransport(new URL(`${f.env.origin}${MCP_PATH}`),
+    { requestInit: { headers: { authorization: `Bearer ${f.cliToken}` } } }));
+  t.after(() => reconnected.close());
+  const poll = (args: Record<string, unknown>) => reconnected.callTool({ name: "get_owner_approval_request", arguments: args });
+  const noIdentity = toolError(await poll({ request_id: asked.request_id }));
+  const unknownName = toolError(await poll({ request_id: asked.request_id, as: "nobody-else" }));
+  const missing = toolError(await poll({ request_id: "apq_doesnotexist1", as: "owner-bot" }));
+  for (const answer of [noIdentity, unknownName, missing]) assert.equal(answer, APPROVAL_REQUEST_NOT_FOUND);
+  assert.match(APPROVAL_REQUEST_NOT_FOUND, /poll again with as set to the hosted name/);
+  // Naming the participant the request was made as finds it, and writes nothing.
+  assert.equal(structured(await poll({ request_id: asked.request_id, as: "owner-bot" })).status, "pending");
+  assert.deepEqual(await participants(), before);
+  assert.equal(lines.length, 0, lines.join("\n"));
+  // Another of the owner's agents reading it is denied with the same text, logged with ids only.
+  structured(await reconnected.callTool({ name: "join_relay", arguments: { name: "second-bot" } }));
+  assert.equal(toolError(await poll({ request_id: asked.request_id })), APPROVAL_REQUEST_NOT_FOUND);
+  const denied = lines.filter(line => line.includes("approval_request_read_denied"));
+  assert.equal(denied.length, 1, lines.join("\n"));
+  assert.match(denied[0]!, new RegExp(asked.request_id));
+  assert.match(denied[0]!, /"same_owner":true/);
+  assert.doesNotMatch(denied[0]!, /private reason|acme\/web|apv_/);
 });

@@ -8,6 +8,7 @@ import { launcherName } from "../src/mcp/relay-participants.js";
 /** The keyring test/support/copilot-desktop.ts configures. */
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
 import { copilotDesktopSetup, MCP_PATH, type DesktopGate } from "./support/copilot-desktop.js";
+import { request } from "./support/harness.js";
 
 // Gate-only installs (relaygatePublicUrl set): every hosted MCP participant
 // enrols at relaygate with a one-time hosted credential (sh_ht_) that
@@ -412,4 +413,37 @@ test("on a gate-only install a lapsed participant whose name now belongs to anot
   assert.equal(env.world.agents.get("notes-agent"), foreign, "the other owner's agent is untouched");
   const after = (await rows())[0];
   if (after) assert.equal(after.token, before.token, "the row adopted nothing");
+});
+
+test("on a gate-only install polling an approval request renews nothing, even when the relaygate token is rejected", async (t) => {
+  const { env, state, issue, connect, rows } = await gateHosted(t);
+  const desktop = await env.desktopSignIn({ hostName: "owner-box" });
+  const enabled = await request(env.origin, `/cloud/api/v1/workspaces/${env.workspaceId}/delegates/policy`,
+    { method: "PUT", cookie: desktop.session, body: { delegation_enabled: true }, headers: { origin: env.origin } });
+  assert.equal(enabled.status, 200, enabled.raw);
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  const asked = structured(await client.callTool({ name: "request_owner_approval",
+    arguments: { actions: [{ class: "merge", target: "acme/web#7", conditions: [{ type: "ci_green" }] }] } }));
+  // The stored relaygate token stops working: any acting call would enrol again.
+  issue("notes-agent");
+  const before = await rows();
+  const credentials = state.credentials.length;
+  const read = structured(await client.callTool({ name: "get_owner_approval_request", arguments: { request_id: asked.request_id } }));
+  assert.equal(read.status, "pending");
+  // A reconnected session naming it with `as` reads it the same way.
+  const other = await connect();
+  assert.equal(structured(await other.callTool({ name: "get_owner_approval_request",
+    arguments: { request_id: asked.request_id, as: "notes-agent" } })).status, "pending");
+  assert.deepEqual(await rows(), before, "the poll wrote nothing");
+  assert.equal(state.credentials.length, credentials, "no hosted credential was minted to renew it");
+  // A row relaygate never admitted this hosted client for is not read as, either way.
+  await env.database.query("UPDATE hosted_relay_participants SET admitted_clients = '{chatgpt}'");
+  const notAdmitted = await rows();
+  for (const args of [{ request_id: asked.request_id }, { request_id: asked.request_id, as: "notes-agent" }]) {
+    assert.match(toolError(await (args.as ? other : client).callTool({ name: "get_owner_approval_request", arguments: args })),
+      /No approval request with that id was made by you/);
+  }
+  assert.deepEqual(await rows(), notAdmitted, "the refused poll wrote nothing");
+  assert.equal(state.credentials.length, credentials, "and enrolled nothing to obtain an admission");
 });

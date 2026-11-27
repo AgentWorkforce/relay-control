@@ -713,6 +713,8 @@ export async function unbindDesktopSession(database: SqlExecutor, input: {
  * card is compared only when it carries metadata.relaygate.agent_id, and a
  * missing card or field is accepted. Throws DesktopIdentityUnavailable; on
  * the gate path each rejection is logged ("desktop identity skipped").
+ * Read-only: it never renews, enrols or rewrites the row. The approval
+ * request poll (get_owner_approval_request) relies on that to write nothing.
  */
 export async function verifyDesktopIdentity(input: {
   keyring: EncryptionKeyring;

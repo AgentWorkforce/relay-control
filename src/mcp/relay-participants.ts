@@ -120,6 +120,11 @@ export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll 
 export const FACTORY_REPLY_GUIDANCE = "Replies to this Factory agent are delivered into its Droid session by the Factory worker; check_relay_inbox does not serve Factory agents. Read the conversation with read_relay_conversation as=<this agent>.";
 export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thread. This receipt does not confirm delivery or reading.";
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
+/**
+ * The single not-found answer of get_owner_approval_request. It carries the
+ * recovery step for a hosted agent that reconnected to a new MCP session.
+ */
+export const APPROVAL_REQUEST_NOT_FOUND = "No approval request with that id was made by you to your owner in this workspace. If you reconnected to a new session, poll again with as set to the hosted name you made the request as.";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
 /** A managed join never changes the desktop identity's card, so its description is not applied. */
@@ -1583,6 +1588,54 @@ function createRelayService(context: McpContext) {
     });
   }
 
+  /**
+   * The identity get_owner_approval_request reads as, found only if it
+   * already exists (Cloud's twin cloud#6735). It is the identity
+   * requesterIdentity would make a request as: a managed chat's verified
+   * desktop identity, this session's desktop link, or the hosted participant
+   * participant() would select. Unlike requesterIdentity it writes nothing:
+   * no relaygate renewal or enrolment, no rename, no OAuth pin. `as` names
+   * one of the caller's own hosted participants, which is how a hosted agent
+   * that reconnected to a new session (its participant still bound to the
+   * old one) finds the identity its request was made as. Null when there is
+   * none, so every not-found case answers the same.
+   */
+  async function existingApprovalRequester(as?: string): Promise<{ agentId: string; name: string } | null> {
+    const none = (error: unknown) => {
+      if (error instanceof RelayToolError) return null;
+      throw error;
+    };
+    if (managed) {
+      if (as) return null;
+      const identity = await desktop().catch(none);
+      return identity ? { agentId: identity.agentId, name: identity.name } : null;
+    }
+    if (!as) {
+      const linkedIdentity = await linkedDesktop().catch(none);
+      if (linkedIdentity) return { agentId: linkedIdentity.agentId, name: linkedIdentity.name };
+    }
+    // A workspace agent identity token never polls: approvalRequestOwner refuses it first.
+    if (agent || agentMissing) return null;
+    const run = await ownRun(as);
+    if (oauth && !run && await runRequired()) return null;
+    const row = await selectedRow(as);
+    if (!row || row.relayWorkspaceId !== relayWorkspaceId) return null;
+    if (gate && row.agentName === launcherName(userId)) return null;
+    // Gate-only installs: only a row relaygate enrolled and admitted this
+    // caller's hosted client for, as gatedParticipant enforces. The poll reads
+    // the stored admission and never enrols to obtain one.
+    if (gate && (row.relaygateAgentId === null || !row.admittedClients.includes(await hostedClient()))) return null;
+    // An OAuth grant acts only as its approved agent, as participant() enforces.
+    if (oauth && !run) {
+      try { oauth.assertActor(as, row.agentName); } catch { return null; }
+      // A name-only grant never reads as a retiring identity: participant()'s
+      // retirement fence refuses it before it could adopt (and pin) the row.
+      if (!oauth.access.agentRemoteId && await retiringIdentity(executor,
+        { organizationId, workspaceId, userId, agentRemoteId: row.agentRemoteId, agentName: row.agentName })) return null;
+    }
+    return { agentId: row.agentRemoteId, name: row.agentName };
+  }
+
   /** The owner an approval request asks: the signed-in person, never a workspace agent identity. */
   function approvalRequestOwner(): string {
     if (agent || agentMissing) {
@@ -1769,14 +1822,15 @@ function createRelayService(context: McpContext) {
      * Reads one approval request this identity made to the caller's own
      * owner: its status, and the approval_id once approved. A request another
      * of the owner's agents made is not visible (an OAuth grant acts only as
-     * its approved agent).
+     * its approved agent). A read: it joins, renews or pins nothing.
      */
     async ownerApprovalRequest(requestId: string, as?: string) {
       const ownerUserId = approvalRequestOwner();
-      const identity = await requesterIdentity(as);
-      const found = await approvalRequests.readApprovalRequest(database, { workspaceId, ownerUserId, requestId,
-        requesterAgentId: identity.agentId });
-      if (!found) throw new RelayToolError("No approval request with that id was made by you to your owner in this workspace.");
+      const identity = await existingApprovalRequester(as);
+      // One answer for a missing id, another identity's request, or no identity yet (no existence oracle).
+      const found = identity ? await approvalRequests.readApprovalRequest(database, { workspaceId, ownerUserId, requestId,
+        requesterAgentId: identity.agentId }) : null;
+      if (!found) throw new RelayToolError(APPROVAL_REQUEST_NOT_FOUND);
       return found;
     },
 

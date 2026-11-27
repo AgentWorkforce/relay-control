@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { Database, SqlExecutor } from "../database.js";
 import { loadPolicy, memberRole, mintId, recordDelegationAudit, type DelegationPolicy } from "./service.js";
+import { logRefused } from "./observe.js";
 import {
   APPROVAL_DEFAULT_MS, APPROVAL_MAX_MS, MAX_ACTIONS, actionSchema, canonicalAction, configTarget, isUndelegableSetting,
   type Action,
@@ -213,7 +214,14 @@ export async function getApprovalRequest(database: Database, workspaceId: string
 export async function readApprovalRequest(database: Database, input: { workspaceId: string; ownerUserId: string; requestId: string;
   requesterAgentId: string }) {
   const request = await getApprovalRequest(database, input.workspaceId, input.requestId);
-  if (!request || request.ownerUserId !== input.ownerUserId || request.requesterAgentId !== input.requesterAgentId) return null;
+  if (!request) return null;
+  if (request.ownerUserId !== input.ownerUserId || request.requesterAgentId !== input.requesterAgentId) {
+    // Ids only: never the note, the actions or the approval id.
+    logRefused("approval_request", { workspaceId: input.workspaceId, reason: "approval_request_read_denied",
+      request_id: request.id, requester_agent_id: request.requesterAgentId, caller_agent_id: input.requesterAgentId,
+      same_owner: request.ownerUserId === input.ownerUserId });
+    return null;
+  }
   return approvalRequestView(request);
 }
 
