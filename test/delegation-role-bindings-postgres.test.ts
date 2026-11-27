@@ -553,3 +553,71 @@ test("review of cloud#6674: a worker grant made under an older resolution is sup
   assert.equal(retired.status, "revoked");
   assert.equal(retired.revoked_reason, SUPERSEDED_BY_RULE);
 });
+
+test("review of cloud#6676: a worker whose existing grant now covers nothing has it retired with its approvals", options, async (t) => {
+  const f = await fixture(t);
+  const relay = await f.bind("relay_agents", null, "trusted");
+  const worker = (await f.materialize("worker-1", workerPath("worker-1")))!;
+  await f.database.query(`INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, grant_id, message_id, actions,
+      single_use, expires_at) VALUES ('apv_uncovered01', $1, $2, 'D', $3, 'm', '[{"class":"pr_ops","target":"acme/web#7:comment"}]'::jsonb,
+      false, now() + interval '1 hour')`, [f.workspaceId, f.ownerId, worker.id]);
+  // Resolution changes under the stored grant: the root now allows labels only, so the worker's Read-only default has no usable op.
+  await f.database.query("UPDATE delegation_trust_rules SET pr_ops_limit = ARRAY['label'] WHERE id = $1", [relay.id]);
+  assert.equal(await f.materialize("worker-1", workerPath("worker-1")), null);
+  const retired = await f.grant(worker.id);
+  assert.equal(retired.status, "revoked");
+  assert.equal(retired.revoked_reason, "binding_changed");
+  const approval = (await f.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = 'apv_uncovered01'")).rows[0]!;
+  assert.notEqual(approval.invalidated_at, null);
+  assert.deepEqual((await f.events("grant.revoked")).map(event => event.reason), ["binding_changed"]);
+  // Asking again retires nothing more.
+  assert.equal(await f.materialize("worker-1", workerPath("worker-1")), null);
+  assert.equal((await f.events("grant.revoked")).length, 1);
+});
+
+test("review of cloud#6681: an uncovered decision made just before a restrictive binding lapses never retires the grant made after it", options, async (t) => {
+  const f = await fixture(t);
+  await f.bind("relay_agents", null, "trusted");
+  const restrictive = await f.bind("connector_kind", "grok-bot", "trusted");
+  // Labels only, lapsing shortly: while it decides, the worker's Read-only default has no usable op.
+  await f.database.query(`UPDATE delegation_trust_rules SET pr_ops_limit = ARRAY['label'], expires_at = now() + interval '400 milliseconds'
+    WHERE id = $1`, [restrictive.id]);
+  let fallback: GrantRow | null = null;
+  const early = await f.materialize("worker-1", workerPath("worker-1"), { onUncovered: async () => {
+    // Paused before its grant lookup until the restriction lapses; another attest then makes the fallback grant.
+    await new Promise(resolve => setTimeout(resolve, 600));
+    fallback = await f.materialize("worker-1", workerPath("worker-1"));
+  } });
+  const made = fallback as GrantRow | null;
+  assert.equal(made?.status, "active");
+  assert.equal(early?.id, made!.id);
+  assert.equal((await f.grant(made!.id)).status, "active");
+  assert.deepEqual(await f.events("grant.revoked"), []);
+});
+
+test("review of relay-control#346: a lapsed grant keeps the owner approvals carried under it, and a grant on another chain is left alone", options, async (t) => {
+  const f = await fixture(t);
+  const relay = await f.bind("relay_agents", null, "trusted");
+  const worker = (await f.materialize("worker-1", workerPath("worker-1")))!;
+  const approvalId = `apv_${randomUUID().replaceAll("-", "")}`;
+  await f.database.query(`INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+    VALUES ($1, $2, $3, 'O', '[{"class":"pr_ops","target":"acme/web#7:comment"}]'::jsonb, false, now() + interval '1 hour')`,
+  [approvalId, f.workspaceId, f.ownerId]);
+  await f.database.query(`INSERT INTO delegation_attestations (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id,
+      delegate_agent_id, kid, accept, standing, issued_at, expires_at)
+    VALUES ($1, $2, $3, $4, 'm', 'r', 'worker-1', 'k', 'code_owners', 'own_owner', now(), now() + interval '5 minutes')`,
+  [randomUUID(), f.workspaceId, approvalId, worker.id]);
+  await f.database.query("UPDATE delegation_trust_rules SET pr_ops_limit = ARRAY['label'] WHERE id = $1", [relay.id]);
+  // Another chain (the worker launched again) decides nothing about this grant: its own chain check re-proves it.
+  assert.equal(await f.materialize("worker-1", workerPath("worker-1", "grok-2")), null);
+  assert.equal((await f.grant(worker.id)).status, "active");
+  // Lapsed before the sweep: left to expiry, so the owner's approval it carried stays valid for other delegates.
+  await f.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [worker.id]);
+  assert.equal(await f.materialize("worker-1", workerPath("worker-1")), null);
+  assert.notEqual((await f.grant(worker.id)).status, "revoked");
+  const approval = (await f.database.query<{ invalidated_at: Date | null }>(
+    "SELECT invalidated_at FROM delegation_approvals WHERE id = $1", [approvalId])).rows[0]!;
+  assert.equal(approval.invalidated_at, null);
+  assert.deepEqual(await f.events("grant.revoked"), []);
+});

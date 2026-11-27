@@ -241,6 +241,8 @@ export const TRUST_RULE_GRANT_EXPIRY = new Date("9999-12-31T00:00:00.000Z");
  * gap in coverage, so it does not floor the replacement grant (Cloud's CHAIN_CHANGED).
  */
 export const CHAIN_CHANGED = "chain_changed";
+/** The revoke reason of a system grant whose bindings no longer cover its delegate. */
+export const BINDING_CHANGED = "binding_changed";
 /** The revoke reason of a system grant a person revoked: the rule does not cover that agent again. */
 export const OWNER_EXCLUDED = "owner_excluded";
 
@@ -2924,7 +2926,9 @@ export async function materializeRuleGrant(database: Database, input: { workspac
   ownerUserId: string; delegateAgentId: string; delegateAgentName: string; trustPath: TrustPath; provenAt: Date;
   claimId?: string;
   /** Test hook: runs once the binding and grant locks are held. */
-  onLocked?: () => Promise<void> }): Promise<GrantRow | null> {
+  onLocked?: () => Promise<void>;
+  /** Test hook: runs after a first decision that covers nothing, before the grant locks. */
+  onUncovered?: () => Promise<void> }): Promise<GrantRow | null> {
   const { workspace } = input;
   const pair = [workspace.id, input.ownerUserId, input.delegateAgentId];
   const run = () => database.transaction(async (tx): Promise<GrantRow | null> => {
@@ -2932,10 +2936,44 @@ export async function materializeRuleGrant(database: Database, input: { workspac
     await lockOwnerBindings(tx, workspace.id, input.ownerUserId, "shared");
     if (!(await loadPolicy(tx, workspace.id, true)).delegation_enabled) return null;
     const state = await bindingState(tx, workspace.id, input.ownerUserId, "share");
-    const decision = decideFor(state, input.delegateAgentId, input.trustPath, new Date());
-    const shape = grantShape(decision);
-    if (!shape || (input.ruleId && shape.binding.id !== input.ruleId)) return null;
-    const rule = state.rows.find(row => row.id === shape.binding.id)!;
+    let decision = decideFor(state, input.delegateAgentId, input.trustPath, new Date());
+    let shape = grantShape(decision);
+    if (!shape) {
+      // Nothing covers the agent, yet it may still hold a system grant from
+      // before resolution changed (a worker whose spawn default now leaves it
+      // no usable action): that grant is retired with its approvals, so the
+      // binding no longer lists the agent as covered (Cloud, review of
+      // cloud#6676).
+      await input.onUncovered?.();
+      await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
+      const held = (await tx.query<{ id: string; trust_rule_id: string | null; expires_at: Date; trust_path: TrustPath | null }>(
+        `SELECT id, trust_rule_id, expires_at, trust_path FROM delegation_grants
+          WHERE workspace_id = $1 AND owner_user_id = $2 AND delegate_agent_id = $3 AND status = 'active' ORDER BY id`, pair,
+      )).rows;
+      // Decided again once those grants are locked (review of cloud#6681):
+      // every grant read here was committed before this time, and a binding
+      // only ever expires, so a grant another attest made after a restrictive
+      // binding lapsed is covered again here and is kept.
+      const at = new Date();
+      decision = decideFor(state, input.delegateAgentId, input.trustPath, at);
+      shape = grantShape(decision);
+      if (!shape) {
+        // Left alone: an owner-made grant; a lapsed one, which the expiry
+        // sweep ends without cancelling the owner approvals carried under it;
+        // and one standing on another chain, which its own chain check
+        // re-proves (review of relay-control#346).
+        const stale = held.filter(row => row.trust_rule_id && new Date(row.expires_at).getTime() > at.getTime() &&
+          (!row.trust_path || trustPathFingerprint(row.trust_path) === trustPathFingerprint(input.trustPath)));
+        if (stale.length) {
+          await revokeGrants(tx, { workspaceId: workspace.id, grantIds: stale.map(row => row.id), actorUserId: null,
+            reason: BINDING_CHANGED, authMethod: "system" });
+        }
+        return null;
+      }
+    }
+    const covered = shape;
+    if (input.ruleId && covered.binding.id !== input.ruleId) return null;
+    const rule = state.rows.find(row => row.id === covered.binding.id)!;
     await lockGrantAndClaims(tx, workspace.id, input.ownerUserId, input.delegateAgentId);
     if (input.claimId) {
       // A claim root: its claim is re-read under its lock (releaseClaim's order).
