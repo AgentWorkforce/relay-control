@@ -29,6 +29,7 @@ import { postgresAttestationStore } from "./copilot-attestation.js";
 import { enrolHostedAtGate, freshAtGate, HostedGateRefused, type GateEnrolment } from "./hosted-gate.js";
 import { underOwnerLock } from "./owner-lock-deadline.js";
 import type { RelayHostedClient } from "./relay-hosted-credentials.js";
+import { issueSlashyTrustToken, slashyTrustKey, verifySlashyTrustToken, type SlashyTrustBinding, type SlashyTrustVerdict } from "./slashy-trust.js";
 
 /**
  * Hosted relay participants and the Relaycast operations behind the
@@ -1675,6 +1676,18 @@ function createRelayService(context: McpContext) {
    * caller that is not a Desktop identity reads through relaygate as its
    * hosted participant, and must have joined first.
    */
+  function trustBinding(): SlashyTrustBinding | null {
+    return context.oauth ? { grantId: context.oauth.access.grantId, workspaceId: context.workspace.id, userId: context.principal.userId } : null;
+  }
+  function slashyTrust(token?: string): SlashyTrustVerdict | null {
+    const binding = trustBinding();
+    if (!token || !binding) return null;
+    try {
+      return verifySlashyTrustToken(slashyTrustKey(keyring.active.key), token, binding);
+    } catch {
+      return { status: "invalid" };
+    }
+  }
   async function callerDirectory(as?: string): Promise<Directory> {
     if (managed) await managedActorOnly(as);
     if (!gate || managed || (!as && await linkedDesktop())) return directory();
@@ -1901,6 +1914,27 @@ function createRelayService(context: McpContext) {
      * Null when no participant is joined. Nothing is acknowledged.
      */
 
+    /** The current Relaycast agent id of each named workspace agent, through the caller's directory; an unknown name is refused. */
+    async resolveAgentIds(names: string[]): Promise<Array<{ name: string; id: string }>> {
+      if (!names.length) return [];
+      // Same boundary as the other name lookups: a gate-only install reads through
+      // the joined participant's relaygate directory, so a hidden name is "unknown".
+      const dir = await callerDirectory();
+      const agents = (await withinRelayRead(signal => dir.via.findAgentsByNames(dir.credential, names, { signal }), RELAY_STATUS_LOOKUP_TIMEOUT_MS))
+        .filter(isListedRelayAgent);
+      return names.map(name => {
+        const found = agents.find(row => row.name === name);
+        if (!found?.id) throw new RelayToolError(`No agent named ${name} is in this workspace's relay. Names are matched exactly, including case: use the name exactly as list_relay_agents shows it.`);
+        return { name, id: found.id };
+      });
+    },
+    /** A trust token for these Relaycast agent ids, bound to this OAuth grant; null when this is not an OAuth connection. */
+    // Async like every service method: relayService fences each one for OAuth connections.
+    async issueSlashyTrustToken(agentIds: string[]): Promise<{ token: string; expiresAt: string } | null> {
+      const binding = trustBinding();
+      if (!binding || !agentIds.length) return null;
+      return issueSlashyTrustToken(slashyTrustKey(keyring.active.key), binding, agentIds);
+    },
     async hostedPresence(): Promise<{ name: string; address: string | null; last_seen: string | null; pending_count: number } | null> {
       if (managed) return null;
       const hosted = await participant(undefined, { allowMissing: true });
@@ -1917,7 +1951,7 @@ function createRelayService(context: McpContext) {
       return { name: hosted.name, address: row?.address ?? null, last_seen: row?.lastSeen ?? null, pending_count: inbox.length };
     },
 
-    async inbox(as: string | undefined, acknowledge: string[]) {
+    async inbox(as: string | undefined, acknowledge: string[], trustToken?: string) {
       if (managed) {
         await managedActorOnly(as);
         const identity = await desktop();
@@ -1965,9 +1999,16 @@ function createRelayService(context: McpContext) {
       // its name or text) is the owner's own person identity. An unreadable
       // proof is false.
       const ownerSenders = context.slashy ? await ownedSenders(messages.flatMap(message => message.sender_id ? [message.sender_id] : [])) : null;
+      // Agents the owner named at connect_slashy_inbox, from a token this server
+      // signed for this grant (slashy-trust.ts). Only a valid token widens trust.
+      const trust = ownerSenders ? slashyTrust(trustToken) : null;
       const enriched = messages.map(message => {
         const base = { ...message, sender_address: context.slashy ? pinnedAddress(message) : message.sender ? addresses.get(message.sender) ?? null : null,
-          ...(ownerSenders ? { sender_is_owner: Boolean(message.sender_id && ownerSenders.has(message.sender_id)) } : {}) };
+          ...(ownerSenders ? (() => {
+            const owner = Boolean(message.sender_id && ownerSenders.has(message.sender_id));
+            const trusted = Boolean(message.sender_id && trust?.status === "ok" && trust.agentIds.has(message.sender_id));
+            return { sender_is_owner: owner, sender_may_use_private_data: owner || trusted };
+          })() : {}) };
         if (isChannelDelivery(message)) {
           const channel = message.channel_id ? channelNames.get(message.channel_id) ?? null : null;
           const root = message.thread_id ?? message.message_id;
@@ -1988,7 +2029,7 @@ function createRelayService(context: McpContext) {
       for (const id of requested) await via.acknowledgeDelivery(hosted.token, id);
       const acknowledged = new Set(requested);
       return { name: hosted.name, messages: enriched.filter(message => !acknowledged.has(message.delivery_id)),
-        acknowledged: requested, has_more: messages.length === 100 };
+        trust_token_status: trust?.status, acknowledged: requested, has_more: messages.length === 100 };
     },
 
     async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string;
