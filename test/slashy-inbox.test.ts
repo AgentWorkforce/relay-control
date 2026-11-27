@@ -86,6 +86,11 @@ test("Slashy reminder text uses the tools' real shapes and the narrow owner gate
   // Owner-only: no model-side sender_id comparison exists to spoof.
   assert.doesNotMatch(slashyReminderText("a"), /sender_id is exactly one of/);
   assert.equal(slashyReminderArguments("a1", 1).schedule_expression, "rate(5 minutes)");
+  // Reconnecting without an interval keeps the existing reminder's schedule.
+  const kept = slashyInboxSetup({ agent: "a1", inboxAddress: "a1@host" }).next_steps.join(" ");
+  assert.ok(kept.includes("keep the old reminder's schedule_expression"));
+  const changed = slashyInboxSetup({ agent: "a1", inboxAddress: "a1@host", intervalMinutes: 15 }).next_steps.join(" ");
+  assert.ok(changed.includes("different text or schedule"));
   assert.equal(slashyReminderArguments("a1", 90).schedule_expression, "rate(15 minutes)");
 });
 
