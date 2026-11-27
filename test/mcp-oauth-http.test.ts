@@ -456,3 +456,15 @@ test("launch disclosure appears above Connect only for launch-enabled owner/admi
     }
   }
 });
+
+test("a Grok callback gets its own validated cookie name and an explicit change step",async()=>{
+  const callback = "https://www.cursor.com/agents/test/callback";
+  const { module } = harness({resources:[SHARED],redirectUris:[callback]});
+  const requested = new URL(pagePath,ORIGIN);
+  requested.searchParams.set("redirect_uri",callback);
+  const hint = {id:"11111111-1111-1111-1111-111111111111",agentName:"my-test-bot",expiresAt:Date.now()+60_000};
+  const response = await module.handle(new Request(requested,{headers:{cookie:"relay_grok_name_hint="+encodeURIComponent(JSON.stringify(hint))}}));
+  const html = await response!.text();
+  assert.match(html,/value="my-test-bot" readonly/);
+  assert.match(html,/Use a different name/);
+});

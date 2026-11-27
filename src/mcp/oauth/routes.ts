@@ -9,7 +9,7 @@ import { APP_BASE_PATH,createMcpOAuthProtocol,mcpOAuthPublicOriginAllowed,type M
 import type { McpOAuthUnavailableReason } from "./config.js";
 import { createMcpOidcIssuer } from "./oidc.js";
 import { createMcpOAuthPublicHandlers,type McpOAuthPublicStore } from "./public-handlers.js";
-import { createMcpOAuthConsentHandlers,resolveMcpConsentAccount,type McpConsentPrincipal,
+import { createMcpOAuthConsentHandlers,grokConsentName,resolveMcpConsentAccount,type McpConsentPrincipal,
   type McpConsentSession,type McpOAuthConsentStore,type AgentNameAvailability } from "./consent.js";
 
 const MAX_BODY=64*1024;
@@ -160,9 +160,10 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
       ?await store.listMcpOAuthGrantsForUser(principal,{clientId:requestValue.clientId,resource:requestValue.resource}):[];
     const existing:Connections=existingRows.map(({id,agentName})=>({id,agentName}));
     const nonce=randomBytes(18).toString("base64url");
-    const payload=JSON.stringify({params,workspaceId:principal.workspaceId,connections:existing}).replaceAll("<","\\u003c");
+    const suggestion=grokConsentName(request,requestValue,client!,params.agent_name,now().getTime());
+    const payload=JSON.stringify({params,workspaceId:principal.workspaceId,connections:existing,hintId:suggestion?.hintId}).replaceAll("<","\\u003c");
     // No shared default: a typed name that matches an existing agent needs explicit confirmation.
-    const suggested=requestValue.requestedAgentName??"";
+    const suggested=suggestion?.name??requestValue.requestedAgentName??"";
     const launchDisclosure = deps.launchEnabled && (principal.role === "owner" || principal.role === "admin") &&
       (requestValue.resourcePath === "/api/v1/mcp/relay-events" ? protocol!.isEventsLaunchConsent(requestValue) : requestValue.scopes.includes("relay:mcp"))
       ? "<p><strong>This app can start coding agents on connected computers and stop agents it starts.</strong></p>" : "";
@@ -176,14 +177,17 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const caution=destination.loopback?"":`<p id="caution"><strong>Caution:</strong> the app chose its own name, and nobody has verified it. Connect only if you trust ${escaped(destination.label)}.</p>`;
     const body=renderPage("Connect Agent Relay",`<h1>${heading}</h1><p id="returns-to" class="muted">Returns to: <strong>${escaped(destination.label)}</strong></p>${caution}<p>Workspace: <strong>${escaped(workspace)}</strong></p>
 <p>This connection may:</p><ul class="list">${requestValue.scopes.map(scope=>`<li>${escaped(labels[scope]??scope)}</li>`).join("")}</ul>
-<form id="consent">${connectionSelect}<p><label>Approved agent name <input id="agent" maxlength="128" required value="${escaped(suggested)}"></label></p>
+<form id="consent">${connectionSelect}<p><label>Approved agent name <input id="agent" maxlength="128" required value="${escaped(suggested)}"${suggestion?.name?" readonly":""}></label></p>
+${suggestion?.name?'<label><input type="checkbox" id="change-name"> Use a different name</label><p>The bot may refuse a connection approved under another name.</p>':""}
 <p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent</label></p>
 ${launchDisclosure}<div class="actions"><button class="btn" type="submit">Connect</button><button class="btn secondary" type="button" id="deny">Cancel</button></div></form><p id="error" class="alert" role="alert"></p>`,`const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
 function showAttach(show){attachRow.hidden=!show;if(!show)attach.checked=false;}
+const changeName=document.getElementById('change-name'),originalName=agent.value;
+if(changeName)changeName.addEventListener('change',()=>{agent.readOnly=!changeName.checked;if(agent.readOnly){agent.value=originalName;if(connection)connection.value='';}check();});
 let checking=0;async function check(){const name=agent.value.trim(),ticket=++checking;showAttach(false);if(!name)return;try{const response=await fetch('${API}/authorize/agent-name?'+new URLSearchParams({workspace_id:data.workspaceId,name}));const value=await response.json();if(ticket===checking)showAttach(response.ok&&value.status==='yours');}catch{}}
 agent.addEventListener('change',check);if(agent.value)check();
-if(connection)connection.addEventListener('change',()=>{const chosen=data.connections.find(row=>row.id===connection.value);if(chosen){agent.value=chosen.agentName;showAttach(false);}});
-async function decide(decision){const buttons=form.querySelectorAll('button');buttons.forEach(button=>button.disabled=true);try{const response=await fetch('${API}/authorize',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({params:data.params,workspace_id:data.workspaceId,agent_name:agent.value,decision,...(!attachRow.hidden&&attach.checked?{attach_existing:true}:{}),...(connection&&connection.value?{continue_grant_id:connection.value}:{})})});const value=await response.json();if(response.ok&&typeof value.redirect_to==='string'){location.assign(value.redirect_to);return;}if(value.error==='agent_name_in_use')showAttach(true);document.getElementById('error').textContent=value.error_description||'Connection could not be completed.';}catch{document.getElementById('error').textContent='Connection could not be completed. Try again.';}buttons.forEach(button=>button.disabled=false);}
+if(connection)connection.addEventListener('change',()=>{const chosen=data.connections.find(row=>row.id===connection.value);if(chosen){if(changeName&&!changeName.checked&&chosen.agentName!==originalName){connection.value='';changeName.focus();return;}agent.value=chosen.agentName;showAttach(false);}});
+async function decide(decision){const buttons=form.querySelectorAll('button');buttons.forEach(button=>button.disabled=true);try{const response=await fetch('${API}/authorize',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({params:data.params,workspace_id:data.workspaceId,agent_name:agent.value,name_handoff_id:data.hintId,confirm_name_change:changeName?.checked===true,decision,...(!attachRow.hidden&&attach.checked?{attach_existing:true}:{}),...(connection&&connection.value?{continue_grant_id:connection.value}:{})})});const value=await response.json();if(response.ok&&typeof value.redirect_to==='string'){location.assign(value.redirect_to);return;}if(value.error==='agent_name_in_use')showAttach(true);document.getElementById('error').textContent=value.error_description||'Connection could not be completed.';}catch{document.getElementById('error').textContent='Connection could not be completed. Try again.';}buttons.forEach(button=>button.disabled=false);}
 form.addEventListener('submit',event=>{event.preventDefault();decide('approve');});document.getElementById('deny').addEventListener('click',()=>decide('deny'));`,"",nonce);
     return new Response(body,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
       "content-security-policy":`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
