@@ -10,7 +10,7 @@ import { APP_BASE_PATH, MCP_EVENTS_SCOPE, type AuthorizationRequest, type create
 
 export type McpConsentPrincipal = {
   userId: string; organizationId: string; workspaceId: string;
-  scopes: readonly string[]; pendingHandoff?: boolean; handoff?: boolean;
+  role?: string | null; scopes: readonly string[]; pendingHandoff?: boolean; handoff?: boolean;
 };
 export type McpConsentSession = { transport: "cookie" | "bearer"; principal: McpConsentPrincipal };
 type ConsentClient = { clientId: string; clientName: string | null; redirectUris: string[] };

@@ -759,6 +759,7 @@ export function createApp(input: {
     ...(input.cursorJwks ? {jwks:input.cursorJwks} : {}),
   }) : undefined;
   const mcpOAuth = createMcpOAuthHttpModule({
+    launchEnabled: features.launch,
     grokRoutines,
     ...(cursorCloud ? {cursorCloudLinks:cursorCloud.links} : {}),
     config,mountedResources:["/mcp","/api/v1/mcp/shared-sessions"],
