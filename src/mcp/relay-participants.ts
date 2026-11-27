@@ -1837,21 +1837,6 @@ function createRelayService(context: McpContext) {
      * last_seen as the reminder's liveness, so this read must not move it).
      * Null when no participant is joined. Nothing is acknowledged.
      */
-    /** The current Relaycast agent id of each named workspace agent, read from Relaycast itself; an unknown name is refused. */
-    async resolveAgentIds(names: string[]): Promise<Array<{ name: string; id: string }>> {
-      if (!names.length) return [];
-      // Same boundary as the other name lookups: on a gate-only install this
-      // reads through the caller's relaygate directory (join first), so a name
-      // the caller's directory hides is "unknown", never revealed or pinned.
-      const dir = await callerDirectory();
-      const agents = (await withinRelayRead(signal => dir.via.findAgentsByNames(dir.credential, names, { signal }), RELAY_STATUS_LOOKUP_TIMEOUT_MS))
-        .filter(isListedRelayAgent);
-      return names.map(name => {
-        const found = agents.find(row => row.name === name);
-        if (!found?.id) throw new RelayToolError(`No agent named ${name} is in this workspace's relay. Use the exact name from list_relay_agents.`);
-        return { name, id: found.id };
-      });
-    },
 
     async hostedPresence(): Promise<{ name: string; address: string | null; last_seen: string | null; pending_count: number } | null> {
       if (managed) return null;

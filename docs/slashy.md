@@ -44,12 +44,9 @@ Registered in `slashy_inbox` only for an OAuth grant whose registered callback
 classifies as Slashy (`connectorKind` returns `slashy`). Neither tool adds
 authority beyond `join_relay`/`relay_status` for the approved agent.
 
-- `connect_slashy_inbox` `{interval_minutes?: 5-15, default 5,
-  trusted_agents?: string[] (at most 20 exact names, default [])}` resolves
-  each trusted agent to its current Relaycast agent id, read from Relaycast
-  itself (an unknown name is refused). It then joins (or reuses) the approved
-  hosted participant and returns `{agent, inbox_address, trusted_agents: [{name,
-  sender_id}], set_reminder_arguments: {name, schedule_expression,
+- `connect_slashy_inbox` `{interval_minutes?: 5-15, default 5}` joins (or
+  reuses) the approved hosted participant and returns `{agent, inbox_address,
+  set_reminder_arguments: {name, schedule_expression,
   write_enabled: true, reminder_text}, next_steps, note}`. The reminder name is
   `Agent Relay inbox (<agent>)`. `next_steps` keep an identical reminder, and
   replace one with different text, so there is never a second. Idempotent.
@@ -74,10 +71,13 @@ reminder posts a public-safe line in the thread ("Sent you the details by DM")
 and sends the private answer by `send_relay_message` to the sender's
 `sender_address`.
 
-## The owner gate: sender_is_owner and trusted_agents
+## The owner gate: sender_is_owner
 
-The policy is "the owner's human identity plus agents the owner names",
-never "every agent the owner owns".
+The policy is owner-only: the owner's mail, calendar or accounts are used only
+for a message from the owner's own human identity. The owner's agents and
+everyone else get only answers that are safe to share. There is no
+trusted-agent list, so there is no model-side `sender_id` comparison for a
+message body to spoof.
 
 `sender_is_owner` appears on each `check_relay_inbox` message, for a Slashy
 connection only. It is computed in `src/mcp/relay-participants.ts`
@@ -88,11 +88,6 @@ installs too, so the stored id matches the id deliveries carry. Desktop
 identities on gate-only installs hold relaygate ids instead, and the owner's
 Desktop sessions, hosted participants and launches are all false. An
 unreadable proof is false.
-
-`trusted_agents` lists the agents the owner explicitly approves. Each is
-pinned into the reminder text as `name (sender_id <Relaycast id>)` at setup,
-and later runs compare each message's `sender_id`. To change the list, call
-`connect_slashy_inbox` again; the reminder is replaced.
 
 `slashy_inbox_status` creates nothing. It reads the participant the way
 `relay_status` does, without a heartbeat (that read still records the grant's
