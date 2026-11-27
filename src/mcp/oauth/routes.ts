@@ -73,6 +73,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   mountedResources?:readonly McpOAuthResourcePath[];
   resolveSession(request:Request):Promise<McpConsentSession|null>;
   workspaceAccess(principal:TenantOwner):Promise<boolean>;
+  launchEnabled?:boolean;
   workspaceLabel?(principal:McpConsentPrincipal):Promise<string>;
   checkAgentNameAvailability(principal:TenantOwner,name:string):Promise<AgentNameAvailability>;
   clientAddress?(request:IncomingMessage):string;
@@ -162,6 +163,9 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const payload=JSON.stringify({params,workspaceId:principal.workspaceId,connections:existing}).replaceAll("<","\\u003c");
     // No shared default: a typed name that matches an existing agent needs explicit confirmation.
     const suggested=requestValue.requestedAgentName??"";
+    const launchDisclosure = deps.launchEnabled && (principal.role === "owner" || principal.role === "admin") &&
+      (requestValue.resourcePath === "/api/v1/mcp/relay-events" ? protocol!.isEventsLaunchConsent(requestValue) : requestValue.scopes.includes("relay:mcp"))
+      ? "<p><strong>This app can start coding agents on connected computers and stop agents it starts.</strong></p>" : "";
     const destination=redirectDestination(requestValue.redirectUri);
     const labels:Record<string,string>={"relay:mcp":"Use available MCP tools in this workspace","relay:agents":"Request supported agent actions",
       "relay:events":"Receive subscribed workspace events",openid:"Share a stable identifier specific to this client",
@@ -174,7 +178,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
 <p>This connection may:</p><ul class="list">${requestValue.scopes.map(scope=>`<li>${escaped(labels[scope]??scope)}</li>`).join("")}</ul>
 <form id="consent">${connectionSelect}<p><label>Approved agent name <input id="agent" maxlength="128" required value="${escaped(suggested)}"></label></p>
 <p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent</label></p>
-<div class="actions"><button class="btn" type="submit">Connect</button><button class="btn secondary" type="button" id="deny">Cancel</button></div></form><p id="error" class="alert" role="alert"></p>`,`const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
+${launchDisclosure}<div class="actions"><button class="btn" type="submit">Connect</button><button class="btn secondary" type="button" id="deny">Cancel</button></div></form><p id="error" class="alert" role="alert"></p>`,`const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
 function showAttach(show){attachRow.hidden=!show;if(!show)attach.checked=false;}
 let checking=0;async function check(){const name=agent.value.trim(),ticket=++checking;showAttach(false);if(!name)return;try{const response=await fetch('${API}/authorize/agent-name?'+new URLSearchParams({workspace_id:data.workspaceId,name}));const value=await response.json();if(ticket===checking)showAttach(response.ok&&value.status==='yours');}catch{}}
 agent.addEventListener('change',check);if(agent.value)check();

@@ -28,7 +28,7 @@ function config(enabled=true,extra:Record<string,string>={}) {
     SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64"),
     SELFHOST_MCP_OAUTH:enabled?"on":"off",...extra});
 }
-function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string|null;fail?:boolean;
+function harness(options:{launchEnabled?:boolean;enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string|null;fail?:boolean;
   resources?:Array<typeof SHARED|"/mcp">;oidc?:Record<string,string>;redirectUris?:string[];
   availability?:"available"|"yours"|"taken"|"unknown"}={}) {
   const calls:string[]=[];
@@ -54,6 +54,7 @@ function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSe
     async revokeMcpOAuthToken() {calls.push("revoke");},
   };
   const module=createMcpOAuthHttpModule({
+    launchEnabled: options.launchEnabled,
     config:config(options.enabled??true,options.oidc),createStore:()=>store,mountedResources:options.resources,
     resolveSession:async()=>options.session===undefined?{transport:"cookie",principal}:options.session,
     workspaceAccess:async()=>options.access!==false,
@@ -442,4 +443,16 @@ test("the start-up notice names the endpoints default-on exposes and the off swi
   assert.equal(metadata.authorization_endpoint,ORIGIN+notice.authorize);
   assert.equal(metadata.token_endpoint,ORIGIN+notice.token);
   assert.equal(metadata.registration_endpoint,ORIGIN+notice.register);
+});
+
+test("launch disclosure appears above Connect only for launch-enabled owner/admin grants",async()=>{
+  const warning = "This app can start coding agents";
+  for (const role of ["owner","admin","member"]) {
+    for (const launchEnabled of [true,false]) {
+      const { module } = harness({resources:[SHARED],launchEnabled,session:{transport:"cookie",principal:{...principal,role}}});
+      const html = await (await module.handle(web(pagePath)))!.text();
+      assert.equal(html.includes(warning),launchEnabled && role !== "member");
+      if (html.includes(warning)) assert.ok(html.indexOf(warning) < html.indexOf('type="submit">Connect'));
+    }
+  }
 });
