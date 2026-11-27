@@ -24,7 +24,7 @@ const KEYRING = { active: { id: "fake-key", key: Buffer.alloc(32, 7) } };
 const URL = "https://api2.cursor.sh/automations/webhook/rt_fake";
 const KEY = "crsr_" + "fake_routine_key_".repeat(3);
 
-async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp" = SHARED) {
+async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp" = SHARED, dashboardOrigin = ORIGIN) {
   const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
   const owner = { userId: randomUUID(), organizationId: randomUUID(), workspaceId: randomUUID(), grantId: randomUUID(), tokenFamilyId: randomUUID() };
   const clientId = "mcpc_" + randomUUID();
@@ -71,12 +71,12 @@ async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp"
   const cast = createRelaycastClient({ internalOrigin: "http://fake-relay.test", fetchImpl: relayFetch });
   const calls: Array<{ url: string; headers: Headers; body: any; redirect?: RequestRedirect }> = [];
   let webhookStatus = 202;
-  const routines = new GrokRoutines({ database, keyring: KEYRING, client: cast, publicOrigin: ORIGIN, tenancyMode: "multi", now: () => now,
+  const routines = new GrokRoutines({ database, keyring: KEYRING, client: cast, dashboardOrigin, publicOrigin: ORIGIN, tenancyMode: "multi", now: () => now,
     fetchImpl: async (input, init) => {
       calls.push({ url: String(input), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)), redirect: init?.redirect });
       return new Response("PROVIDER_SECRET_MUST_NOT_LEAK", { status: webhookStatus });
     } });
-  const config: SelfhostConfig = { databaseUrl: "unused", publicBaseUrl: ORIGIN, dashboardUrl: ORIGIN,
+  const config: SelfhostConfig = { databaseUrl: "unused", publicBaseUrl: ORIGIN, dashboardUrl: dashboardOrigin,
     relaycastUrl: "http://fake-relay.test", relaycastPublicUrl: "https://cast.example.test",
     relayhistoryUrl: "http://unused-history.test", relayhistoryPublicUrl: "https://history.example.test",
     sessionReadApi: { url: "http://unused-history.test", publicUrl: "https://history.example.test", secret: "session-read-secret-".repeat(2) },
@@ -92,7 +92,7 @@ async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp"
   t.after(() => client.close());
   const tool = async (name: string, args = {}) => client.callTool({ name, arguments: args });
   const setup = async (method = "GET", body?: unknown, headers: Record<string, string> = {}) => fetch(base + GROK_SETUP_PATH + "?grant=" + owner.grantId, {
-    method, redirect: "manual", headers: { cookie: `agent_relay_session=${browser.accessToken}`, origin: ORIGIN, "content-type": "application/json", ...headers },
+    method, redirect: "manual", headers: { cookie: `agent_relay_session=${browser.accessToken}`, origin: dashboardOrigin, "content-type": "application/json", ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const save = () => setup("POST", { webhook_url: URL, authorization: `Authorization: Bearer ${KEY}` });
@@ -103,6 +103,24 @@ async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp"
   return { database, owner, clientId, pair, routines, world, calls, tool, setup, save, message, base, stall,
     advance: () => { now = new Date(now.getTime() + 301_000); }, fail: (status: number) => { webhookStatus = status; } };
 }
+
+test("split-host Grok setup signs in and saves on the dashboard for an API-issued grant", async t => {
+  const dashboard = "https://dashboard.example.test";
+  const f = await fixture(t, SHARED, dashboard);
+  const result = (await f.tool("connect_grok_bot_routine")).structuredContent as { setup_url: string };
+  const target = new globalThis.URL(result.setup_url);
+  assert.equal(target.origin, dashboard);
+  assert.equal(target.pathname, GROK_SETUP_PATH);
+  assert.equal(target.searchParams.get("grant"), f.owner.grantId);
+  const anonymous = await f.setup("GET", undefined, { cookie: "" });
+  assert.equal(anonymous.status, 302);
+  const login = new globalThis.URL(anonymous.headers.get("location")!);
+  assert.equal(login.origin, dashboard);
+  assert.equal(login.pathname, "/login");
+  assert.equal(login.searchParams.get("next"), GROK_SETUP_PATH + "?grant=" + f.owner.grantId);
+  assert.equal((await f.setup()).status, 200);
+  assert.equal((await f.save()).status, 200);
+});
 
 test("self-hosted Grok OAuth discovers wake-ups, creates its pinned participant and stores browser-only encrypted credentials", async t => {
   const f = await fixture(t);

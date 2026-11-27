@@ -198,7 +198,7 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
         const principal=await resolveMcpConsentAccount(request,deps.resolveSession);
         if (principal instanceof Response) {
           if (request.method==='GET' && principal.status===401) return new Response(null,{status:302,headers:{
-            location:`/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
+            location:`${deps.grokRoutines.setupOrigin === origin ? "" : deps.grokRoutines.setupOrigin}/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
           return principal;
         }
         if (!await deps.workspaceAccess(principal)) return json({error:"not_found"},404);

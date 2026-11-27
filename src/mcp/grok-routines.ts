@@ -74,7 +74,7 @@ export function grokRoutinesOptions(config: SelfhostConfig,
     cursorRunIdentityRequired: config.cursorCloud?.enabled !== false && config.cursorCloud?.runIdentity === "required",
     ...(config.relaygatePublicUrl
       ? { gate: createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: deps.fetchImpl }) } : {}),
-    publicOrigin: new URL(config.publicBaseUrl).origin, tenancyMode: deps.tenancyMode,
+    publicOrigin: new URL(config.publicBaseUrl).origin, dashboardOrigin: new URL(config.dashboardUrl).origin, tenancyMode: deps.tenancyMode,
     ...(deps.now ? { now: deps.now } : {}),
     // SELFHOST_GROK_ROUTINES_CLOUD_COPY (docs/grok-bot.md); off unless set.
     cloudCopy: config.mcpOAuth?.grokCloudCopy === true,
@@ -92,7 +92,7 @@ export class GrokRoutines {
      * its approved agent, so it has no identity a routine could wake; its routine setup is refused.
      */
     cursorRunIdentityRequired?: boolean;
-    publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number;
+    publicOrigin: string; dashboardOrigin?: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number;
     /** SELFHOST_GROK_ROUTINES_CLOUD_COPY: Cloud's copied prompt, polling, event log and wakes (spec Phase 1). Default off. */
     cloudCopy?: boolean;
     /**
@@ -129,8 +129,12 @@ export class GrokRoutines {
     return { ...row, kind: kind as RoutineKind };
   }
 
+  get setupOrigin(): string {
+    return this.options.dashboardOrigin ?? this.options.publicOrigin;
+  }
+
   setupUrl(grantId: string, from?: string): string {
-    return `${this.options.publicOrigin}${GROK_SETUP_PATH}?${new URLSearchParams({ grant: grantId, ...(from ? { from } : {}) })}`;
+    return `${this.setupOrigin}${GROK_SETUP_PATH}?${new URLSearchParams({ grant: grantId, ...(from ? { from } : {}) })}`;
   }
 
   /**
@@ -259,7 +263,8 @@ export class GrokRoutines {
     const url = new URL(request.url);
     const grantId = url.searchParams.get("grant") ?? "";
     if (!/^[0-9a-f-]{36}$/i.test(grantId)) return json({ error: "not_found" }, 404);
-    if (request.method !== "GET" && request.headers.get("origin") !== this.options.publicOrigin) return json({ error: "forbidden" }, 403);
+    const origin = request.headers.get("origin");
+    if (request.method !== "GET" && origin !== this.setupOrigin && origin !== this.options.publicOrigin) return json({ error: "forbidden" }, 403);
     try {
       if (request.method === "POST") {
         let body: Record<string, unknown>;
