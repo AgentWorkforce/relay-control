@@ -125,7 +125,7 @@ test("a signed Copilot call joins and sends as the verified desktop identity; th
   const sent = await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text: "hello from copilot" }), `/cloud${MCP_PATH}`);
   assert.equal(sent.status, 200, JSON.stringify(sent.body));
   assert.notEqual(sent.body.result.isError, true, JSON.stringify(sent.body.result));
-  assert.equal(sent.body.result.structuredContent.reply_guidance, "replies will be injected into your session by Agent Relay Desktop");
+  assert.equal(sent.body.result.structuredContent.reply_guidance, "Desktop is linked. Check Desktop for a current receiver for this chat. A supported active receiver can inject replies. If Desktop reports the receiver unavailable, injection is unavailable. Missing or stale receiver evidence leaves injection unconfirmed.");
   const conversation = env.world.conversations.find((row) => row.participants.includes("peer"));
   assert.deepEqual(conversation?.participants.slice().sort(), ["copilot-chat", "peer"]);
   const dm = env.world.bodies.find((row) => row.method === "POST" && row.path === "/v1/dm");

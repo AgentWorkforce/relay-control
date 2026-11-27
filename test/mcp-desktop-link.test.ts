@@ -62,14 +62,14 @@ test("join by desktop_address links the session; send, status and inbox act as t
   const joined = structured(await f.client.callTool({ name: "join_relay", arguments: { desktop_address: ` ${f.address} ` } }));
   assert.deepEqual(joined, {
     joined: true, linked: "desktop", name: "desk-chat", address: f.address, already_joined: false,
-    reply_guidance: "replies will be injected into your session by Agent Relay Desktop",
+    reply_guidance: "Desktop is linked. Check Desktop for a current receiver for this chat. A supported active receiver can inject replies. If Desktop reports the receiver unavailable, injection is unavailable. Missing or stale receiver evidence leaves injection unconfirmed.",
   });
   assert.equal((await f.bindings()).length, 1);
   assert.equal(JSON.stringify(joined).includes(f.chat.token), false);
 
   const sent = structured(await f.client.callTool({ name: "send_relay_message", arguments: { to: "peer", text: "from the desk" } }));
   assert.equal(sent.from, "desk-chat");
-  assert.equal(sent.reply_guidance, "replies will be injected into your session by Agent Relay Desktop");
+  assert.equal(sent.reply_guidance, "Desktop is linked. Check Desktop for a current receiver for this chat. A supported active receiver can inject replies. If Desktop reports the receiver unavailable, injection is unavailable. Missing or stale receiver evidence leaves injection unconfirmed.");
   assert.equal(sent.desktop_relay_guidance, undefined);
   const delivered = f.env.world.deliveries.find(row => row.agent === "peer")!;
   assert.equal(delivered.message.agent_name, "desk-chat");
@@ -85,6 +85,8 @@ test("join by desktop_address links the session; send, status and inbox act as t
   assert.equal(inbox.name, "desk-chat");
   assert.deepEqual(inbox.messages, []);
   assert.equal(inbox.polling_needed, false);
+  assert.equal(status.guidance, joined.reply_guidance);
+  assert.equal(inbox.guidance, status.guidance + " This tool reads hosted inboxes only.");
 
   // A repeat join is already_joined and keeps one binding.
   const again = structured(await f.client.callTool({ name: "join_relay", arguments: { desktop_address: f.address } }));

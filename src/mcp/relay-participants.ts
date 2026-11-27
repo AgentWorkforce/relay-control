@@ -119,13 +119,13 @@ export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use 
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
 export const FACTORY_REPLY_GUIDANCE = "Replies to this Factory agent are delivered into its Droid session by the Factory worker; check_relay_inbox does not serve Factory agents. Read the conversation with read_relay_conversation as=<this agent>.";
 export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thread. This receipt does not confirm delivery or reading.";
-export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
+export const DESKTOP_REPLY_GUIDANCE = "Desktop is linked. Check Desktop for a current receiver for this chat. A supported active receiver can inject replies. If Desktop reports the receiver unavailable, injection is unavailable. Missing or stale receiver evidence leaves injection unconfirmed.";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
 /** A managed join never changes the desktop identity's card, so its description is not applied. */
 export const MANAGED_JOIN_DESCRIPTION_IGNORED = "The description was not applied: joining does not change this desktop identity's card. Use set_relay_agent_card to change it.";
 /** Cloud's DESKTOP_RELAY_GUIDANCE without the web-session sentence: self-host has no web sessions. */
-export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; DMs and subscribed channel posts are then injected.";
+export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; Desktop can inject DMs and subscribed posts when this chat has a supported active receiver.";
 export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session is not linked to Agent Relay Desktop, so channel posts would not reach your local session. Call join_relay with desktop_address (from GET /whoami on the relay socket, or an injected Agent Relay message), then retry. To use this MCP session's hosted inbox instead (posts arrive in check_relay_inbox; poll it), pass hosted: true.";
 export const DESKTOP_NOT_SYNCED = "That desktop identity is not synced to your account in this workspace. Is Agent Relay Desktop running and signed in?";
 /** Desktop syncs the direct name@machine address; relay-node's whoami may show an alias instead. */
@@ -134,7 +134,7 @@ const desktopAliasHint = (direct: string) =>
 const DESKTOP_LINK_FIELDS = "desktop_address cannot be combined with name or description.";
 const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id before linking a desktop identity.";
 const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
-const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity.";
+const DESKTOP_INBOX_GUIDANCE = `${DESKTOP_REPLY_GUIDANCE} This tool reads hosted inboxes only.`;
 const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
 const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
@@ -159,7 +159,7 @@ export function normalizeChannelName(channel: string): string {
 }
 const channelReplyHint = (channel: string, threadId: string) => `post_relay_channel channel=${channel} thread_id=${threadId}`;
 const hostedChannelDelivery = (channel: string) => `Posts in #${channel} will arrive in check_relay_inbox; poll it.`;
-const desktopChannelDelivery = (channel: string) => `Posts in #${channel} will be injected into this session by Agent Relay Desktop.`;
+const desktopChannelDelivery = (channel: string) => `Desktop can inject posts in #${channel} when this chat has a supported active receiver.`;
 
 function automaticParticipantName(user: { name: string; email: string }, sessionHash: string): string {
   const label = user.name.trim() || user.email.split("@")[0] || "agent";
