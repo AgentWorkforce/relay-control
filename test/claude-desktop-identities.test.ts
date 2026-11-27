@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { request } from "./support/harness.js";
 import { copilotDesktopSetup, desktopSecret, identitiesPath, installationId, MCP_PATH, tokensPath } from "./support/copilot-desktop.js";
 import { claudeSigner, toolUseId } from "./support/claude-signer.js";
@@ -494,4 +496,60 @@ test("handoff and take outcomes are logged without the proof, the tool-use id or
   for (const secret of [proof, tuid, other, signer.publicKey, signer.kid, proof.split(".")[2]!]) {
     assert.equal(serialized.includes(secret), false);
   }
+});
+
+test("a synced Claude alias follows the native chat across MCP reconnects and stays isolated from its sibling", async t => {
+  const { env, parent, identity, call, sourceId, sid } = await claudeDesktop(t);
+  const siblingSid = randomUUID();
+  function sender(name: string, nativeId: string) {
+    const agent = env.world.addAgent(name, { source: "relay-desktop", owner_hash: ownerHash(env.ownerId) });
+    return { name, address: `${name}@cloud-${agent.id}`, agent_id: agent.id, token: agent.token,
+      native_session: { kind: "claude", id: nativeId } };
+  }
+  const sibling = sender("sibling", siblingSid);
+  const alias = sender("renamed-chat", sid);
+  async function sync(identities: unknown[]) {
+    const response = await request(env.origin, identitiesPath(env.workspaceId), {
+      method: "PUT", token: parent.accessToken, body: { source_id: sourceId, identities },
+    });
+    assert.equal(response.status, 200, response.raw);
+  }
+  async function connect() {
+    const client = new Client({ name: "claude-code", version: "1" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(env.origin + MCP_PATH), {
+      requestInit: { headers: { authorization: `Bearer ${parent.accessToken}`, "x-agent-relay-desktop": "1" } },
+    }));
+    t.after(() => client.close());
+    return client;
+  }
+  async function invoke(client: Client, nativeId: string, tool: string, args: Record<string, unknown> = {}) {
+    return client.callTool((await call(tool, args, { sid: nativeId })).params);
+  }
+  async function checkSender(client: Client, nativeId: string, expected: Pick<typeof identity, "address" | "agent_id">, text: string) {
+    const status = await invoke(client, nativeId, "relay_status");
+    assert.equal((status.structuredContent as { address: string }).address, expected.address);
+    const result = await invoke(client, nativeId, "send_relay_message", { to: "peer", text });
+    const receipt = result.structuredContent as { from_address: string; message_id: string };
+    assert.equal(receipt.from_address, expected.address);
+    const stored = env.world.messages.get(receipt.message_id);
+    assert.equal(stored?.agent_id, expected.agent_id);
+    assert.equal(stored?.text, text);
+  }
+
+  await sync([identity, sibling]);
+  const first = await connect();
+  const second = await connect();
+  await checkSender(first, sid, identity, "before rename");
+
+  // Keep the original registration addressable; only the current sender carries the signed native chat ID.
+  const { native_session, ...original } = identity;
+  await sync([original, alias, sibling]);
+  await checkSender(first, sid, alias, "after rename on original connection");
+  await checkSender(second, siblingSid, sibling, "from sibling");
+  const refused = await invoke(second, siblingSid, "join_relay", { desktop_address: alias.address });
+  assert.equal(refused.isError, true);
+  assert.equal(JSON.stringify(refused.content).includes(alias.address), false);
+
+  await first.close();
+  await checkSender(await connect(), sid, alias, "after reconnect without relinking");
 });
