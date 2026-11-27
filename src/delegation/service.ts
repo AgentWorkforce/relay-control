@@ -35,6 +35,7 @@ import {
   ownerApprovalSchema,
   ownerDisplay,
   PR_TARGET,
+  releaseTargetSha,
   REPO_TARGET,
   repoPart,
   sameActions,
@@ -1726,17 +1727,26 @@ export async function approverIdentityRefusal(deps: DelegationDeps, workspace: D
   return null;
 }
 
+/** Classes Cloud attributes to a repository and commit before an approver may redeem them (cloud#6709 1fcec0c1). */
+const APPROVER_ATTRIBUTED_CLASSES: ReadonlySet<string> = new Set(["release", "deploy", "secret_change", "destructive"]);
+
 /**
- * A granted approver's action on a PR (`owner/repo#N`, or a pr_ops target on
- * one). Cloud refuses it when one of the approver's GitHub logins authored or
- * committed to the PR (self_approval) or when the PR changes a protected path
- * (protected_path), reading both from GitHub at redeem. relay-control reads no
- * GitHub state for delegation, so neither can be checked here: the action
- * fails closed with condition_unavailable, as Cloud does when it cannot read
- * them. An unread exclusion never counts as passed.
+ * Why a granted approver may not redeem this action here, if it may not (the
+ * twin of Cloud's approver PR and target refusals). Cloud reads GitHub at
+ * redeem: on a PR it refuses a PR a listed login authored or committed to
+ * (self_approval), one with an unattributed commit (unattributed_commit) or one
+ * touching a protected path (protected_path); a release or land target is
+ * checked the same way through compare(default...sha). relay-control reads no
+ * GitHub state for delegation, so none of those checks can run and those
+ * actions fail closed with condition_unavailable: an unchecked exclusion never
+ * counts as passed. A deploy, secret_change or destructive target names no
+ * repository and commit to check, so it is unattributable_target, as in Cloud.
  */
-function approverPullTarget(grant: GrantRow, action: Pick<Action, "class" | "target">): boolean {
-  return isApproverGrant(grant) && PR_TARGET.test(repoPart(action));
+export function approverTargetRefusal(grant: GrantRow, action: Pick<Action, "class" | "target">): ReasonCode | null {
+  if (!isApproverGrant(grant)) return null;
+  if (PR_TARGET.test(repoPart(action))) return "condition_unavailable";
+  if (!APPROVER_ATTRIBUTED_CLASSES.has(action.class)) return null;
+  return action.class === "release" && releaseTargetSha(action.target) ? "condition_unavailable" : "unattributable_target";
 }
 
 export async function attestDelegation(deps: DelegationDeps, input: RecipientInput & {
@@ -2119,7 +2129,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     if (!standingNow) refuse("recipient_policy");
     if (isApproverGrant(grant!)) {
       if (standingNow !== "own_owner") refuse("recipient_policy");
-      if (approverPullTarget(grant!, action!)) refuse("condition_unavailable");
+      const target = approverTargetRefusal(grant!, action!);
+      if (target) refuse(target);
     }
     const singleUse = approval!.single_use || highRisk(action!);
     if (singleUse && await actionConsumed(deps.database, approval!.id, action!)) refuse("consumed");

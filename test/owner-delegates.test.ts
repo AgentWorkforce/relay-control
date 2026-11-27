@@ -2476,7 +2476,8 @@ async function approverReady(t: TestContext) {
   const recipient = await env.desktopIdentity("relay-coder");
   const approver = await env.desktopIdentity("release-approver");
   const address = `release-approver@cloud-${approver.id}`;
-  const scopes = [{ class: "deploy", targets: ["relay:prod"] }, { class: "merge", targets: ["AgentWorkforce/*"] }];
+  const scopes = [{ class: "deploy", targets: ["relay:prod"] }, { class: "merge", targets: ["AgentWorkforce/*"] },
+    { class: "external_comms", targets: ["slack:ops"] }, { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }];
   return { env, recipient, approver, address, scopes };
 }
 
@@ -2518,15 +2519,15 @@ test("approvers: granted only to the owner's own agent at its bound address, wit
   assert.equal(listed.body.grants.find((grant: any) => grant.grant_id === plain.grant_id).kind, undefined);
 });
 
-test("approvers: claims, audit and the redeem response name the approver; PR targets fail closed here", async (t) => {
+test("approvers: claims, audit and the redeem response name the approver; unattributable and GitHub-checked targets refuse", async (t) => {
   const { env, recipient, approver, address, scopes } = await approverReady(t);
   const created = await env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, kind: "approver",
     delegate_address: address, github_logins: ["release-bot"] });
   assert.equal(created.status, 201, created.raw);
   const expected = { grant_id: created.body.grant_id, agent_id: approver.id, address, granted_by: env.ownerId };
 
-  const prod = { class: "deploy", target: "relay:prod" };
-  const messageId = send(env, approver, recipient, env.approval([prod]));
+  const comms = { class: "external_comms", target: "slack:ops" };
+  const messageId = send(env, approver, recipient, env.approval([comms]));
   const attested = await env.attest(recipient, messageId, "own_owner");
   assert.equal(attested.body.verdict, "delegate", attested.raw);
   assert.deepEqual(attested.body.claims.approver, expected);
@@ -2536,19 +2537,23 @@ test("approvers: claims, audit and the redeem response name the approver; PR tar
     "SELECT data FROM delegation_audit_events WHERE event = 'approval.attested'")).rows[0]!;
   assert.deepEqual(attestedAudit.data.approver, expected);
 
-  const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, prod);
-  assert.deepEqual(redeemed.body, { ok: true, consumed: true, approver: expected });
+  const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, comms);
+  assert.deepEqual(redeemed.body, { ok: true, consumed: false, approver: expected });
   const redeemAudit = (await env.database.query<{ data: Record<string, unknown> }>(
     "SELECT data FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows[0]!;
   assert.deepEqual(redeemAudit.data.approver, expected);
 
-  // A PR action: self_approval and protected_path need GitHub reads relay-control does not make, so it never redeems.
-  const merge = { class: "merge", target: "AgentWorkforce/relay#2250" };
-  const mergeMessage = send(env, approver, recipient, env.approval([merge]));
-  const mergeAttested = await env.attest(recipient, mergeMessage, "own_owner");
-  assert.equal(mergeAttested.body.verdict, "delegate", mergeAttested.raw);
-  assert.deepEqual((await env.redeem(recipient, mergeAttested.body.claims.approval_id, merge)).body,
-    { ok: false, reason: "condition_unavailable" });
+  // A deploy names no repository and commit: unattributable_target, as Cloud. A PR or a release
+  // would need GitHub reads (authors, committers, files, compare) relay-control does not make: they fail closed.
+  const sha = "a".repeat(40);
+  for (const [action, reason] of [[{ class: "deploy", target: "relay:prod" }, "unattributable_target"],
+    [{ class: "merge", target: "AgentWorkforce/relay#2250" }, "condition_unavailable"],
+    [{ class: "release", target: `AgentWorkforce/relay:stable:v1.2.3:${sha}:123` }, "condition_unavailable"]] as const) {
+    const sent = send(env, approver, recipient, env.approval([action], { quote: `ok ${action.class}` }));
+    const ok = await env.attest(recipient, sent, "own_owner");
+    assert.equal(ok.body.verdict, "delegate", ok.raw);
+    assert.deepEqual((await env.redeem(recipient, ok.body.claims.approval_id, action)).body, { ok: false, reason }, action.class);
+  }
 });
 
 test("approvers: a moved address is identity_mismatch at attest and at redeem", async (t) => {

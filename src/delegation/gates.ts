@@ -8,6 +8,7 @@ import {
   actionConsumed,
   consumeAction,
   approverIdentityRefusal,
+  approverTargetRefusal,
   delegateStillBound,
   decideUnderLocks,
   getTrustRule,
@@ -349,6 +350,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       // A granted approver's approval redeems only while it is the exact identity pinned (cloud#6709).
       const mismatch = await approverIdentityRefusal(deps, workspace, grant);
       if (mismatch) return await refuse(mismatch);
+      // And only for a release it could attribute, which needs GitHub reads relay-control does not make.
+      const unattributed = approverTargetRefusal(grant, action);
+      if (unattributed) return await refuse(unattributed);
       const outOfScope = scopeRefusal([action], grant, policy, "");
       if (outOfScope) return await refuse(outOfScope);
       if (tierOClasses(policy, grant).has(action.class)) return await refuse("tier_o_required");

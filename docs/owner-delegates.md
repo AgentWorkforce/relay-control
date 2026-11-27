@@ -222,13 +222,19 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   granted_by}`.
 - Hard-limit classes (deploy, secret_change, destructive) are covered only
   when the grant lists them; high-risk actions stay single use per action.
-- **PR targets fail closed here.** Cloud refuses an approver's PR action
-  when one of its logins authored or committed to the PR (`self_approval`)
-  or the PR changes a protected path (`protected_path`: CODEOWNERS, the root
-  AGENTS.md or CLAUDE.md, `.claude/rules/`, merge-train, `delegation/`).
-  relay-control reads no GitHub state for delegation, so neither can be
-  checked: an approver's merge or pr_ops redeem answers
-  `condition_unavailable`. Approvers work only on non-PR targets here.
+- **What an approver can redeem here.** Cloud reads GitHub at redeem: on a
+  PR it refuses one a listed login authored or committed to
+  (`self_approval`), one with an unattributed commit
+  (`unattributed_commit`), or one touching a protected path
+  (`protected_path`: `.github/`, `.claude/`, CODEOWNERS, the root AGENTS.md
+  or CLAUDE.md, merge-train, delegation code). A release or land target is
+  checked the same way against the default branch. relay-control reads no
+  GitHub state for delegation, so none of those can be checked: an
+  approver's merge, pr_ops and release redeems answer
+  `condition_unavailable`. A deploy, secret_change or destructive target
+  names no repository and commit, so it is `unattributable_target`, as in
+  Cloud. That leaves spend, external_comms, config_change and
+  prompt_approval. These rules also apply at a release-gate redeem.
 - Migration `0101_delegation_approver_grants.sql` adds `kind` (default
   `delegate`), `delegate_address` and `approver_github_logins` (default
   `{}`): nullable, defaulted, no CHECK. A null kind reads as a delegate.
