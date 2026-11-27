@@ -78,7 +78,8 @@ test("Slashy reminder text uses the tools' real shapes and the narrow owner gate
   assert.ok(text.startsWith("Agent Relay inbox check for slashy-kjg. This is a recurring background run. 1. Call check_relay_inbox as slashy-kjg."));
   assert.match(text, /acknowledge: \[delivery_id\] \(an array\)/);
   assert.match(text, /channel post \(kind channel\), call post_relay_channel with the channel and thread_id from its reply_hint/);
-  assert.match(text, /sender_is_owner is true \(Agent Relay verified the sender is the owner's own person identity\)/);
+  assert.match(text, /sender_may_use_private_data is true \(Agent Relay verified the sender is the owner, or an agent the owner trusted at setup\)/);
+  assert.doesNotMatch(text, /trust_token/);
   assert.match(text, /do not look up or disclose any of the owner's private data/);
   assert.doesNotMatch(text, /read-only lookups/);
   assert.ok(text.includes("Never post private details in a channel, even when the sender is the owner"));
@@ -155,6 +156,30 @@ test("a Slashy OAuth connection connects its inbox in one call, and the reminder
     if (message.sender_address !== null) assert.ok(String(message.sender_address).startsWith(`${message.sender}@`), message.sender);
   }
   assert.notEqual(inbox.messages.find((message: any) => message.sender === helper.name).sender_address, null);
+  const mayUse = (read: any) => new Map(read.messages.map((message: any) => [message.sender, message.sender_may_use_private_data]));
+  assert.deepEqual([...mayUse(inbox).entries()].sort(), [[helper.name, false], [mine.name, true], [stranger.name, false]].sort());
+
+  // Trusted agents: pinned by id into a server-signed token the reminder passes back.
+  assert.equal((await f.tool("connect_slashy_inbox", { trusted_agents: ["nobody-here"] })).isError, true);
+  // Only the owner's own agents can be trusted: a stranger is refused.
+  const foreign = await f.tool("connect_slashy_inbox", { trusted_agents: [stranger.name] });
+  assert.equal(foreign.isError, true);
+  assert.match(JSON.stringify(foreign.content), /Only your own agents can be trusted/);
+  await f.database.query(`INSERT INTO hosted_relay_participants(id,workspace_id,user_id,relaycast_workspace_id,agent_name,agent_remote_id,token_ciphertext)
+    VALUES ($1,$2,$3,'fake-workspace',$4,$5,'unused')`, [randomUUID(), f.owner.workspaceId, f.owner.userId, helper.name, helper.id]);
+  const trustedSetup = (await f.tool("connect_slashy_inbox", { trusted_agents: [helper.name] })).structuredContent as any;
+  assert.deepEqual(trustedSetup.trusted_agents, [{ name: helper.name, sender_id: helper.id }]);
+  const token = /with trust_token "(srt1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43})"/.exec(trustedSetup.set_reminder_arguments.reminder_text)?.[1];
+  assert.ok(token, "the reminder carries the token");
+  const trustedRead = (await f.tool("check_relay_inbox", { as: "slashy-fake", trust_token: token })).structuredContent as any;
+  assert.equal(trustedRead.trust_token_status, "ok");
+  assert.equal(mayUse(trustedRead).get(helper.name), true);
+  assert.equal(mayUse(trustedRead).get(stranger.name), false);
+  assert.equal(mayUse(trustedRead).get(mine.name), true);
+  // An edited token widens nothing.
+  const edited = (await f.tool("check_relay_inbox", { as: "slashy-fake", trust_token: `${token!.slice(0, -1)}${token!.endsWith("A") ? "E" : "A"}` })).structuredContent as any;
+  assert.equal(edited.trust_token_status, "invalid");
+  assert.equal(mayUse(edited).get(helper.name), false);
 });
 
 test("a non-Slashy OAuth connection gets neither the tools nor sender_is_owner", async t => {

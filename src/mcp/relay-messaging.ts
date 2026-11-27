@@ -145,9 +145,10 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
 
   server.registerTool("check_relay_inbox", {
     description: "Read up to 100 unread deliveries for a hosted participant, including sender address, conversation ID, message ID, text and thread. acknowledge removes processed hosted delivery IDs; acknowledging an ID again is safe, so retry the same list after a failure.",
-    inputSchema: { as, acknowledge: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,128}$/)).max(100).default([]) },
+    inputSchema: { as, acknowledge: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,128}$/)).max(100).default([]),
+      trust_token: z.string().max(4096).optional().describe("Slashy connections only: the trust token from connect_slashy_inbox, passed exactly as given. Other connections ignore it.") },
     annotations: { ...annotations, readOnlyHint: false, destructiveHint: true },
-  }, input => run(service => service.inbox(input.as, input.acknowledge)));
+  }, input => run(service => service.inbox(input.as, input.acknowledge, input.trust_token)));
 
   // Channels are opt-in for larger swarms; DMs stay the default. A
   // subscription is the acting identity's Relaycast channel membership.

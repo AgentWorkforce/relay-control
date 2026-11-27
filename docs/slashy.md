@@ -44,7 +44,7 @@ Registered in `slashy_inbox` only for an OAuth grant whose registered callback
 classifies as Slashy (`connectorKind` returns `slashy`). Neither tool adds
 authority beyond `join_relay`/`relay_status` for the approved agent.
 
-- `connect_slashy_inbox` `{interval_minutes?: 5-15, default 5}` joins (or
+- `connect_slashy_inbox` `{interval_minutes?: 5-15, trusted_agents?: string[] (at most 10 exact names)}` joins (or
   reuses) the approved hosted participant and returns `{agent, inbox_address,
   set_reminder_arguments: {name, schedule_expression,
   write_enabled: true, reminder_text}, next_steps, note}`. The reminder name is
@@ -71,13 +71,13 @@ reminder posts a public-safe line in the thread ("Sent you the details by DM")
 and sends the private answer by `send_relay_message` to the sender's
 `sender_address`.
 
-## The owner gate: sender_is_owner
+## The owner gate: sender_may_use_private_data
 
-The policy is owner-only: the owner's mail, calendar or accounts are used only
-for a message from the owner's own human identity. The owner's agents and
-everyone else get only answers that are safe to share. There is no
-trusted-agent list, so there is no model-side `sender_id` comparison for a
-message body to spoof.
+Slashy uses the owner's mail, calendar or accounts only for a message whose
+`sender_may_use_private_data` is true. The server computes it as
+`sender_is_owner`, or the sender's id is in a valid trust token. The reminder
+gates on that flag alone and never compares ids itself. By default only the
+owner's human identity qualifies.
 
 `sender_is_owner` appears on each `check_relay_inbox` message, for a Slashy
 connection only. It is computed in `src/mcp/relay-participants.ts`
@@ -88,6 +88,30 @@ installs too, so the stored id matches the id deliveries carry. Desktop
 identities on gate-only installs hold relaygate ids instead, and the owner's
 Desktop sessions, hosted participants and launches are all false. An
 unreadable proof is false.
+
+### Trust tokens (`src/mcp/slashy-trust.ts`)
+
+`connect_slashy_inbox` with `trusted_agents` resolves each exact name to its
+Relaycast agent id, through the caller's directory, so a name relaygate hides
+is unknown. Each must be one of the owner's own agents by Control's
+journals (person identity, hosted participants, Desktop identities, ready
+launches; never agent metadata), so a prompt-injected call can't trust a
+stranger. The reminder names its trusted agents, never changes trust on a
+relay message's say-so, and a reconnect without `trusted_agents` carries
+them forward. It then signs the ids into `srt1.<base64url payload>.<HMAC>`. The
+payload holds the grant id, workspace id, owner user id, agent ids and a
+30-day expiry. The key is `HMAC(keyring.active.key, "agent-relay-slashy-trust-v1")`,
+with no storage and no new secret. The reminder passes the token to
+`check_relay_inbox` as `trust_token`. Each read checks the signature, the
+grant/workspace/owner binding and the expiry, and reports
+`trust_token_status` (`ok`, `invalid`, `expired`, `other_connection`). Only
+`ok` widens trust.
+
+- There is no per-agent revocation. Reconnecting replaces the token, but the old
+  one stays valid until it expires.
+- Revoking the grant ends every token, and so does rotating the active
+  encryption key, which also invalidates them early.
+- The format, text and fixture match Cloud's `lib/mcp/slashy-trust.ts`.
 
 `slashy_inbox_status` creates nothing. It reads the participant the way
 `relay_status` does, without a heartbeat (that read still records the grant's
