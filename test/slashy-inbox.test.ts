@@ -145,6 +145,11 @@ test("a Slashy OAuth connection connects its inbox in one call, and the reminder
   // A named agent is trusted by its pinned sender_id in the reminder, never by sender_is_owner.
   assert.equal(bySender.get(helper.name), false);
   assert.equal(inbox.messages.find((message: any) => message.sender === helper.name).sender_id, helper.id);
+  // sender_address is pinned to the token-stamped sender_id: a matching roster id yields the address.
+  for (const message of inbox.messages as any[]) {
+    if (message.sender_address !== null) assert.ok(String(message.sender_address).startsWith(`${message.sender}@`), message.sender);
+  }
+  assert.notEqual(inbox.messages.find((message: any) => message.sender === helper.name).sender_address, null);
 });
 
 test("a non-Slashy OAuth connection gets neither the tools nor sender_is_owner", async t => {

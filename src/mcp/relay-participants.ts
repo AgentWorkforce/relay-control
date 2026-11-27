@@ -1894,6 +1894,13 @@ function createRelayService(context: McpContext) {
         signal: AbortSignal.timeout(INBOX_SENDER_LOOKUP_TIMEOUT_MS),
       }).catch(error => { inboxSenderEnrichmentFailed(error); return []; })).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
+      // A Slashy reminder may send the owner's private answer to sender_address,
+      // so on Slashy connections the address is returned only when the roster
+      // agent behind the name is the token-stamped sender_id (cloud#6720 parity).
+      const agentIds = new Map(agents.map(agent => [agent.name, agent.id]));
+      const pinnedAddress = (message: { sender?: string | null; sender_id?: string | null }) =>
+        message.sender && message.sender_id && agentIds.get(message.sender) === message.sender_id
+          ? addresses.get(message.sender) ?? null : null;
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {
         for (const row of (await via.authenticatedAgent(hosted.token)).channels) channelNames.set(row.id, row.name);
@@ -1907,7 +1914,7 @@ function createRelayService(context: McpContext) {
       // proof is false.
       const ownerSenders = context.slashy ? await ownedSenders(messages.flatMap(message => message.sender_id ? [message.sender_id] : [])) : null;
       const enriched = messages.map(message => {
-        const base = { ...message, sender_address: message.sender ? addresses.get(message.sender) ?? null : null,
+        const base = { ...message, sender_address: context.slashy ? pinnedAddress(message) : message.sender ? addresses.get(message.sender) ?? null : null,
           ...(ownerSenders ? { sender_is_owner: Boolean(message.sender_id && ownerSenders.has(message.sender_id)) } : {}) };
         if (isChannelDelivery(message)) {
           const channel = message.channel_id ? channelNames.get(message.channel_id) ?? null : null;
