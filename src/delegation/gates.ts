@@ -7,6 +7,7 @@ import { actionIsValid, canonicalAction, releaseTargetSha, type Action, type Act
 import {
   actionConsumed,
   consumeAction,
+  approverIdentityRefusal,
   delegateStillBound,
   decideUnderLocks,
   getTrustRule,
@@ -345,6 +346,9 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       // A dry run writes nothing: a delegate found unbound is refused, not revoked.
       const unbound = await delegateStillBound(deps, workspace, grant, true, { durable: !dryRun });
       if (unbound) return await refuse(unbound);
+      // A granted approver's approval redeems only while it is the exact identity pinned (cloud#6709).
+      const mismatch = await approverIdentityRefusal(deps, workspace, grant);
+      if (mismatch) return await refuse(mismatch);
       const outOfScope = scopeRefusal([action], grant, policy, "");
       if (outOfScope) return await refuse(outOfScope);
       if (tierOClasses(policy, grant).has(action.class)) return await refuse("tier_o_required");

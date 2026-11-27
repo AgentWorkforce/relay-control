@@ -75,6 +75,8 @@ export const REASON_CODES = [
   "condition_unmet", "condition_unavailable", "predates_grant",
   // Release-gate redeem (§11a.3).
   "gate_unknown", "oidc_invalid", "gate_mismatch", "target_prefix", "sha_mismatch", "repository_mismatch", "gate_owner_unqualified",
+  // Granted approvers (cloud#6709, #owner-decisions 251907114153873408).
+  "identity_mismatch", "protected_path", "self_approval",
 ] as const;
 export type ReasonCode = typeof REASON_CODES[number];
 

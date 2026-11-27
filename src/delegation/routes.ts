@@ -203,12 +203,32 @@ const scopeSchema = z.object({
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
+/** A GitHub login: 1 to 39 letters, digits or single hyphens, not starting or ending with one; an app's bot login ends in `[bot]`. */
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}(?:\[bot\])?$/u;
 const createGrantBody = z.object({
   delegate_agent_id: z.string().min(1).max(200),
   scopes: scopesSchema,
   expires_at: rfc3339.optional(),
   require_tier_o: classList.optional(),
-}).strict();
+  /**
+   * `approver` makes the agent a granted approver (cloud#6709, #owner-decisions
+   * 251907114153873408): pinned to its agent id and its exact address, never a
+   * name. github_logins are the logins it acts as on GitHub; it can never
+   * approve a PR one of them authored or committed to.
+   */
+  kind: z.enum(["delegate", "approver"]).optional(),
+  delegate_address: z.string().min(3).max(512).regex(/^[^\s@]+@[^\s@]+$/u).optional(),
+  github_logins: z.array(z.string().regex(GITHUB_LOGIN)).max(10).optional(),
+}).strict().superRefine((body, ctx) => {
+  if (body.kind === "approver") {
+    if (!body.delegate_address) ctx.addIssue({ code: "custom", path: ["delegate_address"], message: "an approver is pinned to its exact address" });
+    if (!body.github_logins?.length) {
+      ctx.addIssue({ code: "custom", path: ["github_logins"], message: "an approver needs at least one GitHub login, so it never approves its own PRs" });
+    }
+  } else if (body.delegate_address !== undefined || body.github_logins !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["kind"], message: "delegate_address and github_logins are for kind approver only" });
+  }
+});
 const patchGrantBody = z.object({
   scopes: scopesSchema.optional(),
   expires_at: rfc3339.optional(),
@@ -941,6 +961,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (binding!.source === "hosted" && !await connectorRootProven(trustProver(deps, workspace, false), principal.userId, binding!.agentId)) {
         fail("not_delegate", "The agent must be bound to you; claim it first", 403);
       }
+      // A granted approver is pinned to the exact identity bound to the owner
+      // now: its agent id (above) and the address that binding has.
+      const approver = body.kind === "approver" ? { address: body.delegate_address!,
+        githubLogins: [...new Set((body.github_logins ?? []).map(login => login.toLowerCase()))] } : null;
+      if (approver && (!binding!.address || binding!.address !== approver.address)) {
+        fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
+      }
       const requireTierO = uniqueClasses(body.require_tier_o);
       let row: GrantRow;
       try {
@@ -965,6 +992,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           if (!bound || bound.userId !== principal.userId) {
             fail("not_delegate", "The agent must be bound to you; claim it first", 403);
           }
+          if (approver && bound!.address !== approver.address) {
+            fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
+          }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
           const existing = (await tx.query<GrantRow>(
             `SELECT * FROM delegation_grants
@@ -980,15 +1010,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const created = (await tx.query<GrantRow>(
             `INSERT INTO delegation_grants
                (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
-                scopes, require_tier_o, expires_at, created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10) RETURNING *`,
+                scopes, require_tier_o, expires_at, created_auth_method, kind, delegate_address, approver_github_logins)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13) RETURNING *`,
             [mintId("grt"), workspace.id, workspace.organizationId, principal.userId, binding!.agentId, binding!.name,
-              JSON.stringify(scopes), requireTierO, expiresAt, caller.authMethod],
+              JSON.stringify(scopes), requireTierO, expiresAt, caller.authMethod, approver ? "approver" : "delegate",
+              approver?.address ?? null, approver?.githubLogins ?? []],
           )).rows[0]!;
           await recordDelegationAudit(tx, {
             workspaceId: workspace.id, event: "grant.created", ...actor, ownerUserId: principal.userId, grantId: created.id,
             data: { delegate_agent_id: binding!.agentId, scope_diff: { added: scopes, removed: [] },
-              require_tier_o: requireTierO, expires_at: expiresAt.toISOString() },
+              require_tier_o: requireTierO, expires_at: expiresAt.toISOString(),
+              ...(approver ? { kind: "approver", delegate_address: approver.address, approver_github_logins: approver.githubLogins } : {}) },
           });
           return created;
         });

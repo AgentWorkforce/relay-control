@@ -199,6 +199,40 @@ its name, trimmed, lowercased and with `-` and `.` read as `_`, is
 `delegated_approvals_from` or `spawn_delegate_approvals` (or starts with one of
 them and `_`), or mentions delegation at all.
 
+
+### Granted approvers
+
+The self-hosted twin of Cloud's approver registry (cloud#6709). An approver
+is an owner-made grant with `kind: "approver"`, created through `POST
+/delegates` like any grant (human-only, for the owner's own bound agent):
+
+- `delegate_address` pins it to the exact `name@host` the agent is bound at
+  now, alongside its immutable agent id; any other address is `403
+  identity_mismatch`. A claimed agent has no address, so it cannot be an
+  approver.
+- `github_logins` (at least one, lowercased; an app login may end in
+  `[bot]`) are the logins it acts as on GitHub.
+- At attest, at redeem and at a release-gate redeem, the binding is re-read
+  and Relaycast's live agent must still carry the pinned id and address;
+  otherwise `identity_mismatch`.
+- It attests only with own_owner standing (its granter's own OK to the
+  granter's own agents), until the rules text and a desktop line name
+  approvers. Its signed claims, the attestation and redeem audit rows and
+  the redeem response carry `approver: {grant_id, agent_id, address,
+  granted_by}`.
+- Hard-limit classes (deploy, secret_change, destructive) are covered only
+  when the grant lists them; high-risk actions stay single use per action.
+- **PR targets fail closed here.** Cloud refuses an approver's PR action
+  when one of its logins authored or committed to the PR (`self_approval`)
+  or the PR changes a protected path (`protected_path`: CODEOWNERS, the root
+  AGENTS.md or CLAUDE.md, `.claude/rules/`, merge-train, `delegation/`).
+  relay-control reads no GitHub state for delegation, so neither can be
+  checked: an approver's merge or pr_ops redeem answers
+  `condition_unavailable`. Approvers work only on non-PR targets here.
+- Migration `0101_delegation_approver_grants.sql` adds `kind` (default
+  `delegate`), `delegate_address` and `approver_github_logins` (default
+  `{}`): nullable, defaulted, no CHECK. A null kind reads as a delegate.
+
 ## Attestation
 
 The relay-node asks only for deliveries that carry `has_owner_approval`.

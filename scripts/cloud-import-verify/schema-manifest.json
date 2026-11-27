@@ -100,7 +100,8 @@
     {"name":"0097_mcp_attestation_handoffs.sql","sha256":"54a58b53ed36773cce771e77d0397daed530cbdfba3fb2dc1ad9725e2fc28ff3"},
     {"name":"0098_delegation_trust_rules.sql","sha256":"eaaf41053bb111574543596a2a94c6641e8e5525d924e7d971b751e2f2c006dc"},
     {"name":"0099_delegation_role_bindings.sql","sha256":"9309d0e587e813c324ac09b0cb4d30f5b77e80cf7d8827a7e9e829d51ed4ce31"},
-    {"name":"0100_delegation_approval_requests.sql","sha256":"7213aa526314143eee9a68257ece735d8c2745f46fa3a1b73769489a113fbfde"}
+    {"name":"0100_delegation_approval_requests.sql","sha256":"7213aa526314143eee9a68257ece735d8c2745f46fa3a1b73769489a113fbfde"},
+    {"name":"0101_delegation_approver_grants.sql","sha256":"79e8633ff0b8e43b103fc419a25cd5c4de17bb33fe168dba085e9fd71b7287d8"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -412,12 +413,15 @@
     {"kind":"column","name":"public.delegation_gates.target_prefix","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.workflow_ref","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.delegation_gates.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
+    {"kind":"column","name":"public.delegation_grants.approver_github_logins","definition":{"collation":"pg_catalog.default","default":"'{}'::text[]","generated":"","identity":"","not_null":false,"position":21,"type":"text[]"}},
     {"kind":"column","name":"public.delegation_grants.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_grants.created_auth_method","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
+    {"kind":"column","name":"public.delegation_grants.delegate_address","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":20,"type":"text"}},
     {"kind":"column","name":"public.delegation_grants.delegate_agent_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
     {"kind":"column","name":"public.delegation_grants.delegate_agent_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.delegation_grants.expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.delegation_grants.id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
+    {"kind":"column","name":"public.delegation_grants.kind","definition":{"collation":"pg_catalog.default","default":"'delegate'::text","generated":"","identity":"","not_null":false,"position":19,"type":"text"}},
     {"kind":"column","name":"public.delegation_grants.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_grants.owner_user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
     {"kind":"column","name":"public.delegation_grants.require_tier_o","definition":{"collation":"pg_catalog.default","default":"'{}'::text[]","generated":"","identity":"","not_null":true,"position":8,"type":"text[]"}},
@@ -2667,5 +2671,5 @@
   "optional":{
 
   },
-  "sha256":"bc3b2bcb6f2482d13beb7e3a920f3452c18da3cbadb3c87254f5c78acdd6cc07"
+  "sha256":"7f55933ca10478ff772c32350e052b0c9f224986309f8a6f9b83b7e92df36e4f"
 }

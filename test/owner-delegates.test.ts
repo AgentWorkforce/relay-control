@@ -2468,3 +2468,105 @@ test("role bindings (review): an exclusion is allowed while delegation is off; t
   const excluded = await env.browser("/delegates/bindings", "POST", { principal: { kind: "agent", ref: helper.id }, role: "excluded" });
   assert.equal(excluded.status, 201, excluded.raw);
 });
+
+// Granted approvers (cloud#6709): an owner-made grant of kind approver, pinned to one agent id and address.
+async function approverReady(t: TestContext) {
+  const env = await setup(t);
+  await env.enable();
+  const recipient = await env.desktopIdentity("relay-coder");
+  const approver = await env.desktopIdentity("release-approver");
+  const address = `release-approver@cloud-${approver.id}`;
+  const scopes = [{ class: "deploy", targets: ["relay:prod"] }, { class: "merge", targets: ["AgentWorkforce/*"] }];
+  return { env, recipient, approver, address, scopes };
+}
+
+test("approvers: granted only to the owner's own agent at its bound address, with GitHub logins", async (t) => {
+  const { env, approver, address, scopes } = await approverReady(t);
+  const post = (body: Record<string, unknown>) => env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, ...body });
+  for (const body of [{ kind: "approver", github_logins: ["bot"] }, { kind: "approver", delegate_address: address },
+    { kind: "approver", delegate_address: address, github_logins: [] }, { delegate_address: address },
+    { github_logins: ["bot"] }, { kind: "approver", delegate_address: address, github_logins: ["-bad-"] }]) {
+    assert.equal((await post(body)).status, 400, JSON.stringify(body));
+  }
+  const wrong = await post({ kind: "approver", delegate_address: `release-approver@cloud-other`, github_logins: ["bot"] });
+  assert.equal(wrong.status, 403, wrong.raw);
+  assert.equal(wrong.body.code, "identity_mismatch");
+  // A claimed agent has no Relay address to pin.
+  const claimed = await env.claim("claimed-bot");
+  const unpinned = await env.browser("/delegates", "POST", { delegate_agent_id: claimed.id, scopes, kind: "approver",
+    delegate_address: "claimed-bot@somewhere", github_logins: ["bot"] });
+  assert.equal(unpinned.body.code, "identity_mismatch", unpinned.raw);
+  // An agent never grants itself: the route is human-only.
+  assert.equal((await request(env.origin, `${env.base}/delegates`, { method: "POST", token: approver.token,
+    body: { delegate_agent_id: approver.id, scopes, kind: "approver", delegate_address: address, github_logins: ["bot"] } })).status, 401);
+
+  const created = await post({ kind: "approver", delegate_address: address, github_logins: ["Release-Bot", "release-bot", "khaliq", "agent-relay-code[bot]"] });
+  assert.equal(created.status, 201, created.raw);
+  assert.equal(created.body.kind, "approver");
+  assert.equal(created.body.delegate_address, address);
+  assert.deepEqual(created.body.github_logins, ["release-bot", "khaliq", "agent-relay-code[bot]"]);
+  const audit = (await env.database.query<{ data: Record<string, unknown> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'grant.created'")).rows[0]!;
+  assert.equal(audit.data.kind, "approver");
+  assert.equal(audit.data.delegate_address, address);
+  // A delegate grant's view carries none of the approver fields; a pre-0101 row (null kind) reads as a delegate.
+  const other = await env.desktopIdentity("plain-bot");
+  const plain = await env.grant(other.id, scopes);
+  assert.equal("kind" in plain, false);
+  await env.database.query("UPDATE delegation_grants SET kind = NULL WHERE id = $1", [plain.grant_id]);
+  const listed = await env.bearer("/delegates");
+  assert.equal(listed.body.grants.find((grant: any) => grant.grant_id === plain.grant_id).kind, undefined);
+});
+
+test("approvers: claims, audit and the redeem response name the approver; PR targets fail closed here", async (t) => {
+  const { env, recipient, approver, address, scopes } = await approverReady(t);
+  const created = await env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, kind: "approver",
+    delegate_address: address, github_logins: ["release-bot"] });
+  assert.equal(created.status, 201, created.raw);
+  const expected = { grant_id: created.body.grant_id, agent_id: approver.id, address, granted_by: env.ownerId };
+
+  const prod = { class: "deploy", target: "relay:prod" };
+  const messageId = send(env, approver, recipient, env.approval([prod]));
+  const attested = await env.attest(recipient, messageId, "own_owner");
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  assert.deepEqual(attested.body.claims.approver, expected);
+  assert.equal(attested.body.claims.standing, "own_owner");
+  assert.deepEqual(verifyDelegationJws(attested.body.attestation, await env.jwks()), attested.body.claims);
+  const attestedAudit = (await env.database.query<{ data: Record<string, unknown> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'approval.attested'")).rows[0]!;
+  assert.deepEqual(attestedAudit.data.approver, expected);
+
+  const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, prod);
+  assert.deepEqual(redeemed.body, { ok: true, consumed: true, approver: expected });
+  const redeemAudit = (await env.database.query<{ data: Record<string, unknown> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows[0]!;
+  assert.deepEqual(redeemAudit.data.approver, expected);
+
+  // A PR action: self_approval and protected_path need GitHub reads relay-control does not make, so it never redeems.
+  const merge = { class: "merge", target: "AgentWorkforce/relay#2250" };
+  const mergeMessage = send(env, approver, recipient, env.approval([merge]));
+  const mergeAttested = await env.attest(recipient, mergeMessage, "own_owner");
+  assert.equal(mergeAttested.body.verdict, "delegate", mergeAttested.raw);
+  assert.deepEqual((await env.redeem(recipient, mergeAttested.body.claims.approval_id, merge)).body,
+    { ok: false, reason: "condition_unavailable" });
+});
+
+test("approvers: a moved address is identity_mismatch at attest and at redeem", async (t) => {
+  const { env, recipient, approver, address, scopes } = await approverReady(t);
+  const created = await env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, kind: "approver",
+    delegate_address: address, github_logins: ["release-bot"] });
+  assert.equal(created.status, 201, created.raw);
+  const prod = { class: "deploy", target: "relay:prod" };
+  const first = send(env, approver, recipient, env.approval([prod]));
+  const attested = await env.attest(recipient, first, "own_owner");
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+
+  await env.database.query("UPDATE desktop_relay_identities SET address = $1 WHERE agent_remote_id = $2",
+    [`release-approver@cloud-elsewhere`, approver.id]);
+  assert.deepEqual((await env.redeem(recipient, attested.body.claims.approval_id, prod)).body,
+    { ok: false, reason: "identity_mismatch" });
+  const second = send(env, approver, recipient, env.approval([prod], { quote: "deploy again" }));
+  const refused = await env.attest(recipient, second, "own_owner");
+  assert.equal(refused.body.verdict, "none", refused.raw);
+  assert.equal(refused.body.reason, "identity_mismatch");
+});
