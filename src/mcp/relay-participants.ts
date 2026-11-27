@@ -18,6 +18,7 @@ import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.j
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
+import * as approvalRequests from "../delegation/approval-requests.js";
 import type { z } from "zod";
 import { ownerApprovalSchema } from "../delegation/scope.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
@@ -1542,6 +1543,28 @@ function createRelayService(context: McpContext) {
   type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string; gated?: { token: string } };
 
   /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
+  /**
+   * The Relay identity an approval request is made and read as: the one
+   * set_relay_agent_card writes, `as` selecting the caller's own participant
+   * (e.g. a joined Cursor cloud agent run), never someone else's.
+   */
+  async function requesterIdentity(as?: string): Promise<CardIdentity> {
+    return ownCardIdentity(as).catch((error: unknown) => {
+      if (error instanceof RelayToolError && error.message === CARD_NEEDS_IDENTITY) {
+        throw new RelayToolError("An approval request is made as your own Agent Relay identity, and this MCP session has none yet. Call join_relay with desktop_address (from GET /whoami on the relay socket), or join_relay to create a hosted participant, then retry.");
+      }
+      throw error;
+    });
+  }
+
+  /** The owner an approval request asks: the signed-in person, never a workspace agent identity. */
+  function approvalRequestOwner(): string {
+    if (agent || agentMissing) {
+      throw new RelayToolError("A workspace agent identity token has no owner to ask. Request owner approval from a session signed in as the delegate's owner.");
+    }
+    return context.principal.userId;
+  }
+
   async function ownCardIdentity(as?: string): Promise<CardIdentity> {
     if (managed) {
       await managedActorOnly(as);
@@ -1691,6 +1714,46 @@ function createRelayService(context: McpContext) {
      * Relaycast merges them into the stored metadata, so every other key is
      * preserved.
      */
+    /**
+     * One-tap Tier O approval requests (delegation/approval-requests.ts,
+     * Cloud's twin cloud#6704). A request is made as the caller's own Relay
+     * identity, the one set_relay_agent_card writes, to the caller's own
+     * user: the delegate's owner. Cross-user requests are not supported, so
+     * no member can push approval prompts at someone else. A workspace agent
+     * identity token has no person behind it, so it has no owner to ask.
+     */
+    async requestOwnerApproval(input: Record<string, unknown> & { as?: string }) {
+      const requests = approvalRequests;
+      const owner = approvalRequestOwner();
+      const { as, ...request } = input;
+      const parsed = requests.approvalRequestInputSchema.safeParse(request);
+      if (!parsed.success) throw new RelayToolError(`invalid_request: ${requests.approvalRequestIssue(parsed.error)}. Nothing was requested.`);
+      const identity = await requesterIdentity(as);
+      try {
+        return await requests.openApprovalRequest(database, { workspaceId, ownerUserId: owner, authMethod: "hosted_mcp",
+          requester: { agentId: identity.agentId, name: identity.name }, request: parsed.data, origin: context.origin });
+      } catch (error) {
+        if (error instanceof requests.ApprovalRequestRefused) throw new RelayToolError(`${error.code}: ${error.message}. Nothing was requested.`);
+        if (error instanceof requests.ApprovalRequestMembershipGone) throw new RelayToolError("You are not a current member of this workspace.");
+        throw error;
+      }
+    },
+
+    /**
+     * Reads one approval request this identity made to the caller's own
+     * owner: its status, and the approval_id once approved. A request another
+     * of the owner's agents made is not visible (an OAuth grant acts only as
+     * its approved agent).
+     */
+    async ownerApprovalRequest(requestId: string, as?: string) {
+      const ownerUserId = approvalRequestOwner();
+      const identity = await requesterIdentity(as);
+      const found = await approvalRequests.readApprovalRequest(database, { workspaceId, ownerUserId, requestId,
+        requesterAgentId: identity.agentId });
+      if (!found) throw new RelayToolError("No approval request with that id was made by you to your owner in this workspace.");
+      return found;
+    },
+
     async setCard(input: SetCardInput & { as?: string }) {
       const own = await ownCardIdentity(input.as);
       if (own.gated) {

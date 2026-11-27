@@ -101,8 +101,8 @@ on in production, check each of these (decided 2026-11-23):
 ## Who may call what
 
 **Human-only routes** (`/delegates`, `/delegates/{grant_id}`, `revoke-all`,
-`claims`, `approvals`, `audit`, `policy`, `target-owners`) take one of two
-credentials:
+`claims`, `approvals`, `approval-requests/{request_id}`, `audit`, `policy`,
+`target-owners`) take one of two credentials:
 
 - the browser account session (the `/cloud` cookie with scope `account`).
   Cookie writes need JSON from an allowed Origin, as on every cookie route.
@@ -424,6 +424,73 @@ approval run one at a time: insert the consumption, stamp `consumed_at`,
 write the event, commit. Attestation keeps `FOR SHARE`. A gate dry run takes
 no lock at all: it answers from plain reads, the last of them just before it
 answers, so a change committing after that is not reflected.
+
+### Approval requests (one-tap tier O)
+
+The self-hosted twin of Cloud's one-tap flow (cloud#6704). A delegate asks
+its own owner to approve exact actions, and only the owner's decision in a
+human session mints the tier O approval, exactly as `POST
+delegates/approvals` would. The requester never mints anything.
+
+1. The delegate calls the MCP tool `request_owner_approval {actions, note?,
+   single_use?, expires_in_minutes?}` and gets `{request_id, approve_url,
+   status: "pending", expires_at, ...}`. Nothing is approved yet.
+2. It gives its owner the `approve_url`
+   (`<origin>/dashboard/approvals/<request_id>?workspace=<workspace_id>`).
+3. The owner approves or denies with `POST
+   /delegates/approval-requests/{request_id} {decision: "approve" | "deny"}`
+   (`GET` reads it), from the browser session or a verified Desktop bearer.
+4. On approve, Control mints a tier O approval for exactly the requested
+   actions (default 1-hour window from the approval, `single_use` as
+   requested) and stores its `approval_id` on the request.
+5. The delegate polls `get_owner_approval_request {request_id}`. Once it is
+   approved, the delegate sends the actions with `owner_approval.approval_ref`
+   set to the `approval_id`, and attest and redeem decide as for any tier O
+   approval: that still needs a live grant and the owner's standing, and
+   redeem still runs right before acting.
+
+Rules:
+
+- A request is made as the caller's own Relay identity (the one
+  `set_relay_agent_card` writes: the managed or linked Desktop identity, or
+  the session's hosted participant) to the caller's own user. Cross-user
+  requests are not supported, so no member can push approval prompts at
+  someone else. `as` selects the caller's own participant (for example a
+  joined Cursor cloud agent run), as on `set_relay_agent_card`. A request is
+  read back only by the identity that made it: another of the owner's agents
+  (another OAuth grant's approved agent, say) cannot read its note, actions
+  or approval id. A workspace agent identity token has no person behind it,
+  so it is not offered either tool, as in Cloud (the service also refuses
+  one).
+- Actions are checked before anything is recorded: the mint body's action
+  schema (concrete targets, conditions that fit), one per class and target,
+  at most 20; then `delegation_enabled`, the policy's `allowed_classes` and
+  the undelegable delegation settings. Errors name the field
+  (`invalid_request: actions[0]: …`).
+- A request expires on its own: 60 minutes by default, 1440 at most. A
+  pending request past `expires_at` is marked expired once, when it is next
+  read or decided, and answers `409 expired`.
+- Only the request's owner sees or decides it; anyone else gets 404.
+  Approving re-checks the policy inside the deciding transaction, on the
+  policy row locked `FOR SHARE`, so turning delegation off or narrowing the
+  classes either commits first and refuses the mint (`403`), or waits.
+  Denying always works. The request row is locked `FOR UPDATE` and the
+  owner's membership `FOR SHARE`, so two taps decide it once (the second gets
+  `409 decided`) and a removed owner mints nothing (`403 forbidden`). A
+  request expired by the read just before still answers `409 expired`.
+- Status is polled, not pushed: a Relay notification would need Control to
+  post as some Relay identity.
+- The approve link uses the request's site origin and `/dashboard/...`, the
+  same form as session citations. On an install whose dashboard has its own
+  host, Control redirects a browser GET of that path, but today only to the
+  dashboard root (`src/dashboard-links.ts` maps sessions, settings and
+  downloads, not approvals). The approve page and that mapping belong to the
+  dashboard (relay-webapp) work. Its card should show the note as "Reason from
+  @<requester> (not verified)", and warn when an action is deploy,
+  secret_change or destructive, as Cloud's does. Until that page ships, the
+  owner decides through the route above.
+- The MCP tool calls carry no History record here: relay-control does not
+  record hosted MCP tool calls into shared History.
 
 ### Revoking or withdrawing one approval
 
@@ -912,7 +979,8 @@ Turning `delegation_enabled` off makes every attestation and redeem
 
 - `grant.created`, `grant.updated`, `grant.revoked`
 - `delegate.claimed`
-- `approval.minted`, `approval.attested`, `approval.refused`
+- `approval.minted` (with `request_id` when it decides an approval request), `approval.attested`, `approval.refused`
+- `approval_request.requested`, `approval_request.approved`, `approval_request.denied`, `approval_request.expired`
 - `approval.redeemed`, `redeem.refused`
 - `policy.updated`, `target_owners.updated`
 - `approval.revoked`, `approval.withdrawn`, `quote.redacted`
@@ -1039,6 +1107,12 @@ change never refuses a full-length grant) and 60 s after it was created.
 replaces the one-live-rule-per-owner index with one live binding per
 (owner, principal), a superset for legacy rows.
 
+`0100_delegation_approval_requests.sql` (additive) adds
+`delegation_approval_requests` (one-tap tier O requests, above): status is
+CHECK-constrained to `pending`, `approved`, `denied` or `expired`, and
+`decided_at` is null exactly while pending. `approval_id` references the
+minted approval (`ON DELETE SET NULL`).
+
 ## Not on relay-control yet
 
 - **Gate-only installs:** attest, redeem and claims answer `unavailable`, and
@@ -1052,4 +1126,4 @@ replaces the one-live-rule-per-owner index with one live binding per
   - per-grant attestation rate limits and anomaly-triggered tier O;
   - admin co-approval;
   - SIEM webhooks;
-  - the delegate-requested tier O one-tap flow (`approvals/request`).
+  - the dashboard's approve page for one-tap approval requests (relay-webapp).

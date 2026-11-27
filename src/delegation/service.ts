@@ -300,8 +300,8 @@ export function grantView(row: GrantRow, now = new Date()) {
   };
 }
 
-/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `clm_`, `gate_`, `dtr_`), as Cloud's mintId. */
-export function mintId(prefix: "grt" | "apv" | "clm" | "gate" | "dtr" | "grp"): string {
+/** A fresh opaque id with a type prefix (`grt_`, `apv_`, `apq_`, `clm_`, `gate_`, `dtr_`), as Cloud's mintId. */
+export function mintId(prefix: "grt" | "apv" | "apq" | "clm" | "gate" | "dtr" | "grp"): string {
   return `${prefix}_${base62(randomBytes(16))}`;
 }
 
