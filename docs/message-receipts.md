@@ -23,6 +23,23 @@ not that the message arrived. Inspect each delivery's `state`:
 acknowledged. It does not mean a person read the message or a model understood it. An empty list does
 not confirm delivery.
 
+When a delivery targets a webhook-mode Grok routine owned by this Control
+workspace, the send result and verified status result also include a top-level
+`recipient_wake` without changing the engine delivery's `state`:
+
+| `recipient_wake.state` | Meaning |
+| --- | --- |
+| `queued` | The routine exists, but Control has not received a 2xx webhook response for this message |
+| `backoff` | A wake attempt failed and will retry at `next_attempt_at` |
+| `failed` | Wake delivery reached a terminal failure |
+| `wake_sent` | The routine endpoint accepted the trigger; `wake_sent_at` is that acceptance time, not proof that the client woke |
+| `replied` | The routine sent an explicitly correlated reply; `replied_at` is when it did so |
+
+`recipient_wake.attempts` reports recorded webhook attempts, and its `hint`
+explains that a reply can follow a successful wake. Status enrichment occurs
+only after Relaycast returns a sender-scoped delivery receipt; it does not make
+a foreign message visible.
+
 The engine must include Relaycast #625's delivery-confirmation API and its
 migrations. Older engines, unknown messages and messages not visible as your
 own outgoing message return `confirmation: unavailable`, an empty delivery

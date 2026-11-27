@@ -6,7 +6,7 @@ export type MessageDelivery = {
   acked_at: string | null; replied_at: string | null; reply_message_id: string | null;
   dead_lettered_at: string | null; error: string | null; read_at: string | null;
 };
-export const RECEIPT_GUIDANCE = "delivered means recipient software accepted it; consumed means acknowledged, not human reading or understanding. replied requires an explicitly correlated reply. read_at is a protocol read marker and may be recorded on acknowledgement; it does not prove human reading. An empty list does not confirm delivery.";
+export const RECEIPT_GUIDANCE = "delivered means recipient software accepted it; consumed means acknowledged, not human reading or understanding. replied requires an explicitly correlated reply. read_at is a protocol read marker and may be recorded on acknowledgement; it does not prove human reading. When recipient_wake is present, wake_sent means the routine endpoint accepted the trigger, not that the client woke; backoff includes its next retry. An empty list does not confirm delivery.";
 export function parseMessageDeliveries(value: unknown, messageId: string): MessageDelivery[] {
   const data = value as { message_id?: unknown; deliveries?: unknown } | null;
   if (data?.message_id !== messageId || !Array.isArray(data.deliveries)) throw new Error("Invalid delivery receipt response");
