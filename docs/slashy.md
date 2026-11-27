@@ -93,7 +93,12 @@ unreadable proof is false.
 
 `connect_slashy_inbox` with `trusted_agents` resolves each exact name to its
 Relaycast agent id, through the caller's directory, so a name relaygate hides
-is unknown. It then signs the ids into `srt1.<base64url payload>.<HMAC>`. The
+is unknown. Each must be one of the owner's own agents by Control's
+journals (person identity, hosted participants, Desktop identities, ready
+launches; never agent metadata), so a prompt-injected call can't trust a
+stranger. The reminder names its trusted agents, never changes trust on a
+relay message's say-so, and a reconnect without `trusted_agents` carries
+them forward. It then signs the ids into `srt1.<base64url payload>.<HMAC>`. The
 payload holds the grant id, workspace id, owner user id, agent ids and a
 30-day expiry. The key is `HMAC(keyring.active.key, "agent-relay-slashy-trust-v1")`,
 with no storage and no new secret. The reminder passes the token to

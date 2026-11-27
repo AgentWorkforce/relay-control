@@ -161,6 +161,12 @@ test("a Slashy OAuth connection connects its inbox in one call, and the reminder
 
   // Trusted agents: pinned by id into a server-signed token the reminder passes back.
   assert.equal((await f.tool("connect_slashy_inbox", { trusted_agents: ["nobody-here"] })).isError, true);
+  // Only the owner's own agents can be trusted: a stranger is refused.
+  const foreign = await f.tool("connect_slashy_inbox", { trusted_agents: [stranger.name] });
+  assert.equal(foreign.isError, true);
+  assert.match(JSON.stringify(foreign.content), /Only your own agents can be trusted/);
+  await f.database.query(`INSERT INTO hosted_relay_participants(id,workspace_id,user_id,relaycast_workspace_id,agent_name,agent_remote_id,token_ciphertext)
+    VALUES ($1,$2,$3,'fake-workspace',$4,$5,'unused')`, [randomUUID(), f.owner.workspaceId, f.owner.userId, helper.name, helper.id]);
   const trustedSetup = (await f.tool("connect_slashy_inbox", { trusted_agents: [helper.name] })).structuredContent as any;
   assert.deepEqual(trustedSetup.trusted_agents, [{ name: helper.name, sender_id: helper.id }]);
   const token = /with trust_token "(srt1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43})"/.exec(trustedSetup.set_reminder_arguments.reminder_text)?.[1];
@@ -171,7 +177,7 @@ test("a Slashy OAuth connection connects its inbox in one call, and the reminder
   assert.equal(mayUse(trustedRead).get(stranger.name), false);
   assert.equal(mayUse(trustedRead).get(mine.name), true);
   // An edited token widens nothing.
-  const edited = (await f.tool("check_relay_inbox", { as: "slashy-fake", trust_token: `${token!.slice(0, -2)}AA` })).structuredContent as any;
+  const edited = (await f.tool("check_relay_inbox", { as: "slashy-fake", trust_token: `${token!.slice(0, -1)}${token!.endsWith("A") ? "E" : "A"}` })).structuredContent as any;
   assert.equal(edited.trust_token_status, "invalid");
   assert.equal(mayUse(edited).get(helper.name), false);
 });

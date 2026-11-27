@@ -1928,6 +1928,22 @@ function createRelayService(context: McpContext) {
         return { name, id: found.id };
       });
     },
+    /** The subset of these Relaycast ids that are the owner's own agents by Control's journals (never agent metadata). */
+    async ownedAgentIds(ids: string[]): Promise<Set<string>> {
+      const unique = [...new Set(ids)];
+      if (agent || agentMissing || !unique.length) return new Set();
+      const rows = (await context.relay.database.query<{ id: string }>(
+        `SELECT agent_remote_id AS id FROM person_identities
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND agent_remote_id = ANY($4::text[])
+         UNION SELECT agent_remote_id FROM hosted_relay_participants
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND agent_remote_id = ANY($4::text[])
+         UNION SELECT agent_remote_id FROM desktop_relay_identities
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND agent_remote_id = ANY($4::text[])
+         UNION SELECT worker_id FROM relay_spawns
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND state = 'ready' AND worker_id = ANY($4::text[])`,
+        [context.workspace.id, context.principal.userId, relayWorkspaceId, unique])).rows;
+      return new Set(rows.map(row => row.id));
+    },
     /** A trust token for these Relaycast agent ids, bound to this OAuth grant; null when this is not an OAuth connection. */
     // Async like every service method: relayService fences each one for OAuth connections.
     async issueSlashyTrustToken(agentIds: string[]): Promise<{ token: string; expiresAt: string } | null> {
