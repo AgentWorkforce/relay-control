@@ -44,7 +44,7 @@ Registered in `slashy_inbox` only for an OAuth grant whose registered callback
 classifies as Slashy (`connectorKind` returns `slashy`). Neither tool adds
 authority beyond `join_relay`/`relay_status` for the approved agent.
 
-- `connect_slashy_inbox` `{interval_minutes?: 5-60, default 5,
+- `connect_slashy_inbox` `{interval_minutes?: 5-15, default 5,
   trusted_agents?: string[] (at most 20 exact names, default [])}` resolves
   each trusted agent to its current Relaycast agent id, read from Relaycast
   itself (an unknown name is refused). It then joins (or reuses) the approved
@@ -55,9 +55,9 @@ authority beyond `join_relay`/`relay_status` for the approved agent.
   replace one with different text, so there is never a second. Idempotent.
 - `slashy_inbox_status` `{}` returns `{agent, joined, inbox_address,
   last_seen, looks_active, pending_count, pending_count_is_lower_bound,
-  stale_after_seconds: 900, reminder_name}`. `last_seen` is Relaycast's
+  stale_after_seconds: 1800, reminder_name}`. `last_seen` is Relaycast's
   last-seen time for the agent, which each reminder run refreshes by reading
-  the inbox (other relay calls refresh it too). `looks_active` means within 15
+  the inbox (other relay calls refresh it too). `looks_active` means within 30
   minutes. The status read sends no heartbeat and acknowledges nothing.
 
 `src/mcp/slashy.ts` holds the reminder text, mirrored word for word from
