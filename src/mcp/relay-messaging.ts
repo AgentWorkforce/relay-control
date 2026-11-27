@@ -181,4 +181,31 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
       as, as_person: asPerson, hosted },
     annotations,
   }, input => run(service => service.readChannel(input)));
+
+  /**
+   * One-tap Tier O approval requests (Cloud's twin, cloud#6704), after the
+   * channel tools in catalog order. Not offered to a workspace agent identity
+   * token, which has no person to ask (catalog.ts APPROVAL_REQUEST_TOOLS).
+   */
+  if (context.authMode === "agent_identity") return;
+  server.registerTool("request_owner_approval", {
+    description: [
+      "Ask your owner to approve exact actions (a Tier O approval request). This grants nothing: it returns a request_id and an approve_url to give your owner, who approves or denies in their own signed-in Agent Relay session. Nothing is approved until they do.",
+      "Poll the request by its request_id. Once it is approved, send the same actions in owner_approval with approval_ref set to its approval_id; the recipient's Agent Relay then verifies and redeems it as any owner approval.",
+      "actions use the owner_approval action shapes: {class, target, conditions?}, one per class and target. The request is made as your own Agent Relay identity, to your own owner.",
+    ].join(" "),
+    inputSchema: {
+      actions: z.array(z.record(z.string(), z.unknown())).min(1).max(20).describe("The exact actions to approve, each {class, target, conditions?}."),
+      note: z.string().optional().describe("Why you need it, shown to your owner (at most 500 characters). Never put your owner's words here."),
+      single_use: z.boolean().optional().describe("Make every action usable once. High-risk actions are single use anyway."),
+      expires_in_minutes: z.number().int().optional().describe("How long your owner has to decide: 1 to 1440 minutes, default 60. An approval, once given, has its own 1-hour window."),
+    },
+    annotations: { ...annotations, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, input => run(service => service.requestOwnerApproval(input)));
+
+  server.registerTool("get_owner_approval_request", {
+    description: "Read one of your approval requests: status pending, approved, denied or expired, and the approval_id once your owner approved. Only requests made to your own owner are visible. Poll it; Agent Relay does not message you when it changes.",
+    inputSchema: { request_id: z.string().regex(/^apq_[A-Za-z0-9]{8,64}$/u) },
+    annotations,
+  }, input => run(service => service.ownerApprovalRequest(input.request_id)));
 }

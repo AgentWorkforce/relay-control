@@ -611,6 +611,10 @@ test("the fence: tools/list is the allowlist and an unlisted call is refused bef
   assert.equal(report.workspace.can_launch, false);
   const available = report.groups.filter((group: any) => group.status === "available").map((group: any) => group.id).sort();
   assert.deepEqual(available, ["capability_discovery", "relay_messaging"]);
+  // Owner approval requests ask a person: an agent identity has none, so it is not offered them (as Cloud).
+  assert.ok(!tools.includes("request_owner_approval") && !tools.includes("get_owner_approval_request"));
+  const messaging = report.groups.find((group: any) => group.id === "relay_messaging");
+  assert.ok(!messaging.tools.includes("request_owner_approval"));
   const reads = report.groups.find((group: any) => group.id === "shared_session_reads");
   assert.equal(reads.status, "unavailable");
   assert.match(reads.reason, /agent identity token/);
@@ -619,7 +623,7 @@ test("the fence: tools/list is the allowlist and an unlisted call is refused bef
     ...["list_team_activity", "search_shared_sessions", "get_shared_session", "list_session_summaries", "get_session_summary",
       "list_session_timings", "spawn_relay_agent", "release_relay_agent", "list_relay_spawn_targets", "link_webhook_inbox",
       "unlink_webhook_inbox", "ask_customer_support", "bind_replica", "spawn_replica", "bind_amp_thread", "spawn_capy_thread",
-      "show_ui", "show_ui_guide", "create_connect", "not_a_tool"]
+      "show_ui", "show_ui_guide", "create_connect", "request_owner_approval", "get_owner_approval_request", "not_a_tool"]
       .map(name => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } })),
     { jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "ui://relay/inbox" } },
     { jsonrpc: "2.0", id: 1, method: "resources/list" },

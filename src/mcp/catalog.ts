@@ -44,7 +44,14 @@ export function ensureToolTitles(server: McpServer): void {
 
 export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "get_relay_message_status", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
-  "post_relay_channel", "read_relay_channel"] as const;
+  "post_relay_channel", "read_relay_channel", "request_owner_approval", "get_owner_approval_request"] as const;
+/**
+ * One-tap Tier O approval requests ask the caller's own person. A workspace
+ * agent identity token has none, so it is not offered them (as Cloud,
+ * cloud#6704 c2ddd8ed).
+ */
+export const APPROVAL_REQUEST_TOOLS: readonly string[] = ["request_owner_approval", "get_owner_approval_request"];
+const AGENT_IDENTITY_RELAY_TOOLS: readonly string[] = RELAY_TOOLS.filter(tool => !APPROVAL_REQUEST_TOOLS.includes(tool));
 /** Directory reads do not act as the managed chat, so they survive a missing synced Desktop identity. */
 const RELAY_DIRECTORY_TOOLS = ["list_relay_agents", "get_relay_agent_card"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
@@ -123,7 +130,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   // A workspace agent identity token (docs/identity.md) reaches Relay
   // messaging and capability discovery only, whatever else the server enables.
   if (options.agentIdentity) {
-    return (["relay_messaging", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
+    return [{ group: "relay_messaging", tools: AGENT_IDENTITY_RELAY_TOOLS }, { group: "capability_discovery", tools: TOOL_GROUPS.capability_discovery.tools }];
   }
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relayfacts", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
@@ -172,7 +179,7 @@ export const STAFF_READ_GRANT_TOOLS: readonly string[] = [...SHARED_SESSION_READ
  * messaging and capability discovery. The MCP route refuses every other call
  * before a server is built, and the server registers nothing else for it.
  */
-export const AGENT_IDENTITY_TOOLS: readonly string[] = [...RELAY_TOOLS, CAPABILITY_DISCOVERY_TOOL];
+export const AGENT_IDENTITY_TOOLS: readonly string[] = [...AGENT_IDENTITY_RELAY_TOOLS, CAPABILITY_DISCOVERY_TOOL];
 
 const AUTH_MODE_LABELS: Readonly<Record<McpAuthMode, string>> = {
   session: "browser session",

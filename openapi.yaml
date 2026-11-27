@@ -4274,6 +4274,75 @@ paths:
                   approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
         "400": { description: "`invalid_request` or `invalid_expiry`" }
         "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/approval-requests/{requestId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: requestId, in: path, required: true, schema: { type: string, pattern: "^apq_[A-Za-z0-9]{8,64}$" } }
+    get:
+      operationId: getDelegationApprovalRequest
+      tags: [Owner delegates]
+      description: |
+        A one-tap tier O approval request a delegate made to its owner with the
+        `request_owner_approval` MCP tool (Cloud's twin, cloud#6704).
+        Human-only, like `POST delegates/approvals`. Only the request's owner
+        sees it; anyone else gets 404. A pending request past `expires_at` is
+        expired, once, when it is read.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationApprovalRequest" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`: not a human credential, or not a member" }
+        "404": { description: "`not_found`: no such request for this owner" }
+    post:
+      operationId: decideDelegationApprovalRequest
+      tags: [Owner delegates]
+      description: |
+        The owner approves or denies. Approving mints exactly the requested
+        actions as a tier O approval (default 1-hour window from now,
+        `single_use` as requested), audited `approval.minted` with
+        `request_id`, then `approval_request.approved`; the policy is checked
+        again first. Denying always works (`approval_request.denied`). A
+        request is decided once; two racing taps mint once.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, deny] }
+      responses:
+        "200":
+          description: Decided
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationApprovalRequest" }
+        "400": { description: "`invalid_request`: the body is not `{decision}`" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (policy refuses an action now) or `csrf_rejected`" }
+        "404": { description: "`not_found`: no such request for this owner" }
+        "409":
+          description: "`decided` or `expired`; `request` carries its final state"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code, request]
+                properties:
+                  error: { type: string }
+                  code: { type: string, enum: [decided, expired] }
+                  request: { $ref: "#/components/schemas/DelegationApprovalRequest" }
   /api/v1/workspaces/{workspaceId}/delegates/gates:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -11353,6 +11422,25 @@ components:
         scopes: { type: array, minItems: 1, items: { $ref: "#/components/schemas/DelegationScope" } }
         expires_at: { type: string, format: date-time }
         require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+    DelegationApprovalRequest:
+      type: object
+      required: [request_id, status, actions, note, single_use, requester, approval_id, expires_at, created_at, decided_at]
+      properties:
+        request_id: { type: string, pattern: "^apq_[A-Za-z0-9]{8,64}$" }
+        status: { type: string, enum: [pending, approved, denied, expired] }
+        actions: { type: array, items: { $ref: "#/components/schemas/DelegationActionRef" } }
+        note: { type: [string, "null"] }
+        single_use: { type: boolean }
+        requester:
+          type: object
+          required: [agent_id, name]
+          properties:
+            agent_id: { type: string }
+            name: { type: string }
+        approval_id: { type: [string, "null"], description: "The minted tier O approval once approved; send it as `owner_approval.approval_ref`." }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        decided_at: { type: [string, "null"], format: date-time }
     DelegateGrant:
       type: object
       required: [grant_id, owner_id, delegate_agent_id, scopes, require_tier_o, expires_at, status, created_at,

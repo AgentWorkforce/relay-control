@@ -36,6 +36,10 @@ import {
 } from "./scope.js";
 import { logAuditFenced, logUnavailable } from "./observe.js";
 import {
+  APPROVAL_REQUEST_ID, ApprovalRequestMembershipGone, approvalRequestView, decideApprovalRequest,
+  getApprovalRequest, insertOwnerApproval, type ApprovalRequestRecord,
+} from "./approval-requests.js";
+import {
   anyBinding,
   attestDelegation,
   AuditCursorError,
@@ -264,6 +268,7 @@ const mintBody = z.object({
   expires_at: rfc3339.optional(),
   single_use: z.boolean().optional(),
 }).strict();
+const decisionBody = z.object({ decision: z.enum(["approve", "deny"]) }).strict();
 const policyBody = z.object({
   delegation_enabled: z.boolean(),
   max_expiry_days: z.number().int().min(1).max(GRANT_MAX_DAYS).optional(),
@@ -1606,19 +1611,46 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       // The approval-wide flag is the owner's explicit choice only; high-risk
       // actions are single use per action at redeem.
       const singleUse = body.single_use === true;
-      const id = mintId("apv");
-      await input.database.transaction(async (tx) => {
-        await tx.query(
-          `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
-           VALUES ($1, $2, $3, 'O', $4::jsonb, $5, $6)`,
-          [id, workspace.id, principal.userId, JSON.stringify(actions), singleUse, new Date(expiresAt)],
-        );
-        await recordDelegationAudit(tx, {
-          workspaceId: workspace.id, event: "approval.minted", ...actor, ownerUserId: principal.userId, approvalId: id,
-          data: { actions, single_use: singleUse, expires_at: new Date(expiresAt).toISOString() },
-        });
-      });
+      const id = await input.database.transaction(tx => insertOwnerApproval(tx, { workspaceId: workspace.id,
+        ownerUserId: principal.userId, actions, singleUse, expiresAt: new Date(expiresAt), ...actor }));
       json(201, { approval_id: id });
+      return true;
+    }
+
+    // GET/POST /delegates/approval-requests/{id}: one-tap Tier O approval
+    // requests (approval-requests.ts, Cloud's twin cloud#6704). Human-only,
+    // like POST delegates/approvals above. Only the request's owner sees or
+    // decides it; anyone else gets 404. Approving mints exactly the requested
+    // actions as a Tier O approval through this human session, so the policy
+    // is checked again now; denying always works. A request is decided once.
+    if (sub?.startsWith("approval-requests/")) {
+      const requestId = sub.slice("approval-requests/".length);
+      if (method !== "GET" && method !== "POST") fail("method_not_allowed", "Method not allowed", 405);
+      const decision = method === "POST" ? parse(decisionBody, await readJson(request), "Invalid decision").decision : null;
+      if (!APPROVAL_REQUEST_ID.test(requestId)) fail("not_found", "Not found", 404);
+      const at = now();
+      const found = await getApprovalRequest(input.database, workspace.id, requestId, at);
+      if (!found || found.ownerUserId !== principal.userId) fail("not_found", "Not found", 404);
+      if (decision === null) {
+        json(200, approvalRequestView(found!));
+        return true;
+      }
+      // The policy is checked inside the deciding transaction, under a share lock on its row.
+      const decided = await decideApprovalRequest(input.database, { workspaceId: workspace.id, requestId,
+        userId: principal.userId, authMethod: caller.authMethod, decision }, at).catch((error: unknown) => {
+        if (error instanceof ApprovalRequestMembershipGone) fail("forbidden", "Forbidden", 403);
+        throw error;
+      });
+      if (!decided.ok) {
+        if (decided.reason === "not_found") fail("not_found", "Not found", 404);
+        else if (decided.reason === "refused") fail(decided.code, decided.error, 403);
+        else {
+          json(409, { error: decided.reason === "expired" ? "This request has expired" : "This request was already decided",
+            code: decided.reason, request: approvalRequestView(decided.request) });
+          return true;
+        }
+      }
+      json(200, approvalRequestView((decided as { request: ApprovalRequestRecord }).request));
       return true;
     }
 

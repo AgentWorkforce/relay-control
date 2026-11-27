@@ -18,6 +18,7 @@ import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.j
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
+import * as approvalRequests from "../delegation/approval-requests.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 import {
   CursorIdentityError, cursorCloudParticipantName, cursorIdentityNonces, cursorMintCommand, verifyCursorIdentityToken,
@@ -1491,6 +1492,14 @@ function createRelayService(context: McpContext) {
   type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string; gated?: { token: string } };
 
   /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
+  /** The owner an approval request asks: the signed-in person, never a workspace agent identity. */
+  function approvalRequestOwner(): string {
+    if (agent || agentMissing) {
+      throw new RelayToolError("A workspace agent identity token has no owner to ask. Request owner approval from a session signed in as the delegate's owner.");
+    }
+    return context.principal.userId;
+  }
+
   async function ownCardIdentity(as?: string): Promise<CardIdentity> {
     if (managed) {
       await managedActorOnly(as);
@@ -1640,6 +1649,42 @@ function createRelayService(context: McpContext) {
      * Relaycast merges them into the stored metadata, so every other key is
      * preserved.
      */
+    /**
+     * One-tap Tier O approval requests (delegation/approval-requests.ts,
+     * Cloud's twin cloud#6704). A request is made as the caller's own Relay
+     * identity, the one set_relay_agent_card writes, to the caller's own
+     * user: the delegate's owner. Cross-user requests are not supported, so
+     * no member can push approval prompts at someone else. A workspace agent
+     * identity token has no person behind it, so it has no owner to ask.
+     */
+    async requestOwnerApproval(input: Record<string, unknown>) {
+      const requests = approvalRequests;
+      const owner = approvalRequestOwner();
+      const parsed = requests.approvalRequestInputSchema.safeParse(input);
+      if (!parsed.success) throw new RelayToolError(`invalid_request: ${requests.approvalRequestIssue(parsed.error)}. Nothing was requested.`);
+      const identity = await ownCardIdentity().catch((error: unknown) => {
+        if (error instanceof RelayToolError && error.message === CARD_NEEDS_IDENTITY) {
+          throw new RelayToolError("An approval request is made as your own Agent Relay identity, and this MCP session has none yet. Call join_relay with desktop_address (from GET /whoami on the relay socket), or join_relay to create a hosted participant, then retry.");
+        }
+        throw error;
+      });
+      try {
+        return await requests.openApprovalRequest(database, { workspaceId, ownerUserId: owner, authMethod: "hosted_mcp",
+          requester: { agentId: identity.agentId, name: identity.name }, request: parsed.data, origin: context.origin });
+      } catch (error) {
+        if (error instanceof requests.ApprovalRequestRefused) throw new RelayToolError(`${error.code}: ${error.message}. Nothing was requested.`);
+        if (error instanceof requests.ApprovalRequestMembershipGone) throw new RelayToolError("You are not a current member of this workspace.");
+        throw error;
+      }
+    },
+
+    /** Reads one approval request made to the caller's own owner: its status, and the approval_id once approved. */
+    async ownerApprovalRequest(requestId: string) {
+      const found = await approvalRequests.readApprovalRequest(database, { workspaceId, ownerUserId: approvalRequestOwner(), requestId });
+      if (!found) throw new RelayToolError("No approval request with that id was made to your owner in this workspace.");
+      return found;
+    },
+
     async setCard(input: SetCardInput & { as?: string }) {
       const own = await ownCardIdentity(input.as);
       if (own.gated) {
