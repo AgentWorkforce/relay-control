@@ -11312,7 +11312,8 @@ components:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
         consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant, gate_unknown, oidc_invalid,
-        gate_mismatch, target_prefix, sha_mismatch, repository_mismatch, gate_owner_unqualified]
+        gate_mismatch, target_prefix, sha_mismatch, repository_mismatch, gate_owner_unqualified, identity_mismatch,
+        protected_path, self_approval, unattributed_commit, unattributable_target]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }

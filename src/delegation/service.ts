@@ -2319,6 +2319,14 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
       return "unavailable" as const;
     });
     if (unbound) continue;
+    // A granted approver is offered only while it is the exact identity
+    // pinned: one that moved address keeps its agent id and binding, but its
+    // answer would be refused identity_mismatch at attestation.
+    const moved = await approverIdentityRefusal(deps, workspace, grant).catch((error: unknown) => {
+      logUnavailable("prompt_delegates", error, { workspaceId: workspace.id, grantId: grant.id });
+      return "unavailable" as const;
+    });
+    if (moved) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });
   }
   return { delegates };

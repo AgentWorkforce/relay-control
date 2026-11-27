@@ -11,6 +11,7 @@ import {
   base62,
   highRisk,
   ownerDisplay,
+  REASON_CODES,
   targetCovered,
   tierDApprovalId,
   validTargetPattern,
@@ -2620,4 +2621,24 @@ test("approvers: a moved address is identity_mismatch at attest and at redeem", 
   const refused = await env.attest(recipient, second, "own_owner");
   assert.equal(refused.body.verdict, "none", refused.raw);
   assert.equal(refused.body.reason, "identity_mismatch");
+});
+
+test("approvers: prompt-delegates omits an approver whose bound address moved", async (t) => {
+  const { env, recipient, approver, address } = await approverReady(t);
+  const made = await env.grant(approver.id, [{ class: "prompt_approval", targets: ["*"] }]);
+  await env.database.query("UPDATE delegation_grants SET kind = 'approver', delegate_address = $2, approver_github_logins = $3 WHERE id = $1",
+    [made.grant_id, address, ["release-bot"]]);
+  const list = () => request(env.origin, `${env.base}/messaging/delegation/prompt-delegates`, {
+    method: "POST", token: env.desktop.accessToken, body: { session_agent_id: recipient.id, session_token: recipient.token } });
+  assert.deepEqual((await list()).body, { delegates: [{ agent_id: approver.id, grant_id: made.grant_id }] });
+  // Same agent id and binding, another address: its answer would be identity_mismatch, so it is not offered.
+  await env.database.query("UPDATE desktop_relay_identities SET address = $1 WHERE agent_remote_id = $2",
+    [`release-approver@cloud-elsewhere`, approver.id]);
+  assert.deepEqual((await list()).body, { delegates: [] });
+});
+
+test("openapi: DelegationReason lists every reason code the service answers", () => {
+  const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8")) as
+    { components: { schemas: { DelegationReason: { enum: string[] } } } };
+  assert.deepEqual([...spec.components.schemas.DelegationReason.enum].sort(), [...REASON_CODES].sort());
 });

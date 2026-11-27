@@ -380,7 +380,8 @@ bound in the target, and it must name the recipient itself. It takes no
 conditions; the node applies it directly, without a redeem. Only
 the machine owner's delegates count. `prompt-delegates` lists the machine
 owner's delegates whose live grants cover the session (excluding the session
-itself). It returns an empty list when delegation is off or the class is not
+itself). A granted approver is listed only while it is bound at its pinned
+address: one that moved would be refused `identity_mismatch`. It returns an empty list when delegation is off or the class is not
 allowed by policy. A session that is not the caller's, or a failed token
 proof, is `403 forbidden`.
 
@@ -1020,6 +1021,27 @@ since roles may have no grant row at all. An owner who turns the legacy rule
 on again after the rollback gets a new rule id, so none of those exclusions
 apply to it. That owner must revoke the excluded agents' grants again (`DELETE
 /delegates/{grant_id}`) once they reappear under the new rule.
+
+### Rolling back granted approvers (0101)
+
+A build from before migration 0101 ignores `kind`, `delegate_address` and
+`approver_github_logins`. It reads every active approver row as an ordinary
+delegate grant, with no address pin and no approver target refusals
+(`condition_unavailable` on PR and release targets, `unattributable_target`).
+Never roll back below the build that added approvers while an approver grant is
+active:
+
+1. **List them.** `SELECT id FROM delegation_grants WHERE kind = 'approver' AND
+   status = 'active'` (read only).
+2. **Revoke each one** (`DELETE /delegates/{grant_id}`, the owner or an admin)
+   or the owner's `revoke-all`, then rerun the list and require it to be empty.
+3. Roll back.
+
+The schema stays as it is: 0101 is additive, and the old build reads its
+columns' defaults as a delegate. On relay-control today the list is always
+empty, because the route refuses every approver grant (it cannot read
+CODEOWNERS; see above), so an approver row exists only if one was written to
+the database directly. Check it anyway before any rollback.
 
 ## Revocation
 
