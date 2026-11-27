@@ -3,7 +3,6 @@
  * The intentional tenancy adaptation: a browser account session consents only
  * for its issue-time workspace; selecting another workspace requires a switch.
  */
-import { createHash } from "node:crypto";
 import { agentNameError } from "./agent-name.js";
 import { connectorKind, isGrokRoutineKind } from "./connector-kind.js";
 import { APP_BASE_PATH, MCP_EVENTS_SCOPE, type AuthorizationRequest, type createMcpOAuthProtocol } from "./protocol.js";
@@ -50,10 +49,6 @@ function readNameHint(request: Request, now: number): { id: string } | null {
   } catch { return null; }
 }
 
-export function mcpOAuthSetupHandoff(code: string): string {
-  return `mcpos_${createHash("sha256").update(code).digest("hex")}`;
-}
-
 /** Shared account admission for the consent API and its server-rendered page. */
 export async function resolveMcpConsentAccount(request:Request,
   resolveSession:(request:Request)=>Promise<McpConsentSession|null>):Promise<McpConsentPrincipal|Response> {
@@ -74,12 +69,9 @@ export function createMcpOAuthConsentHandlers(deps: {
   /** Live org membership plus workspace->org/session binding; store rechecks in its transaction. */
   workspaceAccess(principal: TenantOwner): Promise<boolean>;
   checkAgentNameAvailability(principal: TenantOwner, name: string): Promise<AgentNameAvailability>;
-  /** Only if the matching relay-app setup route exists; default false. */
-  grokSetupEnabled?: boolean;
   now?: () => number;
 }) {
   const origin = deps.protocol.mcpOAuthOrigin();
-  const grokSetupEnabled = deps.grokSetupEnabled === true;
   const now = deps.now ?? Date.now;
 
   const accountSession = (request:Request) => resolveMcpConsentAccount(request,deps.resolveSession);
@@ -160,11 +152,8 @@ export function createMcpOAuthConsentHandlers(deps: {
       if (error instanceof McpOAuthContinuationError) return oauthJson({ error: "invalid_request", error_description: error.message }, 400);
       throw error;
     }
-    const setupUrl = grok && grokSetupEnabled ? `${APP_BASE_PATH}/connect/grok/webhook?${new URLSearchParams({
-      workspace: principal.workspaceId, handoff: mcpOAuthSetupHandoff(code),
-    })}` : undefined;
-    return finish({ redirect_to: deps.protocol.authorizationResponseUrl(authorization.redirectUri, { code, state: authorization.state }),
-      ...(setupUrl ? { setup_url: setupUrl } : {}) });
+    // The owner receives the setup page from connect_grok_bot_routine after code exchange.
+    return finish({ redirect_to: deps.protocol.authorizationResponseUrl(authorization.redirectUri, { code, state: authorization.state }) });
   }
 
   async function agentName(request: Request): Promise<Response> {

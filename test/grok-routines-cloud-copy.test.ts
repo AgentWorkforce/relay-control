@@ -444,3 +444,9 @@ test("Cloud copy: the server's wiring reads SELFHOST_GROK_ROUTINES_CLOUD_COPY fr
   assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig(env), deps)).cloudCopy, false);
   assert.equal(new GrokRoutines(grokRoutinesOptions(loadConfig({ ...env, SELFHOST_GROK_ROUTINES_CLOUD_COPY: "on" }), deps)).cloudCopy, true);
 });
+
+test("webhook prompt keeps keyed links out of chat notes", () => {
+  const prompt = grokRoutinePrompt("fake-grok", { canReply: true });
+  assert.doesNotMatch(prompt, /observerUrl/);
+  assert.match(prompt, /Never paste links containing keys/);
+});

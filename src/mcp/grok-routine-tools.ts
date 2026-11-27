@@ -110,7 +110,7 @@ function registerCloudCopyTools(server: McpServer, context: McpContext, run: Run
         inbox_address: joined.address ?? status.agent,
         routine_prompt: routines.pastePrompt(status.agent),
         setup_url: routines.setupUrl(grantId, from),
-        next_steps: "Create the Agent Relay inbound Webhook routine now using routine_prompt as its instructions. For this explicit setup request, after it is created, offer to show the routine's webhook URL and Authorization header field links. Point the person to setup_url, where they can paste the URL into Webhook URL and the full header into the separate Authorization header field. Do not send either credential through this tool or show them outside this explicit request.",
+        next_steps: "Create the Agent Relay inbound Webhook routine now using routine_prompt as its instructions. Point the signed-in owner to setup_url, where they can paste the URL into Webhook URL and the full header into the separate Authorization header field. Do not send either credential through this tool or paste keyed links into chat.",
       };
     });
     return result.isError ? { ...result, content: result.content.map(item => ({ ...item,
