@@ -529,8 +529,12 @@ Rules:
   already exists, and it renews, re-enrols, renames or pins nothing. A
   hosted agent that reconnected to a new MCP session (its participant still
   bound to the old one) polls with `as` set to the hosted name it made the
-  request as. A missing id, another identity's request and a session with no
-  identity all get the same answer, with that reconnect hint. A read denied
+  request as. On a gate-only install the poll reads only as a participant
+  relaygate already admitted this hosted client for, and an OAuth grant not
+  yet pinned to an agent never reads as one being retired after a
+  disconnect, as for every other call. A missing id, another identity's
+  request and a session with no identity all get the same answer, with that
+  reconnect hint. A read denied
   for another identity is logged as `approval_request_read_denied` with ids
   only, never the note, the actions or the approval id.
   A workspace agent identity token has no person behind it,

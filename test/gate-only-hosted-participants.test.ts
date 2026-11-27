@@ -437,4 +437,13 @@ test("on a gate-only install polling an approval request renews nothing, even wh
     arguments: { request_id: asked.request_id, as: "notes-agent" } })).status, "pending");
   assert.deepEqual(await rows(), before, "the poll wrote nothing");
   assert.equal(state.credentials.length, credentials, "no hosted credential was minted to renew it");
+  // A row relaygate never admitted this hosted client for is not read as, either way.
+  await env.database.query("UPDATE hosted_relay_participants SET admitted_clients = '{chatgpt}'");
+  const notAdmitted = await rows();
+  for (const args of [{ request_id: asked.request_id }, { request_id: asked.request_id, as: "notes-agent" }]) {
+    assert.match(toolError(await (args.as ? other : client).callTool({ name: "get_owner_approval_request", arguments: args })),
+      /No approval request with that id was made by you/);
+  }
+  assert.deepEqual(await rows(), notAdmitted, "the refused poll wrote nothing");
+  assert.equal(state.credentials.length, credentials, "and enrolled nothing to obtain an admission");
 });

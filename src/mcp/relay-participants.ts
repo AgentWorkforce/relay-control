@@ -1621,9 +1621,17 @@ function createRelayService(context: McpContext) {
     const row = await selectedRow(as);
     if (!row || row.relayWorkspaceId !== relayWorkspaceId) return null;
     if (gate && row.agentName === launcherName(userId)) return null;
+    // Gate-only installs: only a row relaygate enrolled and admitted this
+    // caller's hosted client for, as gatedParticipant enforces. The poll reads
+    // the stored admission and never enrols to obtain one.
+    if (gate && (row.relaygateAgentId === null || !row.admittedClients.includes(await hostedClient()))) return null;
     // An OAuth grant acts only as its approved agent, as participant() enforces.
     if (oauth && !run) {
       try { oauth.assertActor(as, row.agentName); } catch { return null; }
+      // A name-only grant never reads as a retiring identity: participant()'s
+      // retirement fence refuses it before it could adopt (and pin) the row.
+      if (!oauth.access.agentRemoteId && await retiringIdentity(executor,
+        { organizationId, workspaceId, userId, agentRemoteId: row.agentRemoteId, agentName: row.agentName })) return null;
     }
     return { agentId: row.agentRemoteId, name: row.agentName };
   }

@@ -1570,3 +1570,18 @@ test("include_replies reports a thread that fails to load on its post and still 
   assert.ok(logged.some(line=>line.includes("thread_read_failed") && line.includes(posts[2]!) && line.includes("read_thread:503")));
   assert.ok(!logged.some(line=>line.includes("post 2") || line.includes("family")));
 });
+
+test("an approval request poll never reads as a retiring identity through a name-only grant, and writes nothing",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  await f.database.query("INSERT INTO delegation_policies (workspace_id, delegation_enabled) VALUES ($1, true)",[f.owner.workspaceId]);
+  const asked=await f.service.requestOwnerApproval({actions:[{class:"merge",target:"acme/web#7",conditions:[{type:"ci_green"}]}]});
+  assert.equal((await f.service.ownerApprovalRequest(asked.request_id)).status,"pending");
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  // The participant row stays until teardown; a later unpinned grant of the same name must not adopt it.
+  const later=await laterConnection(f,null,true);
+  const before=(await f.database.query("SELECT * FROM hosted_relay_participants ORDER BY id")).rows;
+  await assert.rejects(later.service.ownerApprovalRequest(asked.request_id),/No approval request with that id was made by you/);
+  assert.equal(later.connection.access.agentRemoteId??null,null,"the poll pinned nothing");
+  assert.deepEqual((await f.database.query("SELECT * FROM hosted_relay_participants ORDER BY id")).rows,before);
+  assert.equal((await f.database.query("SELECT agent_remote_id FROM mcp_oauth_grants WHERE id=$1",[later.grantId])).rows[0]?.agent_remote_id,null);
+});
