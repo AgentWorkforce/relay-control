@@ -223,12 +223,12 @@ is an owner-made grant with `kind: "approver"`, created through `POST
 - Hard-limit classes (deploy, secret_change, destructive) are covered only
   when the grant lists them; high-risk actions stay single use per action.
 - **What an approver can redeem here.** Cloud reads GitHub at redeem: on a
-  PR it refuses one a listed login authored or committed to
-  (`self_approval`), one with an unattributed commit
-  (`unattributed_commit`), or one touching a protected path
-  (`protected_path`: `.github/`, `.claude/`, CODEOWNERS, the root AGENTS.md
-  or CLAUDE.md, merge-train, delegation code). A release or land target is
-  checked the same way against the default branch. relay-control reads no
+  PR, and on a release against its previous release, it refuses commits it
+  cannot attribute to someone other than the approver (`self_approval`,
+  `unattributed_commit`) and changes to protected paths (`protected_path`;
+  the list lives in Cloud's `lib/delegation/attest.ts`, `APPROVER_PROTECTED_PATHS`,
+  and covers CODEOWNERS, the approval rules, `.github/`, `.claude/`,
+  migrations, merge-train and delegation code). relay-control reads no
   GitHub state for delegation, so none of those can be checked: an
   approver's merge, pr_ops and release redeems answer
   `condition_unavailable`. A deploy, secret_change or destructive target
