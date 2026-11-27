@@ -9,6 +9,8 @@ import {
   consumeAction,
   approverIdentityRefusal,
   approverTargetRefusal,
+  approverClaim,
+  type ApproverClaim,
   delegateStillBound,
   decideUnderLocks,
   getTrustRule,
@@ -332,6 +334,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
     let chain: ReturnType<typeof chainUnderLock>;
     let grantOwnerUserId: string | null = null;
     let reliedChain: TrustProof | null = null;
+    // A granted approver's evidence, recorded on gate.redeemed (Cloud's twin, cloud#6730).
+    let approverEvidence: ApproverClaim | undefined;
     if (approval.tier === "D") {
       const grant = approval.grant_id ? (await deps.database.query<GrantRow>(
         "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2", [approval.grant_id, workspace.id],
@@ -356,6 +360,7 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       const outOfScope = scopeRefusal([action], grant, policy, "");
       if (outOfScope) return await refuse(outOfScope);
       if (tierOClasses(policy, grant).has(action.class)) return await refuse("tier_o_required");
+      approverEvidence = approverClaim(grant);
       // The rule behind the grant, locked with it in the deciding transaction.
       ruleId = grant.trust_rule_id ?? null;
       grantOwnerUserId = grant.owner_user_id;
@@ -459,7 +464,8 @@ export async function redeemThroughGate(deps: DelegationDeps, input: {
       if (result === "expired") return { refused: "expired" as const };
       // Another run consumed the action first: this run is refused (#278 review).
       if (result === "taken") return { refused: "consumed" as const };
-      await audit("gate.redeemed", null, { same_run: result === "same_run" }, tx);
+      await audit("gate.redeemed", null, { same_run: result === "same_run",
+        ...(approverEvidence ? { approver: approverEvidence } : {}) }, tx);
       return { consumed: result } as const;
     });
     if ("refused" in outcome) return await refuse(outcome.refused);

@@ -34,7 +34,7 @@ import {
   type ActionClass,
   type Scope,
 } from "./scope.js";
-import { logAuditFenced, logUnavailable } from "./observe.js";
+import { logAuditFenced, logRefused, logUnavailable } from "./observe.js";
 import {
   APPROVAL_REQUEST_ID, ApprovalRequestMembershipGone, approvalRequestView, decideApprovalRequest,
   getApprovalRequest, insertOwnerApproval, type ApprovalRequestRecord,
@@ -82,7 +82,7 @@ import {
   type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
-  connectorRootProven, trustProver,
+  connectorRootProven, trustProver, approverScopeRepositories, splitRepository,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
 import {
@@ -965,8 +965,39 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       // now: its agent id (above) and the address that binding has.
       const approver = body.kind === "approver" ? { address: body.delegate_address!,
         githubLogins: [...new Set((body.github_logins ?? []).map(login => login.toLowerCase()))] } : null;
-      if (approver && (!binding!.address || binding!.address !== approver.address)) {
+      // Every refused approver grant is logged (delegation.refused, op approver_grant): ids and reasons only, as Cloud.
+      const refuseApprover = (reason: string, extra: Record<string, string> = {}) =>
+        logRefused("approver_grant", { workspaceId: workspace.id, reason, agentId: binding!.agentId, ...extra });
+      if (approver && !binding!.address) {
+        // A claimed agent carries no address, so it cannot be pinned.
+        refuseApprover("identity_unpinnable");
+        fail("identity_mismatch", "An approver must be an agent Control knows the exact address of (a desktop or hosted identity); a claimed agent has none", 403);
+      }
+      if (approver && binding!.address !== approver.address) {
+        refuseApprover("identity_mismatch");
         fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
+      }
+      if (approver) {
+        // Granted per repository, by a code owner of each: never more than the granter could approve
+        // themselves (Cloud's twin, cloud#6730). Cloud reads CODEOWNERS fresh on every governing branch
+        // (the default branch and the repository's configured merge targets); relay-control reads no
+        // GitHub, so it cannot confirm that and refuses. A definite refusal, not an outage: nothing here
+        // would succeed on retry.
+        const repos = approverScopeRepositories(scopes);
+        if (!repos) {
+          refuseApprover("approver_target_not_repo");
+          fail("approver_target_not_repo", "Every approver scope target must name an exact owner/repo", 400);
+        }
+        const repo = repos![0]!;
+        // As Cloud: a name that is not exactly owner/repo (an owner with `_` or `.`, a `.` or `..` name) has
+        // no governing branches, so it is `unconfigured`.
+        if (!splitRepository(repo)) {
+          refuseApprover("unconfigured", { repo, merge_targets: "unconfigured" });
+          fail("not_code_owner", `${repo} has no configured merge targets, so its governing branches are unknown; approvers can't be granted for it yet`, 403);
+        }
+        refuseApprover("codeowners_unreadable", { repo });
+        fail("not_code_owner", `relay-control cannot read CODEOWNERS, so it cannot confirm you are a code owner of all of ${repo
+        }; approver grants are unavailable on this install`, 403);
       }
       const requireTierO = uniqueClasses(body.require_tier_o);
       let row: GrantRow;
@@ -993,6 +1024,7 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
             fail("not_delegate", "The agent must be bound to you; claim it first", 403);
           }
           if (approver && bound!.address !== approver.address) {
+            refuseApprover("identity_mismatch");
             fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
           }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);

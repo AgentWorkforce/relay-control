@@ -20,6 +20,7 @@ import { request } from "./support/harness.js";
 import { RELAYCAST_INTERNAL_SECRET } from "./support/relaycast-world.js";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
+import { setDelegationLogSinkForTesting } from "../src/delegation/observe.js";
 
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
 const KID = "dlg-2026q4";
@@ -2478,12 +2479,28 @@ async function approverReady(t: TestContext) {
   const address = `release-approver@cloud-${approver.id}`;
   const scopes = [{ class: "deploy", targets: ["relay:prod"] }, { class: "merge", targets: ["AgentWorkforce/*"] },
     { class: "external_comms", targets: ["slack:ops"] }, { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }];
-  return { env, recipient, approver, address, scopes };
+  // relay-control reads no CODEOWNERS, so its route never grants an approver (cloud#6730 needs a
+  // whole-repository code owner). seedApprover stands in for a grant such a check allowed.
+  const seedApprover = async (logins: string[] = ["release-bot"]) => {
+    const made = await env.grant(approver.id, scopes);
+    await env.database.query("UPDATE delegation_grants SET kind = 'approver', delegate_address = $2, approver_github_logins = $3 WHERE id = $1",
+      [made.grant_id, address, logins]);
+    return made.grant_id as string;
+  };
+  return { env, recipient, approver, address, scopes, seedApprover };
 }
 
-test("approvers: granted only to the owner's own agent at its bound address, with GitHub logins", async (t) => {
-  const { env, approver, address, scopes } = await approverReady(t);
-  const post = (body: Record<string, unknown>) => env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, ...body });
+test("approvers: refused by the route on relay-control, after the address pin and the exact-repository check", async (t) => {
+  const { env, approver, address, scopes, seedApprover } = await approverReady(t);
+  const lines: string[] = [];
+  setDelegationLogSinkForTesting((_level, line) => { lines.push(line); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  const refusals = () => lines.map(line => JSON.parse(line) as Record<string, unknown>)
+    .filter(line => line.message === "delegation.refused" && line.op === "approver_grant");
+  const repoScopes = [{ class: "merge", targets: ["AgentWorkforce/relay#7", "agentworkforce/RELAY:main"] },
+    { class: "release", targets: ["AgentWorkforce/cloud:*:*:*:*"] }];
+  const post = (body: Record<string, unknown>, withScopes: unknown = repoScopes) =>
+    env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes: withScopes, ...body });
   for (const body of [{ kind: "approver", github_logins: ["bot"] }, { kind: "approver", delegate_address: address },
     { kind: "approver", delegate_address: address, github_logins: [] }, { delegate_address: address },
     { github_logins: ["bot"] }, { kind: "approver", delegate_address: address, github_logins: ["-bad-"] }]) {
@@ -2494,22 +2511,54 @@ test("approvers: granted only to the owner's own agent at its bound address, wit
   assert.equal(wrong.body.code, "identity_mismatch");
   // A claimed agent has no Relay address to pin.
   const claimed = await env.claim("claimed-bot");
-  const unpinned = await env.browser("/delegates", "POST", { delegate_agent_id: claimed.id, scopes, kind: "approver",
+  const unpinned = await env.browser("/delegates", "POST", { delegate_agent_id: claimed.id, scopes: repoScopes, kind: "approver",
     delegate_address: "claimed-bot@somewhere", github_logins: ["bot"] });
   assert.equal(unpinned.body.code, "identity_mismatch", unpinned.raw);
+  assert.deepEqual(refusals().map(line => line.reason), ["identity_mismatch", "identity_unpinnable"]);
   // An agent never grants itself: the route is human-only.
   assert.equal((await request(env.origin, `${env.base}/delegates`, { method: "POST", token: approver.token,
-    body: { delegate_agent_id: approver.id, scopes, kind: "approver", delegate_address: address, github_logins: ["bot"] } })).status, 401);
+    body: { delegate_agent_id: approver.id, scopes: repoScopes, kind: "approver", delegate_address: address, github_logins: ["bot"] } })).status, 401);
 
-  const created = await post({ kind: "approver", delegate_address: address, github_logins: ["Release-Bot", "release-bot", "khaliq", "agent-relay-code[bot]"] });
-  assert.equal(created.status, 201, created.raw);
-  assert.equal(created.body.kind, "approver");
-  assert.equal(created.body.delegate_address, address);
-  assert.deepEqual(created.body.github_logins, ["release-bot", "khaliq", "agent-relay-code[bot]"]);
-  const audit = (await env.database.query<{ data: Record<string, unknown> }>(
-    "SELECT data FROM delegation_audit_events WHERE event = 'grant.created'")).rows[0]!;
-  assert.equal(audit.data.kind, "approver");
-  assert.equal(audit.data.delegate_address, address);
+  // Every target must name an exact owner/repo: an owner wildcard, a deploy environment or a channel is refused.
+  const pinnedBody = { kind: "approver", delegate_address: address, github_logins: ["release-bot"] };
+  for (const targets of [scopes, [{ class: "merge", targets: ["AgentWorkforce/*"] }], [{ class: "deploy", targets: ["relay:prod"] }],
+    [{ class: "merge", targets: ["AgentWorkforce/relay#7"] }, { class: "external_comms", targets: ["slack:ops"] }]]) {
+    const refused = await post(pinnedBody, targets);
+    assert.equal(refused.status, 400, refused.raw);
+    assert.equal(refused.body.code, "approver_target_not_repo", JSON.stringify(targets));
+  }
+  // Exact repositories: the granter must be a code owner of each, which relay-control cannot read. A
+  // definite 403 (retrying never helps), naming the repositories, lowercased and once each.
+  const notOwner = await post(pinnedBody);
+  assert.equal(notOwner.status, 403, notOwner.raw);
+  assert.equal(notOwner.body.code, "not_code_owner");
+  assert.match(notOwner.raw, /cannot read CODEOWNERS.*agentworkforce\/relay;/);
+  // A name that is not exactly owner/repo (an owner with `_`, a `..` name) has no governing branches: unconfigured, as Cloud.
+  for (const target of ["Agent_Workforce/relay#7", "AgentWorkforce/.."]) {
+    const odd = await post(pinnedBody, [{ class: "merge", targets: [target] }]);
+    assert.equal(odd.status, 403, odd.raw);
+    assert.equal(odd.body.code, "not_code_owner");
+    assert.match(odd.raw, /no configured merge targets/);
+  }
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_grants")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'grant.created'")).rows.length, 0);
+  // Every refused approver grant is logged, ids and reasons only (delegation.refused, op approver_grant).
+  const logged = refusals();
+  assert.deepEqual(logged.map(line => line.reason), ["identity_mismatch", "identity_unpinnable",
+    "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "codeowners_unreadable",
+    "unconfigured", "unconfigured"]);
+  assert.equal(logged[6]!.repo, "agentworkforce/relay");
+  assert.deepEqual(logged.slice(7).map(line => [line.repo, line.merge_targets]),
+    [["agent_workforce/relay", "unconfigured"], ["agentworkforce/..", "unconfigured"]]);
+  assert.equal(logged[0]!.agentId, approver.id);
+  assert.doesNotMatch(JSON.stringify(logged), /release-bot|release-approver@/);
+
+  // A stored approver row (as an install that can read CODEOWNERS would grant) reads back with its fields.
+  const grantId = await seedApprover(["release-bot", "khaliq", "agent-relay-code[bot]"]);
+  const approverView = (await env.bearer("/delegates")).body.grants.find((grant: any) => grant.grant_id === grantId);
+  assert.equal(approverView.kind, "approver");
+  assert.equal(approverView.delegate_address, address);
+  assert.deepEqual(approverView.github_logins, ["release-bot", "khaliq", "agent-relay-code[bot]"]);
   // A delegate grant's view carries none of the approver fields; a pre-0101 row (null kind) reads as a delegate.
   const other = await env.desktopIdentity("plain-bot");
   const plain = await env.grant(other.id, scopes);
@@ -2520,11 +2569,10 @@ test("approvers: granted only to the owner's own agent at its bound address, wit
 });
 
 test("approvers: claims, audit and the redeem response name the approver; unattributable and GitHub-checked targets refuse", async (t) => {
-  const { env, recipient, approver, address, scopes } = await approverReady(t);
-  const created = await env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, kind: "approver",
-    delegate_address: address, github_logins: ["release-bot"] });
-  assert.equal(created.status, 201, created.raw);
-  const expected = { grant_id: created.body.grant_id, agent_id: approver.id, address, granted_by: env.ownerId };
+  const { env, recipient, approver, address, seedApprover } = await approverReady(t);
+  const grantId = await seedApprover();
+  // granted_by_standing is always "none": relay-control cannot judge code ownership (cloud#6730).
+  const expected = { grant_id: grantId, agent_id: approver.id, address, granted_by: env.ownerId, granted_by_standing: "none" };
 
   const comms = { class: "external_comms", target: "slack:ops" };
   const messageId = send(env, approver, recipient, env.approval([comms]));
@@ -2557,10 +2605,8 @@ test("approvers: claims, audit and the redeem response name the approver; unattr
 });
 
 test("approvers: a moved address is identity_mismatch at attest and at redeem", async (t) => {
-  const { env, recipient, approver, address, scopes } = await approverReady(t);
-  const created = await env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes, kind: "approver",
-    delegate_address: address, github_logins: ["release-bot"] });
-  assert.equal(created.status, 201, created.raw);
+  const { env, recipient, approver, seedApprover } = await approverReady(t);
+  await seedApprover();
   const prod = { class: "deploy", target: "relay:prod" };
   const first = send(env, approver, recipient, env.approval([prod]));
   const attested = await env.attest(recipient, first, "own_owner");

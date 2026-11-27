@@ -163,12 +163,51 @@ export function isApproverGrant(grant: Pick<GrantRow, "kind">): boolean {
   return grant.kind === "approver";
 }
 
-/** Who granted an approver and the exact identity it is pinned to, carried by its claims, audit and redeem response. */
-export type ApproverClaim = { grant_id: string; agent_id: string; address: string; granted_by: string };
+/**
+ * Who granted an approver and the exact identity it is pinned to, carried by
+ * its claims, audit and redeem response. `granted_by_standing` is whether the
+ * grant's owner is a code owner of the action's target (Cloud's twin,
+ * cloud#6730). Cloud judges it on CODEOWNERS; relay-control reads no
+ * CODEOWNERS, so it is always "none" here, and repository rules never count an
+ * approver redeemed here as a code owner's OK.
+ */
+export type ApproverClaim = { grant_id: string; agent_id: string; address: string; granted_by: string;
+  granted_by_standing: "code_owner" | "none" };
 
 export function approverClaim(grant: GrantRow): ApproverClaim | undefined {
   return isApproverGrant(grant) && grant.delegate_address ? { grant_id: grant.id, agent_id: grant.delegate_agent_id,
-    address: grant.delegate_address, granted_by: grant.owner_user_id } : undefined;
+    address: grant.delegate_address, granted_by: grant.owner_user_id, granted_by_standing: "none" } : undefined;
+}
+
+/**
+ * `owner/repo` split into its two parts, or null for anything else: an extra
+ * segment, an empty part, or a name GitHub never allows (`.`, `..`). As
+ * Cloud's standing.splitRepository (cloud#6730).
+ */
+export function splitRepository(repo: string): [string, string] | null {
+  const parts = repo.split("/");
+  if (parts.length !== 2) return null;
+  const [owner, name] = parts as [string, string];
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/u.test(owner) || !/^[A-Za-z0-9_.-]{1,100}$/u.test(name) || name === "." || name === "..") return null;
+  return [owner, name];
+}
+
+/**
+ * The repository each scope target of a granted approver names, lowercased,
+ * or null when any target names none concretely (Cloud's twin, cloud#6730).
+ * An approver is granted per repository, by a code owner of each, so every
+ * target must start with an exact `owner/repo` (`owner/repo`, `owner/repo#…`,
+ * `owner/repo:…`); an owner wildcard (`owner/*`, `*`) or a target with no
+ * repository (a deploy environment, a secret) is refused.
+ */
+export function approverScopeRepositories(scopes: ReadonlyArray<{ targets: readonly string[] }>): string[] | null {
+  const repos = new Set<string>();
+  for (const target of scopes.flatMap(scope => scope.targets)) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99})\/([A-Za-z0-9_.-]{1,100})(?=$|[#:])/u.exec(target);
+    if (!match) return null;
+    repos.add(`${match[1]}/${match[2]}`.toLowerCase());
+  }
+  return repos.size ? [...repos] : null;
 }
 
 /** An owner's set-once trust rule (docs/owner-delegates.md, "Trust rule"). */

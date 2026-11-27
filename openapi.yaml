@@ -3555,8 +3555,18 @@ paths:
         (cloud#6709): pinned to the agent id and to `delegate_address`, which
         must equal the address the agent is bound at now (`identity_mismatch`
         otherwise; a claimed agent has none), with at least one
-        `github_logins` entry. An approver attests only with own_owner
-        standing; its claims, audit and redeem response carry `approver`.
+        `github_logins` entry. Every approver scope target must name an exact
+        `owner/repo` (`approver_target_not_repo` otherwise), and the granter
+        must be a code owner of all of each repository (cloud#6730).
+        relay-control reads no CODEOWNERS, so it cannot confirm that and
+        refuses every approver with `403 not_code_owner`: approver grants are
+        unavailable on this install (a name that is not exactly `owner/repo`
+        is `not_code_owner` too, as in Cloud). Each refused approver grant is
+        logged as `delegation.refused`, op `approver_grant`, with reason
+        `identity_unpinnable`, `identity_mismatch`, `approver_target_not_repo`,
+        `unconfigured` or `codeowners_unreadable`. An approver row that exists attests only
+        with own_owner standing; its claims, audit and redeem response carry
+        `approver`, with `granted_by_standing` always `none`.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -3571,9 +3581,9 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DelegateGrant" }
-        "400": { description: "`invalid_request` (unknown field, unknown class, invalid target pattern, duplicate class) or `invalid_expiry`" }
+        "400": { description: "`invalid_request` (unknown field, unknown class, invalid target pattern, duplicate class), `invalid_expiry` or `approver_target_not_repo` (an approver target names no exact owner/repo)" }
         "401": { description: "`unauthorized`" }
-        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `not_delegate` (agent not bound to the caller), `identity_mismatch` (approver address is not the bound address) or `csrf_rejected`" }
+        "403": { description: "`forbidden`, `not_enabled`, `out_of_scope` (class not allowed by policy), `not_delegate` (agent not bound to the caller), `identity_mismatch` (approver address is not the bound address), `not_code_owner` (every approver on relay-control, which cannot read CODEOWNERS) or `csrf_rejected`" }
         "409": { description: "`grant_exists`" }
         "503": { description: "`unavailable`" }
   /api/v1/workspaces/{workspaceId}/delegates/{grantId}:

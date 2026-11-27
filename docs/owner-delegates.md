@@ -212,6 +212,28 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   approver.
 - `github_logins` (at least one, lowercased; an app login may end in
   `[bot]`) are the logins it acts as on GitHub.
+- **Who may grant one (cloud#6730).** An approver is granted per
+  repository: every scope target must name an exact `owner/repo`
+  (`owner/repo`, `owner/repo#…`, `owner/repo:…`), else `400
+  approver_target_not_repo`, and the granter must be a code owner of all
+  of each repository. Cloud reads CODEOWNERS fresh on every governing
+  branch: the default branch and the repository's configured merge targets
+  (Cloud's `CONFIGURED_MERGE_TARGETS`; PR bases and branch protection are
+  deliberately not discovered). relay-control reads no CODEOWNERS, so it
+  cannot confirm this and refuses every approver with `403 not_code_owner`,
+  after the address pin and the repository check. That is a definite
+  refusal, not an outage: approver grants are unavailable on this install
+  until it can read GitHub. As in Cloud, a name that is not exactly
+  `owner/repo` (an owner with `_` or `.`, a `.` or `..` repository name) is
+  `not_code_owner` too, because it has no governing branches.
+- Every refused approver grant is logged as `delegation.refused` with op
+  `approver_grant` and only ids and a reason: `identity_unpinnable` (a
+  claimed agent, no address), `identity_mismatch`,
+  `approver_target_not_repo`, `unconfigured` (with `repo` and
+  `merge_targets: "unconfigured"`) or `codeowners_unreadable` (with
+  `repo`; relay-control's stand-in for Cloud's `not_owner`,
+  `no_codeowners` and `no_access`). The rest of this section describes how
+  a stored approver row behaves.
 - At attest, at redeem and at a release-gate redeem, the binding is re-read
   and Relaycast's live agent must still carry the pinned id and address;
   otherwise `identity_mismatch`.
@@ -219,7 +241,10 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   granter's own agents), until the rules text and a desktop line name
   approvers. Its signed claims, the attestation and redeem audit rows and
   the redeem response carry `approver: {grant_id, agent_id, address,
-  granted_by}`.
+  granted_by, granted_by_standing}`, as does a release gate's
+  `gate.redeemed` row. `granted_by_standing` is whether the granter is a
+  code owner of the action's target; Cloud judges it fresh at redeem, and
+  relay-control, reading no CODEOWNERS, always reports `none`.
 - Hard-limit classes (deploy, secret_change, destructive) are covered only
   when the grant lists them; high-risk actions stay single use per action.
 - **What an approver can redeem here.** Cloud reads GitHub at redeem: on a
