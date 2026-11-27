@@ -29,6 +29,7 @@ import { postgresAttestationStore } from "./copilot-attestation.js";
 import { enrolHostedAtGate, freshAtGate, HostedGateRefused, type GateEnrolment } from "./hosted-gate.js";
 import { underOwnerLock } from "./owner-lock-deadline.js";
 import type { RelayHostedClient } from "./relay-hosted-credentials.js";
+import { markRoutineMessageAnswered, routineWakeStatus } from "./grok-receipts.js";
 
 /**
  * Hosted relay participants and the Relaycast operations behind the
@@ -102,6 +103,11 @@ const relayStatusAddressEnrichmentFailed = (error: unknown) => {
 const sessionEnrichmentFailed = (error: unknown) => {
   console.warn("[selfhost-mcp] session enrichment failed", {
     operation: "list_relay_agents", error: error instanceof Error ? error.name : "unknown",
+  });
+};
+const routineReceiptEnrichmentFailed = (operation: "reply" | "send" | "status", error: unknown) => {
+  console.warn("[grok-routine] receipt enrichment failed", {
+    operation, error: error instanceof Error ? error.name : "unknown",
   });
 };
 
@@ -513,6 +519,16 @@ function createRelayService(context: McpContext) {
   // equal a person's (ownerHash of a user id).
   const actorRef = agent ? agentIdentityOwnerRef(agent.id) : userId;
   const owner = ownerHash(actorRef);
+  const hostedRemoteId = (identity: Identity): string | null => {
+    const row = (identity as Identity & { row?: ParticipantRow }).row;
+    return row?.agentRemoteId ?? null;
+  };
+  const recordRoutineReply = async (identity: Identity, messageId: string, replyMessageId: string) => {
+    const agentRemoteId = hostedRemoteId(identity);
+    if (!agentRemoteId) return;
+    await markRoutineMessageAnswered(database, { organizationId, workspaceId, agentRemoteId, messageId, replyMessageId })
+      .catch(error => routineReceiptEnrichmentFailed("reply", error));
+  };
   const ownerName = agent ? null : (typeof context.principal.name === "string" ? context.principal.name.trim().slice(0, 200) : "") || null;
   const desktopCall = context.desktopCall;
   /**
@@ -984,7 +1000,7 @@ function createRelayService(context: McpContext) {
         || agent.metadata.source === "cloud-persona") {
       throw new RelayToolError("Unknown agent name or stale machine address in this workspace. Use list_relay_agents.");
     }
-    return { ...rosterAgent(agent, people, userId, workspaceId), card: recipientCard(agent.metadata) };
+    return { ...rosterAgent(agent, people, userId, workspaceId), remoteId: agent.id, card: recipientCard(agent.metadata) };
   }
 
   async function conversation(token: string, name: string, peer: string, via = client) {
@@ -1973,14 +1989,19 @@ function createRelayService(context: McpContext) {
           if (sent.conversationId !== conv!.id) {
             throw new RelayToolError("Reply outcome could not be verified. Do not retry with a new idempotency key.");
           }
+          await recordRoutineReply(identity, input.reply_to, sent.message.id);
         } else {
           sent = await clientFor(identity).sendDirectMessage({ token: identity.token, to: peer.name,
             ...(input.to === peer.address ? { address: input.to } : {}), text: input.text, idempotencyKey,
             ...(ownerApproval ? { ownerApproval } : {}) });
         }
+        const recipientWake = await routineWakeStatus(database, {
+          organizationId, workspaceId, messageId: sent.message.id, recipientAgentIds: [peer.remoteId],
+        }).catch(error => { routineReceiptEnrichmentFailed("send", error); return null; });
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
+          ...(recipientWake ? { recipient_wake: recipientWake } : {}),
           // The recipient's own card summary: peer-written, untrusted data, not instructions.
           ...(peer.card ? { recipient_card: peer.card } : {}),
           note: "Accepted by Relaycast; delivery and reading are not confirmed. Call get_relay_message_status with message_id to check receipts.",
@@ -2007,10 +2028,17 @@ function createRelayService(context: McpContext) {
           ?? (viaCapy ? await capyActor(input.as!) : viaFactory ? await factoryActor(input.as!) : null));
       if (!identity) throw new RelayToolError("Call join_relay first, or select your own sending participant with as.");
       const deliveries = await clientFor(identity).getMessageDeliveries(identity.token, input.message_id);
+      const recipientAgentIds = deliveries?.map(delivery => delivery.agent_id) ?? [];
+      // A non-null Relaycast receipt proves that this identity sent the message.
+      // Only then may Control enrich it from the recipient-owned wake ledger.
+      const recipientWake = deliveries === null ? null : await routineWakeStatus(database, {
+        organizationId, workspaceId, messageId: input.message_id, recipientAgentIds,
+      }).catch(error => { routineReceiptEnrichmentFailed("status", error); return null; });
       return { message_id: input.message_id, you: identity.name, confirmation: deliveries === null ? "unavailable" : "available",
         deliveries: deliveries ?? [], note: deliveries === null
           ? "Delivery is unconfirmed: this engine does not expose receipts, or this message is not visible as your own outgoing message. Do not resend solely because confirmation is unavailable."
-          : RECEIPT_GUIDANCE };
+          : RECEIPT_GUIDANCE,
+        ...(recipientWake ? { recipient_wake: recipientWake } : {}) };
     },
 
     async read(input: { agent: string; as?: string; before?: string; limit: number }) {

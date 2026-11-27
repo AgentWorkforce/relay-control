@@ -4,8 +4,12 @@ import { randomUUID } from "node:crypto";
 import { loadConfig } from "../src/config.js";
 import { decryptSecret, encryptSecret } from "../src/crypto.js";
 import { createRelaycastClient } from "../src/messaging/relaycast.js";
-import { GrokRoutines, GROK_SETUP_PATH, grokRoutinesOptions, isDuplicateRoutine } from "../src/mcp/grok-routines.js";
+import {
+  GROK_ROUTINE_MAX_BACKOFF_MS, GROK_ROUTINE_SCAN_CONCURRENCY, GROK_ROUTINE_SCAN_INTERVAL_MS, GROK_ROUTINE_SCAN_LIMIT,
+  GrokRoutines, GROK_SETUP_PATH, grokRoutinesOptions, isDuplicateRoutine, runGrokRoutineTasks,
+} from "../src/mcp/grok-routines.js";
 import { grokRoutinePrompt, parseGrokRoutineDetails } from "../src/mcp/grok-routine.js";
+import { routineWakeStatus } from "../src/mcp/grok-receipts.js";
 import { eventSteps, grantEventsSettings } from "../src/mcp/grok-events-policy.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
 import { revokeMcpOAuthGrantRows } from "../src/mcp/oauth/revocations.js";
@@ -16,7 +20,6 @@ import { grokFixture, KEY, KEYRING, URL } from "./support/grok-fixture.js";
 const fixture = grokFixture;
 
 const text = (result: any) => (result.content as Array<{ text: string }>).map(item => item.text).join("\n");
-
 test("Cloud copy: connect returns Cloud's webhook prompt, response shape and next_steps; other names are refused per bot", async t => {
   const f = await fixture(t);
   const report = (await f.tool("describe_capabilities")).structuredContent as any;
@@ -26,12 +29,103 @@ test("Cloud copy: connect returns Cloud's webhook prompt, response shape and nex
   assert.equal(connected.requires_user_action, true);
   assert.equal(connected.routine_prompt, grokRoutinePrompt("fake-grok", { canReply: true }));
   assert.match(connected.routine_prompt, /get_event with the body's eventId/);
+  assert.match(connected.routine_prompt, /stop for that event if get_event says alreadyAnswered is true/);
+  assert.match(connected.routine_prompt, /eventId or data\.messageId was already handled in this routine chat/);
   assert.match(connected.setup_url, /grant=.*&from=sender$/);
   assert.match(connected.next_steps, /^Create the Agent Relay inbound Webhook routine now/);
   assert.equal(connected.inbox_address, `fake-grok@cloud-${f.world.agents.get("fake-grok")!.id}`);
   const wrong = await f.tool("connect_grok_bot_routine", { name: "other-bot" });
   assert.equal(wrong.isError, true);
   assert.match(text(wrong), /This Agent Relay connection was approved as fake-grok, so it cannot act or read as other-bot/);
+});
+
+test("Cloud copy: a manual reply dedupes a late wake and sender receipts progress queued -> wake_sent -> replied", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY, reply_mode: "answer" });
+  const sent = await f.message("sender", "answer once");
+  const recipient = f.world.agents.get("fake-grok")!;
+  const receipt = () => routineWakeStatus(f.database, {
+    organizationId: f.owner.organizationId, workspaceId: f.owner.workspaceId,
+    messageId: sent.message.id, recipientAgentIds: [recipient.id],
+  });
+
+  assert.equal((await receipt())!.state, "queued");
+  await f.routines.tick();
+  const eventId = f.calls[0]!.body.eventId;
+  const wakeSent = (await receipt())!;
+  assert.equal(wakeSent.state, "wake_sent");
+  assert.match(wakeSent.wake_sent_at!, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(wakeSent.attempts, 1);
+  assert.equal(((await f.tool("get_event", { eventId })).structuredContent as any).alreadyAnswered, false);
+
+  const reply = (await f.tool("send_relay_message", { to: "sender", reply_to: sent.message.id, text: "one answer" })).structuredContent as any;
+  const answered = (await f.tool("get_event", { eventId })).structuredContent as any;
+  assert.equal(answered.alreadyAnswered, true);
+  assert.equal(answered.replyMessageId, reply.message_id);
+  const replied = (await receipt())!;
+  assert.equal(replied.state, "replied");
+  assert.equal(replied.wake_sent_at, wakeSent.wake_sent_at);
+  assert.match(replied.replied_at!, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("Cloud copy: send and verified status expose Cloud's top-level recipient_wake contract", async t => {
+  const f = await fixture(t, true, { receipts: true });
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  const recipient = f.sender("receipt-grok");
+  const grantId = randomUUID(), familyId = randomUUID();
+  await f.addGrant(grantId, recipient.name, familyId);
+  await f.database.query("UPDATE mcp_oauth_grants SET agent_remote_id=$2 WHERE id=$1", [grantId, recipient.id]);
+  await f.database.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,cloud_copy,delivery_mode)
+    VALUES ($1,$2,true,'webhook')`, [grantId, encryptSecret(JSON.stringify({ url: URL, key: KEY }), KEYRING.active)]);
+
+  const sent = (await f.tool("send_relay_message", { to: recipient.name, text: "wake status" })).structuredContent as any;
+  assert.deepEqual(sent.recipient_wake, {
+    state: "queued", wake_sent_at: null, replied_at: null, next_attempt_at: null, attempts: 0,
+    hint: "wake_sent means the routine endpoint accepted the trigger; it does not prove the client woke. Allow time for a reply.",
+  });
+  const status = (await f.tool("get_relay_message_status", { message_id: sent.message_id })).structuredContent as any;
+  assert.equal(status.confirmation, "available");
+  assert.deepEqual(status.recipient_wake, sent.recipient_wake);
+});
+
+test("Cloud copy: a manual inbox reply recorded before event ingestion makes the delayed wake already answered", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY, reply_mode: "answer" });
+  const sent = await f.message("sender", "manual check sees this first");
+  const reply = (await f.tool("send_relay_message", {
+    to: "sender", reply_to: sent.message.id, text: "answered during manual check",
+  })).structuredContent as any;
+  assert.equal((await f.database.query("SELECT 1 FROM grok_bot_events")).rows.length, 0, "the delayed scan has not ingested the event");
+  const ledger = (await f.database.query<{ message_id: string; reply_message_id: string }>(
+    "SELECT message_id,reply_message_id FROM grok_bot_answered_messages")).rows[0]!;
+  assert.deepEqual(ledger, { message_id: sent.message.id, reply_message_id: reply.message_id });
+
+  await f.routines.tick();
+  assert.equal(f.calls.length, 1, "the delayed webhook still wakes once");
+  const event = (await f.tool("get_event", { eventId: f.calls[0]!.body.eventId })).structuredContent as any;
+  assert.equal(event.alreadyAnswered, true);
+  assert.equal(event.replyMessageId, reply.message_id);
+  assert.equal(event.noteToUser, false);
+  assert.equal(event.reply, undefined);
+  assert.match(event.nextSteps, /Stop: do not reply or post another note/);
+});
+
+test("routine scan work is bounded, covers more than the old 20-row page, and uses a sub-five-second cadence", async () => {
+  let active = 0, maximum = 0;
+  const visited: number[] = [];
+  await runGrokRoutineTasks(Array.from({ length: 25 }, (_, index) => index), GROK_ROUTINE_SCAN_CONCURRENCY, async value => {
+    active += 1; maximum = Math.max(maximum, active);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    visited.push(value); active -= 1;
+  });
+  assert.equal(GROK_ROUTINE_SCAN_LIMIT, 100);
+  assert.equal(GROK_ROUTINE_SCAN_INTERVAL_MS, 1_000);
+  assert.equal(GROK_ROUTINE_MAX_BACKOFF_MS, 30_000);
+  assert.equal(visited.length, 25);
+  assert.equal(maximum, GROK_ROUTINE_SCAN_CONCURRENCY);
 });
 
 test("Cloud copy: one-paste setup, one Cloud-shaped wake per message, acknowledgement after commit, get_event app block", async t => {
@@ -125,6 +219,8 @@ test("Cloud copy: polling stores no credential, never wakes, and pages get_recen
   assert.equal(polling.mode, "polling");
   assert.equal(polling.suggested_interval_minutes, 15);
   assert.match(polling.routine_prompt, /get_recent_events with agent = "fake-grok", scheduled = true, limit = 50, and since = "/);
+  assert.match(polling.routine_prompt, /Stop for that event if get_event says alreadyAnswered is true/);
+  assert.match(polling.routine_prompt, /eventId or data\.messageId was already handled in this routine chat/);
   const row = (await f.database.query("SELECT credentials_ciphertext,delivery_mode FROM grok_bot_routines")).rows[0]!;
   assert.equal(row.credentials_ciphertext, null); assert.equal(row.delivery_mode, "polling");
   await f.message("sender", "first"); await f.message("sender", "second");
@@ -180,6 +276,29 @@ test("Cloud copy: a failed wake keeps its event pending with the same id and bac
   f.fail(202); f.advance(); await f.routines.tick();
   assert.equal(f.calls.length, 2);
   assert.equal(f.calls[0]!.body.eventId, f.calls[1]!.body.eventId);
+});
+
+test("Cloud copy: a failed wake is visible to the sender and retry backoff never exceeds 30 seconds", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  const sent = await f.message();
+  const recipient = f.world.agents.get("fake-grok")!;
+  f.fail(503);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await f.routines.tick();
+    const row = (await f.database.query<{ next_attempt_at: Date | string; updated_at: Date | string }>(
+      "SELECT next_attempt_at,updated_at FROM grok_bot_routines")).rows[0]!;
+    assert.ok(new Date(row.next_attempt_at).getTime() - new Date(row.updated_at).getTime() <= GROK_ROUTINE_MAX_BACKOFF_MS);
+    f.advance();
+  }
+  const status = await routineWakeStatus(f.database, {
+    organizationId: f.owner.organizationId, workspaceId: f.owner.workspaceId, messageId: sent.message.id,
+    recipientAgentIds: [recipient.id],
+  });
+  assert.equal(status!.state, "backoff");
+  assert.match(status!.next_attempt_at!, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(status!.attempts, 6);
 });
 
 test("Cloud copy is off by default: no event tools, the #136 inbox prompt, and a typo in the flag fails start-up", async t => {

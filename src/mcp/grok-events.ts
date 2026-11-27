@@ -34,8 +34,8 @@ export function grokEventId(grantId: string, deliveryId: string): string {
 
 type Payload = { data: Record<string, unknown>; detail: Record<string, unknown> };
 type EventRow = { event_id: string; grant_seq: string | number; name: string; sender: string | null; occurred_at: Date | string;
-  payload_ciphertext: string };
-const COLUMNS = "event_id,grant_seq,name,sender,occurred_at,payload_ciphertext";
+  payload_ciphertext: string; answered_at: Date | string | null; reply_message_id: string | null };
+const COLUMNS = "event_id,grant_seq,name,sender,occurred_at,payload_ciphertext,answered_at,reply_message_id";
 
 const iso = (value: Date | string) => new Date(value).toISOString();
 
@@ -99,10 +99,15 @@ export async function insertEvent(tx: SqlExecutor, keyring: EncryptionKeyring, g
     "UPDATE grok_bot_routines SET event_seq=event_seq+1 WHERE grant_id=$1 RETURNING event_seq", [grantId])).rows[0];
   if (!seq) throw new Error("routine_unavailable");
   // created_at uses the same clock as the retention sweep and the read filter.
-  await tx.query(`INSERT INTO grok_bot_events(grant_id,event_id,grant_seq,name,sender,occurred_at,payload_ciphertext,notified_at,created_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+  await tx.query(`INSERT INTO grok_bot_events(grant_id,event_id,grant_seq,name,sender,occurred_at,payload_ciphertext,notified_at,created_at,message_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
   [grantId, event.eventId, seq.event_seq, event.name, typeof event.payload.data.from === "string" ? event.payload.data.from : null,
-    event.occurredAt, encryptSecret(JSON.stringify(event.payload), keyring.active), wake ? null : now, now]);
+    event.occurredAt, encryptSecret(JSON.stringify(event.payload), keyring.active), wake ? null : now, now,
+    typeof event.payload.data.messageId === "string" ? event.payload.data.messageId : null]);
+  await tx.query(`UPDATE grok_bot_events e SET answered_at=a.answered_at,reply_message_id=a.reply_message_id
+      FROM grok_bot_answered_messages a
+      WHERE e.grant_id=$1 AND e.event_id=$2 AND a.grant_id=e.grant_id AND a.message_id=e.message_id`,
+  [grantId, event.eventId]);
 }
 
 /** Until a channel-wake policy exists here, a routine wakes for direct messages and channel mentions only. */
@@ -158,10 +163,14 @@ export async function getEvent(tx: SqlExecutor, keyring: EncryptionKeyring, gran
     return earlierEvent ? [earlierEvent] : [];
   }).filter(item => item.data.conversationId === conversationId).slice(0, 5).reverse()
     .map(item => ({ from: String(item.data.from ?? ""), at: item.timestamp, text: String(item.detail.text ?? item.data.summary ?? "").slice(0, 500) })) : [];
-  return { ...event, earlierMessages: earlier, noteToUser: settings.noteEveryMessage, replyMode: settings.replyMode,
+  const alreadyAnswered = event.name === RELAY_MESSAGE_EVENT && row.answered_at !== null;
+  return { ...event, alreadyAnswered, replyMessageId: row.reply_message_id,
+    earlierMessages: earlier, noteToUser: alreadyAnswered ? false : settings.noteEveryMessage, replyMode: settings.replyMode,
     trustedSender: trust.trusted, trustedSenderReason: trust.reason,
-    nextSteps: eventSteps(settings, { fetched: true, trust, channel: event.name === RELAY_CHANNEL_MESSAGE_EVENT }),
-    ...replyCall(event, settings, trust) };
+    nextSteps: alreadyAnswered
+      ? "This message already has a reply from this inbox (another chat or an earlier run). Stop: do not reply or post another note for it."
+      : eventSteps(settings, { fetched: true, trust, channel: event.name === RELAY_CHANNEL_MESSAGE_EVENT }),
+    ...(alreadyAnswered ? {} : replyCall(event, settings, trust)) };
 }
 
 /** Cloud's getRecentEvents contract: since is this grant's cursor or an ISO timestamp; oldest first; retained events only. */

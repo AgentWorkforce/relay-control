@@ -46,8 +46,9 @@ and provider response bodies are never returned.
 
 ## Delivery and lifecycle
 
-The server checks up to 20 due connections per pass, normally every five
-seconds. It verifies the pinned remote agent's ID, workspace and owner metadata
+The server checks up to 100 due connections per pass with at most five remote
+checks in flight, normally starting the next pass one second after the previous
+one finishes. It verifies the pinned remote agent's ID, workspace and owner metadata
 before reading its pending inbox. One batch wake contains
 `{eventId, name:"relay.inbox", agent, pending_count}` with no message text.
 The routine reads and acknowledges deliveries through `check_relay_inbox`.
@@ -57,7 +58,9 @@ the channel/thread indicated by `reply_hint`.
 Accepted delivery IDs are persisted, bounded to the current inbox page of up
 to 100 messages. Subsequent scans and restarts do not wake repeatedly for the
 same pending page. Once the bot acknowledges it, later pages can advance.
-Failures retry with exponential backoff capped at five minutes. The worker
+Failures retry with exponential backoff capped at 30 seconds. A slow or failing
+routine occupies only its bounded worker slot instead of delaying every routine
+behind it. The worker
 never acknowledges messages. A crash after Grok accepts a trigger but before
 the database commits can cause a duplicate; `webhook-id` remains stable for a
 retry of the same batch. The routine must deduplicate by `delivery_id`.
@@ -101,7 +104,8 @@ Off by default. With it off, everything above applies unchanged. With it on,
 new Grok Bot routines get Agent Relay Cloud's routine behaviour: Cloud's
 routine prompt, sender check and reply policy, copied as is. Cloud itself is
 not changed. See [the spec](specs/grok-bot-dynamic-prompt.md), Phase 1. Apply
-migration `0093_grok_routines_cloud_copy.sql` first.
+migrations `0093_grok_routines_cloud_copy.sql` and
+`0101_grok_routine_receipts.sql` first.
 
 - **Per routine, not per server.** A routine uses the copy only if it was
   saved on the setup page, or connected for polling, while the flag was on
@@ -153,6 +157,10 @@ migration `0093_grok_routines_cloud_copy.sql` first.
   reply** sets the reply mode. `notes-only` (the default) never replies.
   `acknowledge` and `answer` reply automatically only to trusted senders and
   ask the person about anyone else.
+- Each ingested event stores its Relay message ID. A reply sent through this
+  connection records `alreadyAnswered: true` on `get_event`; the webhook prompt
+  also skips event IDs and message IDs already handled in its routine chat. A
+  late wake therefore stops without a second reply or note.
 - The setup page also accepts one paste of the routine's URL and header. A
   routine URL can be saved under only one connection on this server; a
   concurrent second save gets the same refusal. This rule applies with the

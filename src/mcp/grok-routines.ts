@@ -43,6 +43,23 @@ type Acknowledgement = { via: RelaycastClient; token: string; ids: string[] };
 const DUPLICATE_ROUTINE = "This Grok routine is already connected to another Agent Relay connection. Disconnect it there first, or use a different routine.";
 const ROUTINE_URL_INDEX = "grok_bot_routines_routine_url";
 const FROM = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,511}$/;
+export const GROK_ROUTINE_SCAN_LIMIT = 100;
+export const GROK_ROUTINE_SCAN_CONCURRENCY = 5;
+export const GROK_ROUTINE_SCAN_INTERVAL_MS = 1_000;
+export const GROK_ROUTINE_MAX_BACKOFF_MS = 30_000;
+const GROK_ROUTINE_RETENTION_SWEEP_MS = 60 * 60_000;
+
+export async function runGrokRoutineTasks<T>(values: readonly T[], concurrency: number,
+  visit: (value: T) => Promise<void>): Promise<void> {
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < values.length) {
+      const value = values[cursor++];
+      if (value !== undefined) await visit(value);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+}
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
 const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -104,6 +121,7 @@ export class GrokRoutines {
   get cloudCopy(): boolean { return this.options.cloudCopy === true; }
 
   private now() { return this.options.now?.() ?? new Date(); }
+  private lastRetentionSweep?: number;
 
   async grant(tx: SqlExecutor, id: string, owner: Owner): Promise<Grant> {
     await lockUser(tx, owner.userId);
@@ -333,15 +351,21 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
    * is not scanned while the copy is off, so it can neither wake nor starve the scan.
    */
   async tick(signal?: AbortSignal): Promise<void> {
-    // Retention holds whatever the flag says and whether or not a routine still exists to scan.
-    await this.options.database.query("DELETE FROM grok_bot_events WHERE created_at<$1", [this.retainedSince()]);
+    // Retention holds whatever the flag says and whether or not a routine still exists to scan. The worker now scans
+    // every second, so keep retention cleanup hourly instead of putting two DELETEs on every pass.
+    const now = this.now();
+    if (this.lastRetentionSweep === undefined || now.getTime() - this.lastRetentionSweep >= GROK_ROUTINE_RETENTION_SWEEP_MS) {
+      await this.options.database.query("DELETE FROM grok_bot_events WHERE created_at<$1", [this.retainedSince()]);
+      await this.options.database.query("DELETE FROM grok_bot_answered_messages WHERE answered_at<$1", [this.retainedSince()]);
+      this.lastRetentionSweep = now.getTime();
+    }
     const candidates = await this.options.database.query<{ grant_id: string; user_id: string; organization_id: string; workspace_id: string }>(
       `SELECT r.grant_id,g.user_id,g.organization_id,g.workspace_id FROM grok_bot_routines r
        JOIN mcp_oauth_grants g ON g.id=r.grant_id WHERE r.next_attempt_at<=$1 AND ($2::boolean OR NOT r.cloud_copy)
-       ORDER BY r.next_attempt_at LIMIT 20`, [this.now(), this.cloudCopy]);
+       ORDER BY r.next_attempt_at,r.grant_id LIMIT $3`, [this.now(), this.cloudCopy, GROK_ROUTINE_SCAN_LIMIT]);
     const acknowledgements: Acknowledgement[] = [];
-    for (const candidate of candidates.rows) {
-      if (signal?.aborted) break;
+    await runGrokRoutineTasks(candidates.rows, GROK_ROUTINE_SCAN_CONCURRENCY, async candidate => {
+      if (signal?.aborted) return;
       const owner: Owner = { userId: candidate.user_id, organizationId: candidate.organization_id, workspaceId: candidate.workspace_id };
       const recovery = await this.options.database.transaction(async (tx): Promise<Recovery | null> => {
         let grant: Grant;
@@ -441,18 +465,18 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         return null;
       });
       if (recovery) await this.recover(owner, candidate.grant_id, recovery);
-    }
+    });
     // Cloud copy: acknowledge only deliveries whose events have committed. A failed acknowledgement is retried on the
     // next scan; the event id is stable per delivery, so the re-read inserts nothing new. Each routine's acknowledgements
     // share one budget, and stop() aborts them, so one hung connection cannot hold the scan.
-    for (const { via, token, ids } of acknowledgements) {
+    await runGrokRoutineTasks(acknowledgements, GROK_ROUTINE_SCAN_CONCURRENCY, async ({ via, token, ids }) => {
       const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
       const ackSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       for (const id of ids) {
         if (signal?.aborted) return;
         try { await via.acknowledgeDelivery(token, id, ackSignal); } catch { break; }
       }
-    }
+    });
   }
 
   /**
@@ -490,7 +514,10 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
         // An event whose payload cannot be read (a removed key) is skipped rather than blocking later wakes.
         const body = wakeBody(row, this.options.keyring, remote.name);
         // Cloud's `from` narrows which messages wake the routine; others stay readable through get_recent_events.
+        let sent = false;
         if (body && (!routine.from_filter || row.sender === routine.from_filter)) {
+          await tx.query("UPDATE grok_bot_events SET wake_attempts=wake_attempts+1 WHERE grant_id=$1 AND event_id=$2",
+            [grant.id, row.event_id]);
           try {
             const response = await (this.options.fetchImpl ?? fetch)(credentials.url, { method: "POST", redirect: "error", signal: input.signal,
               headers: { "content-type": "application/json", ...grokRoutineHeaders(credentials.key, grant.id, row.event_id) },
@@ -499,8 +526,10 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
             if (!response.ok) throw new Error("webhook_unavailable");
           } catch { failure = true; break; }
           woke = true;
+          sent = true;
         }
-        await tx.query("UPDATE grok_bot_events SET notified_at=$3 WHERE grant_id=$1 AND event_id=$2", [grant.id, row.event_id, now]);
+        await tx.query(`UPDATE grok_bot_events SET notified_at=$3,wake_sent_at=CASE WHEN $4 THEN $3 ELSE wake_sent_at END
+          WHERE grant_id=$1 AND event_id=$2`, [grant.id, row.event_id, now, sent]);
       }
     } else if (routine.delivery_mode === "polling") {
       // A schedule reads the log itself; nothing is pending a wake.
@@ -519,7 +548,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
   /** Neither provider error bodies nor URLs/keys are ever stored or logged. */
   private async failed(tx: SqlExecutor, grantId: string, failures: number): Promise<void> {
     await tx.query(`UPDATE grok_bot_routines SET failures=failures+1,last_error='delivery_unavailable',next_attempt_at=$2,updated_at=$3
-      WHERE grant_id=$1`, [grantId, new Date(this.now().getTime() + Math.min(300_000, 5_000 * 2 ** Math.min(failures + 1, 6))), this.now()]);
+      WHERE grant_id=$1`, [grantId, new Date(this.now().getTime() + Math.min(GROK_ROUTINE_MAX_BACKOFF_MS, 5_000 * 2 ** Math.min(failures + 1, 6))), this.now()]);
   }
 
   /**
@@ -574,7 +603,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
     const run = () => {
       if (this.abort?.signal.aborted) return;
       this.active = this.tick(this.abort?.signal).catch(() => console.warn("[grok-routines] scan unavailable")).finally(() => {
-        if (!this.abort?.signal.aborted) { this.timer = setTimeout(run, 5_000); this.timer.unref(); }
+        if (!this.abort?.signal.aborted) { this.timer = setTimeout(run, GROK_ROUTINE_SCAN_INTERVAL_MS); this.timer.unref(); }
       });
     };
     run();

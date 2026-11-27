@@ -25,7 +25,11 @@ export const URL = "https://api2.cursor.sh/automations/webhook/rt_fake";
 export const KEY = "crsr_" + "fake_routine_key_".repeat(3);
 
 /** A Grok Bot OAuth connection on a self-hosted app, with the Cloud copy on unless cloudCopy is false. */
-export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: { dynamicPrompt?: { bootstrapVersion: number }; agentRules?: AgentRules } = {}) {
+export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: {
+  dynamicPrompt?: { bootstrapVersion: number };
+  agentRules?: AgentRules;
+  receipts?: boolean;
+} = {}) {
   const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
   const owner = { userId: randomUUID(), organizationId: randomUUID(), workspaceId: randomUUID(), grantId: randomUUID(), tokenFamilyId: randomUUID() };
   const clientId = "mcpc_" + randomUUID();
@@ -50,6 +54,20 @@ export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: 
     relayPaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: new Date().toISOString() })) });
+    const receipt = /^\/v1\/messages\/([^/]+)\/deliveries$/.exec(url.pathname);
+    if (extra.receipts && receipt && (init?.method ?? "GET") === "GET") {
+      const messageId = decodeURIComponent(receipt[1]!);
+      const caller = [...world.agents.values()].find(agent => agent.token === (headers.get("authorization") ?? "").replace(/^Bearer /, ""));
+      const message = world.messages.get(messageId);
+      if (!caller || !message || message.agent_name !== caller.name) {
+        return Response.json({ ok: false, error: { code: "not_found" } }, { status: 404 });
+      }
+      return Response.json({ message_id: messageId, deliveries: world.deliveries
+        .filter(row => row.message.id === messageId)
+        .map(row => ({ id: row.id, agent_id: row.agentId ?? world.agents.get(row.agent)?.id, agent_name: row.agent,
+          status: "pending", state: "queued", created_at: message.created_at, delivered_at: null, accepted_at: null,
+          acked_at: null, replied_at: null, reply_message_id: null, dead_lettered_at: null, error: null, read_at: null })) });
+    }
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
       (headers.get("authorization") ?? "").replace(/^Bearer /, ""), init?.body ? JSON.parse(String(init.body)) : null, headers.get("idempotency-key"));
     if (url.pathname === "/v1/agent" && result?.status === 200) (result.body as any).data.workspace_id = "fake-workspace";
