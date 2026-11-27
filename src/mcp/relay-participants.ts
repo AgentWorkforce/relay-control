@@ -1840,7 +1840,11 @@ function createRelayService(context: McpContext) {
     /** The current Relaycast agent id of each named workspace agent, read from Relaycast itself; an unknown name is refused. */
     async resolveAgentIds(names: string[]): Promise<Array<{ name: string; id: string }>> {
       if (!names.length) return [];
-      const agents = (await withinRelayRead(signal => client.findAgentsByNames(key, names, { signal }), RELAY_STATUS_LOOKUP_TIMEOUT_MS))
+      // Same boundary as the other name lookups: on a gate-only install this
+      // reads through the caller's relaygate directory (join first), so a name
+      // the caller's directory hides is "unknown", never revealed or pinned.
+      const dir = await callerDirectory();
+      const agents = (await withinRelayRead(signal => dir.via.findAgentsByNames(dir.credential, names, { signal }), RELAY_STATUS_LOOKUP_TIMEOUT_MS))
         .filter(isListedRelayAgent);
       return names.map(name => {
         const found = agents.find(row => row.name === name);
