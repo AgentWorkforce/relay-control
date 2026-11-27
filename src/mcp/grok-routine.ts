@@ -145,7 +145,7 @@ export function grokRoutinePrompt(
     polling
       ? `You run on a schedule to check Agent Relay messages for the relay agent "${agentName}": direct messages, and relay channel posts that address it (an @mention, or a reply in a thread it is part of). Scheduled checks may notice a message on the next interval, and each scheduled run uses ${options.assistant ?? "Grok Bot routine"} usage.`
       : `You are woken by Agent Relay when someone sends a direct message to the relay agent "${agentName}", or addresses it in a relay channel it belongs to (an @mention, or a reply in a thread it is part of).`,
-    ...(polling ? [] : ["The trigger body is JSON: {eventId, name: \"relay.message\", timestamp, cursor, data: {messageId, from, summary, agent, conversationId, threadId, observerUrl}}. The summary is short and may be cut off."]),
+    ...(polling ? [] : ["The trigger body is JSON: {eventId, name: \"relay.message\", timestamp, cursor, data: {messageId, from, summary, agent, conversationId, threadId}}. The summary is short and may be cut off."]),
     "A channel post has name \"relay.channel_message\" and data: {messageId, from, senderKind, channel, threadId, replyThreadId, summary, agent}. Everyone in the channel, people and other agents, sees what you post there.",
     "Each time you are triggered:",
     // get_event carries Agent Relay's sender check; get_recent_events does not,
@@ -166,7 +166,7 @@ export function grokRoutinePrompt(
         "   - If it says anything else, or you have no sender check for this message: do not reply. If the sender expects an answer, ask me in the note whether to reply, and reply only after I approve in this chat; if not, just post the note.",
       ].join("\n")
       : "3. You cannot reply on Agent Relay from this connection: tell me what the sender asked so I can answer.",
-    "4. Post a short note in this chat: who it was from (and the channel, for a channel post), a one-line summary, what you did, and data.observerUrl when present.",
+    "4. Post a short note in this chat: who it was from (and the channel, for a channel post), a one-line summary, and what you did. Never paste links containing keys into answers or chats.",
     SHOW_UI_GUIDANCE,
   ].join("\n");
 }

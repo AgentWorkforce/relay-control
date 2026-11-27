@@ -116,7 +116,7 @@ export function eventSteps(settings: Pick<EventsSettings, "noteEveryMessage" | "
     "notes-only": null,
   }[settings.replyMode];
   const noteStep = settings.noteEveryMessage
-    ? `${replyStep ? "then " : ""}post a short note to the person: who wrote, a one-line summary, what you replied (or that you are waiting on them, or that the reply was not sent), and data.observerUrl when present;`
+    ? `${replyStep ? "then " : ""}post a short note to the person: who wrote, a one-line summary, what you replied (or that you are waiting on them, or that the reply was not sent); never paste links containing keys into answers or chats;`
     : "do not post a note (the person turned notes off);";
   const steps = [
     // get_event's own steps start after the fetch, so they never send the agent back to it.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createMcpOAuthConsentHandlers, McpOAuthContinuationError, mcpOAuthSetupHandoff,
+import { createMcpOAuthConsentHandlers, McpOAuthContinuationError,
   type McpConsentSession } from "../src/mcp/oauth/consent.js";
 import { createMcpOAuthProtocol, pkceS256 } from "../src/mcp/oauth/protocol.js";
 
@@ -16,7 +16,7 @@ const params = { client_id: client.clientId, response_type: "code", redirect_uri
 const body = { params, decision: "approve", workspace_id: principal.workspaceId, agent_name: "fake-agent" };
 
 function harness(options: { session?: McpConsentSession | null; access?: boolean; grok?: boolean; connected?: boolean;
-  continuationError?: boolean; nameTakenError?: boolean; setup?: boolean;
+  continuationError?: boolean; nameTakenError?: boolean;
   availability?: "available" | "yours" | "taken" | "unknown" | Error } = {}) {
   const calls: Array<{ operation: string; input?: unknown }> = [];
   const protocol = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: [SHARED, EVENTS] });
@@ -41,7 +41,6 @@ function harness(options: { session?: McpConsentSession | null; access?: boolean
       async listConnectedAgentNames(owner) { calls.push({ operation: "connected", input: owner });
         return options.connected ? [{ workspaceId: principal.workspaceId, agentName: "fake-agent" }] : []; },
     },
-    grokSetupEnabled: options.setup,
     now: () => Date.parse("2026-01-01T00:00:00Z"),
   });
   return { handlers, calls };
@@ -148,11 +147,7 @@ test("Grok hint correlation never supplies identity and consumes only the matchi
     assert.equal(Object.hasOwn(payload, "setup_url"), false);
     assert.equal((calls.find(call => call.operation === "code")!.input as { owner: { agentName: string } }).owner.agentName, "fake-agent");
   }
-  const setup = harness({ grok: true, setup: true });
-  const response = await setup.handlers.authorize(request(grokBody()));
-  const url = new URL((await response.json()).setup_url, ORIGIN);
-  assert.equal(url.searchParams.get("handoff"), mcpOAuthSetupHandoff("mcpac_fake-code"));
-  assert.equal(url.searchParams.get("workspace"), principal.workspaceId);
+
 });
 
 test("agent-name advisory stays session/workspace/live-member scoped", async () => {
