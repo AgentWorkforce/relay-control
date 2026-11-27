@@ -636,7 +636,9 @@ function createRelayService(context: McpContext) {
       const row = (await query.query<{ client_name: string | null; redirect_uris: string[]; used: string[] }>(
         `SELECT c.client_name, c.redirect_uris, ${usedRedirectUrisSql("$2::uuid", "c.client_id")} AS used
            FROM mcp_oauth_clients c WHERE c.client_id = $1`, [oauth.access.clientId, oauth.access.grantId])).rows[0];
-      return row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris ?? [] }, row.used ?? []) : "mcp" as const;
+      const kind = row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris ?? [] }, row.used ?? []) : "mcp" as const;
+      // relaygate's policy has no Slashy client: it enrols as the generic MCP client it was before.
+      return kind === "slashy" ? "mcp" as const : kind;
     })();
     return clientKind;
   }
@@ -876,6 +878,30 @@ function createRelayService(context: McpContext) {
     }
     if (!tokenUsable && !allowRejected) throw rejectedToken(name);
     return { row: { ...row, agentName: name }, token, name, remotePresent: remote !== null, tokenUsable };
+  }
+
+  /**
+   * The sender ids, of `ids`, that are this owner's own person (human)
+   * identity in this workspace's relay. Person identities are registered with
+   * Relaycast directly, on gate-only installs too, so the stored id is the
+   * Relaycast id deliveries carry (Desktop identities there hold relaygate
+   * ids, which is one more reason the owner's agents are trusted only when
+   * named explicitly). Relaycast stamps sender ids from the sending token,
+   * so a re-registered name never matches.
+   */
+  async function ownedSenders(ids: string[]): Promise<Set<string>> {
+    const unique = [...new Set(ids)];
+    if (agent || agentMissing || !unique.length) return new Set();
+    try {
+      const rows = (await context.relay.database.query<{ id: string }>(
+        `SELECT agent_remote_id AS id FROM person_identities
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND agent_remote_id = ANY($4::text[])`,
+        [context.workspace.id, context.principal.userId, relayWorkspaceId, unique])).rows;
+      return new Set(rows.map(row => row.id));
+    } catch {
+      console.warn("[mcp] check_relay_inbox owner proof unavailable");
+      return new Set();
+    }
   }
 
   async function touchPresence(identity: Identity): Promise<void> {
@@ -1868,6 +1894,29 @@ function createRelayService(context: McpContext) {
         ...(cursor && !await ownRun(as) ? { cursor_identity: cursor } : {}) };
     },
 
+    /**
+     * This connection's hosted participant, its Relaycast last_seen and its
+     * pending count, read without a heartbeat (slashy_inbox_status reports
+     * last_seen as the reminder's liveness, so this read must not move it).
+     * Null when no participant is joined. Nothing is acknowledged.
+     */
+
+    async hostedPresence(): Promise<{ name: string; address: string | null; last_seen: string | null; pending_count: number } | null> {
+      if (managed) return null;
+      const hosted = await participant(undefined, { allowMissing: true });
+      if (!hosted) return null;
+      const dir = directory(hosted);
+      const [agents, inbox] = await Promise.all([
+        withinRelayRead(
+          signal => dir.via.findAgentsByNames(dir.credential, [hosted.name], { signal }),
+          RELAY_STATUS_LOOKUP_TIMEOUT_MS,
+        ).catch(error => { relayStatusAddressEnrichmentFailed(error); return []; }),
+        clientFor(hosted).readHostedInbox(hosted.token),
+      ]);
+      const row = agents.find(agent => agent.name === hosted.name && isListedRelayAgent(agent));
+      return { name: hosted.name, address: row?.address ?? null, last_seen: row?.lastSeen ?? null, pending_count: inbox.length };
+    },
+
     async inbox(as: string | undefined, acknowledge: string[]) {
       if (managed) {
         await managedActorOnly(as);
@@ -1897,6 +1946,13 @@ function createRelayService(context: McpContext) {
         signal: AbortSignal.timeout(INBOX_SENDER_LOOKUP_TIMEOUT_MS),
       }).catch(error => { inboxSenderEnrichmentFailed(error); return []; })).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
+      // A Slashy reminder may send the owner's private answer to sender_address,
+      // so on Slashy connections the address is returned only when the roster
+      // agent behind the name is the token-stamped sender_id (cloud#6720 parity).
+      const agentIds = new Map(agents.map(agent => [agent.name, agent.id]));
+      const pinnedAddress = (message: { sender?: string | null; sender_id?: string | null }) =>
+        message.sender && message.sender_id && agentIds.get(message.sender) === message.sender_id
+          ? addresses.get(message.sender) ?? null : null;
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {
         for (const row of (await via.authenticatedAgent(hosted.token)).channels) channelNames.set(row.id, row.name);
@@ -1904,8 +1960,14 @@ function createRelayService(context: McpContext) {
           for (const row of await dir.via.listChannels(dir.credential)) channelNames.set(row.id, row.name);
         }
       }
+      // A Slashy connection acts on its owner's mail and calendar from these
+      // messages, so each says whether the sender's Relaycast agent id (never
+      // its name or text) is the owner's own person identity. An unreadable
+      // proof is false.
+      const ownerSenders = context.slashy ? await ownedSenders(messages.flatMap(message => message.sender_id ? [message.sender_id] : [])) : null;
       const enriched = messages.map(message => {
-        const base = { ...message, sender_address: message.sender ? addresses.get(message.sender) ?? null : null };
+        const base = { ...message, sender_address: context.slashy ? pinnedAddress(message) : message.sender ? addresses.get(message.sender) ?? null : null,
+          ...(ownerSenders ? { sender_is_owner: Boolean(message.sender_id && ownerSenders.has(message.sender_id)) } : {}) };
         if (isChannelDelivery(message)) {
           const channel = message.channel_id ? channelNames.get(message.channel_id) ?? null : null;
           const root = message.thread_id ?? message.message_id;

@@ -20,6 +20,7 @@ import { registerTeamActivity } from "./team-activity.js";
 import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
 import { registerGrokEventTools, registerGrokRoutineTools } from "./grok-routine-tools.js";
+import { registerSlashyInboxTools, SLASHY_SERVER_INSTRUCTIONS } from "./slashy.js";
 import { registerAgentRulesTools } from "./agent-rules-tools.js";
 import { registerSessionAccessTools } from "./session-access.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
@@ -61,7 +62,8 @@ export function buildMcpServer(context: McpContext): McpServer {
     { instructions: context.authMode === "staff_read_grant" ? STAFF_READ_GRANT_INSTRUCTIONS
       : context.authMode === "agent_identity" ? AGENT_IDENTITY_INSTRUCTIONS : context.oauth ? oauthMcpInstructions(context.principal.scopes) + (context.grokRoutines
       ? " This self-hosted server supports Grok Bot webhook wake-ups: after the person chooses them, call connect_grok_bot_routine for a secure setup link and routine prompt. Check grok_bot_routine_status; confirm a real message appeared in Grok before reporting success." : "") + (context.capyPermits
-      ? " Explicit bind_capy_thread may additionally permit send_relay_message as that existing Capy binding. This never grants inbox, channel, history or launch access as Capy." : "") : SELFHOST_MCP_INSTRUCTIONS,
+      ? " Explicit bind_capy_thread may additionally permit send_relay_message as that existing Capy binding. This never grants inbox, channel, history or launch access as Capy." : "")
+      + (context.slashy ? ` ${SLASHY_SERVER_INSTRUCTIONS}` : "") : SELFHOST_MCP_INSTRUCTIONS,
       capabilities: context.oauth || context.authMode === "staff_read_grant" || context.authMode === "agent_identity" ? {} : { experimental: {
       [NATIVE_SESSION_CAPABILITY]: { version: 1 },
       // All are implemented here: Claude, Cursor and Copilot proofs are verified
@@ -84,7 +86,8 @@ export function buildMcpServer(context: McpContext): McpServer {
   const capyPermits = Boolean(context.oauth && context.capyPermits);
   const sessionAccess = context.sessionAccess;
   registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines), grokEvents: Boolean(context.grokRoutines?.cloudCopy), agentRules: Boolean(context.agentRules),
-    sessionAccess: Boolean(sessionAccess), staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity" }), {
+    sessionAccess: Boolean(sessionAccess), staffReadGrant: context.authMode === "staff_read_grant", agentIdentity: context.authMode === "agent_identity",
+    slashy: Boolean(context.oauth && context.slashy) }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
     relayfacts: () => registerRelayfactsTools(server, context),
@@ -94,6 +97,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     grok_routines: () => registerGrokRoutineTools(server, context),
     grok_events: () => registerGrokEventTools(server, context),
     agent_rules: () => registerAgentRulesTools(server, context),
+    slashy_inbox: () => registerSlashyInboxTools(server, context),
     ...(launch ? { hosted_launch: () => registerRelaySpawnTools(server, context) } : {}),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),

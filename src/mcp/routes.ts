@@ -541,12 +541,13 @@ export function createMcpHandler(input: {
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
     if (input.agentRules && !staffGrant) context.agentRules = input.agentRules;
-    if (oauth && input.grokRoutines) {
+    if (oauth) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];
-      if (client && isGrokRoutineKind(connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }))) {
-        context.grokRoutines = input.grokRoutines;
-      }
+      const kind = client ? connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }) : "mcp";
+      if (input.grokRoutines && isGrokRoutineKind(kind)) context.grokRoutines = input.grokRoutines;
+      // Slashy's reminder setup and owner-verified inbox senders (docs/slashy.md).
+      if (kind === "slashy") context.slashy = true;
     }
     if (config.customerSupport && personOnly) context.customerSupport = {
       origin: new URL(config.publicBaseUrl).origin,

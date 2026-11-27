@@ -21,6 +21,17 @@ const classifications: ReadonlyArray<readonly [string, ConnectorKind]> = [
   ["https://agent.meta.ai/callback", "muse"],
   ["http://muse.ai/callback", "mcp"],
   ["https://muse.ai.attacker.test/callback", "mcp"],
+  ["https://slashy.com/integrations/mcp/callback", "slashy"],
+  ["https://api.slashy.com/oauth/callback", "slashy"],
+  ["https://slashy.ctrlcenter.ai/integrations/mcp/complete", "slashy"],
+  ["http://slashy.ctrlcenter.ai/callback", "mcp"],
+  ["https://evil.ctrlcenter.ai/callback", "mcp"],
+  ["https://ctrlcenter.ai/callback", "mcp"],
+  ["https://slashy.ctrlcenter.ai.evil.net/callback", "mcp"],
+  ["http://slashy.com/callback", "mcp"],
+  ["https://slashy.com.evil.net/callback", "mcp"],
+  ["https://notslashy.com/callback", "mcp"],
+  ["slashyemail://oauth", "mcp"],
   ["not a URL", "mcp"],
 ];
 for (const [uri, expected] of classifications) {
@@ -37,6 +48,10 @@ test("mixed registrations retain Cursor, Grok, then ChatGPT then Muse precedence
     assert.equal(connectorKind({ clientName: "fake-muse", redirectUris: uris }), "cursor-cloud");
   }
   assert.equal(connectorKind({ clientName: null, redirectUris: ["https://x.ai/callback", "https://chatgpt.com/callback"] }), "grok-bot");
+  // slashy turns on owner-data behaviour, so a registration mixing in any non-Slashy callback is not Slashy.
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/cb", "https://attacker.example/cb"] }), "mcp");
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/cb", "http://localhost:3000/cb"] }), "mcp");
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://slashy.ctrlcenter.ai/a", "https://app.slashy.com/b"] }), "slashy");
   for (const uris of [[chatgpt, muse], [muse, chatgpt]]) {
     assert.equal(connectorKind({ clientName: "fake-grok", redirectUris: uris }), "chatgpt");
   }

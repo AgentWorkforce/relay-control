@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProviderStatus } from "../providers/registry.js";
 import { GROK_EVENT_TOOLS, GROK_ROUTINE_TOOLS } from "./grok-routine.js";
+import { SLASHY_INBOX_TOOLS } from "./slashy.js";
 import { AGENT_RULES_TOOLS } from "./agent-rules-tools.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
@@ -19,6 +20,7 @@ const TOOL_TITLE_WORDS: Readonly<Record<string, string>> = {
   api: "API",
   capy: "Capy",
   grok: "Grok",
+  slashy: "Slashy",
   mcp: "MCP",
   relay: "Relay",
   replicas: "Replicas",
@@ -81,7 +83,7 @@ export const SESSION_ACCESS_TOOLS = ["get_session_access", "set_session_access",
 
 export type ToolGroupId =
   | "shared_session_reads" | "team_activity" | "relayfacts" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
-  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "grok_events" | "agent_rules" | "relay_inbox_app" | "screens" | "events_settings"
+  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "grok_events" | "agent_rules" | "slashy_inbox" | "relay_inbox_app" | "screens" | "events_settings"
   | "session_access" | "capability_discovery";
 
 type GroupDefinition = {
@@ -111,6 +113,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   // SELFHOST_GROK_ROUTINES_CLOUD_COPY: the event reads Cloud's copied routine prompt calls.
   grok_events: { title: "Grok Bot routine events (Cloud copy)", tools: GROK_EVENT_TOOLS },
   agent_rules: { title: "Agent Relay operating rules", tools: AGENT_RULES_TOOLS },
+  slashy_inbox: { title: "Slashy inbox reminder", tools: SLASHY_INBOX_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
@@ -121,7 +124,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; agentRules?: boolean; sessionAccess?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; agentRules?: boolean; sessionAccess?: boolean; staffReadGrant?: boolean; agentIdentity?: boolean; slashy?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -148,6 +151,8 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.grokRoutines) groups.push("grok_routines");
   if (options.grokRoutines && options.grokEvents) groups.push("grok_events");
   if (options.agentRules) groups.push("agent_rules");
+  // A Slashy OAuth connection gets its one-call inbox reminder setup.
+  if (options.slashy) groups.push("slashy_inbox");
   // Session access tools exist only where the read API is relaygate and the
   // connection is a person's own session (src/sessions/access.ts).
   if (options.sessionAccess) groups.push("session_access");
@@ -240,6 +245,8 @@ export function describeCapabilities(input: {
   grokRoutines?: boolean;
   grokEvents?: boolean;
   agentRules?: boolean;
+  /** An OAuth connection classified as Slashy (context.slashy). */
+  slashy?: boolean;
   /** Whether this connection was given the session access tools (see planToolGroups). */
   sessionAccess?: boolean;
   /** Whether a managed native call resolves to its synced Desktop identity. */
@@ -253,7 +260,8 @@ export function describeCapabilities(input: {
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
     capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents, agentRules: input.agentRules, sessionAccess: input.sessionAccess,
-    staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity" })
+    staffReadGrant: input.authMode === "staff_read_grant", agentIdentity: input.authMode === "agent_identity",
+    slashy: input.slashy && input.authMode === "oauth" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
@@ -297,6 +305,9 @@ export function describeCapabilities(input: {
         reason: "Only current workspace owners and admins with a person connection can link webhook inboxes.",
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
+    if (id === "slashy_inbox" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "Only an OAuth connection registered by Slashy (a slashy.com or slashy.ctrlcenter.ai callback) gets the Slashy inbox reminder.",
+      how_to_enable: "Add this server's MCP URL in Slashy (Settings > Integrations > Add MCP, authentication Automatic) and approve the agent at sign-in." };
     if (id === "webhook_inbox" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: input.authMode === "oauth"
         ? "Webhook inbox links need a person connection; this OAuth connection acts only as its approved agent."

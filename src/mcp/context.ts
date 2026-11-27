@@ -57,6 +57,8 @@ export type McpContext = {
    */
   agentIdentity?: { id: string; name: string };
   grokRoutines?: GrokRoutines;
+  /** True for an OAuth grant whose registered callback is Slashy's (connector-kind.ts): slashy_inbox tools and sender_is_owner. */
+  slashy?: boolean;
   /** The rules source for get_agent_rules (docs/agent-rules.md); absent for staff read grants. */
   agentRules?: AgentRules;
   /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
