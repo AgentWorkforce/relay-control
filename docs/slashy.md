@@ -97,9 +97,12 @@ because Grok routines are never mounted for a Slashy grant.
 
 ## Classification
 
-A Slashy grant is one with a registered **https** redirect URI whose host is
-`slashy.com`, a subdomain of it, or exactly `slashy.ctrlcenter.ai`. The
-client name never decides. The Agent Relay consent screen for a real Slashy
+A Slashy grant is one whose registration has at least one redirect URI and
+**every** redirect URI is an **https** URL whose host is `slashy.com`, a
+subdomain of it, or exactly `slashy.ctrlcenter.ai`. A registration that mixes
+in any other callback (another host, `http`, localhost) is `mcp`, because the
+`slashy` kind turns on owner-data behaviour (`sender_is_owner`). The client
+name never decides. The Agent Relay consent screen for a real Slashy
 connection (2026-11-27) showed "Returns to slashy.ctrlcenter.ai", Slashy's
 original MCP host, so its callback is not under slashy.com. Other
 `ctrlcenter.ai` hosts are not Slashy. If Slashy moves its callback elsewhere,
