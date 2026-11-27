@@ -66,6 +66,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
       grokEvents: Boolean(context.grokRoutines?.cloudCopy),
+      slashy: Boolean(context.oauth && context.slashy),
       agentRules: Boolean(context.agentRules),
       sessionAccess: Boolean(context.sessionAccess),
       nativeAuthorityAvailable,

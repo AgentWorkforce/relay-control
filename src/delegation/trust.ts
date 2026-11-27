@@ -1,5 +1,14 @@
 import type { SqlExecutor } from "../database.js";
-import { connectorKind } from "../mcp/oauth/connector-kind.js";
+import { connectorKind, type ConnectorKind } from "../mcp/oauth/connector-kind.js";
+
+/**
+ * Delegation roles bind the kinds in roles.ts CONNECTOR_KINDS. A Slashy grant
+ * keeps the generic "mcp" connector kind it had before Slashy was classified,
+ * so existing connector:mcp bindings still cover it (as in Cloud).
+ */
+function delegationConnectorKind(kind: ConnectorKind): Exclude<ConnectorKind, "slashy"> {
+  return kind === "slashy" ? "mcp" : kind;
+}
 import { sha256Hex } from "./scope.js";
 
 /**
@@ -163,7 +172,7 @@ async function rootOf(reader: TrustReader, input: WalkInput): Promise<{ root: Tr
   const provenAt = new Date(Math.max(first.createdAt.getTime(), first.grantCreatedAt.getTime()));
   return { name: first.participantName, root: { kind: "connector", oauth_grant_id: first.grantId, agent_id: input.agentId,
     created_at: provenAt.toISOString(),
-    connector: connectorKind({ clientName: first.clientName, redirectUris: first.redirectUris }) } };
+    connector: delegationConnectorKind(connectorKind({ clientName: first.clientName, redirectUris: first.redirectUris })) } };
 }
 
 /**

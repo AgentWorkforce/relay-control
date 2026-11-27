@@ -15,6 +15,11 @@ durable deliveries and history uploads. No route here forwards to Cloud.
 | Devin | Validate org/session read and management permission, encrypted workspace key, masked summary, replace/disconnect | Not ported: session message adapter | Not ported |
 | Cursor Cloud | Validate key identity, encrypted workspace key, masked summary, replace/disconnect | Not ported: principal-bound agent bindings, launch and cleanup | Not ported |
 
+Slashy (an OAuth MCP assistant, not a stored-key provider) has runtime parity
+with Cloud: `connect_slashy_inbox`, `slashy_inbox_status` and
+`check_relay_inbox`'s `sender_is_owner` are served here for Slashy OAuth grants,
+with the same reminder prompt. See `slashy.md`.
+
 This is **connection-management parity**, not full provider/runtime parity.
 The connection API reports `connectionManagement`, `relayBinding` and
 `historySync` separately. The latter two stay false for these four providers.

@@ -21,6 +21,12 @@ const classifications: ReadonlyArray<readonly [string, ConnectorKind]> = [
   ["https://agent.meta.ai/callback", "muse"],
   ["http://muse.ai/callback", "mcp"],
   ["https://muse.ai.attacker.test/callback", "mcp"],
+  ["https://slashy.com/integrations/mcp/callback", "slashy"],
+  ["https://api.slashy.com/oauth/callback", "slashy"],
+  ["http://slashy.com/callback", "mcp"],
+  ["https://slashy.com.evil.net/callback", "mcp"],
+  ["https://notslashy.com/callback", "mcp"],
+  ["slashyemail://oauth", "mcp"],
   ["not a URL", "mcp"],
 ];
 for (const [uri, expected] of classifications) {

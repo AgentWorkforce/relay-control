@@ -2,7 +2,7 @@
 // URIs. A leaf (no imports) so the request-auth path can classify a grant
 // without loading the connectors dashboard module.
 
-export type ConnectorKind = "chatgpt" | "grok-bot" | "cursor-cloud" | "muse" | "mcp";
+export type ConnectorKind = "chatgpt" | "grok-bot" | "cursor-cloud" | "muse" | "slashy" | "mcp";
 
 /**
  * Kinds that may use Grok Bot routines (relay-events wake-ups). Grok Bot runs
@@ -38,7 +38,10 @@ const under = (host: string, domain: string) => host === domain || host.endsWith
  * ChatGPT registers chatgpt.com / openai.com callbacks. The client name is
  * self-reported, so it never decides the kind; a grant with a routine is Grok
  * Bot unless its registered callback identifies Muse, whose polling uses
- * the same ingest infrastructure.
+ * the same ingest infrastructure. Slashy (slashy.com, an email and calendar
+ * assistant) connects remote MCP servers from its own backend, so its
+ * callback is an https URL under slashy.com (docs/slashy.md: the exact
+ * registered URI is unverified; any https slashy.com host matches).
  */
 export function connectorKind(client: { clientName: string | null; redirectUris: string[] }): ConnectorKind {
   // Mixed registrations retain the established Cursor, Grok, then ChatGPT, then Muse
@@ -48,6 +51,7 @@ export function connectorKind(client: { clientName: string | null; redirectUris:
   if (hosts.some(({ host }) => under(host, "x.ai"))) return "grok-bot";
   if (hosts.some(({ host }) => under(host, "chatgpt.com") || under(host, "openai.com"))) return "chatgpt";
   if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "muse.ai") || under(host, "agent.meta.ai")))) return "muse";
+  if (hosts.some(({ scheme, host }) => scheme === "https" && under(host, "slashy.com"))) return "slashy";
   return "mcp";
 }
 
