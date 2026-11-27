@@ -199,6 +199,71 @@ its name, trimmed, lowercased and with `-` and `.` read as `_`, is
 `delegated_approvals_from` or `spawn_delegate_approvals` (or starts with one of
 them and `_`), or mentions delegation at all.
 
+
+### Granted approvers
+
+The self-hosted twin of Cloud's approver registry (cloud#6709). An approver
+is an owner-made grant with `kind: "approver"`, created through `POST
+/delegates` like any grant (human-only, for the owner's own bound agent):
+
+- `delegate_address` pins it to the exact `name@host` the agent is bound at
+  now, alongside its immutable agent id; any other address is `403
+  identity_mismatch`. A claimed agent has no address, so it cannot be an
+  approver.
+- `github_logins` (at least one, lowercased; an app login may end in
+  `[bot]`) are the logins it acts as on GitHub.
+- **Who may grant one (cloud#6730).** An approver is granted per
+  repository: every scope target must name an exact `owner/repo`
+  (`owner/repo`, `owner/repo#…`, `owner/repo:…`), else `400
+  approver_target_not_repo`, and the granter must be a code owner of all
+  of each repository. Cloud reads CODEOWNERS fresh on every governing
+  branch: the default branch and the repository's configured merge targets
+  (Cloud's `CONFIGURED_MERGE_TARGETS`; PR bases and branch protection are
+  deliberately not discovered). relay-control reads no CODEOWNERS, so it
+  cannot confirm this and refuses every approver with `403 not_code_owner`,
+  after the address pin and the repository check. That is a definite
+  refusal, not an outage: approver grants are unavailable on this install
+  until it can read GitHub. As in Cloud, a name that is not exactly
+  `owner/repo` (an owner with `_` or `.`, a `.` or `..` repository name) is
+  `not_code_owner` too, because it has no governing branches.
+- Every refused approver grant is logged as `delegation.refused` with op
+  `approver_grant` and only ids and a reason: `identity_unpinnable` (a
+  claimed agent, no address), `identity_mismatch`,
+  `approver_target_not_repo`, `unconfigured` (with `repo` and
+  `merge_targets: "unconfigured"`) or `codeowners_unreadable` (with
+  `repo`; relay-control's stand-in for Cloud's `not_owner`,
+  `no_codeowners` and `no_access`). The rest of this section describes how
+  a stored approver row behaves.
+- At attest, at redeem and at a release-gate redeem, the binding is re-read
+  and Relaycast's live agent must still carry the pinned id and address;
+  otherwise `identity_mismatch`.
+- It attests only with own_owner standing (its granter's own OK to the
+  granter's own agents), until the rules text and a desktop line name
+  approvers. Its signed claims, the attestation and redeem audit rows and
+  the redeem response carry `approver: {grant_id, agent_id, address,
+  granted_by, granted_by_standing}`, as does a release gate's
+  `gate.redeemed` row. `granted_by_standing` is whether the granter is a
+  code owner of the action's target; Cloud judges it fresh at redeem, and
+  relay-control, reading no CODEOWNERS, always reports `none`.
+- Hard-limit classes (deploy, secret_change, destructive) are covered only
+  when the grant lists them; high-risk actions stay single use per action.
+- **What an approver can redeem here.** Cloud reads GitHub at redeem: on a
+  PR, and on a release against its previous release, it refuses commits it
+  cannot attribute to someone other than the approver (`self_approval`,
+  `unattributed_commit`) and changes to protected paths (`protected_path`;
+  the list lives in Cloud's `lib/delegation/attest.ts`, `APPROVER_PROTECTED_PATHS`,
+  and covers CODEOWNERS, the approval rules, `.github/`, `.claude/`,
+  migrations, merge-train and delegation code). relay-control reads no
+  GitHub state for delegation, so none of those can be checked: an
+  approver's merge, pr_ops and release redeems answer
+  `condition_unavailable`. A deploy, secret_change or destructive target
+  names no repository and commit, so it is `unattributable_target`, as in
+  Cloud. That leaves spend, external_comms, config_change and
+  prompt_approval. These rules also apply at a release-gate redeem.
+- Migration `0101_delegation_approver_grants.sql` adds `kind` (default
+  `delegate`), `delegate_address` and `approver_github_logins` (default
+  `{}`): nullable, defaulted, no CHECK. A null kind reads as a delegate.
+
 ## Attestation
 
 The relay-node asks only for deliveries that carry `has_owner_approval`.
@@ -315,7 +380,8 @@ bound in the target, and it must name the recipient itself. It takes no
 conditions; the node applies it directly, without a redeem. Only
 the machine owner's delegates count. `prompt-delegates` lists the machine
 owner's delegates whose live grants cover the session (excluding the session
-itself). It returns an empty list when delegation is off or the class is not
+itself). A granted approver is listed only while it is bound at its pinned
+address: one that moved would be refused `identity_mismatch`. It returns an empty list when delegation is off or the class is not
 allowed by policy. A session that is not the caller's, or a failed token
 proof, is `403 forbidden`.
 
@@ -955,6 +1021,27 @@ since roles may have no grant row at all. An owner who turns the legacy rule
 on again after the rollback gets a new rule id, so none of those exclusions
 apply to it. That owner must revoke the excluded agents' grants again (`DELETE
 /delegates/{grant_id}`) once they reappear under the new rule.
+
+### Rolling back granted approvers (0101)
+
+A build from before migration 0101 ignores `kind`, `delegate_address` and
+`approver_github_logins`. It reads every active approver row as an ordinary
+delegate grant, with no address pin and no approver target refusals
+(`condition_unavailable` on PR and release targets, `unattributable_target`).
+Never roll back below the build that added approvers while an approver grant is
+active:
+
+1. **List them.** `SELECT id FROM delegation_grants WHERE kind = 'approver' AND
+   status = 'active'` (read only).
+2. **Revoke each one** (`DELETE /delegates/{grant_id}`, the owner or an admin)
+   or the owner's `revoke-all`, then rerun the list and require it to be empty.
+3. Roll back.
+
+The schema stays as it is: 0101 is additive, and the old build reads its
+columns' defaults as a delegate. On relay-control today the list is always
+empty, because the route refuses every approver grant (it cannot read
+CODEOWNERS; see above), so an approver row exists only if one was written to
+the database directly. Check it anyway before any rollback.
 
 ## Revocation
 

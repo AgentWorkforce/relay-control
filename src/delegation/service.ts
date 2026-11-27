@@ -35,6 +35,7 @@ import {
   ownerApprovalSchema,
   ownerDisplay,
   PR_TARGET,
+  releaseTargetSha,
   REPO_TARGET,
   repoPart,
   sameActions,
@@ -149,7 +150,65 @@ export type GrantRow = {
   trust_rule_id?: string | null;
   /** The ownership chain proven when the system grant was created, for audit. */
   trust_path?: TrustPath | null;
+  /** `approver` for a granted approver (0101); null or `delegate` otherwise. */
+  kind?: string | null;
+  /** A granted approver's pinned Relay address. */
+  delegate_address?: string | null;
+  /** GitHub logins a granted approver acts as (it never approves their PRs). */
+  approver_github_logins?: string[] | null;
 };
+
+/** Whether a grant makes its agent a granted approver (owner-made, pinned to agent id and address), as Cloud's isApproverGrant. */
+export function isApproverGrant(grant: Pick<GrantRow, "kind">): boolean {
+  return grant.kind === "approver";
+}
+
+/**
+ * Who granted an approver and the exact identity it is pinned to, carried by
+ * its claims, audit and redeem response. `granted_by_standing` is whether the
+ * grant's owner is a code owner of the action's target (Cloud's twin,
+ * cloud#6730). Cloud judges it on CODEOWNERS; relay-control reads no
+ * CODEOWNERS, so it is always "none" here, and repository rules never count an
+ * approver redeemed here as a code owner's OK.
+ */
+export type ApproverClaim = { grant_id: string; agent_id: string; address: string; granted_by: string;
+  granted_by_standing: "code_owner" | "none" };
+
+export function approverClaim(grant: GrantRow): ApproverClaim | undefined {
+  return isApproverGrant(grant) && grant.delegate_address ? { grant_id: grant.id, agent_id: grant.delegate_agent_id,
+    address: grant.delegate_address, granted_by: grant.owner_user_id, granted_by_standing: "none" } : undefined;
+}
+
+/**
+ * `owner/repo` split into its two parts, or null for anything else: an extra
+ * segment, an empty part, or a name GitHub never allows (`.`, `..`). As
+ * Cloud's standing.splitRepository (cloud#6730).
+ */
+export function splitRepository(repo: string): [string, string] | null {
+  const parts = repo.split("/");
+  if (parts.length !== 2) return null;
+  const [owner, name] = parts as [string, string];
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/u.test(owner) || !/^[A-Za-z0-9_.-]{1,100}$/u.test(name) || name === "." || name === "..") return null;
+  return [owner, name];
+}
+
+/**
+ * The repository each scope target of a granted approver names, lowercased,
+ * or null when any target names none concretely (Cloud's twin, cloud#6730).
+ * An approver is granted per repository, by a code owner of each, so every
+ * target must start with an exact `owner/repo` (`owner/repo`, `owner/repo#…`,
+ * `owner/repo:…`); an owner wildcard (`owner/*`, `*`) or a target with no
+ * repository (a deploy environment, a secret) is refused.
+ */
+export function approverScopeRepositories(scopes: ReadonlyArray<{ targets: readonly string[] }>): string[] | null {
+  const repos = new Set<string>();
+  for (const target of scopes.flatMap(scope => scope.targets)) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99})\/([A-Za-z0-9_.-]{1,100})(?=$|[#:])/u.exec(target);
+    if (!match) return null;
+    repos.add(`${match[1]}/${match[2]}`.toLowerCase());
+  }
+  return repos.size ? [...repos] : null;
+}
 
 /** An owner's set-once trust rule (docs/owner-delegates.md, "Trust rule"). */
 export type TrustRuleRow = {
@@ -297,6 +356,8 @@ export function grantView(row: GrantRow, now = new Date()) {
     revoked_reason: row.revoked_reason,
     trust_rule_id: row.trust_rule_id ?? null,
     trust_path: row.trust_path ?? null,
+    ...(isApproverGrant(row) ? { kind: "approver" as const, delegate_address: row.delegate_address ?? null,
+      github_logins: row.approver_github_logins ?? [] } : {}),
   };
 }
 
@@ -1158,6 +1219,12 @@ export type AttestationClaims = {
   tier: "D" | "O";
   actions: Action[];
   standing: Standing;
+  /**
+   * Set when the sender is a granted approver. Shipped desktops ignore it; its
+   * standing is always own_owner until the rules text and the desktop line
+   * name approvers (cloud#6709).
+   */
+  approver?: ApproverClaim;
   single_use: boolean;
   /** §16.4: the stored quote, or null once redacted (or never given). */
   quote: string | null;
@@ -1680,6 +1747,47 @@ export function freshRefusal(state: DecisionState, input: { actions: readonly Ac
  * Desktop-verified bearer of a current member of `workspace`;
  * `stillAuthorized` re-proves it after the network lookups.
  */
+/**
+ * A granted approver must still be the exact identity it was pinned to: bound
+ * now, to its granter, at the grant's agent id and at the same address, and
+ * Relaycast's live agent for that binding must carry the same id and address
+ * (as Cloud's approverIdentityRefusal, cloud#6709 db101362). A name is never
+ * compared on its own.
+ */
+export async function approverIdentityRefusal(deps: DelegationDeps, workspace: DelegationWorkspace, grant: GrantRow): Promise<ReasonCode | null> {
+  if (!isApproverGrant(grant)) return null;
+  const binding = await resolveBinding(deps.database, workspace.id, workspace.relaycastWorkspaceId, grant.delegate_agent_id, true);
+  if (!binding || binding.agentId !== grant.delegate_agent_id || binding.userId !== grant.owner_user_id) return "identity_mismatch";
+  if (!binding.address || binding.address !== grant.delegate_address) return "identity_mismatch";
+  const live = await deps.relaycast.getRosterAgent(workspace.relaycastApiKey, binding.name);
+  if (!live || live.id !== grant.delegate_agent_id || live.address !== grant.delegate_address || live.status === "released") {
+    return "identity_mismatch";
+  }
+  return null;
+}
+
+/** Classes Cloud attributes to a repository and commit before an approver may redeem them (cloud#6709 1fcec0c1). */
+const APPROVER_ATTRIBUTED_CLASSES: ReadonlySet<string> = new Set(["release", "deploy", "secret_change", "destructive"]);
+
+/**
+ * Why a granted approver may not redeem this action here, if it may not (the
+ * twin of Cloud's approver PR and target refusals). Cloud reads GitHub at
+ * redeem: on a PR it refuses a PR a listed login authored or committed to
+ * (self_approval), one with an unattributed commit (unattributed_commit) or one
+ * touching a protected path (protected_path); a release or land target is
+ * checked the same way through compare(default...sha). relay-control reads no
+ * GitHub state for delegation, so none of those checks can run and those
+ * actions fail closed with condition_unavailable: an unchecked exclusion never
+ * counts as passed. A deploy, secret_change or destructive target names no
+ * repository and commit to check, so it is unattributable_target, as in Cloud.
+ */
+export function approverTargetRefusal(grant: GrantRow, action: Pick<Action, "class" | "target">): ReasonCode | null {
+  if (!isApproverGrant(grant)) return null;
+  if (PR_TARGET.test(repoPart(action))) return "condition_unavailable";
+  if (!APPROVER_ATTRIBUTED_CLASSES.has(action.class)) return null;
+  return action.class === "release" && releaseTargetSha(action.target) ? "condition_unavailable" : "unattributable_target";
+}
+
 export async function attestDelegation(deps: DelegationDeps, input: RecipientInput & {
   messageId: string;
   accept: AcceptMode;
@@ -1742,6 +1850,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       }
     }
     if (unbound) refuse(unbound);
+    const mismatch = await approverIdentityRefusal(deps, workspace, grant);
+    if (mismatch) refuse(mismatch);
     const current = await currentSystemGrant(deps, workspace, prove, grant);
     if (typeof current === "string") refuse(current);
     if ((current as GrantRow).id !== grant.id) {
@@ -1822,6 +1932,12 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId, accept: input.accept, actions,
     });
     if (!standing) return refuse("recipient_policy");
+    // A granted approver attests only as its granter's own OK to the granter's
+    // own agents (own_owner). Shipped desktops ignore the approver claim and
+    // would print "(code owner)" for code_owner standing, which today's rules
+    // read as a code owner's OK: that waits for the rules text and a desktop
+    // line that names approvers (cloud#6709).
+    if (isApproverGrant(grant) && standing !== "own_owner") return refuse("recipient_policy");
     if (tier === "D") {
       await deps.database.query(
         `INSERT INTO delegation_approvals
@@ -1890,6 +2006,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         tier,
         actions: actions.map(canonicalAction),
         standing,
+        ...(approverClaim(grant) ? { approver: approverClaim(grant) } : {}),
         single_use: singleUse,
         quote: quoteRedacted ? null : approval.quote ?? null,
         iat,
@@ -1911,7 +2028,8 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
         actorAgentId: senderId, messageId: input.messageId, recipientAgentId: input.recipientAgentId,
         data: { actions: claims.actions, tier, standing, single_use: singleUse, jti: claims.jti, kid: deps.signer!.kid,
           quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null,
-          ...(grant.trust_rule_id ? { trust_rule_id: grant.trust_rule_id } : {}) },
+          ...(grant.trust_rule_id ? { trust_rule_id: grant.trust_rule_id } : {}),
+          ...(claims.approver ? { approver: claims.approver } : {}) },
         quote: approval.quote ?? null,
         quoteHash: approval.quote ? quoteDigest(deps.quoteKey, workspace.id, approval.quote) : null,
         quoteRedacted,
@@ -1955,7 +2073,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
 }
 
 export type RedeemResult =
-  | { ok: true; consumed: boolean }
+  | { ok: true; consumed: boolean; approver?: ApproverClaim }
   | { ok: false; reason: ReasonCode; unmet?: Condition[] };
 
 /**
@@ -2018,6 +2136,8 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     const prove = trustProver(deps, workspace, true);
     const unbound = await delegateStillBound(deps, workspace, grant!, true, { prove });
     if (unbound) refuse(unbound);
+    const mismatch = await approverIdentityRefusal(deps, workspace, grant!);
+    if (mismatch) refuse(mismatch);
     // The attested grant must still be what the bindings decide now: a superseded one redeems nothing.
     const current = await currentSystemGrant(deps, workspace, prove, grant!);
     if (typeof current === "string" || current.id !== grant!.id) refuse("revoked");
@@ -2044,7 +2164,13 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
       approvalOwnerId: approval!.owner_user_id, recipientOwnerId: input.callerUserId,
       accept: attested!.accept === "own_owner" ? "own_owner" as const : "code_owners" as const, actions: [action!],
     };
-    if (!await standingFor(deps.database, workspace.id, standingInput)) refuse("recipient_policy");
+    const standingNow = await standingFor(deps.database, workspace.id, standingInput);
+    if (!standingNow) refuse("recipient_policy");
+    if (isApproverGrant(grant!)) {
+      if (standingNow !== "own_owner") refuse("recipient_policy");
+      const target = approverTargetRefusal(grant!, action!);
+      if (target) refuse(target);
+    }
     const singleUse = approval!.single_use || highRisk(action!);
     if (singleUse && await actionConsumed(deps.database, approval!.id, action!)) refuse("consumed");
     const conditions = evaluateConditions(checkedConditions, now);
@@ -2092,10 +2218,12 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
         data: { action: input.action, consumed: singleUse, conditions: checkedConditions,
           // Who minted the approval: a delegated (Tier D) approval is traceable to its grant and delegate.
           tier: approval!.tier, minter: { grant_id: grant!.id, delegate_agent_id: grant!.delegate_agent_id,
-            owner_id: grant!.owner_user_id, ...(grant!.trust_rule_id ? { binding_id: grant!.trust_rule_id } : {}) } },
+            owner_id: grant!.owner_user_id, ...(grant!.trust_rule_id ? { binding_id: grant!.trust_rule_id } : {}) },
+          ...(approverClaim(grant!) ? { approver: approverClaim(grant!) } : {}) },
       });
     });
-    return { ok: true, consumed: singleUse };
+    const approver = approverClaim(grant!);
+    return { ok: true, consumed: singleUse, ...(approver ? { approver } : {}) };
   } catch (error) {
     const reason: ReasonCode = error instanceof ConditionUnmet ? "condition_unmet"
       : error instanceof Refusal ? error.reason : "unavailable";
@@ -2191,6 +2319,14 @@ export async function promptDelegates(deps: DelegationDeps, input: RecipientInpu
       return "unavailable" as const;
     });
     if (unbound) continue;
+    // A granted approver is offered only while it is the exact identity
+    // pinned: one that moved address keeps its agent id and binding, but its
+    // answer would be refused identity_mismatch at attestation.
+    const moved = await approverIdentityRefusal(deps, workspace, grant).catch((error: unknown) => {
+      logUnavailable("prompt_delegates", error, { workspaceId: workspace.id, grantId: grant.id });
+      return "unavailable" as const;
+    });
+    if (moved) continue;
     delegates.push({ agent_id: grant.delegate_agent_id, grant_id: grant.id });
   }
   return { delegates };

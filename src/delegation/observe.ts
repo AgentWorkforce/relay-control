@@ -13,7 +13,11 @@
  *   delegation.audit_write_failed a best-effort audit write failed (the answer is unchanged)
  *   delegation.revoke_failed      a durable system revocation failed (the use is still refused)
  *   delegation.dependency_failed  a JWKS (or other dependency) read failed (fails closed)
- *   delegation.refused            one refusal, by `op` and `reason` (info level)
+ *   delegation.refused            one refusal, by `op` and `reason` (info level). For op
+ *                                 `approver_grant` (a refused approver grant, cloud#6730) the reason is
+ *                                 identity_unpinnable, identity_mismatch, approver_target_not_repo,
+ *                                 unconfigured (with `repo`, merge_targets "unconfigured") or
+ *                                 codeowners_unreadable (with `repo`)
  *   delegation.redaction_backlog  the Relaycast redaction queue after a sweep (warn when it needs an operator)
  *   delegation.audit_fenced       a paged audit read held events back behind a running transaction (info)
  *   delegation.repository_mismatch a gate redeem token matched a gate by name but carried other repository ids (warn)
@@ -23,7 +27,7 @@
  * the Worker's waitUntil for the same reason).
  */
 export type DelegationOp = "attest" | "redeem" | "gate_redeem" | "prompt_delegates" | "conditions" | "standing" |
-  "github_oidc_jwks" | "retention" | "audit" | "gate_registry" | "trust_backfill" | "role_seed" | "role_quiesce" | "bindings";
+  "github_oidc_jwks" | "retention" | "audit" | "gate_registry" | "trust_backfill" | "role_seed" | "role_quiesce" | "bindings" | "approver_grant";
 
 export type SafeContext = {
   workspaceId?: string | null;

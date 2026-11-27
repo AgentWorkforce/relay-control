@@ -34,7 +34,7 @@ import {
   type ActionClass,
   type Scope,
 } from "./scope.js";
-import { logAuditFenced, logUnavailable } from "./observe.js";
+import { logAuditFenced, logRefused, logUnavailable } from "./observe.js";
 import {
   APPROVAL_REQUEST_ID, ApprovalRequestMembershipGone, approvalRequestView, decideApprovalRequest,
   getApprovalRequest, insertOwnerApproval, type ApprovalRequestRecord,
@@ -82,7 +82,7 @@ import {
   type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
-  connectorRootProven, trustProver,
+  connectorRootProven, trustProver, approverScopeRepositories, splitRepository,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
 import {
@@ -203,12 +203,32 @@ const scopeSchema = z.object({
 const scopesSchema = z.array(scopeSchema).min(1).max(ACTION_CLASSES.length)
   .refine(scopes => new Set(scopes.map(scope => scope.class)).size === scopes.length, "one scope per class");
 
+/** A GitHub login: 1 to 39 letters, digits or single hyphens, not starting or ending with one; an app's bot login ends in `[bot]`. */
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}(?:\[bot\])?$/u;
 const createGrantBody = z.object({
   delegate_agent_id: z.string().min(1).max(200),
   scopes: scopesSchema,
   expires_at: rfc3339.optional(),
   require_tier_o: classList.optional(),
-}).strict();
+  /**
+   * `approver` makes the agent a granted approver (cloud#6709, #owner-decisions
+   * 251907114153873408): pinned to its agent id and its exact address, never a
+   * name. github_logins are the logins it acts as on GitHub; it can never
+   * approve a PR one of them authored or committed to.
+   */
+  kind: z.enum(["delegate", "approver"]).optional(),
+  delegate_address: z.string().min(3).max(512).regex(/^[^\s@]+@[^\s@]+$/u).optional(),
+  github_logins: z.array(z.string().regex(GITHUB_LOGIN)).max(10).optional(),
+}).strict().superRefine((body, ctx) => {
+  if (body.kind === "approver") {
+    if (!body.delegate_address) ctx.addIssue({ code: "custom", path: ["delegate_address"], message: "an approver is pinned to its exact address" });
+    if (!body.github_logins?.length) {
+      ctx.addIssue({ code: "custom", path: ["github_logins"], message: "an approver needs at least one GitHub login, so it never approves its own PRs" });
+    }
+  } else if (body.delegate_address !== undefined || body.github_logins !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["kind"], message: "delegate_address and github_logins are for kind approver only" });
+  }
+});
 const patchGrantBody = z.object({
   scopes: scopesSchema.optional(),
   expires_at: rfc3339.optional(),
@@ -941,6 +961,44 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (binding!.source === "hosted" && !await connectorRootProven(trustProver(deps, workspace, false), principal.userId, binding!.agentId)) {
         fail("not_delegate", "The agent must be bound to you; claim it first", 403);
       }
+      // A granted approver is pinned to the exact identity bound to the owner
+      // now: its agent id (above) and the address that binding has.
+      const approver = body.kind === "approver" ? { address: body.delegate_address!,
+        githubLogins: [...new Set((body.github_logins ?? []).map(login => login.toLowerCase()))] } : null;
+      // Every refused approver grant is logged (delegation.refused, op approver_grant): ids and reasons only, as Cloud.
+      const refuseApprover = (reason: string, extra: Record<string, string> = {}) =>
+        logRefused("approver_grant", { workspaceId: workspace.id, reason, agentId: binding!.agentId, ...extra });
+      if (approver && !binding!.address) {
+        // A claimed agent carries no address, so it cannot be pinned.
+        refuseApprover("identity_unpinnable");
+        fail("identity_mismatch", "An approver must be an agent Control knows the exact address of (a desktop or hosted identity); a claimed agent has none", 403);
+      }
+      if (approver && binding!.address !== approver.address) {
+        refuseApprover("identity_mismatch");
+        fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
+      }
+      if (approver) {
+        // Granted per repository, by a code owner of each: never more than the granter could approve
+        // themselves (Cloud's twin, cloud#6730). Cloud reads CODEOWNERS fresh on every governing branch
+        // (the default branch and the repository's configured merge targets); relay-control reads no
+        // GitHub, so it cannot confirm that and refuses. A definite refusal, not an outage: nothing here
+        // would succeed on retry.
+        const repos = approverScopeRepositories(scopes);
+        if (!repos) {
+          refuseApprover("approver_target_not_repo");
+          fail("approver_target_not_repo", "Every approver scope target must name an exact owner/repo", 400);
+        }
+        const repo = repos![0]!;
+        // As Cloud: a name that is not exactly owner/repo (an owner with `_` or `.`, a `.` or `..` name) has
+        // no governing branches, so it is `unconfigured`.
+        if (!splitRepository(repo)) {
+          refuseApprover("unconfigured", { repo, merge_targets: "unconfigured" });
+          fail("not_code_owner", `${repo} has no configured merge targets, so its governing branches are unknown; approvers can't be granted for it yet`, 403);
+        }
+        refuseApprover("codeowners_unreadable", { repo });
+        fail("not_code_owner", `relay-control cannot read CODEOWNERS, so it cannot confirm you are a code owner of all of ${repo
+        }; approver grants are unavailable on this install`, 403);
+      }
       const requireTierO = uniqueClasses(body.require_tier_o);
       let row: GrantRow;
       try {
@@ -965,6 +1023,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           if (!bound || bound.userId !== principal.userId) {
             fail("not_delegate", "The agent must be bound to you; claim it first", 403);
           }
+          if (approver && bound!.address !== approver.address) {
+            refuseApprover("identity_mismatch");
+            fail("identity_mismatch", "delegate_address is not the address this agent is bound at", 403);
+          }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
           const existing = (await tx.query<GrantRow>(
             `SELECT * FROM delegation_grants
@@ -980,15 +1042,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const created = (await tx.query<GrantRow>(
             `INSERT INTO delegation_grants
                (id, workspace_id, organization_id, owner_user_id, delegate_agent_id, delegate_agent_name,
-                scopes, require_tier_o, expires_at, created_auth_method)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10) RETURNING *`,
+                scopes, require_tier_o, expires_at, created_auth_method, kind, delegate_address, approver_github_logins)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13) RETURNING *`,
             [mintId("grt"), workspace.id, workspace.organizationId, principal.userId, binding!.agentId, binding!.name,
-              JSON.stringify(scopes), requireTierO, expiresAt, caller.authMethod],
+              JSON.stringify(scopes), requireTierO, expiresAt, caller.authMethod, approver ? "approver" : "delegate",
+              approver?.address ?? null, approver?.githubLogins ?? []],
           )).rows[0]!;
           await recordDelegationAudit(tx, {
             workspaceId: workspace.id, event: "grant.created", ...actor, ownerUserId: principal.userId, grantId: created.id,
             data: { delegate_agent_id: binding!.agentId, scope_diff: { added: scopes, removed: [] },
-              require_tier_o: requireTierO, expires_at: expiresAt.toISOString() },
+              require_tier_o: requireTierO, expires_at: expiresAt.toISOString(),
+              ...(approver ? { kind: "approver", delegate_address: approver.address, approver_github_logins: approver.githubLogins } : {}) },
           });
           return created;
         });

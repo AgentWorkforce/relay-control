@@ -1494,3 +1494,40 @@ test("gate redeem under the owner's trust rule: a rule revoked after a dry run r
   assert.deepEqual((await env.redeem(token(), approvalId)).body, { ok: false, reason: "revoked" });
   assert.equal((await env.database.query("SELECT 1 FROM delegation_action_consumptions")).rows.length, 0);
 });
+
+test("gate redeem: a granted approver's release is refused before consumption, real or dry run (cloud#6730)", async (t) => {
+  const env = await setup(t);
+  await env.gate();
+  // An approver bound at a pinned desktop address. relay-control's route never grants one (it cannot read
+  // CODEOWNERS), so the row is converted in place, as a pre-existing approver row would be.
+  const agent = env.world.addAgent("release-approver");
+  const address = `release-approver@cloud-${agent.id}`;
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+        agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rw_primary', $5, 'release-approver', $6, $7, $8)`,
+    [randomUUID(), env.workspaceId, env.orgId, env.ownerId, randomUUID(), agent.id, address,
+      encryptSecret(agent.token, KEYRING.active)],
+  );
+  const made = await env.browser("/delegates", "POST", {
+    delegate_agent_id: agent.id, scopes: [{ class: "release", targets: [`${REPO}:*:*:*:*`] }],
+  });
+  assert.equal(made.status, 201, made.raw);
+  const approvalId = await env.approval([STABLE], "release-approver");
+  await env.database.query("UPDATE delegation_grants SET kind = 'approver', delegate_address = $2, approver_github_logins = $3 WHERE id = $1",
+    [made.body.grant_id, address, ["release-bot"]]);
+  const token = (runId: string) => mint(env.github, env.workflowClaims({ run_id: runId }));
+  // The release's commit attribution needs GitHub reads relay-control does not make: it fails closed.
+  assert.deepEqual((await env.redeem(token("60"), approvalId, STABLE, { dry_run: true })).body,
+    { ok: false, reason: "condition_unavailable", dry_run: true });
+  assert.deepEqual((await env.redeem(token("61"), approvalId)).body, { ok: false, reason: "condition_unavailable" });
+  // A moved address is refused first, as identity_mismatch.
+  await env.database.query("UPDATE desktop_relay_identities SET address = $1 WHERE agent_remote_id = $2",
+    ["release-approver@cloud-elsewhere", agent.id]);
+  assert.deepEqual((await env.redeem(token("62"), approvalId)).body, { ok: false, reason: "identity_mismatch" });
+  // Nothing was consumed, so no gate receipt ever answers for an approver without its evidence.
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_gate_redemptions WHERE approval_id = $1", [approvalId])).rows.length, 0);
+  assert.deepEqual(await env.events("gate.redeemed"), []);
+  assert.deepEqual(await env.events("gate.checked"), []);
+});

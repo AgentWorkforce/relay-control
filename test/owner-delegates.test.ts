@@ -11,6 +11,7 @@ import {
   base62,
   highRisk,
   ownerDisplay,
+  REASON_CODES,
   targetCovered,
   tierDApprovalId,
   validTargetPattern,
@@ -20,6 +21,7 @@ import { request } from "./support/harness.js";
 import { RELAYCAST_INTERNAL_SECRET } from "./support/relaycast-world.js";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
+import { setDelegationLogSinkForTesting } from "../src/delegation/observe.js";
 
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
 const KID = "dlg-2026q4";
@@ -2467,4 +2469,176 @@ test("role bindings (review): an exclusion is allowed while delegation is off; t
     role: "trusted" })).status, 403);
   const excluded = await env.browser("/delegates/bindings", "POST", { principal: { kind: "agent", ref: helper.id }, role: "excluded" });
   assert.equal(excluded.status, 201, excluded.raw);
+});
+
+// Granted approvers (cloud#6709): an owner-made grant of kind approver, pinned to one agent id and address.
+async function approverReady(t: TestContext) {
+  const env = await setup(t);
+  await env.enable();
+  const recipient = await env.desktopIdentity("relay-coder");
+  const approver = await env.desktopIdentity("release-approver");
+  const address = `release-approver@cloud-${approver.id}`;
+  const scopes = [{ class: "deploy", targets: ["relay:prod"] }, { class: "merge", targets: ["AgentWorkforce/*"] },
+    { class: "external_comms", targets: ["slack:ops"] }, { class: "release", targets: ["AgentWorkforce/relay:*:*:*:*"] }];
+  // relay-control reads no CODEOWNERS, so its route never grants an approver (cloud#6730 needs a
+  // whole-repository code owner). seedApprover stands in for a grant such a check allowed.
+  const seedApprover = async (logins: string[] = ["release-bot"]) => {
+    const made = await env.grant(approver.id, scopes);
+    await env.database.query("UPDATE delegation_grants SET kind = 'approver', delegate_address = $2, approver_github_logins = $3 WHERE id = $1",
+      [made.grant_id, address, logins]);
+    return made.grant_id as string;
+  };
+  return { env, recipient, approver, address, scopes, seedApprover };
+}
+
+test("approvers: refused by the route on relay-control, after the address pin and the exact-repository check", async (t) => {
+  const { env, approver, address, scopes, seedApprover } = await approverReady(t);
+  const lines: string[] = [];
+  setDelegationLogSinkForTesting((_level, line) => { lines.push(line); });
+  t.after(() => setDelegationLogSinkForTesting(null));
+  const refusals = () => lines.map(line => JSON.parse(line) as Record<string, unknown>)
+    .filter(line => line.message === "delegation.refused" && line.op === "approver_grant");
+  const repoScopes = [{ class: "merge", targets: ["AgentWorkforce/relay#7", "agentworkforce/RELAY:main"] },
+    { class: "release", targets: ["AgentWorkforce/cloud:*:*:*:*"] }];
+  const post = (body: Record<string, unknown>, withScopes: unknown = repoScopes) =>
+    env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes: withScopes, ...body });
+  for (const body of [{ kind: "approver", github_logins: ["bot"] }, { kind: "approver", delegate_address: address },
+    { kind: "approver", delegate_address: address, github_logins: [] }, { delegate_address: address },
+    { github_logins: ["bot"] }, { kind: "approver", delegate_address: address, github_logins: ["-bad-"] }]) {
+    assert.equal((await post(body)).status, 400, JSON.stringify(body));
+  }
+  const wrong = await post({ kind: "approver", delegate_address: `release-approver@cloud-other`, github_logins: ["bot"] });
+  assert.equal(wrong.status, 403, wrong.raw);
+  assert.equal(wrong.body.code, "identity_mismatch");
+  // A claimed agent has no Relay address to pin.
+  const claimed = await env.claim("claimed-bot");
+  const unpinned = await env.browser("/delegates", "POST", { delegate_agent_id: claimed.id, scopes: repoScopes, kind: "approver",
+    delegate_address: "claimed-bot@somewhere", github_logins: ["bot"] });
+  assert.equal(unpinned.body.code, "identity_mismatch", unpinned.raw);
+  assert.deepEqual(refusals().map(line => line.reason), ["identity_mismatch", "identity_unpinnable"]);
+  // An agent never grants itself: the route is human-only.
+  assert.equal((await request(env.origin, `${env.base}/delegates`, { method: "POST", token: approver.token,
+    body: { delegate_agent_id: approver.id, scopes: repoScopes, kind: "approver", delegate_address: address, github_logins: ["bot"] } })).status, 401);
+
+  // Every target must name an exact owner/repo: an owner wildcard, a deploy environment or a channel is refused.
+  const pinnedBody = { kind: "approver", delegate_address: address, github_logins: ["release-bot"] };
+  for (const targets of [scopes, [{ class: "merge", targets: ["AgentWorkforce/*"] }], [{ class: "deploy", targets: ["relay:prod"] }],
+    [{ class: "merge", targets: ["AgentWorkforce/relay#7"] }, { class: "external_comms", targets: ["slack:ops"] }]]) {
+    const refused = await post(pinnedBody, targets);
+    assert.equal(refused.status, 400, refused.raw);
+    assert.equal(refused.body.code, "approver_target_not_repo", JSON.stringify(targets));
+  }
+  // Exact repositories: the granter must be a code owner of each, which relay-control cannot read. A
+  // definite 403 (retrying never helps), naming the repositories, lowercased and once each.
+  const notOwner = await post(pinnedBody);
+  assert.equal(notOwner.status, 403, notOwner.raw);
+  assert.equal(notOwner.body.code, "not_code_owner");
+  assert.match(notOwner.raw, /cannot read CODEOWNERS.*agentworkforce\/relay;/);
+  // A name that is not exactly owner/repo (an owner with `_`, a `..` name) has no governing branches: unconfigured, as Cloud.
+  for (const target of ["Agent_Workforce/relay#7", "AgentWorkforce/.."]) {
+    const odd = await post(pinnedBody, [{ class: "merge", targets: [target] }]);
+    assert.equal(odd.status, 403, odd.raw);
+    assert.equal(odd.body.code, "not_code_owner");
+    assert.match(odd.raw, /no configured merge targets/);
+  }
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_grants")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'grant.created'")).rows.length, 0);
+  // Every refused approver grant is logged, ids and reasons only (delegation.refused, op approver_grant).
+  const logged = refusals();
+  assert.deepEqual(logged.map(line => line.reason), ["identity_mismatch", "identity_unpinnable",
+    "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "codeowners_unreadable",
+    "unconfigured", "unconfigured"]);
+  assert.equal(logged[6]!.repo, "agentworkforce/relay");
+  assert.deepEqual(logged.slice(7).map(line => [line.repo, line.merge_targets]),
+    [["agent_workforce/relay", "unconfigured"], ["agentworkforce/..", "unconfigured"]]);
+  assert.equal(logged[0]!.agentId, approver.id);
+  assert.doesNotMatch(JSON.stringify(logged), /release-bot|release-approver@/);
+
+  // A stored approver row (as an install that can read CODEOWNERS would grant) reads back with its fields.
+  const grantId = await seedApprover(["release-bot", "khaliq", "agent-relay-code[bot]"]);
+  const approverView = (await env.bearer("/delegates")).body.grants.find((grant: any) => grant.grant_id === grantId);
+  assert.equal(approverView.kind, "approver");
+  assert.equal(approverView.delegate_address, address);
+  assert.deepEqual(approverView.github_logins, ["release-bot", "khaliq", "agent-relay-code[bot]"]);
+  // A delegate grant's view carries none of the approver fields; a pre-0101 row (null kind) reads as a delegate.
+  const other = await env.desktopIdentity("plain-bot");
+  const plain = await env.grant(other.id, scopes);
+  assert.equal("kind" in plain, false);
+  await env.database.query("UPDATE delegation_grants SET kind = NULL WHERE id = $1", [plain.grant_id]);
+  const listed = await env.bearer("/delegates");
+  assert.equal(listed.body.grants.find((grant: any) => grant.grant_id === plain.grant_id).kind, undefined);
+});
+
+test("approvers: claims, audit and the redeem response name the approver; unattributable and GitHub-checked targets refuse", async (t) => {
+  const { env, recipient, approver, address, seedApprover } = await approverReady(t);
+  const grantId = await seedApprover();
+  // granted_by_standing is always "none": relay-control cannot judge code ownership (cloud#6730).
+  const expected = { grant_id: grantId, agent_id: approver.id, address, granted_by: env.ownerId, granted_by_standing: "none" };
+
+  const comms = { class: "external_comms", target: "slack:ops" };
+  const messageId = send(env, approver, recipient, env.approval([comms]));
+  const attested = await env.attest(recipient, messageId, "own_owner");
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  assert.deepEqual(attested.body.claims.approver, expected);
+  assert.equal(attested.body.claims.standing, "own_owner");
+  assert.deepEqual(verifyDelegationJws(attested.body.attestation, await env.jwks()), attested.body.claims);
+  const attestedAudit = (await env.database.query<{ data: Record<string, unknown> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'approval.attested'")).rows[0]!;
+  assert.deepEqual(attestedAudit.data.approver, expected);
+
+  const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, comms);
+  assert.deepEqual(redeemed.body, { ok: true, consumed: false, approver: expected });
+  const redeemAudit = (await env.database.query<{ data: Record<string, unknown> }>(
+    "SELECT data FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows[0]!;
+  assert.deepEqual(redeemAudit.data.approver, expected);
+
+  // A deploy names no repository and commit: unattributable_target, as Cloud. A PR or a release
+  // would need GitHub reads (authors, committers, files, compare) relay-control does not make: they fail closed.
+  const sha = "a".repeat(40);
+  for (const [action, reason] of [[{ class: "deploy", target: "relay:prod" }, "unattributable_target"],
+    [{ class: "merge", target: "AgentWorkforce/relay#2250" }, "condition_unavailable"],
+    [{ class: "release", target: `AgentWorkforce/relay:stable:v1.2.3:${sha}:123` }, "condition_unavailable"]] as const) {
+    const sent = send(env, approver, recipient, env.approval([action], { quote: `ok ${action.class}` }));
+    const ok = await env.attest(recipient, sent, "own_owner");
+    assert.equal(ok.body.verdict, "delegate", ok.raw);
+    assert.deepEqual((await env.redeem(recipient, ok.body.claims.approval_id, action)).body, { ok: false, reason }, action.class);
+  }
+});
+
+test("approvers: a moved address is identity_mismatch at attest and at redeem", async (t) => {
+  const { env, recipient, approver, seedApprover } = await approverReady(t);
+  await seedApprover();
+  const prod = { class: "deploy", target: "relay:prod" };
+  const first = send(env, approver, recipient, env.approval([prod]));
+  const attested = await env.attest(recipient, first, "own_owner");
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+
+  await env.database.query("UPDATE desktop_relay_identities SET address = $1 WHERE agent_remote_id = $2",
+    [`release-approver@cloud-elsewhere`, approver.id]);
+  assert.deepEqual((await env.redeem(recipient, attested.body.claims.approval_id, prod)).body,
+    { ok: false, reason: "identity_mismatch" });
+  const second = send(env, approver, recipient, env.approval([prod], { quote: "deploy again" }));
+  const refused = await env.attest(recipient, second, "own_owner");
+  assert.equal(refused.body.verdict, "none", refused.raw);
+  assert.equal(refused.body.reason, "identity_mismatch");
+});
+
+test("approvers: prompt-delegates omits an approver whose bound address moved", async (t) => {
+  const { env, recipient, approver, address } = await approverReady(t);
+  const made = await env.grant(approver.id, [{ class: "prompt_approval", targets: ["*"] }]);
+  await env.database.query("UPDATE delegation_grants SET kind = 'approver', delegate_address = $2, approver_github_logins = $3 WHERE id = $1",
+    [made.grant_id, address, ["release-bot"]]);
+  const list = () => request(env.origin, `${env.base}/messaging/delegation/prompt-delegates`, {
+    method: "POST", token: env.desktop.accessToken, body: { session_agent_id: recipient.id, session_token: recipient.token } });
+  assert.deepEqual((await list()).body, { delegates: [{ agent_id: approver.id, grant_id: made.grant_id }] });
+  // Same agent id and binding, another address: its answer would be identity_mismatch, so it is not offered.
+  await env.database.query("UPDATE desktop_relay_identities SET address = $1 WHERE agent_remote_id = $2",
+    [`release-approver@cloud-elsewhere`, approver.id]);
+  assert.deepEqual((await list()).body, { delegates: [] });
+});
+
+test("openapi: DelegationReason lists every reason code the service answers", () => {
+  const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8")) as
+    { components: { schemas: { DelegationReason: { enum: string[] } } } };
+  assert.deepEqual([...spec.components.schemas.DelegationReason.enum].sort(), [...REASON_CODES].sort());
 });
