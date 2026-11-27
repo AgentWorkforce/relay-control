@@ -44,12 +44,15 @@ Registered in `slashy_inbox` only for an OAuth grant whose registered callback
 classifies as Slashy (`connectorKind` returns `slashy`). Neither tool adds
 authority beyond `join_relay`/`relay_status` for the approved agent.
 
-- `connect_slashy_inbox` `{interval_minutes?: 5-60, default 5}` joins (or
-  reuses) the approved hosted participant and returns `{agent, inbox_address,
-  set_reminder_arguments: {name, schedule_expression, write_enabled: true,
-  reminder_text}, next_steps, note}`. The reminder name is
-  `Agent Relay inbox (<agent>)`, so a repeated setup keeps the existing
-  reminder. Idempotent.
+- `connect_slashy_inbox` `{interval_minutes?: 5-60, default 5,
+  trusted_agents?: string[] (at most 20 exact names, default [])}` resolves
+  each trusted agent to its current Relaycast agent id, read from Relaycast
+  itself (an unknown name is refused). It then joins (or reuses) the approved
+  hosted participant and returns `{agent, inbox_address, trusted_agents: [{name,
+  sender_id}], set_reminder_arguments: {name, schedule_expression,
+  write_enabled: true, reminder_text}, next_steps, note}`. The reminder name is
+  `Agent Relay inbox (<agent>)`. `next_steps` keep an identical reminder, and
+  replace one with different text, so there is never a second. Idempotent.
 - `slashy_inbox_status` `{}` returns `{agent, joined, inbox_address,
   last_seen, looks_active, pending_count, pending_count_is_lower_bound,
   stale_after_seconds: 900, reminder_name}`. `last_seen` is Relaycast's
@@ -58,18 +61,44 @@ authority beyond `join_relay`/`relay_status` for the approved agent.
   minutes. The status read sends no heartbeat and acknowledges nothing.
 
 `src/mcp/slashy.ts` holds the reminder text, mirrored word for word from
-Cloud's `packages/web/lib/mcp/slashy-inbox.ts`.
+Cloud's `packages/web/lib/mcp/slashy-inbox.ts`. `test/fixtures/slashy-reminder.fixture.json`
+is a verbatim copy of Cloud's fixture, and both repos assert their output against it.
 
-## sender_is_owner
+The reminder replies to a direct message with `send_relay_message` and
+`reply_to`, and to a channel post with `post_relay_channel` and the
+`reply_hint`'s channel and `thread_id`. It acknowledges with
+`acknowledge: [delivery_id]`. A sender that does not pass the gate below gets
+only information safe to share publicly, or a reply that the request needs
+the owner's approval. It never gets a lookup of the owner's private data. Private details are never posted in a channel, even for the owner: the
+reminder posts a public-safe line in the thread ("Sent you the details by DM")
+and sends the private answer by `send_relay_message` to the sender's
+`sender_address`.
 
-For a Slashy connection only, each `check_relay_inbox` message carries
-`sender_is_owner`. It is true only when the message's Relaycast `sender_id`
-(stamped from the sending token, unlike the name) is one of the owner's own
-rows in this workspace's relay: their person identity, synced Desktop
-identities, hosted participants or launched workers (`relay_spawns.worker_id`).
-Other people's agents and an unreadable proof are false. The reminder takes
-mail, calendar, task, reminder, memory or Slack actions only for such a
-message and otherwise answers from read-only lookups or asks the owner.
+## The owner gate: sender_is_owner and trusted_agents
+
+The policy is "the owner's human identity plus agents the owner names",
+never "every agent the owner owns".
+
+`sender_is_owner` appears on each `check_relay_inbox` message, for a Slashy
+connection only. It is computed in `src/mcp/relay-participants.ts`
+(`ownedSenders`) and is true only when the message's Relaycast `sender_id` is
+the grant user's own `person_identities.agent_remote_id` in this workspace's
+relay. Person identities register with Relaycast directly, on gate-only
+installs too, so the stored id matches the id deliveries carry. Desktop
+identities on gate-only installs hold relaygate ids instead, and the owner's
+Desktop sessions, hosted participants and launches are all false. An
+unreadable proof is false.
+
+`trusted_agents` lists the agents the owner explicitly approves. Each is
+pinned into the reminder text as `name (sender_id <Relaycast id>)` at setup,
+and later runs compare each message's `sender_id`. To change the list, call
+`connect_slashy_inbox` again; the reminder is replaced.
+
+`slashy_inbox_status` creates nothing. It reads the participant the way
+`relay_status` does, without a heartbeat (that read still records the grant's
+pin to its agent id). There is no relay provisioning to trigger on a
+self-hosted server. No MCP Events pump consumes a self-hosted Slashy inbox,
+because Grok routines are never mounted for a Slashy grant.
 
 ## Classification (assumption)
 

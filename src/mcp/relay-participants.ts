@@ -880,23 +880,22 @@ function createRelayService(context: McpContext) {
   }
 
   /**
-   * The sender ids, of `ids`, that are this owner's own Relaycast identities
-   * in this workspace's relay: their person identity, synced Desktop
-   * identities, hosted participants and verified launches (worker ids), from
-   * rows this server wrote when the owner created them. Relaycast stamps
-   * sender ids from the sending token, so a re-registered name never matches.
+   * The sender ids, of `ids`, that are this owner's own person (human)
+   * identity in this workspace's relay. Person identities are registered with
+   * Relaycast directly, on gate-only installs too, so the stored id is the
+   * Relaycast id deliveries carry (Desktop identities there hold relaygate
+   * ids, which is one more reason the owner's agents are trusted only when
+   * named explicitly). Relaycast stamps sender ids from the sending token,
+   * so a re-registered name never matches.
    */
   async function ownedSenders(ids: string[]): Promise<Set<string>> {
     const unique = [...new Set(ids)];
     if (agent || agentMissing || !unique.length) return new Set();
     try {
-      const params = [context.workspace.id, context.principal.userId, relayWorkspaceId, unique];
-      const owned = `workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3`;
       const rows = (await context.relay.database.query<{ id: string }>(
-        `SELECT agent_remote_id AS id FROM hosted_relay_participants WHERE ${owned} AND agent_remote_id = ANY($4::text[])
-         UNION SELECT agent_remote_id FROM desktop_relay_identities WHERE ${owned} AND agent_remote_id = ANY($4::text[])
-         UNION SELECT agent_remote_id FROM person_identities WHERE ${owned} AND agent_remote_id = ANY($4::text[])
-         UNION SELECT worker_id FROM relay_spawns WHERE ${owned} AND worker_id = ANY($4::text[])`, params)).rows;
+        `SELECT agent_remote_id AS id FROM person_identities
+          WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND agent_remote_id = ANY($4::text[])`,
+        [context.workspace.id, context.principal.userId, relayWorkspaceId, unique])).rows;
       return new Set(rows.map(row => row.id));
     } catch {
       console.warn("[mcp] check_relay_inbox owner proof unavailable");
@@ -1838,6 +1837,18 @@ function createRelayService(context: McpContext) {
      * last_seen as the reminder's liveness, so this read must not move it).
      * Null when no participant is joined. Nothing is acknowledged.
      */
+    /** The current Relaycast agent id of each named workspace agent, read from Relaycast itself; an unknown name is refused. */
+    async resolveAgentIds(names: string[]): Promise<Array<{ name: string; id: string }>> {
+      if (!names.length) return [];
+      const agents = (await withinRelayRead(signal => client.findAgentsByNames(key, names, { signal }), RELAY_STATUS_LOOKUP_TIMEOUT_MS))
+        .filter(isListedRelayAgent);
+      return names.map(name => {
+        const found = agents.find(row => row.name === name);
+        if (!found?.id) throw new RelayToolError(`No agent named ${name} is in this workspace's relay. Use the exact name from list_relay_agents.`);
+        return { name, id: found.id };
+      });
+    },
+
     async hostedPresence(): Promise<{ name: string; address: string | null; last_seen: string | null; pending_count: number } | null> {
       if (managed) return null;
       const hosted = await participant(undefined, { allowMissing: true });
@@ -1892,8 +1903,8 @@ function createRelayService(context: McpContext) {
       }
       // A Slashy connection acts on its owner's mail and calendar from these
       // messages, so each says whether the sender's Relaycast agent id (never
-      // its name or text) proves out as the owner's own by the delegation
-      // ownership chain. An unreadable proof is false.
+      // its name or text) is the owner's own person identity. An unreadable
+      // proof is false.
       const ownerSenders = context.slashy ? await ownedSenders(messages.flatMap(message => message.sender_id ? [message.sender_id] : [])) : null;
       const enriched = messages.map(message => {
         const base = { ...message, sender_address: message.sender ? addresses.get(message.sender) ?? null : null,
