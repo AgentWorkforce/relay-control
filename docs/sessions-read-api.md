@@ -299,13 +299,19 @@ routes (`/cloud/api/v1/workspaces/{ws}/sessions...`):
 | 404 on timing | 200 `{timing:null}` |
 | 401 | cached token dropped, one new handoff and retry |
 | 410 | `410 {"error":"cursor_expired"}`: the client restarts from the first page |
-| 503 (dormant or refusing) | `503 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":503}`, retryable; the cached token is kept |
-| other failures | `502 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":<status>}`; no retry, no upstream body |
+| 503 (dormant or refusing, for example a fenced or buffered session) | `503 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":503}`, retryable; the cached token is kept. A numeric (delta-seconds, at most 4 digits) upstream `Retry-After` is passed through; any other form is dropped. |
+| read timed out | `503 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":null}`, retryable, without `Retry-After` |
+| missing or different workspace attestation | `502 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":<status>}`; no upstream body, no `Retry-After` |
+| other failures (including an unreachable read API) | `502 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":<status or null>}`; no retry, no upstream body, no `Retry-After` |
 
 Handoff failures report `stage: "exchange"` the same way. Redirects are
 refused and never followed. The MCP shared-sessions tools report a 501 as an
 unsupported view, a 410 as an explicit restart instruction, and any other
 non-200 read as their usual "unavailable" tool error.
+
+There is one session reader here, so Control has no "empty within this
+workspace" marker: every read is already scoped to the authorized workspace
+and an empty page is answered as an empty page.
 
 `SESSION_READ_API_MCP_READS=true` additionally gives MCP its own per-user read
 pair through Control (see the README); without it MCP reads use the same

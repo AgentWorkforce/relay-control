@@ -547,6 +547,123 @@ test("per-session events and turns with a missing or different attestation give 
   }
 });
 
+const PER_SESSION_RESOURCES = ["events", "turns", "summary", "timing", "catalog"] as const;
+
+test("per-session reads: an upstream 503 stays a retryable 503 and passes a numeric Retry-After through", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions/alpha-1`;
+  for (const resource of PER_SESSION_RESOURCES) {
+    const upstream = `/v1/sessions/alpha-1/${resource}`;
+    for (const [retryAfter, expected] of [
+      ["7", "7"],
+      [undefined, null],
+      // Only delta-seconds pass; a date or junk is dropped, never guessed at.
+      ["Wed, 21 Oct 2026 07:28:00 GMT", null],
+      ["-1", null],
+      ["99999", null],
+    ] as const) {
+      env.history.overrides.set(upstream, () => ({
+        status: 503,
+        headers: retryAfter === undefined ? {} as Record<string, string> : { "retry-after": retryAfter as string },
+        body: { error: { code: "buffered_fenced" }, private: "must-not-echo" },
+      }));
+      const before = env.history.requests.length;
+      const response = await call(env.origin, `${base}/${resource}?source=codex`, { token });
+      const label = `${resource} retry-after ${JSON.stringify(retryAfter)}`;
+      assert.equal(response.status, 503, label);
+      assert.equal(response.headers.get("retry-after"), expected, label);
+      assert.equal(response.headers.get("cache-control"), "no-store", label);
+      assert.deepEqual(response.body, {
+        error: "relayhistory_session_failed",
+        stage: "read",
+        upstreamStatus: 503,
+      }, label);
+      // One upstream read: a 503 is never retried inside the request.
+      assert.deepEqual(env.history.requests.slice(before).filter((entry) => entry.path.startsWith("/v1/"))
+        .map((entry) => entry.path), [upstream], label);
+    }
+    env.history.overrides.delete(upstream);
+  }
+});
+
+test("per-session reads: other upstream failures and attestation failures stay 502 without Retry-After or the body", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions/alpha-1`;
+  for (const resource of PER_SESSION_RESOURCES) {
+    const upstream = `/v1/sessions/alpha-1/${resource}`;
+    const failures: Array<[string, { status?: number; headers: Record<string, string | null>; body: unknown }]> = [
+      ["500", { status: 500, headers: { "retry-after": "7" }, body: { private: "must-not-echo" } }],
+      ["502", { status: 502, headers: { "retry-after": "7" }, body: { private: "must-not-echo" } }],
+      ["unattested", { headers: { "x-relayhistory-workspace-id": null, "retry-after": "7" }, body: { private: "must-not-echo" } }],
+      ["mis-attested", { headers: { "x-relayhistory-workspace-id": env.beta, "retry-after": "7" }, body: { private: "must-not-echo" } }],
+    ];
+    for (const [name, failure] of failures) {
+      env.history.overrides.set(upstream, () => failure);
+      const response = await call(env.origin, `${base}/${resource}?source=codex`, { token });
+      const label = `${resource} ${name}`;
+      assert.equal(response.status, 502, label);
+      assert.equal(response.headers.get("retry-after"), null, label);
+      assert.equal(response.body.error, "relayhistory_session_failed", label);
+      assert(!JSON.stringify(response.body).includes("must-not-echo"), label);
+    }
+    env.history.overrides.delete(upstream);
+  }
+});
+
+test("per-session reads: an upstream read timeout is a retryable 503; other transport failures stay 502", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions/alpha-1`;
+  // Hold a read credential first, so only the read itself is intercepted.
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token })).status, 200);
+  const realFetch = globalThis.fetch;
+  let failure: Error | null = null;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (failure && url.origin === env.history.origin && url.pathname.startsWith("/v1/sessions/alpha-1/")) throw failure;
+    return realFetch(input, init);
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = realFetch; });
+
+  for (const resource of PER_SESSION_RESOURCES) {
+    failure = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const timedOut = await call(env.origin, `${base}/${resource}?source=codex`, { token });
+    assert.equal(timedOut.status, 503, `${resource} timeout`);
+    // No upstream Retry-After exists for a timeout, so none is invented.
+    assert.equal(timedOut.headers.get("retry-after"), null, `${resource} timeout`);
+    assert.deepEqual(timedOut.body, { error: "relayhistory_session_failed", stage: "read", upstreamStatus: null });
+
+    failure = new TypeError("fetch failed");
+    const unreachable = await call(env.origin, `${base}/${resource}?source=codex`, { token });
+    assert.equal(unreachable.status, 502, `${resource} network failure`);
+    assert.equal(unreachable.headers.get("retry-after"), null, `${resource} network failure`);
+    assert(!JSON.stringify(unreachable.body).includes("fetch failed"), `${resource} network failure`);
+  }
+  failure = null;
+  assert.equal((await call(env.origin, `${base}/events?source=codex`, { token })).status, 200);
+});
+
+test("per-session reads: a cursor the read API cannot continue answers 410 cursor_expired", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions/alpha-1`;
+  for (const resource of ["events", "turns"] as const) {
+    env.history.overrides.set(`/v1/sessions/alpha-1/${resource}`, () => ({
+      status: 410, headers: { "retry-after": "7" }, body: { error: { code: "cursor_expired" }, private: "must-not-echo" },
+    }));
+    const response = await call(env.origin, `${base}/${resource}?source=codex&cursor=opaque-cursor`, { token });
+    assert.equal(response.status, 410, resource);
+    assert.equal(response.headers.get("retry-after"), null, resource);
+    assert.deepEqual(response.body, {
+      error: "cursor_expired",
+      message: "This session cursor has expired. Restart from the first page.",
+    }, resource);
+    env.history.overrides.delete(`/v1/sessions/alpha-1/${resource}`);
+  }
+});
+
 test("members: names for the dashboard without a History read", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);

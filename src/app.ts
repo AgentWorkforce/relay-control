@@ -3756,6 +3756,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           status: error.status ?? 502,
           component: "relayhistory",
         });
+        if (error.retryable && error.retryAfterSeconds !== undefined) {
+          response.setHeader("retry-after", String(error.retryAfterSeconds));
+        }
         json(response, error.retryable ? 503 : 502, {
           error: "relayhistory_session_failed",
           stage: error.stage,

@@ -200,7 +200,10 @@ export async function readWorkspaceHistory(
         },
       });
     } catch (error) {
-      throw new UpstreamError("read", undefined, error instanceof Error ? error.message : undefined);
+      // A read that timed out is temporary (retryable 503); any other
+      // transport failure stays a plain upstream failure (502).
+      const timedOut = error instanceof Error && error.name === "TimeoutError";
+      throw new UpstreamError("read", undefined, error instanceof Error ? error.message : undefined, timedOut);
     }
     if (response.status === 401 && attempt === 0) {
       // A revoked or rotated read session: mint a fresh one once.
@@ -226,7 +229,10 @@ export async function readWorkspaceHistory(
       // cached read token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
       if (response.status === 410) throw new ReadCursorExpiredError();
-      throw new UpstreamError("read", response.status, undefined, response.status === 503);
+      if (response.status === 503) {
+        throw new UpstreamError("read", 503, undefined, true, retryAfterOf(response));
+      }
+      throw new UpstreamError("read", response.status);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
       await response.body?.cancel().catch(() => {});
@@ -239,6 +245,16 @@ export async function readWorkspaceHistory(
     return { status: "ok", body, agentMatch: response.headers.get(AGENT_MATCH_HEADER) };
   }
   throw new UpstreamError("read", 401);
+}
+
+/**
+ * A numeric (delta-seconds) `Retry-After` on an upstream 503, passed through
+ * so a temporary refusal (a fenced or buffered session) says when to retry.
+ * A date or any other form is dropped rather than guessed at.
+ */
+function retryAfterOf(response: Response): number | undefined {
+  const value = response.headers.get("retry-after")?.trim();
+  return value && /^\d{1,4}$/.test(value) ? Number(value) : undefined;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
