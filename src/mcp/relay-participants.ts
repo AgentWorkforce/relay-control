@@ -316,8 +316,10 @@ export const OWNER_APPROVAL_MAX_BYTES = 192 * 1024;
  * only finds a grant whose owner is the delegate's binding owner
  * (delegateStillBound). So `owner_id` (and `v`) are filled in when omitted,
  * and an `owner_id` naming anyone else is refused. A workspace agent identity
- * token has no person behind it (null): nothing is filled in or compared, and
- * the object must carry its own `owner_id`. The result is checked against the
+ * token has no person behind it (null): its hosted participant has no owning
+ * user, so no approval it sends could ever attest, and owner_approval is
+ * refused there (as Cloud withdrew owner approval tools from agent identity
+ * tokens, cloud#6704). The result is checked against the
  * schema attest uses (delegation/scope.ts ownerApprovalSchema), so a mistake
  * names its field here instead of costing a send. What is returned is passed
  * to Relaycast exactly, byte for byte: the caller's object, plus `v` and
@@ -330,11 +332,14 @@ export function prepareOwnerApproval(ownerApproval: Record<string, unknown> | un
   if (Buffer.byteLength(JSON.stringify(ownerApproval), "utf8") > OWNER_APPROVAL_MAX_BYTES) {
     throw new RelayToolError("owner_approval is larger than 192 KiB, above any valid approval. Nothing was sent.");
   }
-  if (ownerUserId !== null && ownerApproval.owner_id !== undefined && !sameOwner(ownerApproval.owner_id, ownerUserId)) {
+  if (ownerUserId === null) {
+    throw new RelayToolError("invalid_owner_approval: a workspace agent identity token has no owner, so it cannot relay an owner approval. Send it from a session signed in as the delegate's owner. Nothing was sent.");
+  }
+  if (ownerApproval.owner_id !== undefined && !sameOwner(ownerApproval.owner_id, ownerUserId)) {
     throw new RelayToolError("invalid_owner_approval: owner_id must be your owner's user id, the one this connection signs in as. Omit owner_id and it is filled in. Nothing was sent.");
   }
   const built = { ...(ownerApproval.v === undefined ? { v: 1 } : {}), ...ownerApproval,
-    ...(ownerApproval.owner_id === undefined && ownerUserId !== null ? { owner_id: ownerUserId } : {}) };
+    ...(ownerApproval.owner_id === undefined ? { owner_id: ownerUserId } : {}) };
   const parsed = ownerApprovalSchema.safeParse(built);
   if (!parsed.success) throw new RelayToolError(`invalid_owner_approval: ${ownerApprovalIssue(parsed.error.issues[0], built)} Nothing was sent.`);
   return built;

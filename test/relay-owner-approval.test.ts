@@ -53,10 +53,11 @@ test("owner_approval fills v and the caller's own owner_id, and passes a hand-st
   // The schema canonicalizes a UUID's case, so an upper-case spelling of the same owner is that owner, sent as given.
   const upper = { v: 1, owner_id: OWNER.toUpperCase(), actions };
   assert.equal(JSON.stringify(prepareOwnerApproval(upper, null, OWNER)), JSON.stringify(upper));
-  // An agent identity token has no person to fill in: owner_id must be stated, and is not compared.
-  assert.throws(() => prepareOwnerApproval({ actions }, null, null), /invalid_owner_approval: owner_approval\.owner_id:/);
-  assert.equal(JSON.stringify(prepareOwnerApproval({ owner_id: "someone", actions }, null, null)),
-    JSON.stringify({ v: 1, owner_id: "someone", actions }));
+  // An agent identity token has no owner: any owner_approval is refused, stated owner_id or not.
+  for (const given of [{ actions }, { owner_id: OWNER, actions }]) {
+    assert.throws(() => prepareOwnerApproval(given, null, null), /invalid_owner_approval: a workspace agent identity token has no owner/);
+  }
+  assert.equal(prepareOwnerApproval(undefined, null, null), undefined);
 });
 
 test("owner_approval for another owner, or with a bad field, is refused naming the field, before sending", () => {
