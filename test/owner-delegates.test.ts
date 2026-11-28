@@ -2585,6 +2585,34 @@ test("approvers: GET approver-candidates is a definite 404 approver_grants_unava
   const agent = await env.desktopIdentity("candidates-bot");
   const byAgent = await request(env.origin, `${env.base}/delegates/approver-candidates`, { method: "GET", token: agent.token });
   assert.equal(byAgent.status, 401, byAgent.raw);
+  // The same refusal as the policy GET for a caller of another workspace, and for no credential.
+  const other = await request(env.origin, `/api/v1/workspaces/${env.otherWorkspaceId}/delegates/approver-candidates`,
+    { token: env.desktop.accessToken });
+  assert.equal(other.status, 403, other.raw);
+  assert.equal(other.body.code, "forbidden");
+  const otherPolicy = await request(env.origin, `/api/v1/workspaces/${env.otherWorkspaceId}/delegates/policy`,
+    { token: env.desktop.accessToken });
+  assert.deepEqual([other.status, other.body.code], [otherPolicy.status, otherPolicy.body.code]);
+  assert.equal((await request(env.origin, `${env.base}/delegates/approver-candidates`)).status, 401);
+});
+
+test("approvers: GET approver-candidates on an unbound workspace is the 404 and provisions nothing", async (t) => {
+  const { env } = await approverReady(t);
+  // An imported workspace starts out unbound; this harness configures no Relaycast provisioner, so a read
+  // that reached workspaceForUser would fail as 403 forbidden, or, with a provisioner, bind the workspace.
+  await env.database.query(
+    "UPDATE workspaces SET relaycast_workspace_id = NULL, relaycast_api_key_ciphertext = NULL, relaycast_binding_claim_id = NULL WHERE id = $1",
+    [env.workspaceId]);
+  const bodies = env.world.bodies.length;
+  for (const listed of [await env.bearer("/delegates/approver-candidates"),
+    await request(env.origin, `/cloud${env.base}/delegates/approver-candidates`, { cookie: env.desktop.session })]) {
+    assert.equal(listed.status, 404, listed.raw);
+    assert.equal(listed.body.code, "approver_grants_unavailable");
+  }
+  assert.equal(env.world.bodies.length, bodies, "no Relaycast call");
+  const row = await env.database.query<{ relaycast_workspace_id: string | null; relaycast_binding_claim_id: string | null }>(
+    "SELECT relaycast_workspace_id, relaycast_binding_claim_id FROM workspaces WHERE id = $1", [env.workspaceId]);
+  assert.deepEqual(row.rows[0], { relaycast_workspace_id: null, relaycast_binding_claim_id: null });
 });
 
 test("approvers: claims and audit name the approver; every class but release, and GitHub-checked targets, refuse at redeem", async (t) => {
