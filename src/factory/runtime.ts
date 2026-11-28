@@ -4,6 +4,8 @@
  * code and whether the write may have happened (`unknown`).
  */
 
+import { factoryCanonicalEvidence, factoryMessagePage, type FactoryMessage } from "./provider.js";
+
 export type FactoryComputer = { id: string; name: string; status: string };
 export type FactorySessionRow = { id: string; title: string; computerId: string };
 export type FactorySessionMeta = {
@@ -234,6 +236,33 @@ export function createFactoryRuntime(input: { apiUrl: string; fetchImpl?: typeof
     /** Session metadata, pinned to the computer it must be on. */
     async getSession(key: string, sessionId: string, computerId: string): Promise<FactorySessionMeta> {
       return sessionMeta(operation(key), sessionId, computerId);
+    },
+
+    /** Read a complete computer-bound Sessions API snapshot before projecting any history. */
+    async readHistory(key: string, sessionId: string, computerId: string) {
+      const request = operation(key);
+      const before = await sessionMeta(request, sessionId, computerId);
+      const messages: FactoryMessage[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | null = null;
+      for (let index = 0; index < MAX_PAGES; index++) {
+        const raw = await request(`/api/v0/sessions/${encodeURIComponent(sessionId)}/messages`, { computerId, cursor, limit: "100" });
+        const page = factoryMessagePage(raw);
+        for (const message of page.messages) messages.push(message);
+        if (messages.length > before.messageCount) throw new FactoryRuntimeError("rejected", "factory_snapshot_incomplete");
+        cursor = pageCursor(raw.pagination);
+        if (!cursor) {
+          const after = await sessionMeta(request, sessionId, computerId);
+          if (before.updatedAt !== after.updatedAt || before.messageCount !== after.messageCount) {
+            throw new FactoryRuntimeError("rejected", "factory_snapshot_changed");
+          }
+          if (messages.length !== before.messageCount) throw new FactoryRuntimeError("rejected", "factory_snapshot_incomplete");
+          return { session: after, records: await factoryCanonicalEvidence(sessionId, messages) };
+        }
+        if (cursors.has(cursor) || !page.messages.length) throw new FactoryRuntimeError("rejected", "factory_pagination_incomplete");
+        cursors.add(cursor);
+      }
+      throw new FactoryRuntimeError("rejected", "factory_page_limit");
     },
 
     /**
