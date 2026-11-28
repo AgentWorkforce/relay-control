@@ -82,7 +82,7 @@ import {
   type DelegationPolicy,
   type DelegationWorkspace,
   type GrantRow,
-  connectorRootProven, trustProver, approverScopeRepositories, splitRepository,
+  connectorRootProven, trustProver, approverScopeRefusal, approverScopeRepositories, splitRepository,
 } from "./service.js";
 import { backfillConnectorRoots } from "./trust-backfill.js";
 import {
@@ -987,6 +987,13 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
         if (!repos) {
           refuseApprover("approver_target_not_repo");
           fail("approver_target_not_repo", "Every approver scope target must name an exact owner/repo", 400);
+        }
+        // Release class only, in a repository with an approver allow-list, as Cloud (cloud#6789): refused before the
+        // code-owner check, which relay-control always refuses.
+        const scopeRefused = approverScopeRefusal(scopes, repos!);
+        if (scopeRefused) {
+          refuseApprover(scopeRefused.code);
+          fail(scopeRefused.code, scopeRefused.error, 400);
         }
         const repo = repos![0]!;
         // As Cloud: a name that is not exactly owner/repo (an owner with `_` or `.`, a `.` or `..` name) has

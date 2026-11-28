@@ -16,6 +16,7 @@
  *   delegation.refused            one refusal, by `op` and `reason` (info level). For op
  *                                 `approver_grant` (a refused approver grant, cloud#6730) the reason is
  *                                 identity_unpinnable, identity_mismatch, approver_target_not_repo,
+ *                                 approver_class_not_release, approver_repo_not_allowed,
  *                                 unconfigured (with `repo`, merge_targets "unconfigured") or
  *                                 codeowners_unreadable (with `repo`)
  *   delegation.redaction_backlog  the Relaycast redaction queue after a sweep (warn when it needs an operator)
