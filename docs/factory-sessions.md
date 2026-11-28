@@ -64,8 +64,10 @@ before authentication, and the worker does not start.
 | Relay-events webhook and Relaycast subscriptions | Deferred. `POST /api/v1/factory-sessions/relay-events/{bindingId}` is always 404. Delivery uses inbox polling. |
 | Acquisition enrollment token | Shipped, inert unless `SELFHOST_ACQUISITION_ORIGIN` is set. See [Acquisition enrollment](#acquisition-enrollment). |
 | Acquisition transport and install envelope | Not implemented. Control mints and retires the enrollment token only; it never calls the acquisition service. |
-| Session mapper and export | Not implemented. Unknown sends are never reconciled from session metadata. |
+| Sessions API history reader | The transport reads every message page for the pinned computer and session. It checks the message count and the final session revision before using RelayHistory’s Droid canonical mapper. Background publication remains deferred. |
 | Admin force-disconnect | Not provided, by design. Only the person who connected Factory manages that connection. |
+
+The native Droid reader belongs on the Desktop or sandbox that owns its local history files. Control reads the Factory Sessions API for remote snapshots. Binding a session for messaging does not transfer history ownership. Publication requires an acquisition decision for the workspace and native session so that the local reader and remote collector cannot publish competing snapshots.
 
 ## Configuration
 

@@ -1,0 +1,10 @@
+{
+  "repository": "AgentWorkforce/relayhistory",
+  "commit": "98d58b9e05b29d2a8c41502b1aa4b6100dbac1d6",
+  "path": "sdk-ts/src/factory-source.ts",
+  "sha256": "6e1948965df0fe20d76bcfa6ce3f67e0f99ab6fbb76204c33d3341027c277ebc",
+  "license": "MIT",
+  "localChanges": [
+    "Type-only non-null assertions on both bounds-checked array reads in compareUnicode for noUncheckedIndexedAccess."
+  ]
+}
