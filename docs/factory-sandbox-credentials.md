@@ -1,0 +1,22 @@
+# Proposed Factory credential delivery for a sandbox Droid run
+
+**Decision requested under [#99](https://github.com/AgentWorkforce/relay-control/issues/99).** Choose the credential the headless Droid process may receive. Both options require the launcher authorization below. This proposal defines a review target. The runner attestation and private handoff still need implementation and verification.
+
+| Option | Credential delivered to Droid | End of run or disconnect |
+| --- | --- | --- |
+| A. Stored key with process-scoped delivery | Control opens the connecting person's Factory key envelope for one authorized launch. The trusted launcher sets `FACTORY_API_KEY` only in the isolated Droid child's environment. | Closing the run or disconnecting blocks future deliveries. A copied key retains its provider permissions until rotated or revoked at Factory. The owner must accept exposure to the child and any code it can run. |
+| B. Provider-issued run-scoped credential | Control uses the stored connection at a trusted issuer boundary. Only a short-lived credential restricted by Factory reaches the child. | Requires documented provider-enforced scope, expiry and revocation semantics, and evidence that headless Droid accepts the credential. Factory support for this flow is unverified. If issuance is unavailable, fail the launch. Falling back to A requires a separate decision. |
+
+## Proposed authorization and delivery sequence
+
+1. Control authenticates the initiating person, checks current launch permission in the workspace and looks up that person's connection in that workspace. Control records an expiring launch intent bound to the person, workspace, connection revision, run, attempt and Droid harness. The run owner comes from the authenticated operation.
+2. The Cloud provisioner binds the authorized run to the instance it actually created. Control must verify a private launcher identity, intended audience and instance/run binding against trusted provisioning evidence. Reviewers must identify the issuer, verifier and key custody before implementation. A fleet-node registration token authenticates a different operation.
+3. Immediately before spawn, the launcher claims the intent on an authenticated private channel. Control checks that the run is active, the connection is current, the person remains authorized, and caller, instance, run and attempt match. Serialize claim against cancellation, disconnect and rotation. Consume the claim once. Refuse a stale or duplicate claim before opening the envelope. An ambiguous delivery consumes that attempt; a later launch requires fresh authorization.
+4. Pass the selected credential over the private launcher channel directly to the child process environment at exec. The launcher must establish isolation from other processes and users, including environment inspection, crash dumps and inherited child environments outside the run. Keep credential material out of command arguments, files, sandbox-wide environment, durable jobs, dashboards, application responses, traces and logs. If the sandbox cannot provide that isolation, disable credentialed launch.
+5. Register the agent using a separate Relay launch identity bound to the run. Exercise send and receive as that agent. Record only run correlation, outcome and refusal class. On exit or cancellation, terminate the run process tree and invalidate outstanding claims. For B, apply the verified provider revocation or expiry policy.
+
+## Offline acceptance evidence
+
+Use synthetic credentials and a fake provisioner. Prove the matching person/workspace/run can launch once and exchange a Relay message. Refuse a different person in the same workspace, a different workspace, swapped instance or run, expired attempt, duplicate concurrent claim, and cancellation or disconnect before claim. After an ambiguous delivery, verify a replay yields no credential. Test that diagnostic and API output, persisted jobs and a sibling process expose no synthetic key. For B, separately demonstrate that the provider claim enforces its advertised scope and lifetime before selecting it for use; an offline fake alone cannot establish that property.
+
+Existing source boundaries are the Control Factory connection routes in `src/factory/routes.ts`, the fleet launch journal in `src/mcp/relay-spawn.ts`, and the Daytona sandbox image in [Cloud #6798](https://github.com/AgentWorkforce/cloud/pull/6798). The image supplies the CLI. Adoption of either credential option and operational rollout remain separate decisions.
