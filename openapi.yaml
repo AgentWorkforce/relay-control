@@ -4094,6 +4094,23 @@ paths:
           content:
             application/json:
               schema: { type: object, required: [agents], properties: { agents: { type: array, items: { type: object } } } }
+  /api/v1/workspaces/{workspaceId}/delegates/approver-candidates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listApproverCandidates
+      tags: [Owner delegates]
+      description: |
+        Human-only. Cloud's list of the agents an approver grant can be pinned to
+        (cloud#6790, #6810). relay-control grants no approvers (it reads no
+        CODEOWNERS, so `POST /delegates` with `kind: "approver"` always refuses),
+        so this always answers `404 approver_grants_unavailable`. relay-web shows
+        that as "Approver grants aren't available on this install".
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "404": { description: "`approver_grants_unavailable`" }
   /internal/v1/delegation/role-quiesce:
     post:
       operationId: delegationRoleQuiesce

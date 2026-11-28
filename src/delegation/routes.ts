@@ -927,6 +927,17 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       json(200, await loadPolicy(input.database, await memberWorkspaceId(principal, workspaceId)));
       return true;
     }
+    // GET /delegates/approver-candidates (cloud#6790, #6810): Cloud lists the agents an approver grant can be
+    // pinned to. relay-control grants no approvers (it reads no CODEOWNERS, so POST kind=approver always
+    // refuses), so it has none to list: a definite 404 `approver_grants_unavailable`, which relay-web shows as
+    // "Approver grants aren't available on this install" (#owner-decisions 252314445629317120). Resolved before
+    // human(), like the policy GET: membership is read without workspaceForUser, so it provisions no Relaycast
+    // binding and needs no provisioner. It reads nothing else.
+    if (sub === "approver-candidates" && method === "GET") {
+      const { principal } = await humanPrincipal(request, publicPath, { write: false });
+      await memberWorkspaceId(principal, workspaceId);
+      return fail("approver_grants_unavailable", "Approver grants aren't available on this install", 404);
+    }
     const caller = await human(request, publicPath, workspaceId, { write: method !== "GET" });
     const { principal, workspace } = caller;
     const actor = { actorUserId: principal.userId, authMethod: caller.authMethod };
@@ -1211,6 +1222,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       }
       return fail("method_not_allowed", "Method not allowed", 405);
     }
+
+    // Any other method on approver-candidates: an explicit 405, ahead of the /{grant_id} branch, so the path is
+    // never read as a grant id. (GET is answered before human(), above.)
+    if (sub === "approver-candidates") return fail("method_not_allowed", "Method not allowed", 405);
 
     // Role bindings, groups, the agents picker and the presets (Cloud's
     // delegates/bindings, groups, agents and roles routes, cloud#6665;
