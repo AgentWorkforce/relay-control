@@ -1768,8 +1768,29 @@ export async function approverIdentityRefusal(deps: DelegationDeps, workspace: D
   return null;
 }
 
-/** Classes Cloud attributes to a repository and commit before an approver may redeem them (cloud#6709 1fcec0c1). */
-const APPROVER_ATTRIBUTED_CLASSES: ReadonlySet<string> = new Set(["release", "deploy", "secret_change", "destructive"]);
+/**
+ * The repositories an approver can be granted for, as Cloud's APPROVER_ALLOWED_PATHS keys (lowercased): only
+ * these have an approver allow-list, so a change an approver ships from any other is refused at redeem anyway
+ * (Khaliq, #owner-decisions 252264737111511040, 252273679358218240; tighter, pre-approved under 252219350137679872).
+ */
+export const APPROVER_REPOSITORIES: ReadonlySet<string> = new Set(["agentworkforce/cloud", "agentworkforce/relay-app"]);
+
+/**
+ * Why a granted approver's scopes can never be written, or null, as Cloud's approverScopeRefusal (cloud#6789):
+ * any class but release (a land is a release target), or a repository without an approver allow-list.
+ * `repos` is approverScopeRepositories(scopes).
+ */
+export function approverScopeRefusal(scopes: ReadonlyArray<{ class: string }>, repos: readonly string[]):
+  { code: "approver_class_not_release" | "approver_repo_not_allowed"; error: string } | null {
+  if (scopes.some(scope => scope.class !== "release")) {
+    return { code: "approver_class_not_release", error: "An approver can only be granted the release class (a land is a release target)" };
+  }
+  const unlisted = repos.find(repo => !APPROVER_REPOSITORIES.has(repo));
+  if (unlisted !== undefined) {
+    return { code: "approver_repo_not_allowed", error: `Approvers can't be granted for ${unlisted}: only AgentWorkforce/cloud and AgentWorkforce/relay-app have an approver allow-list` };
+  }
+  return null;
+}
 
 /**
  * Why a granted approver may not redeem this action here, if it may not (the
@@ -1780,14 +1801,20 @@ const APPROVER_ATTRIBUTED_CLASSES: ReadonlySet<string> = new Set(["release", "de
  * checked the same way through compare(default...sha). relay-control reads no
  * GitHub state for delegation, so none of those checks can run and those
  * actions fail closed with condition_unavailable: an unchecked exclusion never
- * counts as passed. A deploy, secret_change or destructive target names no
- * repository and commit to check, so it is unattributable_target, as in Cloud.
+ * counts as passed. Every class but release is refused as unattributable_target,
+ * as in Cloud (its approverActionCause, cloud#6765 and cloud#6789): an approver is
+ * only ever redeemed for a release or land. That includes deploy, secret_change
+ * and destructive, whose targets name no repository and commit, and spend,
+ * external_comms, config_change and prompt_approval, which an approver redeemed
+ * here before (Khaliq, #owner-decisions 252264737111511040, 252273679358218240;
+ * tighter, pre-approved under 252219350137679872). So on relay-control no approver
+ * redeem succeeds: a release would need GitHub reads it does not make.
  */
 export function approverTargetRefusal(grant: GrantRow, action: Pick<Action, "class" | "target">): ReasonCode | null {
   if (!isApproverGrant(grant)) return null;
   if (PR_TARGET.test(repoPart(action))) return "condition_unavailable";
-  if (!APPROVER_ATTRIBUTED_CLASSES.has(action.class)) return null;
-  return action.class === "release" && releaseTargetSha(action.target) ? "condition_unavailable" : "unattributable_target";
+  if (action.class !== "release") return "unattributable_target";
+  return releaseTargetSha(action.target) ? "condition_unavailable" : "unattributable_target";
 }
 
 export async function attestDelegation(deps: DelegationDeps, input: RecipientInput & {

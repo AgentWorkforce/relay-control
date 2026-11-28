@@ -256,10 +256,20 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   migrations, merge-train and delegation code). relay-control reads no
   GitHub state for delegation, so none of those can be checked: an
   approver's merge, pr_ops and release redeems answer
-  `condition_unavailable`. A deploy, secret_change or destructive target
-  names no repository and commit, so it is `unattributable_target`, as in
-  Cloud. That leaves spend, external_comms, config_change and
-  prompt_approval. These rules also apply at a release-gate redeem.
+  `condition_unavailable`. Every other class is `unattributable_target`, as
+  in Cloud: an approver is only ever redeemed for a release or land. That
+  includes deploy, secret_change and destructive (their targets name no
+  repository and commit) and spend, external_comms, config_change and
+  prompt_approval, which an approver redeemed here before (#owner-decisions
+  252264737111511040, 252273679358218240). So no approver redeem succeeds on
+  relay-control. These rules also apply at a release-gate redeem.
+- **Write-time limits, as Cloud (cloud#6789).** Before the code-owner check,
+  `POST /delegates` with `kind: "approver"` refuses any scope class but
+  `release` (`400 approver_class_not_release`; a land is a release target)
+  and any repository other than `AgentWorkforce/cloud` and
+  `AgentWorkforce/relay-app` (`400 approver_repo_not_allowed`), both logged
+  as `delegation.refused`. Anything left still gets the `403
+  not_code_owner` above.
 - Migration `0101_delegation_approver_grants.sql` adds `kind` (default
   `delegate`), `delegate_address` and `approver_github_logins` (default
   `{}`): nullable, defaulted, no CHECK. A null kind reads as a delegate.

@@ -2498,8 +2498,7 @@ test("approvers: refused by the route on relay-control, after the address pin an
   t.after(() => setDelegationLogSinkForTesting(null));
   const refusals = () => lines.map(line => JSON.parse(line) as Record<string, unknown>)
     .filter(line => line.message === "delegation.refused" && line.op === "approver_grant");
-  const repoScopes = [{ class: "merge", targets: ["AgentWorkforce/relay#7", "agentworkforce/RELAY:main"] },
-    { class: "release", targets: ["AgentWorkforce/cloud:*:*:*:*"] }];
+  const repoScopes = [{ class: "release", targets: ["agentworkforce/CLOUD:land:*:*", "AgentWorkforce/cloud:*:*:*:*"] }];
   const post = (body: Record<string, unknown>, withScopes: unknown = repoScopes) =>
     env.browser("/delegates", "POST", { delegate_agent_id: approver.id, scopes: withScopes, ...body });
   for (const body of [{ kind: "approver", github_logins: ["bot"] }, { kind: "approver", delegate_address: address },
@@ -2533,13 +2532,19 @@ test("approvers: refused by the route on relay-control, after the address pin an
   const notOwner = await post(pinnedBody);
   assert.equal(notOwner.status, 403, notOwner.raw);
   assert.equal(notOwner.body.code, "not_code_owner");
-  assert.match(notOwner.raw, /cannot read CODEOWNERS.*agentworkforce\/relay;/);
-  // A name that is not exactly owner/repo (an owner with `_`, a `..` name) has no governing branches: unconfigured, as Cloud.
-  for (const target of ["Agent_Workforce/relay#7", "AgentWorkforce/.."]) {
-    const odd = await post(pinnedBody, [{ class: "merge", targets: [target] }]);
-    assert.equal(odd.status, 403, odd.raw);
-    assert.equal(odd.body.code, "not_code_owner");
-    assert.match(odd.raw, /no configured merge targets/);
+  assert.match(notOwner.raw, /cannot read CODEOWNERS.*agentworkforce\/cloud;/);
+  // Release class only, in a repository with an approver allow-list, as Cloud (cloud#6789; #owner-decisions
+  // 252264737111511040, 252273679358218240): refused before the code-owner check. A repository that is not exactly
+  // owner/repo (an owner with `_`, a `..` name) is never on the list.
+  for (const [targets, code] of [[[{ class: "merge", targets: ["AgentWorkforce/cloud#7"] }], "approver_class_not_release"],
+    [[{ class: "deploy", targets: ["AgentWorkforce/cloud:prod"] }], "approver_class_not_release"],
+    [[{ class: "release", targets: ["AgentWorkforce/cloud:land:*:*"] }, { class: "merge", targets: ["AgentWorkforce/cloud"] }], "approver_class_not_release"],
+    [[{ class: "release", targets: ["AgentWorkforce/relay:land:*:*"] }], "approver_repo_not_allowed"],
+    [[{ class: "release", targets: ["AgentWorkforce/cloud:land:*:*", "AgentWorkforce/skip:land:*:*"] }], "approver_repo_not_allowed"],
+    [[{ class: "release", targets: ["Agent_Workforce/relay:land:*:*"] }], "approver_repo_not_allowed"]] as const) {
+    const scoped = await post(pinnedBody, targets);
+    assert.equal(scoped.status, 400, scoped.raw);
+    assert.equal(scoped.body.code, code, JSON.stringify(targets));
   }
   assert.equal((await env.database.query("SELECT 1 FROM delegation_grants")).rows.length, 0);
   assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'grant.created'")).rows.length, 0);
@@ -2547,10 +2552,9 @@ test("approvers: refused by the route on relay-control, after the address pin an
   const logged = refusals();
   assert.deepEqual(logged.map(line => line.reason), ["identity_mismatch", "identity_unpinnable",
     "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "approver_target_not_repo", "codeowners_unreadable",
-    "unconfigured", "unconfigured"]);
-  assert.equal(logged[6]!.repo, "agentworkforce/relay");
-  assert.deepEqual(logged.slice(7).map(line => [line.repo, line.merge_targets]),
-    [["agent_workforce/relay", "unconfigured"], ["agentworkforce/..", "unconfigured"]]);
+    "approver_class_not_release", "approver_class_not_release", "approver_class_not_release",
+    "approver_repo_not_allowed", "approver_repo_not_allowed", "approver_repo_not_allowed"]);
+  assert.equal(logged[6]!.repo, "agentworkforce/cloud");
   assert.equal(logged[0]!.agentId, approver.id);
   assert.doesNotMatch(JSON.stringify(logged), /release-bot|release-approver@/);
 
@@ -2569,7 +2573,7 @@ test("approvers: refused by the route on relay-control, after the address pin an
   assert.equal(listed.body.grants.find((grant: any) => grant.grant_id === plain.grant_id).kind, undefined);
 });
 
-test("approvers: claims, audit and the redeem response name the approver; unattributable and GitHub-checked targets refuse", async (t) => {
+test("approvers: claims and audit name the approver; every class but release, and GitHub-checked targets, refuse at redeem", async (t) => {
   const { env, recipient, approver, address, seedApprover } = await approverReady(t);
   const grantId = await seedApprover();
   // granted_by_standing is always "none": relay-control cannot judge code ownership (cloud#6730).
@@ -2586,14 +2590,14 @@ test("approvers: claims, audit and the redeem response name the approver; unattr
     "SELECT data FROM delegation_audit_events WHERE event = 'approval.attested'")).rows[0]!;
   assert.deepEqual(attestedAudit.data.approver, expected);
 
+  // An approver is only ever redeemed for a release or land, as Cloud (cloud#6765, cloud#6789): external_comms, which
+  // redeemed here before, is refused, and nothing is consumed or audited as redeemed.
   const redeemed = await env.redeem(recipient, attested.body.claims.approval_id, comms);
-  assert.deepEqual(redeemed.body, { ok: true, consumed: false, approver: expected });
-  const redeemAudit = (await env.database.query<{ data: Record<string, unknown> }>(
-    "SELECT data FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows[0]!;
-  assert.deepEqual(redeemAudit.data.approver, expected);
+  assert.deepEqual(redeemed.body, { ok: false, reason: "unattributable_target" });
+  assert.equal((await env.database.query("SELECT 1 FROM delegation_audit_events WHERE event = 'approval.redeemed'")).rows.length, 0);
 
-  // A deploy names no repository and commit: unattributable_target, as Cloud. A PR or a release
-  // would need GitHub reads (authors, committers, files, compare) relay-control does not make: they fail closed.
+  // Every other class but release is unattributable_target too, and a PR or a release would need GitHub reads
+  // (authors, committers, files, compare) relay-control does not make: they fail closed.
   const sha = "a".repeat(40);
   for (const [action, reason] of [[{ class: "deploy", target: "relay:prod" }, "unattributable_target"],
     [{ class: "merge", target: "AgentWorkforce/relay#2250" }, "condition_unavailable"],
