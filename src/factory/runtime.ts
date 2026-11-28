@@ -90,6 +90,17 @@ function pageCursor(value: unknown): string | null {
   return page.hasMore ? page.nextCursor as string : null;
 }
 
+/** Scrub transcript credentials before the mapper copies text and raw metadata into records. */
+function redactHistory(value: unknown, key: string): unknown {
+  const scrub = (text: string) => text.replace(/factory_reply_[A-Za-z0-9_-]{43}/g, "[REDACTED]").replaceAll(key, "[REDACTED]");
+  if (typeof value === "string") return scrub(value);
+  if (Array.isArray(value)) return value.map(item => redactHistory(item, key));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [scrub(name), redactHistory(item, key)]));
+  }
+  return value;
+}
+
 export function createFactoryRuntime(input: { apiUrl: string; fetchImpl?: typeof fetch }) {
   const fetcher = input.fetchImpl ?? fetch;
   const origin = input.apiUrl.replace(/\/+$/, "");
@@ -257,7 +268,7 @@ export function createFactoryRuntime(input: { apiUrl: string; fetchImpl?: typeof
             throw new FactoryRuntimeError("rejected", "factory_snapshot_changed");
           }
           if (messages.length !== before.messageCount) throw new FactoryRuntimeError("rejected", "factory_snapshot_incomplete");
-          return { session: after, records: await factoryCanonicalEvidence(sessionId, messages) };
+          return { session: after, records: await factoryCanonicalEvidence(sessionId, messages.map(message => redactHistory(message, key))) };
         }
         if (cursors.has(cursor) || !page.messages.length) throw new FactoryRuntimeError("rejected", "factory_pagination_incomplete");
         cursors.add(cursor);

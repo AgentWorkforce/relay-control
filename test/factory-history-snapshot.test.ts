@@ -36,6 +36,19 @@ test("projects both pages with local-reader event identities after the second me
   ]);
 });
 
+test("scrubs the connection key and injected reply capabilities from evidence and raw metadata", async () => {
+  const reply = "factory_reply_" + "a".repeat(43);
+  const source = page("first", null);
+  source.messages[0]!.content[0]!.text = `use ${reply} or offline-fixture-key`;
+  Object.assign(source.messages[0]!, { meta: { [reply]: ["offline-fixture-key"] } });
+  const meta = { ...metadata, messageCount: 1 };
+  const { records } = await snapshot([meta, source, meta]).read();
+  const projection = JSON.stringify(records);
+  assert.ok(projection.includes("[REDACTED]"));
+  assert.ok(!projection.includes(reply));
+  assert.ok(!projection.includes("offline-fixture-key"));
+});
+
 for (const [name, responses, error] of [
   ["short snapshot", [metadata, page("first", null), metadata], /snapshot_incomplete/],
   ["moving snapshot", [metadata, page("first", null), { ...metadata, updatedAt: 124 }], /snapshot_changed/],
