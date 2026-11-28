@@ -184,8 +184,10 @@ paths:
       description: |
         Authenticated service callback from relay-agent; never carries reply text.
         Verifies current organization/workspace membership, the exact synced Desktop
-        address and its current Relaycast ownership. Sends an idempotent DM as the
-        member. No Cloud service is required. See docs/customer-support-mcp.md.
+        address and its current Relaycast ownership. Sends an idempotent DM from the
+        workspace's Agent Relay Support identity (`agent-relay-support`, or a stable
+        per-workspace fallback), never as the member, rechecking membership right
+        before the send. No Cloud service is required. See docs/customer-support-mcp.md.
       requestBody:
         required: true
         content:

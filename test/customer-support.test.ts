@@ -113,9 +113,13 @@ test("real MCP calls, private history exclusion and Desktop reply wakes work wit
   assert.equal(env.world.messages.size, messagesBefore + 1, "duplicate notices create only one Relaycast message");
   assert.equal(notices[0]!.body!.address, desktopAddress);
   assert(!JSON.stringify(notices).includes("PRIVATE_SUPPORT_REPLY"));
+  // From the workspace's Agent Relay Support identity, never the member's own person identity.
+  const noticeMessages = [...env.world.messages.values()].filter(m => String(m.text).includes("ask_customer_support"));
+  assert.deepEqual(noticeMessages.map(m => m.agent_name), ["agent-relay-support"]);
+  assert.equal(env.world.agents.get("agent-relay-support")!.metadata.workspace_id, env.workspaceId);
   const person = await env.database.query<{ agent_name: string }>("SELECT agent_name FROM person_identities WHERE user_id = $1", [env.ownerId]);
-  assert.equal(person.rows.length, 1);
-  assert.equal(person.rows[0]!.agent_name.startsWith("control-"), false, "a default install registers the notice sender without the gate-only prefix");
+  assert.equal(person.rows.some(row => noticeMessages.some(m => m.agent_name === row.agent_name)), false,
+    "the notice is never sent as the member");
 
   beforeReply = async () => { await env.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [env.ownerId]); };
   const revoked = await client.callTool({ name: "ask_customer_support", arguments: { ...input, request_id: "revoke-during-call" } });

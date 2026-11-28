@@ -5,8 +5,9 @@ import type { SelfhostConfig } from "../config.js";
 import { secureEqual } from "../crypto.js";
 import type { ControlPlaneStore } from "../store.js";
 import { findDesktopIdentityByAddress, findDesktopIdentityBySession, linkedDesktopIdentity, verifyDesktopIdentity } from "../messaging/desktop-identities.js";
-import { ensurePersonIdentity, type MessagingDeps } from "../messaging/identity.js";
+import type { MessagingDeps } from "../messaging/identity.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
+import { sendAsSupport } from "../messaging/support-identity.js";
 import type { McpContext } from "./context.js";
 
 export const CUSTOMER_SUPPORT_NOTICE_PATH = "/internal/v1/customer-support/reply-notice";
@@ -49,19 +50,32 @@ export async function deliverCustomerSupportNotice(store: ControlPlaneStore, dep
     : undefined;
   const desktop = await verifyDesktopIdentity({ keyring: deps.keyring, client, ...(gate ? { gate } : {}),
     relaycastApiKey: workspace.relaycastApiKey, userId: notice.userId, relaycastWorkspaceId: workspace.relaycastWorkspaceId, row });
-  const users = await store.database.query<{ email: string; name: string }>("SELECT email, name FROM users WHERE id = $1", [notice.userId]);
-  if (!users.rows[0]) return "not_authorized";
-  const identity = await ensurePersonIdentity(deps, { workspaceId: workspace.id, organizationId: workspace.organizationId,
-    relaycastWorkspaceId: workspace.relaycastWorkspaceId, relaycastApiKey: workspace.relaycastApiKey,
-    user: { userId: notice.userId, ...users.rows[0] } });
-  const current = await store.workspaceForUser(notice.workspaceId, notice.userId);
-  if (!current || current.organizationId !== notice.organizationId || current.relaycastWorkspaceId !== workspace.relaycastWorkspaceId) return "not_authorized";
   const id = createHash("sha256").update(JSON.stringify(["support-reply-notice-v1", notice.conversationId, notice.revision,
     notice.replyId, notice.desktopAddress])).digest("hex").slice(0, 40);
-  await client.sendDirectMessage({ token: identity.token, to: desktop.name, address: desktop.address,
-    text: `Agent Relay support replied on your case. Call ask_customer_support with conversation_id "${notice.conversationId}" and an empty message to read it.`,
-    idempotencyKey: `support-reply-${id}` });
-  return "sent";
+  // From the workspace's Agent Relay Support identity, never the member's own
+  // person identity: sent as the member it read as them messaging themselves.
+  // Membership and the relay binding are rechecked inside the sender's lock,
+  // after its token is acquired and immediately before the DM.
+  const sent = await sendAsSupport(
+    { database: store.database, relaycast: client, gateOnly: Boolean(deps.relaygatePublicUrl) },
+    { id: workspace.id, relaycastApiKey: workspace.relaycastApiKey },
+    { to: desktop.name, address: desktop.address,
+      text: `Agent Relay support replied on your case. Call ask_customer_support with conversation_id "${notice.conversationId}" and an empty message to read it.`,
+      idempotencyKey: `support-reply-${id}` },
+    async (tx) => {
+      // Same membership and binding test as workspaceForUser, through the lock's transaction.
+      const current = await tx.query<{ organization_id: string; relaycast_workspace_id: string | null }>(
+        `SELECT w.organization_id, w.relaycast_workspace_id
+           FROM workspaces w
+           JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $2
+          WHERE w.id = $1`,
+        [notice.workspaceId, notice.userId]);
+      const row = current.rows[0];
+      return Boolean(row && row.organization_id === notice.organizationId
+        && row.relaycast_workspace_id === workspace.relaycastWorkspaceId);
+    },
+  );
+  return sent ? "sent" : "not_authorized";
 }
 
 export function createCustomerSupportNoticeHandler(config: SelfhostConfig, store: ControlPlaneStore, deps: MessagingDeps) {

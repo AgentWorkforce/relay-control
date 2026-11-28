@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { PresenceRow, RosterAgent } from "../messaging/relaycast.js";
 import { type McpContext, type McpMember, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
 import { assertEventScope, boundedContent, buildDirectEventsPath, resolveWorkspace, SessionEventsPageSchema } from "./shared-session-reads.js";
+import { SUPPORT_SENDER_SOURCE } from "../messaging/support-identity.js";
 
 /**
  * list_team_activity, ported from Cloud's `lib/mcp/team-activity.ts`,
@@ -141,10 +142,15 @@ const record = (value: unknown): Record<string, unknown> =>
 const isRecordValue = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-/** Persona deployments are retired; renamed desktop addresses are not separate agents. */
+/**
+ * Persona deployments are retired; renamed desktop addresses are not separate
+ * agents. The Agent Relay Support sender (messaging/support-identity.ts) only
+ * sends notices and nothing reads its inbox, so it is not offered as a peer.
+ */
 export function isListedRelayAgent(agent: Pick<RosterAgent, "metadata">): boolean {
   const renamed = agent.metadata.renamed_to;
   return agent.metadata.source !== "cloud-persona-deploy" && agent.metadata.source !== "cloud-persona" &&
+    agent.metadata.source !== SUPPORT_SENDER_SOURCE &&
     !(typeof renamed === "string" && renamed.trim());
 }
 
