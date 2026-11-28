@@ -2573,6 +2573,20 @@ test("approvers: refused by the route on relay-control, after the address pin an
   assert.equal(listed.body.grants.find((grant: any) => grant.grant_id === plain.grant_id).kind, undefined);
 });
 
+test("approvers: GET approver-candidates is a definite 404 approver_grants_unavailable, never the grant-id branch", async (t) => {
+  const { env } = await approverReady(t);
+  const listed = await env.bearer("/delegates/approver-candidates");
+  assert.equal(listed.status, 404, listed.raw);
+  assert.equal(listed.body.code, "approver_grants_unavailable");
+  // Not mistaken for a grant id: another method is 405 here, and no grant row is read or written.
+  const posted = await env.browser("/delegates/approver-candidates", "POST", {});
+  assert.equal(posted.status, 405, posted.raw);
+  // People only, like every route here: an agent's token is refused.
+  const agent = await env.desktopIdentity("candidates-bot");
+  const byAgent = await request(env.origin, `${env.base}/delegates/approver-candidates`, { method: "GET", token: agent.token });
+  assert.equal(byAgent.status, 401, byAgent.raw);
+});
+
 test("approvers: claims and audit name the approver; every class but release, and GitHub-checked targets, refuse at redeem", async (t) => {
   const { env, recipient, approver, address, seedApprover } = await approverReady(t);
   const grantId = await seedApprover();

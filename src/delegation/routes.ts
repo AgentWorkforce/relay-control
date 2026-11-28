@@ -1212,6 +1212,16 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       return fail("method_not_allowed", "Method not allowed", 405);
     }
 
+    // Cloud's GET /delegates/approver-candidates (cloud#6790, #6810) lists the agents an approver grant can
+    // be pinned to. relay-control grants no approvers (it reads no CODEOWNERS, so POST kind=approver always
+    // refuses), so it has none to list: a definite 404 `approver_grants_unavailable`, which relay-web shows as
+    // "Approver grants aren't available on this install". An explicit route, ahead of the /{grant_id} branch,
+    // which would otherwise answer 405 (#owner-decisions 252314445629317120). It reads nothing.
+    if (sub === "approver-candidates") {
+      if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
+      return fail("approver_grants_unavailable", "Approver grants aren't available on this install", 404);
+    }
+
     // Role bindings, groups, the agents picker and the presets (Cloud's
     // delegates/bindings, groups, agents and roles routes, cloud#6665;
     // #owner-decisions 251526750352171008). People only, like every route
