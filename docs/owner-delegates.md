@@ -226,6 +226,19 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   until it can read GitHub. As in Cloud, a name that is not exactly
   `owner/repo` (an owner with `_` or `.`, a `.` or `..` repository name) is
   `not_code_owner` too, because it has no governing branches.
+- **The Approvers section.** Cloud's dashboard and relay-web both have an
+  Approvers section under Agent permissions › Advanced (#owner-decisions
+  252264737111511040). It lists and removes approver grants and adds one
+  through `POST /delegates` with `kind: "approver"`: an agent with a known
+  address, its GitHub logins, `AgentWorkforce/cloud` or
+  `AgentWorkforce/relay-app`, and the release class only (lands and
+  releases). On this install that add answers the `403 not_code_owner`
+  above, and relay-web shows the refusal as the route words it. This is
+  deliberate: relay-control's refusal is unchanged, so self-hosted installs
+  still can't grant approvers. Listing and removing work as for any grant.
+  Cloud also refuses, at write time, any approver scope class but `release`
+  and any repository without an approver allow-list; relay-control refuses
+  every approver before those would matter.
 - Every refused approver grant is logged as `delegation.refused` with op
   `approver_grant` and only ids and a reason: `identity_unpinnable` (a
   claimed agent, no address), `identity_mismatch`,
