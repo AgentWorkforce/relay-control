@@ -37,6 +37,23 @@ function holdNextPost(env: FactoryEnv) {
   return { arrived, release: () => { env.factory.holdInject = null; release(); } };
 }
 
+test("bounded inbox polls wake every bound session and wrap for later messages", async (t) => {
+  const env = await startFactoryEnv(t);
+  const first = await connectAndBind(env);
+  const second = await connectAndBind(env, { sessionId: "sess-b" });
+  for (const bound of [first, second]) {
+    queueRelayMessage(env.relay, bound.agent.name, { id: bound.session_id, from: "lead", text: "wake" });
+  }
+  assert.equal(await env.module.worker.pollInbox(1), 1);
+  assert.equal(await env.module.worker.pollInbox(1), 1);
+  for (const bound of [first, second]) {
+    assert.equal((await deliveryRows(env, bound.binding_id)).length, 1);
+    queueRelayMessage(env.relay, bound.agent.name, { id: bound.session_id + "-next", from: "lead", text: "next" });
+  }
+  assert.equal(await env.module.worker.pollInbox(1), 1);
+  assert.equal(await env.module.worker.pollInbox(1), 1);
+});
+
 test("factory worker round trip: inbox commit before ack, one pinned inject, reply bearer answers, no secrets logged", async (t) => {
   const acksAtInsert: string[][] = [];
   const env = await startFactoryEnv(t, { hooks: { beforeInboxInsert: async () => { acksAtInsert.push([...env.relay.acked]); } } });

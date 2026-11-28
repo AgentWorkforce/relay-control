@@ -589,13 +589,13 @@ export async function findDelivery(
   return result.rows[0] ?? null;
 }
 
-/** Bound bindings for the inbox poll, oldest-polled first (soft cap per tick). */
-export async function boundBindings(executor: SqlExecutor, limit: number): Promise<FactoryBindingRow[]> {
+/** Fetch one page of active inboxes in stable binding-id order. */
+export async function boundBindings(executor: SqlExecutor, limit: number, after: string | null): Promise<FactoryBindingRow[]> {
   const result = await executor.query<FactoryBindingRow>(
     `SELECT ${BINDING_COLUMNS} FROM factory_bindings
-      WHERE state = 'bound' AND hosted_token_envelope IS NOT NULL
+      WHERE state = 'bound' AND hosted_token_envelope IS NOT NULL AND ($2::uuid IS NULL OR id > $2)
       ORDER BY id LIMIT $1`,
-    [limit],
+    [limit, after],
   );
   return result.rows;
 }

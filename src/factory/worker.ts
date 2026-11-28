@@ -110,10 +110,16 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
 
   // ------------------------------------------------------------ inbox poll
 
+  let inboxAfter: string | null = null;
+
   /** Reads each bound agent's inbox into the outbox; acks only after the row is committed. */
   async function pollInbox(limit = INBOX_BINDINGS_PER_TICK): Promise<number> {
     let recorded = 0;
-    for (const binding of await boundBindings(database, limit)) {
+    let bindings = await boundBindings(database, limit, inboxAfter);
+    if (!bindings.length && inboxAfter) bindings = await boundBindings(database, limit, null);
+    for (const binding of bindings) {
+      // Advance even if this binding is unreachable. Its inbox is retried on the next pass.
+      inboxAfter = binding.id;
       let token: string;
       let deliveries;
       try {
@@ -169,6 +175,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
         });
       }
     }
+    if (bindings.length < limit) inboxAfter = null;
     return recorded;
   }
 

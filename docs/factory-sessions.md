@@ -9,6 +9,14 @@ The feature is **off by default**. With `SELFHOST_FACTORY_ENABLED` unset or
 `false`, every Factory route answers the generic `404 {"error":"not_found"}`
 before authentication, and the worker does not start.
 
+## Connect a remote session
+
+In the self-hosted dashboard, open **Settings → Connections → Remote Agents → Factory** as a workspace owner or admin. Enter the Factory key, choose a computer, and bind a session. The key must be allowed to list computers and sessions in the Factory organization. If the key validates but a computer is unreachable, start Factory Remote Control on that computer and refresh the session list.
+
+Send a Relay DM to the agent shown for the binding. Control polls that agent’s inbox and injects the message into the selected Droid session. The worker rotates through bindings when there are more than 200. The injected message carries the single-use reply capability for that sender. Disconnecting removes the saved key and retires the bindings.
+
+Factory also supports headless execution with `droid exec`. A sandbox runner needs an installed Droid CLI and a process-scoped `FACTORY_API_KEY`. The dashboard connection alone does not install the CLI or deliver the key to a sandbox. [Factory headless installation and authentication](https://docs.factory.ai/cli/droid-exec/overview).
+
 ## What ships
 
 - Connect a Factory API key per workspace (owner/admin only). The key is
