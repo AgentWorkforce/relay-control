@@ -670,6 +670,18 @@ export function createRelaycastClient(input: {
       return { id, name, token };
     },
 
+    /** A server-operated `agent` identity (not a person), e.g. the Agent Relay Support sender. */
+    async registerSystemAgent(workspaceKey: string, input: { name: string; persona: string; metadata: Record<string, unknown> }): Promise<RegisteredAgent> {
+      const data = record(await labeled("register_system", () => call("POST", "/v1/agents", workspaceKey, {
+        name: input.name, type: "agent", auto_join_general: false, persona: input.persona, metadata: input.metadata,
+      })));
+      const id = text(data?.id);
+      const registered = text(data?.name);
+      const token = text(data?.token);
+      if (!id || registered !== input.name || !token) throw new RelaycastCallError(502, "", true);
+      return { id, name: input.name, token };
+    },
+
     /** Re-issues the token of an orphaned hosted participant this owner registered. */
     async recoverHosted(workspaceKey: string, name: string, expectedAgentId: string, actor: string): Promise<RegisteredAgent> {
       const data = record(await labeled("recover_hosted", () =>

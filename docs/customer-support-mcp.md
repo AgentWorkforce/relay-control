@@ -43,6 +43,23 @@ The two HTTP contracts are:
 | Control → relay-agent | `POST /api/v1/agents/agent-relay/support/control` | Dedicated service bearer plus exact `controlOrigin` |
 | relay-agent → Control | `POST /internal/v1/customer-support/reply-notice` | Dedicated service bearer; current membership and exact synced Desktop ownership |
 
+The reply notice carries no reply text. Control sends it from the workspace's
+**Agent Relay Support** identity (`src/messaging/support-identity.ts`), never as
+the member: sent as the member it read as them messaging themselves, from
+whichever machine their person identity last connected on. The sender is
+`agent-relay-support` (`control-agent-relay-support` on gate-only installs),
+registered on first use with ownership metadata and taken back through
+Relaycast's audited owner takeover for each send, under a per-workspace lock;
+its token is never stored. A same-named agent Control did not register is never
+taken over: a stable per-workspace fallback name (`agent-relay-support-<hash>`)
+is used, preferring one Control already owns so the per-wake, per-address
+idempotency key keeps deduplicating. Membership and the relay binding are
+rechecked inside that lock, after the token is acquired and immediately before
+the DM, which goes only to the member's exact verified Desktop address. It is
+not listed as a messageable agent. A member who limits Desktop delivery to
+known senders sees the first notice held until they allow it. Parity with
+Cloud (AgentWorkforce/cloud#6792).
+
 The first route is under the existing `/api/v1/agents/*` support ingress. It accepts
 the following server-generated body (never exposed as tool input):
 
