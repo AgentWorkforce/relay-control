@@ -3564,8 +3564,9 @@ paths:
         repository (cloud#6730).
         relay-control reads no CODEOWNERS, so it cannot confirm that and
         refuses every approver with `403 not_code_owner`: approver grants are
-        unavailable on this install (a name that is not exactly `owner/repo`
-        is `not_code_owner` too, as in Cloud). Each refused approver grant is
+        unavailable on this install (a name that is not exactly `owner/repo`,
+        such as `Agent_Workforce/relay`, is never on the approver repository
+        list, so it is `approver_repo_not_allowed` first). Each refused approver grant is
         logged as `delegation.refused`, op `approver_grant`, with reason
         `identity_unpinnable`, `identity_mismatch`, `approver_target_not_repo`,
         `approver_class_not_release`, `approver_repo_not_allowed`,

@@ -223,9 +223,10 @@ is an owner-made grant with `kind: "approver"`, created through `POST
   cannot confirm this and refuses every approver with `403 not_code_owner`,
   after the address pin and the repository check. That is a definite
   refusal, not an outage: approver grants are unavailable on this install
-  until it can read GitHub. As in Cloud, a name that is not exactly
-  `owner/repo` (an owner with `_` or `.`, a `.` or `..` repository name) is
-  `not_code_owner` too, because it has no governing branches.
+  until it can read GitHub. A name that is not exactly `owner/repo` (an
+  owner with `_` or `.`, a `.` or `..` repository name) is never on the
+  approver repository list, so it is `400 approver_repo_not_allowed` before
+  the code-owner check (see the write-time limits below).
 - Every refused approver grant is logged as `delegation.refused` with op
   `approver_grant` and only ids and a reason: `identity_unpinnable` (a
   claimed agent, no address), `identity_mismatch`,
